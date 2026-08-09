@@ -74,6 +74,12 @@ Configure the OCR service URL and network policy so only workers can submit jobs
 OCR responses are treated as untrusted artifacts and retain engine/model/language
 provenance.
 
+Scan finalization (`POST /scan/jobs/<id>/finish/`) is queued and returns a durable
+job identifier. Poll `GET /scan-finalizations/<job-id>/` or inspect the scan-job
+pipeline payload. Finalization requires successful ScanTailor output for every
+page by default. `allow_raw_pages=true` is an emergency/manual override; it is
+recorded in variant provenance and should not be used for normal production scans.
+
 ## Routine checks
 
 ```bash

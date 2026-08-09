@@ -11,7 +11,14 @@ from django.test import Client
 from PIL import Image
 
 from ebook_server.core import conversion, ocr, scan_pipeline
-from ebook_server.core.models import Book, FileVariant, ScanJob, ScanPage, ScanPageVersion
+from ebook_server.core.models import (
+    Book,
+    FileVariant,
+    ProcessingJob,
+    ScanJob,
+    ScanPage,
+    ScanPageVersion,
+)
 
 
 class _ScriptedOCRClient:
@@ -82,6 +89,19 @@ class _InMemoryTextConverter:
     ) -> None:
         del source_format, target_format, options
         destination_path.write_bytes(self.payload)
+
+
+class _DeferredQueue:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def enqueue(self, func: Any, *args: Any, **kwargs: Any) -> str:
+        self.calls.append((func, args, kwargs))
+        return "deferred"
+
+    def run_next(self) -> None:
+        func, args, kwargs = self.calls.pop(0)
+        func(*args, **kwargs)
 
 
 def _install_ocr_client(
@@ -322,9 +342,13 @@ def test_scan_page_replacement_preserves_previous_version() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_scan_job_finish_creates_cleaned_variant_when_book_linked() -> None:
+def test_scan_job_finish_is_queued_and_creates_cleaned_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     book = Book.objects.create(title="Scan Finish Book")
     client, job = _create_scan_job_with_book("scan-finish", book_id=book.id)
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: queue)
 
     upload_payload = _valid_png_bytes()
     first = _upload_scan_page(
@@ -339,13 +363,35 @@ def test_scan_job_finish_creates_cleaned_variant_when_book_linked() -> None:
 
     finish = client.post(
         f"/scan/jobs/{job.id}/finish/",
-        data={"create_cleaned_variant": "true"},
+        data={"create_cleaned_variant": "true", "allow_raw_pages": "true"},
     )
-    assert finish.status_code == 200, finish.content.decode()
+    assert finish.status_code == 202, finish.content.decode()
     payload = finish.json()
 
-    assert payload["state"] == ScanJob.State.COMPLETE
-    assert payload["pipeline"]["cleaned_variant_id"] is not None
+    assert payload["state"] == ScanJob.State.FINALIZING
+    assert payload["finalization_job"]["state"] == ProcessingJob.JobState.QUEUED
+    assert len(queue.calls) == 1
+
+    blocked_upload = _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=2,
+        side="single",
+        payload=upload_payload,
+        filename="late-page.png",
+    )
+    assert blocked_upload.status_code == 400
+
+    queue.run_next()
+    job.refresh_from_db()
+    assert job.state == ScanJob.State.COMPLETE
+
+    status = client.get(
+        f"/scan-finalizations/{payload['finalization_job']['job_id']}/",
+    )
+    assert status.status_code == 200
+    assert status.json()["state"] == ProcessingJob.JobState.SUCCESS
+    assert status.json()["cleaned_variant_id"] is not None
 
     assert (
         FileVariant.objects.filter(
@@ -370,6 +416,78 @@ def test_scan_job_finish_failure_does_not_mark_job_complete() -> None:
     assert finish.status_code == 400
     job.refresh_from_db()
     assert job.state != ScanJob.State.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_scan_job_finish_rejects_silent_raw_page_fallback() -> None:
+    book = Book.objects.create(title="Raw scan is not cleaned")
+    client, job = _create_scan_job_with_book("scan-raw-rejected", book_id=book.id)
+    upload = _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_valid_png_bytes(),
+        filename="raw.png",
+    )
+    assert upload.status_code == 201
+
+    finish = client.post(f"/scan/jobs/{job.id}/finish/")
+
+    assert finish.status_code == 400
+    assert "processed output" in finish.content.decode()
+    job.refresh_from_db()
+    assert job.state != ScanJob.State.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_scan_finalization_failure_restores_job_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book = Book.objects.create(title="Retry scan finalization")
+    client, job = _create_scan_job_with_book("scan-finalization-retry", book_id=book.id)
+    upload = _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_valid_png_bytes(),
+        filename="retry.png",
+    )
+    assert upload.status_code == 201
+
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: queue)
+    original_builder = scan_pipeline._build_pdf_from_images
+
+    finish = client.post(
+        f"/scan/jobs/{job.id}/finish/",
+        data={"allow_raw_pages": "true"},
+    )
+    assert finish.status_code == 202
+    finalization_job_id = finish.json()["finalization_job"]["job_id"]
+
+    def fail_builder(_paths: Any) -> Path:
+        raise scan_pipeline.ScanPipelineError("synthetic packaging failure")
+
+    monkeypatch.setattr(scan_pipeline, "_build_pdf_from_images", fail_builder)
+    with pytest.raises(scan_pipeline.ScanPipelineError, match="synthetic packaging failure"):
+        queue.run_next()
+
+    job.refresh_from_db()
+    processing_job = ProcessingJob.objects.get(job_id=finalization_job_id)
+    assert job.state == ScanJob.State.OPEN
+    assert processing_job.state == ProcessingJob.JobState.FAILED
+    assert processing_job.details["attempt_count"] == 1
+
+    monkeypatch.setattr(scan_pipeline, "_build_pdf_from_images", original_builder)
+    scan_pipeline.process_scan_finalization_job(finalization_job_id)
+
+    job.refresh_from_db()
+    processing_job.refresh_from_db()
+    assert job.state == ScanJob.State.COMPLETE
+    assert processing_job.state == ProcessingJob.JobState.SUCCESS
+    assert processing_job.details["attempt_count"] == 2
 
 
 @pytest.mark.django_db(transaction=True)
@@ -410,20 +528,27 @@ def test_scan_job_finish_auto_ocr_and_conversion_chain(
 
     finish = client.post(
         f"/scan/jobs/{job.id}/finish/",
-        data='{"create_cleaned_variant": true, "auto_ocr": true, "target_formats": ["txt", "pdf"]}',
+        data={
+            "create_cleaned_variant": True,
+            "allow_raw_pages": True,
+            "auto_ocr": True,
+            "target_formats": ["txt", "pdf"],
+        },
         content_type="application/json",
     )
-    assert finish.status_code == 200, finish.content.decode()
+    assert finish.status_code == 202, finish.content.decode()
     response_payload = finish.json()
 
     assert response_payload["state"] == "complete"
-    assert response_payload["cleaned_variant_id"] is not None
-    assert "ocr_job" in response_payload
+    finalization_payload = response_payload["finalization_job"]
+    assert finalization_payload["cleaned_variant_id"] is not None
+    assert finalization_payload["ocr_job_id"] is not None
 
     job_refresh = ScanJob.objects.get(pk=job.id)
     detail_payload = client.get(f"/scan/jobs/{job_refresh.id}/").json()
     assert (
-        detail_payload["pipeline"]["cleaned_variant_id"] == response_payload["cleaned_variant_id"]
+        detail_payload["pipeline"]["cleaned_variant_id"]
+        == finalization_payload["cleaned_variant_id"]
     )
     assert any(
         item["state"] == "success" and item["source_type"] == "variant"
@@ -473,7 +598,11 @@ def test_page_replacement_invalidates_scan_job_library_derivatives(
 
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
 
-    scan_pipeline.create_cleaned_variant_for_scan_job(job, request_name="cleaned")
+    scan_pipeline.create_cleaned_variant_for_scan_job(
+        job,
+        request_name="cleaned",
+        allow_raw_pages=True,
+    )
 
     _install_ocr_client(
         monkeypatch,

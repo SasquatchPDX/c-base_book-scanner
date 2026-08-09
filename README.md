@@ -50,12 +50,16 @@ Redis.
 - `/reviews/` — low-confidence metadata review queue
 - `/scan/jobs/` — scanner jobs and page capture
 - `/scan/jobs/<id>/workspace/` — per-page ScanTailor stage state
+- `/scan/jobs/<id>/finish/` — queue scan packaging and optional OCR
+- `/scan-finalizations/<job-id>/` — durable scan-finalization status
 - `/healthz/` and `/healthz/dependencies/` — liveness/readiness
 - `/admin/` — Django administration for application operators
 
 Artifacts are never addressed by request-supplied absolute paths. Library and
 scan data live below the configured storage root and are intentionally ignored by
 Git. Originals and page versions are preserved; derived variants record lineage.
+Scan finalization requires processed output for every page by default and runs in
+the worker queue in production.
 
 ## Operations
 

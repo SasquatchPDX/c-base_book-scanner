@@ -20,6 +20,10 @@ sprint or production deployment is complete.
 - Production settings validate PostgreSQL, Redis, LDAP, secrets, hosts, HTTPS,
   secure cookies, and HSTS. PostgreSQL now has an installed psycopg driver.
 - RQ dispatch applies a default timeout, retention limits, and retry policy.
+- Scan completion is now a durable `ProcessingJob`: the request returns `202`,
+  page mutations are locked while finalization runs, failures are retry-aware,
+  and status is queryable. Raw captures are rejected as cleaned output unless an
+  explicit, provenance-recorded override is requested.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
@@ -33,12 +37,10 @@ sprint or production deployment is complete.
   format represented by `FileVariant`. Cover/thumbnail extraction is incomplete.
 - Administration: explicit, confirmed library deletion with storage/database
   consistency handling is not implemented.
-- Physical pipeline: completion can still package raw pages when a successful
-  ScanTailor output is absent, and an unlinked scan job does not yet enter the
-  bibliographic identification/review pipeline automatically.
+- Physical pipeline: an unlinked scan job does not yet enter the bibliographic
+  identification/review pipeline automatically.
 - Async purity: development intentionally supports synchronous execution without
-  Redis; deployed production is now prevented from using that configuration, but
-  scan-job completion still performs cleaned-PDF assembly in the request path.
+  Redis; deployed production is prevented from using that configuration.
 - Observability: structured event/metric coverage for queue depth, confidence
   distributions, providers, conversion, OCR, and ScanTailor duration/failure is
   incomplete.

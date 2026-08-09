@@ -351,6 +351,7 @@ class ScanJob(models.Model):
         OPEN = "open", "Open"
         CAPTURING = "capturing", "Capturing"
         PAUSED = "paused", "Paused"
+        FINALIZING = "finalizing", "Finalizing"
         COMPLETE = "complete", "Complete"
         CANCELLED = "cancelled", "Cancelled"
 
@@ -642,6 +643,7 @@ class ProcessingJob(models.Model):
         CONVERSION = "conversion", "Conversion"
         OCR = "ocr", "OCR"
         STAGE = "stage", "ScanTailor Stage"
+        SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"

@@ -17,7 +17,7 @@ from django.conf import settings as django_settings
 from django.contrib.auth import logout
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import ContentFile
-from django.db import connections
+from django.db import connections, transaction
 from django.db.models import Count, Q
 from django.http import (
     FileResponse,
@@ -525,53 +525,61 @@ def _store_scan_page(
     force_new_version: bool = False,
 ) -> tuple[ScanPage, ScanPageVersion, bool]:
     staged_path, size_bytes = _stage_scan_upload(uploaded_file)
-    checksum_sha256 = intake.compute_sha256(staged_path)
-    if requested_checksum is not None and requested_checksum.lower() != checksum_sha256.lower():
-        _cleanup_staged_upload(staged_path)
-        raise ValueError("checksum mismatch")
-
-    page, _ = ScanPage.objects.get_or_create(
-        scan_job=job,
-        logical_sequence_number=logical_sequence_number,
-        side=side,
-    )
-
-    existing_version = None
-    if not force_new_version:
-        # Idempotent duplicate for already-uploaded artifact.
-        existing_version = (
-            page.versions.filter(checksum_sha256=checksum_sha256).order_by("-version").first()
-        )
-    if existing_version is not None:
-        if not existing_version.is_active:
-            page.versions.filter(is_active=True).update(is_active=False)
-            existing_version.is_active = True
-            existing_version.save(update_fields=["is_active", "updated_at"])
-        _cleanup_staged_upload(staged_path)
-        page.refresh_from_db()
-        return page, existing_version, False
-
     try:
-        version = _append_version(
-            page=page,
-            uploader_id=uploader_id,
-            staged_path=staged_path,
-            checksum_sha256=checksum_sha256,
-            mime_type=getattr(uploaded_file, "content_type", "application/octet-stream"),
-            size_bytes=size_bytes,
-            capture_timestamp=capture_timestamp,
-            scanner_metadata=scanner_metadata,
-        )
-        if page.scan_job_id is not None:
+        checksum_sha256 = intake.compute_sha256(staged_path)
+        if requested_checksum is not None and requested_checksum.lower() != checksum_sha256.lower():
+            raise ValueError("checksum mismatch")
+
+        with transaction.atomic():
+            locked_job = ScanJob.objects.select_for_update().get(pk=job.pk)
+            if locked_job.state not in {
+                ScanJob.State.OPEN,
+                ScanJob.State.CAPTURING,
+                ScanJob.State.PAUSED,
+            }:
+                raise ValueError("job not accepting pages")
+
+            page, _ = ScanPage.objects.get_or_create(
+                scan_job=locked_job,
+                logical_sequence_number=logical_sequence_number,
+                side=side,
+            )
+
+            existing_version = None
+            if not force_new_version:
+                # Idempotent duplicate for already-uploaded artifact.
+                existing_version = (
+                    page.versions.filter(checksum_sha256=checksum_sha256)
+                    .order_by("-version")
+                    .first()
+                )
+            if existing_version is not None:
+                if not existing_version.is_active:
+                    page.versions.filter(is_active=True).update(is_active=False)
+                    existing_version.is_active = True
+                    existing_version.save(update_fields=["is_active", "updated_at"])
+                page.refresh_from_db()
+                return page, existing_version, False
+
+            version = _append_version(
+                page=page,
+                uploader_id=uploader_id,
+                staged_path=staged_path,
+                checksum_sha256=checksum_sha256,
+                mime_type=getattr(uploaded_file, "content_type", "application/octet-stream"),
+                size_bytes=size_bytes,
+                capture_timestamp=capture_timestamp,
+                scanner_metadata=scanner_metadata,
+            )
             scantailor.mark_state_stale(
                 scan_job_id=str(page.scan_job_id),
                 page_id=str(page.id),
                 reason="source changed",
             )
             scan_pipeline.invalidate_scan_job_library_artifacts(page.scan_job)
+            return page, version, True
     finally:
         _cleanup_staged_upload(staged_path)
-    return page, version, True
 
 
 def _stage_scan_page_from_existing_version(page: ScanPage) -> tuple[str, int]:
@@ -1517,6 +1525,13 @@ def scan_page_stage(
         )
         return JsonResponse(_serialize_workspace_page(page))
 
+    if page.scan_job.state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
+        return HttpResponseBadRequest("scan job is not accepting processing changes")
+
     payload = _json_body(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
     if expected_revision is not None and expected_revision != state.revision:
@@ -1578,6 +1593,12 @@ def scan_job_stage_batch(
         job = ScanJob.objects.prefetch_related("pages").get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
+    if job.state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
+        return HttpResponseBadRequest("scan job is not accepting processing changes")
 
     payload = _json_body(request)
     preserve_exceptions = True
@@ -1716,6 +1737,7 @@ def scan_jobs(
             ScanJob.State.OPEN,
             ScanJob.State.CAPTURING,
             ScanJob.State.PAUSED,
+            ScanJob.State.FINALIZING,
         ]
         queryset = _scan_job_queryset(with_open_todo_count=include_open_todos)
         queryset = queryset.filter(state__in=states)
@@ -1749,7 +1771,11 @@ def scan_jobs(
 
     notes = _normalize_scanner_metadata(payload.get("notes"))
     initial_state = _coerce_str_or_none(payload.get("state")) or ScanJob.State.OPEN
-    if initial_state not in dict(ScanJob.State.choices):
+    if initial_state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
         return HttpResponseBadRequest("invalid state")
 
     job = ScanJob.objects.create(
@@ -1897,6 +1923,12 @@ def scan_page_request_rescan(
         page = ScanPage.objects.select_related("scan_job").get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
+    if page.scan_job.state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
+        return HttpResponseBadRequest("scan job is not accepting rescan requests")
 
     payload = _scan_page_request_payload(request)
     reason = _coerce_str_or_none(payload.get("reason")) or ""
@@ -1952,7 +1984,11 @@ def upload_scan_page(
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
-    if job.state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
+    if job.state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
         return HttpResponseBadRequest("job not accepting pages")
 
     uploaded_file = request.FILES.get("file")
@@ -2055,7 +2091,11 @@ def scan_page(
             # Legacy compatibility mode cannot verify content hash when body is form-string-encoded.
             requested_checksum = None
 
-    if job.state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
+    if job.state not in {
+        ScanJob.State.OPEN,
+        ScanJob.State.CAPTURING,
+        ScanJob.State.PAUSED,
+    }:
         return HttpResponseBadRequest("job not accepting pages")
 
     try:
@@ -2240,6 +2280,9 @@ def scan_job_finish(
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
     try:
         job = ScanJob.objects.get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
@@ -2252,17 +2295,11 @@ def scan_job_finish(
         except Exception:  # pragma: no cover - defensive for odd requests
             payload = {}
 
-    if not _scan_job_transition_allowed(job, ScanJob.State.COMPLETE):
-        return HttpResponseBadRequest("transition not allowed")
-    if job.todos.filter(
-        state__in=[ScanTodo.State.OPEN, ScanTodo.State.CLAIMED],
-    ).exists():
-        return HttpResponseBadRequest("outstanding scan todos must be resolved")
-
     create_cleaned_variant = _coerce_optional_bool(
         payload.get("create_cleaned_variant"),
         default=True,
     )
+    allow_raw_pages = _coerce_optional_bool(payload.get("allow_raw_pages"), default=False)
     auto_ocr = _coerce_optional_bool(payload.get("auto_ocr"), default=False)
     target_formats = payload.get("target_formats")
     language = payload.get("language") if isinstance(payload.get("language"), str) else None
@@ -2272,48 +2309,48 @@ def scan_job_finish(
         payload.get("request_options") if isinstance(payload.get("request_options"), dict) else None
     )
 
-    cleaned_variant = None
-    if create_cleaned_variant:
-        if job.book_id is None:
-            create_cleaned_variant = False
-        else:
-            try:
-                cleaned_variant = scan_pipeline.create_cleaned_variant_for_scan_job(
-                    job,
-                    request_name="cleaned",
-                )
-            except scan_pipeline.ScanPipelineError as error:
-                return HttpResponseBadRequest(str(error))
+    try:
+        finalization_job = scan_pipeline.request_scan_finalization(
+            scan_job=job,
+            requested_by_user_id=profile.user_id,
+            create_cleaned_variant=create_cleaned_variant,
+            allow_raw_pages=allow_raw_pages,
+            auto_ocr=auto_ocr,
+            target_formats=target_formats,
+            request_language=language,
+            engine=engine,
+            model=model,
+            request_options=request_options,
+        )
+    except scan_pipeline.ScanPipelineError as error:
+        return HttpResponseBadRequest(str(error))
 
-    ocr_job = None
-    if auto_ocr and cleaned_variant is not None:
-        try:
-            ocr_job = ocr.request_ocr_from_variant(
-                source_variant=cleaned_variant,
-                requested_by_user_id=job.operator_id,
-                target_formats=target_formats,
-                request_language=language,
-                engine=engine,
-                model=model,
-                request_options=request_options,
-            )
-        except ocr.OCRJobError as error:
-            return HttpResponseBadRequest(str(error))
-
-    ok, reason = _apply_scan_job_transition(job, ScanJob.State.COMPLETE)
-    if not ok:  # pragma: no cover - guarded before processing
-        return HttpResponseBadRequest(reason)
-
+    job.refresh_from_db()
     response: dict[str, Any] = {
         "job_id": str(job.id),
         "state": job.state,
         "pipeline": scan_pipeline.pipeline_progress(job),
+        "finalization_job": scan_pipeline.finalization_job_payload(finalization_job),
     }
-    if cleaned_variant is not None:
-        response["cleaned_variant_id"] = cleaned_variant.id
-    if ocr_job is not None:
-        response["ocr_job"] = ocr.ocr_job_payload(ocr_job)
-    return JsonResponse(response)
+    return JsonResponse(response, status=202)
+
+
+@require_GET
+@login_required
+def scan_finalization_job_status(
+    request: HttpRequest,
+    job_id: str,
+) -> JsonResponse | HttpResponseNotFound | HttpResponseForbidden:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.SCAN_FINALIZATION:
+        return HttpResponseNotFound()
+    return JsonResponse(scan_pipeline.finalization_job_payload(job))
 
 
 @require_POST

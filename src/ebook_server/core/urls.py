@@ -123,6 +123,11 @@ urlpatterns = [
         views.stage_job_status,
         name="stage-job-status",
     ),
+    path(
+        "scan-finalizations/<uuid:job_id>/",
+        views.scan_finalization_job_status,
+        name="scan-finalization-job-status",
+    ),
     path("admin-only/", views.admin_only, name="admin-only"),
     path("imports/upload/", views.upload_file, name="imports-upload"),
     path("imports/<uuid:job_id>/", views.import_status, name="imports-status"),

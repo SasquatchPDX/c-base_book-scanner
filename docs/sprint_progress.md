@@ -29,7 +29,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 015 | ✅ Done | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
 | 016 | ✅ Done | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
 | 017 | ✅ Done | Output/Binarization implemented with pluggable algorithms (Otsu/Sauvola/Wolf/Fox/Window/Grad paths), optional CV2-powered local-threshold handling, zone controls, and regression tests added |
-| 018 | ✅ Done | Added scan-job finish OCR + conversion chain coverage, OCR/cleaned variant pipeline summaries for job-level workflows, and scan-job finish endpoint wiring for end-to-end completion |
+| 018 | ✅ Done | Added durable queued scan finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
 
 ## Sprint evidence checklist (as of 2026-08-08)
 
