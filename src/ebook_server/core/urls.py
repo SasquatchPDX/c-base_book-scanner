@@ -13,6 +13,7 @@ urlpatterns = [
     path("accounts/logout/", views.library_logout, name="library-logout"),
     path("healthz/", views.health),
     path("healthz/dependencies/", views.readiness),
+    path("metrics/", views.prometheus_metrics, name="prometheus-metrics"),
     path("library/", views.library_home, name="library-home"),
     path("library/books/", views.library_books, name="library-books"),
     path("library/books/<int:book_id>/", views.library_book_detail, name="library-book-detail"),

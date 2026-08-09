@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,11 +35,14 @@ from django.shortcuts import redirect, render
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from ebook_server.jobs import enqueue
 from ebook_server.storage import LocalFilesystemStorage
 
 from . import book_deletion, conversion, intake, ocr, scan_pipeline, scantailor
+from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
     Author,
@@ -97,6 +101,24 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
 def library_logout(request: HttpRequest) -> HttpResponseBase:
     logout(request)
     return redirect("library-login")
+
+
+@require_GET
+def prometheus_metrics(request: HttpRequest) -> HttpResponseBase:
+    if not django_settings.BOOK_SCANNER_METRICS_ENABLED:
+        return HttpResponseNotFound()
+    expected_token = django_settings.BOOK_SCANNER_METRICS_BEARER_TOKEN
+    if expected_token:
+        authorization = request.headers.get("Authorization", "")
+        supplied_token = authorization.removeprefix("Bearer ") if authorization else ""
+        if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
+            response = HttpResponseForbidden("invalid metrics credentials")
+            response["WWW-Authenticate"] = "Bearer"
+            return response
+
+    registry = CollectorRegistry(auto_describe=True)
+    registry.register(PersistentStateCollector())
+    return HttpResponse(generate_latest(registry), content_type=CONTENT_TYPE_LATEST)
 
 
 def _normalize_stage(value: str) -> str | None:
@@ -685,6 +707,12 @@ def _check_queue() -> DependencyResult:
             name="queue",
             status="disabled",
             details={"reason": "not configured"},
+        )
+    if queue_url.startswith("inline://"):
+        return DependencyResult(
+            name="queue",
+            status="ok",
+            details={"mode": "inline development queue"},
         )
     client = redis.Redis.from_url(queue_url)
     try:

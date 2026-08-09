@@ -7,14 +7,18 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import structlog
 from django.conf import settings as django_settings
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import token_set_ratio
+
+logger = structlog.get_logger(__name__)
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -261,7 +265,13 @@ class OpenLibraryMetadataProvider:
         url = f"https://openlibrary.org/isbn/{isbn}.json"
         try:
             payload = self._get_json(url)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "metadata_provider_request_failed",
+                provider_id=self.provider_id,
+                operation="isbn",
+                error_type=type(exc).__name__,
+            )
             return None
         if not isinstance(payload, dict):
             return None
@@ -272,7 +282,13 @@ class OpenLibraryMetadataProvider:
         url = f"https://openlibrary.org/search.json?{encoded}"
         try:
             payload = self._get_json(url)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "metadata_provider_request_failed",
+                provider_id=self.provider_id,
+                operation="search",
+                error_type=type(exc).__name__,
+            )
             return []
         docs = payload.get("docs", []) if isinstance(payload, dict) else []
         return docs if isinstance(docs, list) else []
@@ -309,7 +325,23 @@ def _provider_instances() -> list[MetadataProvider]:
 def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandidate]:
     raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
     for provider in _provider_instances():
-        raw_list = _query_provider(provider, signals)
+        started_at = perf_counter()
+        try:
+            raw_list = _query_provider(provider, signals)
+        except Exception as exc:  # provider boundary: one provider must not abort intake
+            logger.exception(
+                "metadata_provider_failed",
+                provider_id=provider.provider_id,
+                duration_seconds=perf_counter() - started_at,
+                error_type=type(exc).__name__,
+            )
+            continue
+        logger.info(
+            "metadata_provider_completed",
+            provider_id=provider.provider_id,
+            candidate_count=len(raw_list),
+            duration_seconds=perf_counter() - started_at,
+        )
         for candidate in raw_list:
             raw_candidates.append((provider, candidate))
 

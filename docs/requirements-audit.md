@@ -34,6 +34,10 @@ sprint or production deployment is complete.
 - Admin book deletion requires exact-title confirmation, verifies managed
   artifact hashes, quarantines files before the database transaction commits,
   restores them on failure, and then purges quarantine.
+- The bearer-protected Prometheus endpoint reports persistent PostgreSQL/Redis
+  queue and workflow state, processing-duration populations, ScanTailor status,
+  and metadata-confidence distributions. Provider and worker lifecycle events use
+  structured logs with bounded metadata and no document content.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
@@ -49,9 +53,9 @@ sprint or production deployment is complete.
   identification/review pipeline automatically.
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.
-- Observability: structured event/metric coverage for queue depth, confidence
-  distributions, providers, conversion, OCR, and ScanTailor duration/failure is
-  incomplete.
+- Observability: core metrics and structured events are present; deployment alert
+  rules, dashboards, retention policy, and production scrape verification remain
+  operator/integration work.
 - Integration/E2E depth: PostgreSQL, a real LDAP test directory, real worker
   processes, external converter binaries, and a browser-driven full physical-book
   flow need dedicated integration environments.

@@ -134,6 +134,37 @@ def test_no_match_produces_no_candidates() -> None:
     assert candidates == []
 
 
+def test_failing_provider_does_not_abort_other_providers() -> None:
+    signals = IdentificationInput(
+        title_hints=["Resilient Metadata"],
+        author_hints=[],
+        isbns=[],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+
+    class FailingProvider:
+        provider_id = "failing"
+
+        def search(self, *args: object, **kwargs: object) -> list[dict[str, Any]]:
+            del args, kwargs
+            raise OSError("provider unavailable")
+
+    healthy_provider = _stub_provider_from_candidates(
+        [{"title": "Resilient Metadata", "author_name": []}],
+    )()
+    with patch(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [FailingProvider(), healthy_provider],
+    ):
+        candidates = resolve_candidates(signals)
+
+    assert len(candidates) == 1
+    assert candidates[0].provider_id == "stub"
+
+
 def test_conflicting_metadata_keeps_filename_signal() -> None:
     payload = build_identification_input(
         source_path="/incoming/series/The%20War%20of%20The%20Worlds.pdf",

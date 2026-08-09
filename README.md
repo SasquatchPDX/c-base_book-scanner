@@ -55,6 +55,7 @@ Redis.
 - `/scan/jobs/<id>/finish/` — queue scan packaging and optional OCR
 - `/scan-finalizations/<job-id>/` — durable scan-finalization status
 - `/healthz/` and `/healthz/dependencies/` — liveness/readiness
+- `/metrics/` — bearer-protected Prometheus metrics
 - `/admin/` — Django administration for application operators
 
 Workflow routes return JSON to API clients and HTML to browsers through content

@@ -100,3 +100,18 @@ uv run pytest -q
 
 Monitor queue depth, failed `ProcessingJob` and `ImportJob` records, provider/OCR
 errors, storage capacity, and health endpoint status. Do not log document content.
+
+## Metrics and logs
+
+Set a long random `BOOK_SCANNER_METRICS_BEARER_TOKEN` in production and configure
+Prometheus to scrape `/metrics/` with `Authorization: Bearer <token>`. Production
+configuration fails closed when metrics are enabled without a token. The endpoint
+derives its values from PostgreSQL and Redis, so web and worker state is visible
+without relying on process-local counters.
+
+Metrics include queue health/depth, collection size, import/processing/review/scan
+state counts, ScanTailor stage status, processing-duration bucket populations,
+and metadata-confidence bucket populations by provider. Labels use bounded model
+enums or configured provider IDs; filenames, titles, usernames, and book contents
+are never labels. Structured logs record provider latency/failure and processing
+job lifecycle events without document content.

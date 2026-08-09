@@ -12,7 +12,7 @@ This file tracks execution status while advancing Sprint documents in order.
 
 | Sprint | Status | Completed artifacts |
 | --- | --- | --- |
-| 001 | ✅ Done | Architecture/research docs, tool-choice docs, project skeleton, dependency/tooling baseline, health endpoints, CI |
+| 001 | ✅ Done | Architecture/research docs, project skeleton, dependency/tooling baseline, health/readiness and secured Prometheus endpoints, structured logging, CI |
 | 002 | ✅ Done | Local auth role model/profile, LDAP adapter boundary, Django auth backend scaffold, RQ queue module, and starter queue/storage settings + Sprint002 test coverage |
 | 003 | ✅ Done | Canonical book/domain models (Book, Author, Identifier, FileVariant, CoverImage, Storage/Source locations) and baseline migration/test coverage |
 | 004 | ✅ Done | Upload/intake path with staging, hashing, metadata extraction, deduplication, durable archive copy, and API status/update behavior |

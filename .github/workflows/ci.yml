@@ -39,6 +39,7 @@ jobs:
           BOOK_SCANNER_CSRF_COOKIE_SECURE: "true"
           BOOK_SCANNER_SECURE_HSTS_SECONDS: "31536000"
           BOOK_SCANNER_SECURE_HSTS_PRELOAD: "true"
+          BOOK_SCANNER_METRICS_BEARER_TOKEN: ci-only-monitoring-token
         run: uv run python manage.py check --deploy --fail-level WARNING
       - name: Dependency audit
         run: uv run pip-audit --skip-editable

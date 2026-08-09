@@ -28,6 +28,7 @@ dependencies = [
   "django-stubs-ext>=5.2,<7",
   "psycopg[binary]>=3.2,<4",
   "scikit-image>=0.25,<1",
+  "prometheus-client>=0.22,<1",
 ]
 
 [project.scripts]

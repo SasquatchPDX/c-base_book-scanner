@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     ldap_connect_timeout: float = 5.0
     ldap_start_tls: bool = False
     log_level: str = "INFO"
+    metrics_enabled: bool = True
+    metrics_bearer_token: SecretStr = SecretStr("")
     max_upload_bytes: int = 150 * 1024 * 1024
     metadata_providers: list[str] = [
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
@@ -84,6 +86,8 @@ class Settings(BaseSettings):
             errors.append("secure session and CSRF cookies must be enabled")
         if self.secure_hsts_seconds <= 0:
             errors.append("secure_hsts_seconds must be positive")
+        if self.metrics_enabled and not self.metrics_bearer_token.get_secret_value():
+            errors.append("metrics_bearer_token is required when metrics are enabled")
         if errors:
             raise ValueError("unsafe production configuration: " + "; ".join(errors))
         return self
@@ -185,6 +189,8 @@ BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
+BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds
