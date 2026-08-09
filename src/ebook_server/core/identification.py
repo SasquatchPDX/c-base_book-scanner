@@ -5,9 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import URLError
@@ -15,20 +13,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from django.conf import settings as django_settings
-
-# Optional normalization/similarity libraries improve matching precision when available.
-try:
-    from isbnlib import is_isbn10, is_isbn13, to_isbn13
-except Exception:  # pragma: no cover - optional dependency path
-    is_isbn10: Callable[[str], bool] | None = None
-    is_isbn13: Callable[[str], bool] | None = None
-    to_isbn13: Callable[[str], str] | None = None
-
-try:
-    from rapidfuzz.fuzz import token_set_ratio
-except Exception:  # pragma: no cover - optional dependency path
-    token_set_ratio: Callable[[str, str], int | float] | None = None
-
+from isbnlib import is_isbn10, is_isbn13, to_isbn13
+from rapidfuzz.fuzz import token_set_ratio
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -88,17 +74,15 @@ class IdentificationCandidate:
     raw: dict[str, Any]
 
 
-
 def _normalize_identifier(value: str | None) -> str | None:
     if not value:
         return None
 
     normalized = re.sub(r"[^0-9Xx]", "", value).upper()
-    if is_isbn10 is not None and is_isbn13 is not None:
-        if is_isbn10(normalized):
-            return normalized
-        if is_isbn13(normalized):
-            return normalized
+    if is_isbn10(normalized):
+        return normalized
+    if is_isbn13(normalized):
+        return normalized
 
     if len(normalized) == 10 and _isbn10_valid(normalized):
         return normalized
@@ -116,13 +100,9 @@ def _isbn10_check(isbn10: str) -> bool:
 
 
 def _isbn10_to_isbn13(isbn10: str) -> str:
-    if to_isbn13 is not None:
-        try:
-            converted = to_isbn13(isbn10)
-            if _isbn13_valid(converted):
-                return converted
-        except Exception:
-            pass
+    converted = to_isbn13(isbn10)
+    if _isbn13_valid(converted):
+        return converted
     body = isbn10[:-1]
     prefix12 = f"978{body}"
     total = 0
@@ -248,9 +228,9 @@ def build_identification_input(
         folder_hints=[h for h in folder_hints if h],
         language=normalize_text(extracted_metadata.get("language")),
         publisher=normalize_text(extracted_metadata.get("publisher")),
-        description=extracted_metadata.get("description") if isinstance(
-            extracted_metadata.get("description"), str
-        ) else None,
+        description=extracted_metadata.get("description")
+        if isinstance(extracted_metadata.get("description"), str)
+        else None,
     )
 
 
@@ -378,11 +358,15 @@ def _normalize_candidate(
         title = "Unknown title"
 
     raw_authors = payload.get("author_name")
-    authors = [
-        str(value)
-        for value in raw_authors
-        if isinstance(value, str) and normalize_text(value).strip()
-    ] if isinstance(raw_authors, list) else []
+    authors = (
+        [
+            str(value)
+            for value in raw_authors
+            if isinstance(value, str) and normalize_text(value).strip()
+        ]
+        if isinstance(raw_authors, list)
+        else []
+    )
 
     isbn10 = None
     isbn13 = None
@@ -427,9 +411,7 @@ def _normalize_candidate(
         isbn10=isbn10,
         isbn13=isbn13,
         language=language,
-        description=payload.get("subtitle")
-        if isinstance(payload.get("subtitle"), str)
-        else None,
+        description=payload.get("subtitle") if isinstance(payload.get("subtitle"), str) else None,
         publisher=publisher,
         edition=payload.get("edition_name")
         if isinstance(payload.get("edition_name"), str)
@@ -442,9 +424,7 @@ def _normalize_candidate(
 
 
 def _title_match_score(left: str, right: str) -> float:
-    if token_set_ratio is not None:
-        return token_set_ratio(normalize_text(left), normalize_text(right)) / 100.0
-    return SequenceMatcher(None, normalize_text(left), normalize_text(right)).ratio()
+    return token_set_ratio(normalize_text(left), normalize_text(right)) / 100.0
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:
@@ -465,16 +445,13 @@ def _apply_scoring(
 
     if signals.isbns:
         isbn_matches = {
-            value
-            for value in signals.isbns
-            if value in {candidate.isbn10, candidate.isbn13}
+            value for value in signals.isbns if value in {candidate.isbn10, candidate.isbn13}
         }
         if isbn_matches:
             score += 0.95
 
     title_scores = [
-        _title_match_score(title_hint, candidate.title)
-        for title_hint in signals.title_hints
+        _title_match_score(title_hint, candidate.title) for title_hint in signals.title_hints
     ]
     if title_scores:
         score += 0.55 * max(title_scores)

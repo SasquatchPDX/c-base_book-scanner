@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
+from typing import Any
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -102,9 +103,7 @@ def _create_stub_converter(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         conversion,
         "CAPABILITIES",
-        (
-            conversion.ConversionCapability("txt", "epub", "stub"),
-        ),
+        (conversion.ConversionCapability("txt", "epub", "stub"),),
     )
 
 
@@ -165,7 +164,7 @@ def _upload_scan_page(
     *,
     filename: str,
     content_type: str = "image/png",
-) -> tuple:
+) -> Any:
     return client.post(
         f"/scan/jobs/{job_id}/pages/",
         data={
@@ -359,6 +358,21 @@ def test_scan_job_finish_creates_cleaned_variant_when_book_linked() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_scan_job_finish_failure_does_not_mark_job_complete() -> None:
+    book = Book.objects.create(title="Incomplete scan")
+    client, job = _create_scan_job_with_book("scan-finish-failure", book_id=book.id)
+
+    finish = client.post(
+        f"/scan/jobs/{job.id}/finish/",
+        data={"create_cleaned_variant": "true"},
+    )
+
+    assert finish.status_code == 400
+    job.refresh_from_db()
+    assert job.state != ScanJob.State.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
 def test_scan_job_finish_auto_ocr_and_conversion_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,8 +423,7 @@ def test_scan_job_finish_auto_ocr_and_conversion_chain(
     job_refresh = ScanJob.objects.get(pk=job.id)
     detail_payload = client.get(f"/scan/jobs/{job_refresh.id}/").json()
     assert (
-        detail_payload["pipeline"]["cleaned_variant_id"]
-        == response_payload["cleaned_variant_id"]
+        detail_payload["pipeline"]["cleaned_variant_id"] == response_payload["cleaned_variant_id"]
     )
     assert any(
         item["state"] == "success" and item["source_type"] == "variant"
@@ -436,9 +449,7 @@ def test_scan_job_finish_auto_ocr_and_conversion_chain(
     assert conversion_response.status_code == 202
 
     conversion_payload = conversion_response.json()
-    assert (
-        conversion_payload["state"] == "success"
-    ), f"conversion payload: {conversion_payload!r}"
+    assert conversion_payload["state"] == "success", f"conversion payload: {conversion_payload!r}"
     assert conversion_payload["source_variant_id"] == ocr_variant.id
     assert conversion_payload["target_format"] == "epub"
 

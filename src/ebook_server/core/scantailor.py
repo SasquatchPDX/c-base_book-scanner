@@ -6,22 +6,19 @@ import hashlib
 import shutil
 import statistics
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from math import hypot
 from pathlib import Path
 from typing import Any, Final
 
-try:
-    import cv2
-    import numpy as np
-except Exception:  # pragma: no cover - optional dependency path
-    cv2 = None  # type: ignore[assignment]
-    np = None  # type: ignore[assignment]
-
+import cv2
+import numpy as np
+import structlog
 from django.conf import settings as django_settings
 from django.db.models import Q
 from django.utils import timezone
 from PIL import Image, UnidentifiedImageError
+from skimage.filters import threshold_niblack, threshold_sauvola
 
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
@@ -33,7 +30,12 @@ from .models import (
     StorageLocation,
 )
 
+logger = structlog.get_logger(__name__)
+
 STAGE_NAMESPACE: Final[str] = "scan-jobs"
+type Point = tuple[int, int]
+type Quad = tuple[Point, Point, Point, Point]
+type Box = tuple[int, int, int, int]
 
 DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
     "page_split": "auto_split",
@@ -158,13 +160,17 @@ def _resolve_input_identifier(state: ScanTailorStageState) -> str:
 
 
 def _coerce_int(value: object, default: int, *, minimum: int | None = None) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        value_int = value
+    elif isinstance(value, (str, bytes, bytearray, float)):
         try:
-            value_int = int(value)  # type: ignore[arg-type]
+            value_int = int(value)
         except (TypeError, ValueError):
             return default
     else:
-        value_int = value
+        return default
     if minimum is not None and value_int < minimum:
         return default
     return value_int
@@ -366,6 +372,16 @@ def _copy_fallback(source_path: Path, output_path: Path, preview_path: Path) -> 
     return {"algorithm": "copy"}
 
 
+def _run_copy(
+    state: ScanTailorStageState,
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+) -> dict[str, Any]:
+    del state
+    return _copy_fallback(source_path, output_path, preview_path)
+
+
 def _auto_split_position(
     image: Image.Image,
     *,
@@ -381,7 +397,10 @@ def _auto_split_position(
     sample_step = max(1, height // 120)
     row_positions = range(0, height, sample_step)
 
-    pixels = list(grayscale.getdata())
+    pixels = [
+        int(value[0]) if isinstance(value, tuple) else int(value)
+        for value in grayscale.get_flattened_data()
+    ]
 
     best_value: int | None = None
     best_x: int | None = None
@@ -491,10 +510,13 @@ def _run_page_split(
     if split_detected is not None:
         updates["resolved_split_x"] = split_detected
         updates["resolved_width"] = output.width
-    return _as_recorded_parameters(parameters, {
-        "resolved_split_mode": resolved,
-        **updates,
-    })
+    return _as_recorded_parameters(
+        parameters,
+        {
+            "resolved_split_mode": resolved,
+            **updates,
+        },
+    )
 
 
 def _deskew_score(image: Image.Image) -> float:
@@ -557,10 +579,13 @@ def _run_deskew(
     output.save(output_path, format="PNG")
     _save_preview(output, preview_path)
 
-    return _as_recorded_parameters(parameters, {
-        "deskew_mode": mode,
-        "angle": angle,
-    })
+    return _as_recorded_parameters(
+        parameters,
+        {
+            "deskew_mode": mode,
+            "angle": angle,
+        },
+    )
 
 
 def _run_select_content(
@@ -609,21 +634,24 @@ def _run_select_content(
         out.save(output_path, format="PNG")
         _save_preview(out, preview_path)
 
-    return _as_recorded_parameters(parameters, {
-        "content_mode": mode,
-        "content_box": {
-            "x1": left,
-            "y1": top,
-            "x2": right,
-            "y2": bottom,
-            "width": right - left,
-            "height": bottom - top,
+    return _as_recorded_parameters(
+        parameters,
+        {
+            "content_mode": mode,
+            "content_box": {
+                "x1": left,
+                "y1": top,
+                "x2": right,
+                "y2": bottom,
+                "width": right - left,
+                "height": bottom - top,
+            },
+            "content_area_width": right - left,
+            "content_area_height": bottom - top,
+            "source_width": source.width,
+            "source_height": source.height,
         },
-        "content_area_width": right - left,
-        "content_area_height": bottom - top,
-        "source_width": source.width,
-        "source_height": source.height,
-    })
+    )
 
 
 def _coerce_box(
@@ -786,20 +814,23 @@ def _run_margins(
     canvas.save(output_path, format="PNG")
     _save_preview(canvas, preview_path)
 
-    return _as_recorded_parameters(parameters, {
-        "margins_mode": mode,
-        "margin_top": top,
-        "margin_right": right,
-        "margin_bottom": bottom,
-        "margin_left": left,
-        "align_x": align_x,
-        "align_y": align_y,
-        "canvas_width": target_w,
-        "canvas_height": target_h,
-    })
+    return _as_recorded_parameters(
+        parameters,
+        {
+            "margins_mode": mode,
+            "margin_top": top,
+            "margin_right": right,
+            "margin_bottom": bottom,
+            "margin_left": left,
+            "align_x": align_x,
+            "align_y": align_y,
+            "canvas_width": target_w,
+            "canvas_height": target_h,
+        },
+    )
 
 
-def _ordered_quad_points(points: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+def _ordered_quad_points(points: list[Point]) -> Quad:
     if len(points) != 4:
         raise ValueError("need four points")
     np_points = np.array(points, dtype=np.float32) if np is not None else []
@@ -815,10 +846,22 @@ def _ordered_quad_points(points: list[tuple[int, int]]) -> tuple[tuple[int, int]
 
     s = np_points.sum(axis=1)
     diff = np_points[:, 1] - np_points[:, 0]
-    top_left = tuple(np_points[np.argmin(s)].astype(int))
-    bottom_right = tuple(np_points[np.argmax(s)].astype(int))
-    top_right = tuple(np_points[np.argmin(diff)].astype(int))
-    bottom_left = tuple(np_points[np.argmax(diff)].astype(int))
+    top_left = (
+        int(np_points[np.argmin(s)][0]),
+        int(np_points[np.argmin(s)][1]),
+    )
+    bottom_right = (
+        int(np_points[np.argmax(s)][0]),
+        int(np_points[np.argmax(s)][1]),
+    )
+    top_right = (
+        int(np_points[np.argmin(diff)][0]),
+        int(np_points[np.argmin(diff)][1]),
+    )
+    bottom_left = (
+        int(np_points[np.argmax(diff)][0]),
+        int(np_points[np.argmax(diff)][1]),
+    )
     return (top_left, top_right, bottom_right, bottom_left)
 
 
@@ -827,10 +870,10 @@ def _coerce_dewarp_points(
     image_size: tuple[int, int],
 ) -> list[tuple[int, int]] | None:
     width, height = image_size
-    values: list[tuple[int, int]] = []
+    values: list[Point] = []
 
     if isinstance(raw_points, dict):
-        sequence = (
+        sequence: Sequence[Any] = (
             raw_points.get("tl"),
             raw_points.get("tr"),
             raw_points.get("br"),
@@ -860,17 +903,13 @@ def _coerce_dewarp_points(
             return None
         values.append((_coerce_int(int(x), 0), _coerce_int(int(y), 0)))
 
-    values = [
-        (max(0, min(x, width)), max(0, min(y, height))) for x, y in values
-    ]
+    values = [(max(0, min(x, width)), max(0, min(y, height))) for x, y in values]
     return values
 
 
 def _auto_dewarp_points(
     image: Image.Image,
-) -> (
-    tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None
-):
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
     if cv2 is None or np is None:
         return None
     grayscale = np.array(image.convert("L"))
@@ -882,7 +921,7 @@ def _auto_dewarp_points(
 
     width, height = image.size
     min_area = (width * height) * 0.15
-    best: list[tuple[int, int]] | None = None
+    best: list[Point] | None = None
 
     for contour in sorted(contours, key=cv2.contourArea, reverse=True):
         area = cv2.contourArea(contour)
@@ -899,10 +938,10 @@ def _auto_dewarp_points(
             approx = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
             if len(approx) != 4:
                 continue
-            candidates = [tuple(int(v) for v in point[0]) for point in approx]
+            candidates = [(int(point[0][0]), int(point[0][1])) for point in approx]
             best = candidates
             break
-        candidates = [tuple(int(v) for v in point[0]) for point in approximated]
+        candidates = [(int(point[0][0]), int(point[0][1])) for point in approximated]
         best = candidates
         break
 
@@ -913,7 +952,7 @@ def _auto_dewarp_points(
 
 
 def _estimate_target_dimensions(
-    quad: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]],
+    quad: Quad,
 ) -> tuple[int, int]:
     top_left, top_right, bottom_right, bottom_left = quad
 
@@ -981,6 +1020,7 @@ def _run_perspective_dewarp(
         source.size,
     )
 
+    source_quad: Quad | None
     if mode == "manual" and manual_points is not None:
         source_quad = _ordered_quad_points(manual_points)
     else:
@@ -1060,7 +1100,7 @@ def _normalize_zone_mode(value: object, default: str = "auto") -> str:
 def _zone_rectangles(
     parameters: dict[str, Any],
     image_size: tuple[int, int],
-) -> dict[str, tuple[int, int, int, int]]:
+) -> dict[str, Box | None]:
     text_box = _coerce_box(
         {},
         parameters.get("text_box"),
@@ -1102,11 +1142,7 @@ def _pil_otsu_threshold(image: Image.Image) -> int:
         mean_background = cumulative_sum / background_weight
         mean_foreground = (total_weighted_sum - cumulative_sum) / foreground_weight
 
-        between = (
-            background_weight
-            * foreground_weight
-            * (mean_background - mean_foreground) ** 2
-        )
+        between = background_weight * foreground_weight * (mean_background - mean_foreground) ** 2
         if between > best:
             best = between
             best_threshold = value
@@ -1151,24 +1187,25 @@ def _binarize_with_cv2(
             k,
         )
     elif mode == "fox":
-        # Niblack-like approximation.
         block = max(3, window_size)
         if block % 2 == 0:
             block += 1
-        mean = cv2.blur(gray.astype(np.float32), (block, block))
-        sq_mean = cv2.blur((gray.astype(np.float32) ** 2), (block, block))
-        std = np.sqrt(np.maximum(sq_mean - (mean * mean), 0.0))
-        threshold = mean + k * std
+        threshold = threshold_niblack(  # type: ignore[no-untyped-call]
+            gray,
+            window_size=block,
+            k=k,
+        )
         output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
     elif mode == "sauvola":
-        # Practical open-source approximation via local stats.
         block = max(3, window_size)
         if block % 2 == 0:
             block += 1
-        mean = cv2.blur(gray.astype(np.float32), (block, block))
-        sq_mean = cv2.blur((gray.astype(np.float32) ** 2), (block, block))
-        std = np.sqrt(np.maximum(sq_mean - (mean * mean), 0.0))
-        threshold = mean * (1.0 + k * (std / max(r, 1.0) - 1.0))
+        threshold = threshold_sauvola(  # type: ignore[no-untyped-call]
+            gray,
+            window_size=block,
+            k=k,
+            r=max(r, 1.0),
+        )
         output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
     elif mode == "wolf":
         # Wolf-like approximation from local contrast.
@@ -1189,7 +1226,13 @@ def _binarize_with_cv2(
         gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
         gradient = cv2.magnitude(gx, gy)
-        normalized = cv2.normalize(gradient, None, 0, 255, cv2.NORM_MINMAX)
+        normalized = cv2.normalize(  # type: ignore[call-overload]
+            np.asarray(gradient, dtype=np.float32),
+            None,
+            alpha=0,
+            beta=255,
+            norm_type=cv2.NORM_MINMAX,
+        )
         _, gradient_mask = cv2.threshold(
             normalized.astype(np.uint8),
             0,
@@ -1344,19 +1387,28 @@ def _run_output(
     return output_payload
 
 
-_STAGE_RUNNERS: dict[str, dict[str, Callable[[
-    ScanTailorStageState,
-    Path,
-    Path,
-    Path,
-], dict[str, Any]]]] = {
+_STAGE_RUNNERS: dict[
+    str,
+    dict[
+        str,
+        Callable[
+            [
+                ScanTailorStageState,
+                Path,
+                Path,
+                Path,
+            ],
+            dict[str, Any],
+        ],
+    ],
+] = {
     ScanTailorStageState.Stage.PAGE_SPLIT.value: {
-        "copy": _copy_fallback,
+        "copy": _run_copy,
         "auto_split": _run_page_split,
         "manual_split": _run_page_split,
     },
     ScanTailorStageState.Stage.DESKEW.value: {
-        "copy": _copy_fallback,
+        "copy": _run_copy,
         "projection_deskew": _run_deskew,
         "manual_deskew": _run_deskew,
     },
@@ -1392,12 +1444,15 @@ _STAGE_RUNNERS: dict[str, dict[str, Callable[[
 
 def _resolve_stage_algorithm(
     state: ScanTailorStageState,
-) -> Callable[[
-    ScanTailorStageState,
-    Path,
-    Path,
-    Path,
-], dict[str, Any]]:
+) -> Callable[
+    [
+        ScanTailorStageState,
+        Path,
+        Path,
+        Path,
+    ],
+    dict[str, Any],
+]:
     stage_algorithms = _STAGE_RUNNERS.get(state.stage, {})
     algorithm = (state.algorithm or "").strip()
     runner = stage_algorithms.get(algorithm)
@@ -1513,6 +1568,12 @@ def process_stage_job(job_id: str) -> None:
     state.started_at = now
     job.save(update_fields=["state", "started_at"])
     state.save(update_fields=["status", "started_at", "updated_at"])
+    logger.info(
+        "scantailor_stage_started",
+        processing_job_id=str(job.job_id),
+        scan_job_id=str(state.scan_job_id),
+        stage=state.stage,
+    )
 
     try:
         source_identifier = _resolve_input_identifier(state)
@@ -1586,6 +1647,13 @@ def process_stage_job(job_id: str) -> None:
             "output_storage_location_id": storage_location.id,
         }
         job.save(update_fields=["state", "finished_at", "details"])
+        logger.info(
+            "scantailor_stage_succeeded",
+            processing_job_id=str(job.job_id),
+            scan_job_id=str(state.scan_job_id),
+            stage=state.stage,
+            output_size_bytes=output_size,
+        )
     except Exception as exc:  # pragma: no cover - defensive path
         state.status = ScanTailorStageState.StageStatus.FAILED
         state.last_error = str(exc)
@@ -1600,3 +1668,8 @@ def _fail_stage_job(job: ProcessingJob, message: str) -> None:
     job.finished_at = timezone.now()
     job.details = {**details, "error": message}
     job.save(update_fields=["state", "finished_at", "details"])
+    logger.error(
+        "scantailor_stage_failed",
+        processing_job_id=str(job.job_id),
+        stage=details.get("stage"),
+    )

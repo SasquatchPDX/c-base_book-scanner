@@ -18,7 +18,16 @@ dependencies = [
   "structlog>=25.1.0,<26.0",
   "pydantic>=2.10.4,<3.0",
   "pydantic-settings>=2.8.0,<3.0",
-  "pillow==10.4.0",
+  "pillow>=12.3,<13",
+  "ldap3>=2.9.1,<3",
+  "pypdf>=5,<7",
+  "defusedxml>=0.7,<1",
+  "numpy>=2,<3",
+  "opencv-python-headless>=4.10,<5",
+  "img2pdf>=0.6,<1",
+  "django-stubs-ext>=5.2,<7",
+  "psycopg[binary]>=3.2,<4",
+  "scikit-image>=0.25,<1",
 ]
 
 [project.scripts]
@@ -31,7 +40,9 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
   "coverage>=7.7.0",
+  "django-stubs>=5.2.0,<6.0",
   "mypy>=2.3.0",
+  "pip-audit>=2.9,<3",
   "pytest>=9.1.1",
   "pytest-django>=4.10.0",
   "pytest-mock>=3.14.0",
@@ -43,6 +54,10 @@ DJANGO_SETTINGS_MODULE = "ebook_server.settings"
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--reuse-db"
+filterwarnings = [
+  "ignore:tagMap is deprecated:DeprecationWarning:ldap3.utils.asn1",
+  "ignore:typeMap is deprecated:DeprecationWarning:ldap3.utils.asn1",
+]
 
 [tool.coverage.run]
 branch = true
@@ -67,5 +82,10 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.13"
 ignore_missing_imports = true
 strict = true
+plugins = ["mypy_django_plugin.main"]
 exclude = '^.*/core/migrations/.*$'
 disable_error_code = ["misc", "no-any-return"]
+
+[tool.django-stubs]
+django_settings_module = "ebook_server.settings"
+strict_settings = true

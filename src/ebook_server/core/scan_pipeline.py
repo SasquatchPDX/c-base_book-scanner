@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
-import hashlib
 import tempfile
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import img2pdf
 from django.conf import settings as django_settings
 from django.db import connection
 from django.db.models import Q
 from django.utils import timezone
-from PIL import Image
 
 from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake
-from .models import FileVariant, ProcessingJob, ScanJob, ScanPage, ScanTailorStageState
+from .models import (
+    FileVariant,
+    ProcessingJob,
+    ScanJob,
+    ScanPage,
+    ScanTailorStageState,
+    StorageLocation,
+)
 
 
 class ScanPipelineError(RuntimeError):
@@ -32,7 +39,7 @@ def _library_storage() -> LocalFilesystemStorage:
     return intake._default_storage()
 
 
-def _library_location():
+def _library_location() -> StorageLocation:
     return intake._default_storage_location()
 
 
@@ -142,8 +149,7 @@ def pipeline_progress(job: ScanJob) -> dict[str, Any]:
         else:
             source_kind, source_identifier = source
             try:
-                _scan_storage().resolve_location(source_identifier)
-                exists = True
+                exists = _scan_storage().resolve_location(source_identifier).is_file()
             except ValueError:
                 exists = False
             resolved_sources.append(
@@ -162,9 +168,7 @@ def pipeline_progress(job: ScanJob) -> dict[str, Any]:
         "page_count": page_count,
         "ready_pages": ready_count,
         "missing_pages": [
-            entry["page_id"]
-            for entry in resolved_sources
-            if entry["status"] != "ready"
+            entry["page_id"] for entry in resolved_sources if entry["status"] != "ready"
         ],
         "stage_counts": {"output_stage_success": ready_count},
     }
@@ -173,12 +177,16 @@ def pipeline_progress(job: ScanJob) -> dict[str, Any]:
         result["cleaned_variant_id"] = None
         return result
 
-    cleaned = FileVariant.objects.filter(
-        book_id=job.book_id,
-        source_type=FileVariant.SourceType.CLEANED,
-        processing_state=FileVariant.ProcessingState.COMPLETE,
-        converter_options__scan_job_id=str(job.id),
-    ).order_by("-created_at").first()
+    cleaned = (
+        FileVariant.objects.filter(
+            book_id=job.book_id,
+            source_type=FileVariant.SourceType.CLEANED,
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+            converter_options__scan_job_id=str(job.id),
+        )
+        .order_by("-created_at")
+        .first()
+    )
     result["cleaned_variant_id"] = cleaned.id if cleaned is not None else None
 
     result["ocr_jobs"] = [
@@ -250,33 +258,7 @@ def _build_pdf_from_images(image_paths: Sequence[Path]) -> Path:
         if not image_paths:
             raise ScanPipelineError("no page images available")
 
-        try:
-            import img2pdf  # type: ignore[import-not-found]
-
-        except ModuleNotFoundError:
-            img2pdf = None  # type: ignore[assignment]
-
-        if img2pdf is None:
-            opened: list[Image.Image] = []
-            try:
-                for candidate in image_paths:
-                    with Image.open(candidate) as raw:
-                        opened.append(raw.convert("RGB"))
-                if not opened:
-                    raise ScanPipelineError("no page images available")
-                first_image = opened[0]
-                appendix = opened[1:] if len(opened) > 1 else []
-                first_image.save(
-                    destination,
-                    format="PDF",
-                    save_all=True,
-                    append_images=appendix,
-                )
-            finally:
-                for image in opened:
-                    image.close()
-        else:
-            destination.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
+        destination.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
         return destination
     except Exception:
         destination.unlink(missing_ok=True)
@@ -319,16 +301,8 @@ def create_cleaned_variant_for_scan_job(
     pdf_path = _build_pdf_from_images(resolved_paths)
     file_storage = _library_storage()
     safe_name = (request_name or "cleaned").strip().replace(" ", "_")
-    destination = file_storage.generate_destination(
-        f"books/{job.book_id}/cleaned",
-        f"{job.id}-{safe_name}.pdf",
-    )
-    file_storage.store(str(pdf_path), destination)
-    pdf_path.unlink(missing_ok=True)
-
-    final_path = file_storage.resolve_location(destination)
-    output_sha = hashlib.sha256(final_path.read_bytes()).hexdigest()
-    output_size = final_path.stat().st_size
+    output_sha = intake.compute_sha256(str(pdf_path))
+    output_size = pdf_path.stat().st_size
 
     existing = (
         FileVariant.objects.filter(
@@ -341,7 +315,17 @@ def create_cleaned_variant_for_scan_job(
         .first()
     )
     if existing is not None:
+        pdf_path.unlink(missing_ok=True)
         return existing
+
+    destination = file_storage.generate_destination(
+        f"books/{job.book_id}/cleaned",
+        f"{uuid.uuid4()}-{safe_name}.pdf",
+    )
+    try:
+        file_storage.store(str(pdf_path), destination)
+    finally:
+        pdf_path.unlink(missing_ok=True)
 
     return FileVariant.objects.create(
         book_id=job.book_id,

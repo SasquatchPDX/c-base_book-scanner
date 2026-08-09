@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -253,6 +253,29 @@ def test_unsupported_format_is_rejected() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_spoofed_pdf_extension_is_rejected() -> None:
+    profile = get_or_create_profile("spoofed-pdf-user")
+    client = Client()
+    client.force_login(profile.user)
+
+    response = client.post(
+        "/imports/upload/",
+        {
+            "file": SimpleUploadedFile(
+                "not-really.pdf",
+                b"plain text pretending to be a document",
+                content_type="application/pdf",
+            ),
+        },
+    )
+
+    assert response.status_code == 400
+    job = ImportJob.objects.get(original_filename="not-really.pdf")
+    assert job.state == ImportJob.State.FAILED
+    assert "not a PDF" in job.last_error
+
+
+@pytest.mark.django_db(transaction=True)
 def test_storage_failure_keeps_source_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -277,3 +300,32 @@ def test_storage_failure_keeps_source_recoverable(
     assert job.state == ImportJob.State.FAILED
     assert job.last_error
     assert Path(job.source_path).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_epub_archive_bomb_metadata_is_rejected(
+    tmp_path: Path,
+) -> None:
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("unsafe-epub-uploader")
+    client = Client()
+    client.force_login(profile.user)
+    epub_path = tmp_path / "unsafe.epub"
+    with ZipFile(epub_path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("META-INF/container.xml", b"A" * (3 * 1024 * 1024))
+
+    response = client.post(
+        "/imports/upload/",
+        {
+            "file": SimpleUploadedFile(
+                "unsafe.epub",
+                epub_path.read_bytes(),
+                content_type="application/epub+zip",
+            ),
+        },
+    )
+
+    assert response.status_code == 400
+    job = ImportJob.objects.get(original_filename="unsafe.epub")
+    assert job.state == ImportJob.State.FAILED
+    assert "safe size limit" in job.last_error

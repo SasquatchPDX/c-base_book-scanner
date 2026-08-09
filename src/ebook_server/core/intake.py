@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
-import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -14,11 +13,15 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, cast
 from urllib.parse import unquote
-from zipfile import ZipFile
+from zipfile import ZipFile, is_zipfile
 
+import structlog
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from pypdf import PdfReader
 
 from ebook_server.storage import LocalFilesystemStorage
 
@@ -35,10 +38,7 @@ from .models import (
     StorageLocation,
 )
 
-try:
-    from PyPDF2 import PdfReader
-except Exception:  # pragma: no cover - optional dependency availability path
-    PdfReader = None
+logger = structlog.get_logger(__name__)
 
 
 class IntakeError(RuntimeError):
@@ -73,6 +73,8 @@ MAX_UPLOAD_BYTES = getattr(
 )
 AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
+MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
+MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 
 
 def normalize_filename(raw: str) -> str:
@@ -125,6 +127,18 @@ def detect_format(filename: str, mime_type: str | None = None) -> tuple[str, str
     raise ValidationError(f"unsupported file format: {filename}")
 
 
+def validate_container_signature(file_path: str, detected_format: str) -> None:
+    """Reject obvious extension/MIME spoofing before invoking metadata parsers."""
+    path = Path(file_path)
+    if detected_format == "pdf":
+        with path.open("rb") as source:
+            if source.read(5) != b"%PDF-":
+                raise ValidationError("file content is not a PDF")
+        return
+    if detected_format == "epub" and not is_zipfile(path):
+        raise ValidationError("file content is not an EPUB/ZIP container")
+
+
 def _default_storage() -> LocalFilesystemStorage:
     base = django_settings.APP_DATA_DIR
     return LocalFilesystemStorage(str(base / "library-artifacts"))
@@ -144,7 +158,7 @@ def _default_storage_location() -> StorageLocation:
 def _source_transfer_mode(job: ImportJob) -> str:
     if job.source_location is None:
         return "move"
-    return cast(str, job.source_location.transfer_mode)
+    return job.source_location.transfer_mode
 
 
 def _archive_should_preserve_source(job: ImportJob) -> bool:
@@ -316,16 +330,16 @@ def extract_metadata(
             return _extract_pdf_metadata(file_path, original_filename=original_filename)
         if detected_format == "epub":
             return _extract_epub_metadata(file_path, original_filename=original_filename)
+    except (ValidationError, DefusedXmlException):
+        raise
     except Exception:
         return {"title": Path(original_filename).stem}
     return {"title": Path(original_filename).stem}
 
 
 def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
-    if PdfReader is None:
-        return {"title": Path(original_filename).stem}
     reader = PdfReader(file_path)
-    metadata = reader.metadata or {}
+    metadata: Any = reader.metadata or {}
     metadata_dict = (
         {str(key): str(value) for key, value in metadata.items()}
         if hasattr(metadata, "items")
@@ -348,7 +362,10 @@ def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str
 def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     with ZipFile(file_path, "r") as archive:
         try:
-            container_doc = archive.read("META-INF/container.xml")
+            container_doc = _read_epub_metadata_member(
+                archive,
+                "META-INF/container.xml",
+            )
         except KeyError:
             return {
                 "title": Path(original_filename).stem,
@@ -356,9 +373,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
                 "container_type": "epub",
             }
         root = ET.fromstring(container_doc)
-        rootfile = root.find(
-            ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
-        )
+        rootfile = root.find(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
         opf_path = rootfile.attrib.get("full-path") if rootfile is not None else None
         if not opf_path:
             return {
@@ -374,7 +389,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             }
         if opf_path.startswith("/"):
             opf_path = opf_path[1:]
-        opf_bytes = archive.read(opf_path)
+        opf_bytes = _read_epub_metadata_member(archive, opf_path)
         opf_root = ET.fromstring(opf_bytes)
         # Namespace-safe extraction; these fields are best-effort only.
         title = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title")
@@ -393,6 +408,23 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             },
             "container_type": "epub",
         }
+
+
+def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
+    """Read a small EPUB metadata member while rejecting archive-bomb inputs."""
+    info = archive.getinfo(member_name)
+    if info.flag_bits & 0x1:
+        raise ValidationError("encrypted EPUB metadata is not supported")
+    if info.file_size > MAX_EPUB_METADATA_MEMBER_BYTES:
+        raise ValidationError("EPUB metadata member exceeds safe size limit")
+    compressed_size = max(info.compress_size, 1)
+    if info.file_size / compressed_size > MAX_EPUB_METADATA_COMPRESSION_RATIO:
+        raise ValidationError("EPUB metadata compression ratio exceeds safe limit")
+    with archive.open(info, "r") as member:
+        payload = member.read(MAX_EPUB_METADATA_MEMBER_BYTES + 1)
+    if len(payload) > MAX_EPUB_METADATA_MEMBER_BYTES:
+        raise ValidationError("EPUB metadata member exceeds safe size limit")
+    return payload
 
 
 def _find_text_any(root: ET.Element, expression: str) -> str | None:
@@ -474,9 +506,7 @@ def _create_review_task(
     existing.decision_payload = {"candidate_count": len(candidates)}
     existing.inferred_title = inferred_title
     existing.inferred_authors = inferred_authors
-    existing.embedded_metadata = (
-        job.evidence if isinstance(job.evidence, dict) else {}
-    )
+    existing.embedded_metadata = job.evidence if isinstance(job.evidence, dict) else {}
     existing.provider_snapshot = provider_snapshot
     existing.selected_candidate = None
     existing.decision_notes = ""
@@ -658,15 +688,23 @@ def _provision_book_from_metadata(
 ) -> Book:
     if candidate is not None:
         if candidate.isbn13:
-            identifier = Identifier.objects.filter(
-                value=candidate.isbn13,
-            ).select_related("book").first()
+            identifier = (
+                Identifier.objects.filter(
+                    value=candidate.isbn13,
+                )
+                .select_related("book")
+                .first()
+            )
             if identifier is not None:
                 return identifier.book
         if candidate.isbn10:
-            identifier = Identifier.objects.filter(
-                value=candidate.isbn10,
-            ).select_related("book").first()
+            identifier = (
+                Identifier.objects.filter(
+                    value=candidate.isbn10,
+                )
+                .select_related("book")
+                .first()
+            )
             if identifier is not None:
                 return identifier.book
 
@@ -755,6 +793,7 @@ def process_import_job(job_id: str) -> None:
         job.sha256 = compute_sha256(job.source_path)
         job.size_bytes = source_path.stat().st_size
         detected_format, mime_type = detect_format(job.original_filename, job.mime_type or None)
+        validate_container_signature(job.source_path, detected_format)
         job.detected_format = detected_format
         job.mime_type = mime_type
         if not job.normalized_filename:
@@ -917,5 +956,11 @@ def process_import_job(job_id: str) -> None:
                 "next_retry_at",
                 "updated_at",
             ],
+        )
+        logger.error(
+            "intake_failed",
+            import_job_id=str(job.id),
+            source_type=job.source_type,
+            error_recorded=True,
         )
         raise

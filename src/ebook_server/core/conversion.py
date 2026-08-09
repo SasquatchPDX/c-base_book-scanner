@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import structlog
 from django.utils import timezone
 
 from ebook_server.jobs import get_queue
@@ -19,6 +20,8 @@ from ebook_server.storage import LocalFilesystemStorage
 
 from . import intake
 from .models import Book, FileVariant, ProcessingJob
+
+logger = structlog.get_logger(__name__)
 
 
 class ConversionError(RuntimeError):
@@ -341,6 +344,12 @@ def process_conversion_job(job_id: str) -> None:
     conversion_job.state = ProcessingJob.JobState.RUNNING
     conversion_job.started_at = timezone.now()
     conversion_job.save(update_fields=["state", "started_at"])
+    logger.info(
+        "conversion_started",
+        processing_job_id=str(conversion_job.job_id),
+        source_variant_id=source_variant.id,
+        target_format=details.get("target_format"),
+    )
 
     try:
         route_payload = details.get("route")
@@ -363,6 +372,12 @@ def process_conversion_job(job_id: str) -> None:
             "error": "",
         }
         conversion_job.save(update_fields=["state", "finished_at", "details"])
+        logger.info(
+            "conversion_succeeded",
+            processing_job_id=str(conversion_job.job_id),
+            output_variant_id=output_variant.id,
+            target_format=target_format,
+        )
     except Exception as exc:  # pragma: no cover - defensive path
         _fail_conversion_job(conversion_job, str(exc))
 
@@ -491,6 +506,11 @@ def _fail_conversion_job(job: ProcessingJob, message: str) -> None:
     job.finished_at = timezone.now()
     job.details = details
     job.save(update_fields=["state", "finished_at", "details"])
+    logger.error(
+        "conversion_failed",
+        processing_job_id=str(job.job_id),
+        error_recorded=bool(message),
+    )
 
 
 def _run_conversion_command(

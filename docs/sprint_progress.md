@@ -2,6 +2,12 @@
 
 This file tracks execution status while advancing Sprint documents in order.
 
+> Historical implementation log: “Done” means the originally recorded coding
+> pass was completed. It is not an acceptance or production-readiness sign-off.
+> The current requirement-by-requirement findings, including remaining UI,
+> pipeline, observability, and integration gaps, are in
+> `docs/requirements-audit.md`.
+
 ## Current snapshot
 
 | Sprint | Status | Completed artifacts |

@@ -19,5 +19,25 @@ jobs:
         run: uv run ruff check .
       - name: Type check
         run: uv run mypy src tests
+      - name: Django checks
+        run: |
+          uv run python manage.py check
+          uv run python manage.py makemigrations --check --dry-run
+      - name: Production configuration check
+        env:
+          BOOK_SCANNER_ENVIRONMENT: production
+          BOOK_SCANNER_SECRET_KEY: ci-only-production-shaped-secret-key-0123456789-abcdefghijklmnopqrstuvwxyz
+          BOOK_SCANNER_ALLOWED_HOSTS: '["library.example.test"]'
+          BOOK_SCANNER_DATABASE_URL: postgresql://ci:ci@database.example.test/library
+          BOOK_SCANNER_REDIS_URL: redis://redis.example.test:6379/0
+          BOOK_SCANNER_LDAP_MODE: ldap
+          BOOK_SCANNER_SECURE_SSL_REDIRECT: "true"
+          BOOK_SCANNER_SESSION_COOKIE_SECURE: "true"
+          BOOK_SCANNER_CSRF_COOKIE_SECURE: "true"
+          BOOK_SCANNER_SECURE_HSTS_SECONDS: "31536000"
+          BOOK_SCANNER_SECURE_HSTS_PRELOAD: "true"
+        run: uv run python manage.py check --deploy --fail-level WARNING
+      - name: Dependency audit
+        run: uv run pip-audit --skip-editable
       - name: Test
         run: uv run pytest -q

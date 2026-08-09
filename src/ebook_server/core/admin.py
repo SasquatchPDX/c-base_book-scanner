@@ -28,45 +28,45 @@ from .models import (
 
 
 @admin.register(AppUserProfile)
-class AppUserProfileAdmin(admin.ModelAdmin):
+class AppUserProfileAdmin(admin.ModelAdmin[AppUserProfile]):
     list_display = ("ldap_uid", "role", "is_disabled", "created_at")
     list_filter = ("role", "is_disabled")
 
 
 @admin.register(Book)
-class BookAdmin(admin.ModelAdmin):
+class BookAdmin(admin.ModelAdmin[Book]):
     list_display = ("title", "publisher", "publication_date")
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories", "genres")
 
 
 @admin.register(Author)
-class AuthorAdmin(admin.ModelAdmin):
+class AuthorAdmin(admin.ModelAdmin[Author]):
     list_display = ("full_name",)
 
 
 @admin.register(Category)
-class CategoryAdmin(admin.ModelAdmin):
+class CategoryAdmin(admin.ModelAdmin[Category]):
     list_display = ("name",)
 
 
 @admin.register(Genre)
-class GenreAdmin(admin.ModelAdmin):
+class GenreAdmin(admin.ModelAdmin[Genre]):
     list_display = ("name",)
 
 
 @admin.register(Identifier)
-class IdentifierAdmin(admin.ModelAdmin):
+class IdentifierAdmin(admin.ModelAdmin[Identifier]):
     list_display = ("book", "kind", "value")
 
 
 @admin.register(CoverImage)
-class CoverImageAdmin(admin.ModelAdmin):
+class CoverImageAdmin(admin.ModelAdmin[CoverImage]):
     list_display = ("book", "position", "storage_identifier")
 
 
 @admin.register(FileVariant)
-class FileVariantAdmin(admin.ModelAdmin):
+class FileVariantAdmin(admin.ModelAdmin[FileVariant]):
     list_display = (
         "book",
         "format",
@@ -77,19 +77,19 @@ class FileVariantAdmin(admin.ModelAdmin):
 
 
 @admin.register(ScanJob)
-class ScanJobAdmin(admin.ModelAdmin):
+class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
     list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
     list_filter = ("state",)
 
 
 @admin.register(ScanPage)
-class ScanPageAdmin(admin.ModelAdmin):
+class ScanPageAdmin(admin.ModelAdmin[ScanPage]):
     list_display = ("id", "scan_job", "logical_sequence_number", "side", "updated_at")
     list_filter = ("side",)
 
 
 @admin.register(ScanTailorStageState)
-class ScanTailorStageStateAdmin(admin.ModelAdmin):
+class ScanTailorStageStateAdmin(admin.ModelAdmin[ScanTailorStageState]):
     list_display = (
         "id",
         "scan_job",
@@ -104,7 +104,7 @@ class ScanTailorStageStateAdmin(admin.ModelAdmin):
 
 
 @admin.register(ScanPageVersion)
-class ScanPageVersionAdmin(admin.ModelAdmin):
+class ScanPageVersionAdmin(admin.ModelAdmin[ScanPageVersion]):
     list_display = (
         "scan_page",
         "version",
@@ -117,12 +117,12 @@ class ScanPageVersionAdmin(admin.ModelAdmin):
 
 
 @admin.register(StorageLocation)
-class StorageLocationAdmin(admin.ModelAdmin):
+class StorageLocationAdmin(admin.ModelAdmin[StorageLocation]):
     list_display = ("identifier", "backend", "base_path")
 
 
 @admin.register(SourceLocation)
-class SourceLocationAdmin(admin.ModelAdmin):
+class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
     list_display = (
         "name",
         "root_path",
@@ -134,24 +134,24 @@ class SourceLocationAdmin(admin.ModelAdmin):
 
 
 @admin.register(ProcessingJob)
-class ProcessingJobAdmin(admin.ModelAdmin):
+class ProcessingJobAdmin(admin.ModelAdmin[ProcessingJob]):
     list_display = ("job_id", "job_type", "state", "file_variant")
 
 
 @admin.register(ImportJob)
-class ImportJobAdmin(admin.ModelAdmin):
+class ImportJobAdmin(admin.ModelAdmin[ImportJob]):
     list_display = ("id", "state", "source_type", "uploader", "original_filename", "created_at")
     list_filter = ("state", "source_type")
 
 
 @admin.register(MetadataCandidate)
-class MetadataCandidateAdmin(admin.ModelAdmin):
+class MetadataCandidateAdmin(admin.ModelAdmin[MetadataCandidate]):
     list_display = ("import_job", "provider_id", "title", "score", "state", "created_at")
     list_filter = ("provider_id", "state")
 
 
 @admin.register(ReviewTask)
-class ReviewTaskAdmin(admin.ModelAdmin):
+class ReviewTaskAdmin(admin.ModelAdmin[ReviewTask]):
     list_display = (
         "import_job",
         "task_type",
@@ -166,7 +166,7 @@ class ReviewTaskAdmin(admin.ModelAdmin):
 
 
 @admin.register(ScanTodo)
-class ScanTodoAdmin(admin.ModelAdmin):
+class ScanTodoAdmin(admin.ModelAdmin[ScanTodo]):
     list_display = (
         "id",
         "scan_job",

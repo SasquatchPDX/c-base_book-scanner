@@ -210,7 +210,7 @@ def test_accept_candidate_resolves_import_to_existing_book(
 
     response = client.post(
         f"/reviews/{task.id}/accept-candidate/",
-        data=f"{{\"candidate_id\": {selected_candidate_id}}}".encode(),
+        data=f'{{"candidate_id": {selected_candidate_id}}}'.encode(),
         content_type="application/json",
     )
     assert response.status_code == 200

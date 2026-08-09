@@ -8,6 +8,7 @@ from typing import ClassVar, Final
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import User
 from django.db import models
 from django.utils.timezone import now
 
@@ -157,9 +158,21 @@ class Book(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    authors = models.ManyToManyField("Author", related_name="books", blank=True)
-    categories = models.ManyToManyField("Category", related_name="books", blank=True)
-    genres = models.ManyToManyField("Genre", related_name="books", blank=True)
+    authors: models.ManyToManyField[Author, Author] = models.ManyToManyField(
+        "Author",
+        related_name="books",
+        blank=True,
+    )
+    categories: models.ManyToManyField[Category, Category] = models.ManyToManyField(
+        "Category",
+        related_name="books",
+        blank=True,
+    )
+    genres: models.ManyToManyField[Genre, Genre] = models.ManyToManyField(
+        "Genre",
+        related_name="books",
+        blank=True,
+    )
 
     front_cover = models.ForeignKey(
         "CoverImage",
@@ -404,9 +417,7 @@ class ScanPage(models.Model):
         ]
 
     def __str__(self) -> str:
-        return (
-            f"job={self.scan_job_id}:seq={self.logical_sequence_number}:side={self.side}"
-        )
+        return f"job={self.scan_job_id}:seq={self.logical_sequence_number}:side={self.side}"
 
     def active_version(self) -> ScanPageVersion | None:
         return self.versions.filter(is_active=True).order_by("-version").first()
@@ -511,7 +522,7 @@ class ScanTodo(models.Model):
     def is_open(self) -> bool:
         return self.state == self.State.OPEN
 
-    def claim(self, user: settings.AUTH_USER_MODEL) -> None:
+    def claim(self, user: User) -> None:
         if self.state == self.State.OPEN:
             self.state = self.State.CLAIMED
             self.claimed_by = user
@@ -909,7 +920,7 @@ class ReviewTask(models.Model):
     def is_resolved(self) -> bool:
         return self.state == self.State.RESOLVED
 
-    def can_be_resolved_by(self, user: settings.AUTH_USER_MODEL) -> bool:
+    def can_be_resolved_by(self, user: User) -> bool:
         if self.import_job is None or self.import_job.uploader is None:
             return False
         try:

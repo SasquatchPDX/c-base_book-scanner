@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+import structlog
 from django.conf import settings as django_settings
 from django.utils import timezone
 from pydantic import BaseModel, Field
@@ -22,7 +23,9 @@ from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake
-from .models import Book, FileVariant, ProcessingJob, ScanJob
+from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
+
+logger = structlog.get_logger(__name__)
 
 
 class OCRClientError(RuntimeError):
@@ -101,7 +104,9 @@ class HttpxOCRClient:
     status_endpoint = "/v1/ocr/jobs/{job_id}"
 
     def __init__(self, base_url: str | None = None) -> None:
-        self.base_url = (base_url or _setting("BOOK_SCANNER_OCR_SERVICE_URL", "http://localhost:8020")).rstrip("/")
+        self.base_url = (
+            base_url or _setting("BOOK_SCANNER_OCR_SERVICE_URL", "http://localhost:8020")
+        ).rstrip("/")
         self.timeout_seconds = float(_setting("BOOK_SCANNER_OCR_REQUEST_TIMEOUT", 30))
         self._client = httpx.Client(timeout=self.timeout_seconds)
 
@@ -121,19 +126,19 @@ class HttpxOCRClient:
             "options": request.options,
         }
         payload = _compact_payload(payload)
-        files = {
-            "file": (
-                source_path.name,
-                source_path.read_bytes(),
-                source_mime or "application/octet-stream",
-            ),
-        }
         try:
-            response = self._client.post(
-                f"{self.base_url}{self.submit_endpoint}",
-                files=files,
-                data={"payload": json.dumps(payload)},
-            )
+            with source_path.open("rb") as source_stream:
+                response = self._client.post(
+                    f"{self.base_url}{self.submit_endpoint}",
+                    files={
+                        "file": (
+                            source_path.name,
+                            source_stream,
+                            source_mime or "application/octet-stream",
+                        ),
+                    },
+                    data={"payload": json.dumps(payload)},
+                )
             response.raise_for_status()
             raw = response.json()
         except (httpx.HTTPError, OSError) as exc:
@@ -190,7 +195,7 @@ def _default_ocr_storage() -> LocalFilesystemStorage:
     return intake._default_storage()
 
 
-def _default_ocr_storage_location():
+def _default_ocr_storage_location() -> StorageLocation:
     return intake._default_storage_location()
 
 
@@ -202,11 +207,7 @@ def _get_ocr_client() -> OCRClientProtocol:
 
 
 def _compact_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in raw.items()
-        if value not in (None, "", [], {}, b"")
-    }
+    return {key: value for key, value in raw.items() if value not in (None, "", [], {}, b"")}
 
 
 def _coerce_target_formats(raw: Any) -> list[str]:
@@ -295,19 +296,13 @@ def _coerce_poll_payload(payload: object) -> OCRPollResult:
         raise OCRMalformedResponseError("poll payload missing status")
 
     raw_artifacts = (
-        payload.get("artifacts")
-        or payload.get("outputs")
-        or payload.get("results")
-        or []
+        payload.get("artifacts") or payload.get("outputs") or payload.get("results") or []
     )
     if isinstance(payload.get("result"), Mapping):
         nested = payload["result"]
         if isinstance(nested, Mapping):
             nested_artifacts = (
-                nested.get("artifacts")
-                or nested.get("outputs")
-                or nested.get("results")
-                or []
+                nested.get("artifacts") or nested.get("outputs") or nested.get("results") or []
             )
             if nested_artifacts:
                 raw_artifacts = nested_artifacts
@@ -521,6 +516,11 @@ def process_ocr_job(job_id: str) -> None:
     ocr_job.state = ProcessingJob.JobState.RUNNING
     ocr_job.started_at = timezone.now()
     ocr_job.save(update_fields=["state", "started_at"])
+    logger.info(
+        "ocr_started",
+        processing_job_id=str(ocr_job.job_id),
+        source_type=details.get("source_type"),
+    )
 
     cleanup_paths: list[Path] = []
     try:
@@ -568,6 +568,11 @@ def process_ocr_job(job_id: str) -> None:
         ocr_job.finished_at = timezone.now()
         ocr_job.details = details
         ocr_job.save(update_fields=["state", "finished_at", "details"])
+        logger.info(
+            "ocr_succeeded",
+            processing_job_id=str(ocr_job.job_id),
+            output_count=len(output_variants),
+        )
     except Exception as exc:  # pragma: no cover - defensive
         _fail_ocr_job(ocr_job, str(exc))
     finally:
@@ -625,6 +630,7 @@ def _resolve_source_artifact(
     source_variant_id = details.get("source_variant_id")
     if not isinstance(source_variant_id, int):
         raise OCRJobError("source_variant_id missing")
+    source_variant: FileVariant | None
     if ocr_job.file_variant_id is None:
         source_variant = FileVariant.objects.select_related("book").get(pk=source_variant_id)
     else:
@@ -807,6 +813,11 @@ def _fail_ocr_job(job: ProcessingJob, message: str) -> None:
     job.finished_at = timezone.now()
     job.details = details
     job.save(update_fields=["state", "finished_at", "details"])
+    logger.error(
+        "ocr_failed",
+        processing_job_id=str(job.job_id),
+        error_recorded=bool(message),
+    )
 
 
 def ocr_job_payload(job: ProcessingJob) -> dict[str, Any]:

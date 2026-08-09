@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
 from django.conf import settings as django_settings
+from django.http import StreamingHttpResponse
 from django.test import Client
 
 from ebook_server.core.models import (
@@ -173,13 +176,12 @@ def test_library_book_cover_and_download(tmp_path: Path) -> None:
         mime="application/epub+zip",
         contents=b"dummy-epub",
     )
-    front = _seed_cover_image(
+    _seed_cover_image(
         book,
         storage,
         position=CoverImage.CoverPosition.FRONT,
         filename="front.png",
     )
-    _ = front
 
     client = Client()
     client.force_login(profile.user)
@@ -194,7 +196,9 @@ def test_library_book_cover_and_download(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response["Content-Type"] == "application/epub+zip"
     assert response["Content-Length"] == str(len(b"dummy-epub"))
-    assert b"".join(response.streaming_content) == b"dummy-epub"
+    streaming_response = cast(StreamingHttpResponse, response)
+    chunks = cast(Iterable[bytes], streaming_response.streaming_content)
+    assert b"".join(chunks) == b"dummy-epub"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -206,6 +210,4 @@ def test_library_permissions(tmp_path: Path) -> None:
 
     assert client.get("/library/books/").status_code == 403
     assert client.get(f"/library/books/{book.id}/").status_code == 403
-    assert (
-        client.get(f"/library/books/{book.id}/download/?format=pdf").status_code == 403
-    )
+    assert client.get(f"/library/books/{book.id}/download/?format=pdf").status_code == 403

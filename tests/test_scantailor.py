@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Iterable
+from typing import cast
 
 import pytest
+from django.http import StreamingHttpResponse
+from django.test import Client
 from PIL import Image, ImageDraw
 
 from ebook_server.core import scantailor
@@ -120,12 +124,18 @@ def _mixed_content_bytes(
     return buffer.getvalue()
 
 
-def _stage_preview_size(client, job_id: str, page_id: str, stage: str) -> tuple[int, int]:
+def _stage_preview_size(
+    client: Client,
+    job_id: str,
+    page_id: str,
+    stage: str,
+) -> tuple[int, int]:
     response = client.get(
         f"/scan/jobs/{job_id}/pages/{page_id}/stages/{stage}/preview/",
     )
     assert response.status_code == 200
-    payload = b"".join(response.streaming_content)
+    streaming_response = cast(StreamingHttpResponse, response)
+    payload = b"".join(cast(Iterable[bytes], streaming_response.streaming_content))
     preview = Image.open(io.BytesIO(payload))
     with preview:
         return preview.size
@@ -186,9 +196,7 @@ def test_concurrent_edit_conflict_is_reported() -> None:
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
 
     initial = client.get(_stages_url(str(job.id), str(page.id))).json()
-    page_split_state = next(
-        item for item in initial["stages"] if item["stage"] == "page_split"
-    )
+    page_split_state = next(item for item in initial["stages"] if item["stage"] == "page_split")
     expected_revision = page_split_state["revision"]
 
     first = client.post(
@@ -430,9 +438,7 @@ def test_select_content_detects_text_area() -> None:
     assert response.status_code == 202
 
     state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="select_content")
-    assert state.status == ScanTailorStageState.StageStatus.SUCCESS, (
-        state.last_error
-    )
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
     assert state.parameters["content_mode"] == "auto"
     preview_width, preview_height = _stage_preview_size(
         client,
@@ -713,7 +719,11 @@ def test_dewarping_bypass_keeps_source_as_output() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_dewarping_without_library_falls_back_safely() -> None:
+def test_dewarping_without_library_falls_back_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scantailor, "cv2", None)
+    monkeypatch.setattr(scantailor, "np", None)
     client, job = _create_scan_job("scan-user-dewarp-fallback")
     _upload_scan_page(
         client,
@@ -778,6 +788,34 @@ def test_output_default_otsu_is_reproducible() -> None:
     assert second.status_code == 202
     second_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="output")
     assert second_state.output_sha256 == first_hash
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("output_mode", ["otsu", "sauvola", "wolf", "fox", "window", "grad"])
+def test_each_documented_output_algorithm_produces_an_artifact(output_mode: str) -> None:
+    client, job = _create_scan_job(f"scan-user-output-{output_mode}")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_mixed_content_bytes(),
+        filename=f"{output_mode}.png",
+        content_type="image/png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+
+    response = client.post(
+        _stage_url(str(job.id), str(page.id), "output"),
+        data=json.dumps({"parameters": {"output_mode": output_mode}}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 202
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="output")
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.parameters["output_mode"] == output_mode
+    assert state.output_sha256
 
 
 @pytest.mark.django_db(transaction=True)

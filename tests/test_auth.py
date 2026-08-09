@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import pytest
 from django.contrib.auth import authenticate
-from django.test import Client
+from django.test import Client, override_settings
 
-from ebook_server.core.auth import LdapBackend, LdapIdentity, StubLdapAdapter
+from ebook_server.core.auth import (
+    Ldap3Adapter,
+    LdapAuthenticationError,
+    LdapBackend,
+    LdapIdentity,
+    StubLdapAdapter,
+)
 from ebook_server.core.models import AppUserProfile, get_or_create_profile
 
 
@@ -72,3 +78,49 @@ def test_role_enforcement_for_admin_endpoint() -> None:
 
     admin_response_ok = admin_client.get("/admin-only/")
     assert admin_response_ok.status_code == 200
+
+
+@override_settings(BOOK_SCANNER_LDAP_MODE="unsupported")
+def test_unknown_ldap_mode_fails_closed() -> None:
+    with pytest.raises(LdapAuthenticationError, match="unsupported LDAP mode"):
+        LdapBackend()
+
+
+@override_settings(
+    BOOK_SCANNER_LDAP_SERVER_URI="ldaps://ldap.example.test:636",
+    BOOK_SCANNER_LDAP_USER_DN_TEMPLATE="uid={username},ou=people,dc=example,dc=test",
+    BOOK_SCANNER_LDAP_CONNECT_TIMEOUT=3,
+    BOOK_SCANNER_LDAP_START_TLS=False,
+    BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE="mail",
+)
+def test_real_ldap_adapter_binds_with_escaped_user_dn(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: dict[str, object] = {}
+
+    class FakeEntry:
+        entry_attributes_as_dict = {"mail": ["member@example.test"]}
+
+    class FakeConnection:
+        entries = [FakeEntry()]
+
+        def __init__(self, server: object, *, user: str, password: str, **kwargs: object) -> None:
+            events["user"] = user
+            events["password"] = password
+
+        def open(self) -> None:
+            events["opened"] = True
+
+        def bind(self) -> bool:
+            return True
+
+        def search(self, *args: object, **kwargs: object) -> bool:
+            return True
+
+        def unbind(self) -> None:
+            events["unbound"] = True
+
+    monkeypatch.setattr("ebook_server.core.auth.Connection", FakeConnection)
+    identity = Ldap3Adapter().authenticate("member,admin", "correct horse")
+
+    assert events["user"] == "uid=member\\,admin,ou=people,dc=example,dc=test"
+    assert identity.email == "member@example.test"
+    assert events["unbound"] is True

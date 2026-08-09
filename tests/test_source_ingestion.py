@@ -231,7 +231,7 @@ def test_failed_source_import_leaves_file_recoverable(
         uploader=intake._make_system_user(),
     )
 
-    def _fail_archive(*_args, **_kwargs):
+    def _fail_archive(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("archive unavailable")
 
     monkeypatch.setattr("ebook_server.core.intake._archive_source", _fail_archive)

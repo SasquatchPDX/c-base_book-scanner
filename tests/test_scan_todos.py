@@ -29,9 +29,7 @@ def test_request_rescan_creates_todo() -> None:
     payload = response.json()
     assert payload["created"] is True
     assert payload["todo"]["state"] == ScanTodo.State.OPEN
-    assert (
-        ScanTodo.objects.filter(scan_page=page, state=ScanTodo.State.OPEN).count() == 1
-    )
+    assert ScanTodo.objects.filter(scan_page=page, state=ScanTodo.State.OPEN).count() == 1
 
 
 @pytest.mark.django_db(transaction=True)

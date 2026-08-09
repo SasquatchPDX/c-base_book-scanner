@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
@@ -27,6 +28,7 @@ from django.http import (
     HttpResponseNotFound,
     JsonResponse,
 )
+from django.http.response import HttpResponseBase
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
@@ -103,8 +105,7 @@ def _serialize_scan_page(page: ScanPage) -> dict[str, Any]:
         "open_rescan_todos": page.todos.filter(state=ScanTodo.State.OPEN).count(),
         "active_version": _serialize_scan_page_version(active_version),
         "available_versions": [
-            _serialize_scan_page_version(v)
-            for v in page.versions.order_by("-version")
+            _serialize_scan_page_version(v) for v in page.versions.order_by("-version")
         ],
         "created_at": page.created_at.isoformat(),
         "updated_at": page.updated_at.isoformat(),
@@ -216,15 +217,15 @@ def _normalize_scanner_metadata(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _parse_capture_ts(raw: Any) -> timezone.datetime | None:
+def _parse_capture_ts(raw: Any) -> datetime | None:
     if raw is None:
         return None
     if isinstance(raw, (int, float)):
-        return timezone.datetime.fromtimestamp(raw, tz=timezone.UTC)
+        return datetime.fromtimestamp(raw, tz=UTC)
     if isinstance(raw, str):
         normalized = raw.strip().replace("Z", "+00:00")
         try:
-            return timezone.datetime.fromisoformat(normalized)
+            return datetime.fromisoformat(normalized)
         except ValueError:
             return None
     return None
@@ -302,7 +303,6 @@ def _coerce_bool(value: Any) -> bool:
         return False
     text = str(value).strip().lower()
     return text in {"1", "true", "t", "yes", "y", "on"}
-    return False
 
 
 def _coerce_optional_bool(value: Any, default: bool = False) -> bool:
@@ -330,13 +330,13 @@ def _coerce_optional_int_list(value: Any) -> list[int] | None:
             values.append(parsed)
         return values
     if isinstance(value, str):
-        parsed: list[int] = []
+        parsed_values: list[int] = []
         for entry in value.split(","):
             parsed_entry = _coerce_int(entry, minimum=0)
             if parsed_entry is None:
                 return None
-            parsed.append(parsed_entry)
-        return parsed
+            parsed_values.append(parsed_entry)
+        return parsed_values
     return None
 
 
@@ -420,7 +420,7 @@ def _append_version(
     checksum_sha256: str,
     mime_type: str,
     size_bytes: int,
-    capture_timestamp: timezone.datetime | None,
+    capture_timestamp: datetime | None,
     scanner_metadata: dict[str, Any],
 ) -> ScanPageVersion:
     latest = page.versions.order_by("version").last()
@@ -520,7 +520,7 @@ def _store_scan_page(
     uploaded_file: Any,
     uploader_id: int,
     scanner_metadata: dict[str, Any],
-    capture_timestamp: timezone.datetime | None,
+    capture_timestamp: datetime | None,
     requested_checksum: str | None = None,
     force_new_version: bool = False,
 ) -> tuple[ScanPage, ScanPageVersion, bool]:
@@ -539,9 +539,9 @@ def _store_scan_page(
     existing_version = None
     if not force_new_version:
         # Idempotent duplicate for already-uploaded artifact.
-        existing_version = page.versions.filter(
-            checksum_sha256=checksum_sha256
-        ).order_by("-version").first()
+        existing_version = (
+            page.versions.filter(checksum_sha256=checksum_sha256).order_by("-version").first()
+        )
     if existing_version is not None:
         if not existing_version.is_active:
             page.versions.filter(is_active=True).update(is_active=False)
@@ -762,7 +762,9 @@ def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     )
 
 
-def _require_role(required_role: str) -> Callable[
+def _require_role(
+    required_role: str,
+) -> Callable[
     [Callable[[HttpRequest], HttpResponse]],
     Callable[[HttpRequest], HttpResponse],
 ]:
@@ -785,7 +787,7 @@ def _require_role(required_role: str) -> Callable[
     return decorator
 
 
-@require_GET  # type: ignore[untyped-decorator]
+@require_GET
 def health(request: HttpRequest) -> JsonResponse:
     dependencies = _status_payload()
     any_down = any(item["status"] == "down" for item in dependencies)
@@ -799,7 +801,7 @@ def health(request: HttpRequest) -> JsonResponse:
     )
 
 
-@require_GET  # type: ignore[untyped-decorator]
+@require_GET
 def readiness(request: HttpRequest) -> JsonResponse:
     dependencies = _status_payload()
     any_down = any(item["status"] == "down" for item in dependencies)
@@ -808,8 +810,8 @@ def readiness(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "ready", "dependencies": dependencies})
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def library_home(request: HttpRequest) -> JsonResponse:
     profile = _profile_for_request(request)
     if profile is None:
@@ -900,9 +902,9 @@ def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
     return value
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
-def library_books(request: HttpRequest) -> JsonResponse:
+@require_GET
+@login_required
+def library_books(request: HttpRequest) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -959,9 +961,7 @@ def library_books(request: HttpRequest) -> JsonResponse:
     end = start + page_size
 
     total = books.count()
-    serialized = [
-        _serialize_book(book, include_variants=False) for book in books[start:end]
-    ]
+    serialized = [_serialize_book(book, include_variants=False) for book in books[start:end]]
     return JsonResponse(
         {
             "count": total,
@@ -972,9 +972,9 @@ def library_books(request: HttpRequest) -> JsonResponse:
     )
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
-def library_book_detail(request: HttpRequest, book_id: int) -> JsonResponse | HttpResponseNotFound:
+@require_GET
+@login_required
+def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1007,8 +1007,8 @@ def library_book_detail(request: HttpRequest, book_id: int) -> JsonResponse | Ht
     return JsonResponse(payload)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def library_book_download(
     request: HttpRequest,
     book_id: int,
@@ -1050,12 +1050,12 @@ def library_book_download(
     return response
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def library_book_conversion_request(
     request: HttpRequest,
     book_id: int,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1100,8 +1100,8 @@ def library_book_conversion_request(
     return JsonResponse(conversion.conversion_job_payload(job), status=202)
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def library_book_ocr_request(
     request: HttpRequest,
     book_id: int,
@@ -1137,9 +1137,7 @@ def library_book_ocr_request(
             request_language=payload.get("language")
             if isinstance(payload.get("language"), str)
             else None,
-            engine=payload.get("engine")
-            if isinstance(payload.get("engine"), str)
-            else None,
+            engine=payload.get("engine") if isinstance(payload.get("engine"), str) else None,
             model=payload.get("model") if isinstance(payload.get("model"), str) else None,
             request_options=payload.get("request_options")
             if isinstance(payload.get("request_options"), dict)
@@ -1151,8 +1149,8 @@ def library_book_ocr_request(
     return JsonResponse(ocr.ocr_job_payload(job), status=202)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def conversion_job_status(
     request: HttpRequest,
     job_id: str,
@@ -1170,8 +1168,8 @@ def conversion_job_status(
     return JsonResponse(conversion.conversion_job_payload(job))
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def ocr_job_status(
     request: HttpRequest,
     job_id: str,
@@ -1189,8 +1187,8 @@ def ocr_job_status(
     return JsonResponse(ocr.ocr_job_payload(job))
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def stage_job_status(
     request: HttpRequest,
     job_id: str,
@@ -1283,9 +1281,7 @@ def _ensure_workspace_stage_states(job: ScanJob, page: ScanPage) -> list[ScanTai
 
 def _serialize_workspace_page(page: ScanPage) -> dict[str, Any]:
     payload = _serialize_scan_page_with_thumbnail(page)
-    payload["stages"] = [
-        _serialize_stage_state(state) for state in _ordered_stages_for_page(page)
-    ]
+    payload["stages"] = [_serialize_stage_state(state) for state in _ordered_stages_for_page(page)]
     return payload
 
 
@@ -1415,8 +1411,8 @@ def _apply_stage_payload_to_state(
     state.status = ScanTailorStageState.StageStatus.QUEUED
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_job_workspace(
     request: HttpRequest,
     job_id: str,
@@ -1426,10 +1422,14 @@ def scan_job_workspace(
         return HttpResponseBadRequest("invalid job id")
 
     try:
-        job = ScanJob.objects.select_related("book", "operator").prefetch_related(
-            "pages",
-            "pages__versions",
-        ).get(pk=job_id)
+        job = (
+            ScanJob.objects.select_related("book", "operator")
+            .prefetch_related(
+                "pages",
+                "pages__versions",
+            )
+            .get(pk=job_id)
+        )
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
@@ -1448,8 +1448,8 @@ def scan_job_workspace(
     )
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_page_stages(
     request: HttpRequest,
     job_id: str,
@@ -1470,17 +1470,14 @@ def scan_page_stages(
         {
             "job_id": str(job.id),
             "page_id": str(page.id),
-            "stages": [
-                _serialize_stage_state(state)
-                for state in _ordered_stages_for_page(page)
-            ],
+            "stages": [_serialize_stage_state(state) for state in _ordered_stages_for_page(page)],
             "count": page.stage_states.count(),
         },
     )
 
 
-@require_http_methods(["GET", "POST"])  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_http_methods(["GET", "POST"])
+@login_required
 def scan_page_stage(
     request: HttpRequest,
     job_id: str,
@@ -1559,8 +1556,8 @@ def scan_page_stage(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_stage_batch(
     request: HttpRequest,
     job_id: str,
@@ -1666,14 +1663,14 @@ def scan_job_stage_batch(
     )
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_page_stage_preview(
     request: HttpRequest,
     job_id: str,
     page_id: str,
     stage: str,
-) -> HttpResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
+) -> HttpResponseBase:
     del request
     if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
@@ -1701,11 +1698,11 @@ def scan_page_stage_preview(
     return FileResponse(stream, as_attachment=False, filename=Path(identifier).name)
 
 
-@require_http_methods(["GET", "POST"])  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_http_methods(["GET", "POST"])
+@login_required
 def scan_jobs(
     request: HttpRequest,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1730,11 +1727,7 @@ def scan_jobs(
         scanner_id = _coerce_str_or_none(request.GET.get("scanner_id"))
         if scanner_id:
             queryset = queryset.filter(scanner_id=scanner_id)
-        serializer = (
-            _scan_job_payload_with_open_todos
-            if include_open_todos
-            else _scan_job_payload
-        )
+        serializer = _scan_job_payload_with_open_todos if include_open_todos else _scan_job_payload
         return JsonResponse(
             {
                 "items": [serializer(job) for job in queryset],
@@ -1770,27 +1763,31 @@ def scan_jobs(
     return JsonResponse(_scan_job_payload(job), status=201)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_job_detail(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     del request
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
-        job = ScanJob.objects.select_related("book", "operator").prefetch_related(
-            "pages",
-            "pages__versions",
-        ).get(pk=job_id)
+        job = (
+            ScanJob.objects.select_related("book", "operator")
+            .prefetch_related(
+                "pages",
+                "pages__versions",
+            )
+            .get(pk=job_id)
+        )
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
     return JsonResponse(_scan_job_payload(job))
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_job_todos(
     request: HttpRequest,
     job_id: str,
@@ -1816,15 +1813,17 @@ def scan_job_todos(
         ScanTodo.State.CANCELLED,
     ]
     todos = ScanTodo.objects.filter(scan_job=job, state__in=states).order_by("-created_at")
-    return JsonResponse({
-        "scan_job_id": str(job.id),
-        "items": [_serialize_scan_todo(todo) for todo in todos],
-        "count": todos.count(),
-    })
+    return JsonResponse(
+        {
+            "scan_job_id": str(job.id),
+            "items": [_serialize_scan_todo(todo) for todo in todos],
+            "count": todos.count(),
+        }
+    )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_ocr_request(
     request: HttpRequest,
     job_id: str,
@@ -1850,9 +1849,7 @@ def scan_job_ocr_request(
             request_language=payload.get("language")
             if isinstance(payload.get("language"), str)
             else None,
-            engine=payload.get("engine")
-            if isinstance(payload.get("engine"), str)
-            else None,
+            engine=payload.get("engine") if isinstance(payload.get("engine"), str) else None,
             model=payload.get("model") if isinstance(payload.get("model"), str) else None,
             request_options=payload.get("request_options")
             if isinstance(payload.get("request_options"), dict)
@@ -1863,8 +1860,8 @@ def scan_job_ocr_request(
     return JsonResponse(ocr.ocr_job_payload(job), status=202)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_todos(
     request: HttpRequest,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden:
@@ -1885,8 +1882,8 @@ def scan_todos(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_page_request_rescan(
     request: HttpRequest,
     page_id: str,
@@ -1939,8 +1936,8 @@ def scan_page_request_rescan(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def upload_scan_page(
     request: HttpRequest,
     job_id: str,
@@ -2005,12 +2002,12 @@ def upload_scan_page(
     )
 
 
-@require_http_methods(["GET", "PUT"])  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_http_methods(["GET", "PUT"])
+@login_required
 def scan_page(
     request: HttpRequest,
     page_id: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     if _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid page id")
     profile = _active_library_profile(request)
@@ -2026,7 +2023,7 @@ def scan_page(
 
     payload = _scan_page_request_payload(request)
     requested_checksum = _coerce_str_or_none(payload.get("checksum_sha256"))
-    uploaded_file = request.FILES.get("file")
+    uploaded_file: Any = request.FILES.get("file")
     if uploaded_file is None:
         if request.content_type == "application/octet-stream":
             legacy_payload = _parse_legacy_scan_put_payload(request.body)
@@ -2094,8 +2091,8 @@ def scan_page(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_todo_claim(
     request: HttpRequest,
     todo_id: int,
@@ -2127,8 +2124,8 @@ def scan_todo_claim(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_todo_complete(
     request: HttpRequest,
     todo_id: int,
@@ -2150,8 +2147,8 @@ def scan_todo_complete(
     return JsonResponse({"todo_id": todo.id, "state": todo.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_todo_cancel(
     request: HttpRequest,
     todo_id: int,
@@ -2170,12 +2167,12 @@ def scan_todo_cancel(
     return JsonResponse({"todo_id": todo.id, "state": todo.state})
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def scan_page_thumbnail(
     request: HttpRequest,
     page_id: str,
-) -> HttpResponse | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     del request
     if _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid page id")
@@ -2197,8 +2194,8 @@ def scan_page_thumbnail(
     return response
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_pause(
     request: HttpRequest,
     job_id: str,
@@ -2216,8 +2213,8 @@ def scan_job_pause(
     return JsonResponse({"job_id": str(job.id), "state": job.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_resume(
     request: HttpRequest,
     job_id: str,
@@ -2235,8 +2232,8 @@ def scan_job_resume(
     return JsonResponse({"job_id": str(job.id), "state": job.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_finish(
     request: HttpRequest,
     job_id: str,
@@ -2255,9 +2252,12 @@ def scan_job_finish(
         except Exception:  # pragma: no cover - defensive for odd requests
             payload = {}
 
-    ok, reason = _apply_scan_job_transition(job, ScanJob.State.COMPLETE)
-    if not ok:
-        return HttpResponseBadRequest(reason)
+    if not _scan_job_transition_allowed(job, ScanJob.State.COMPLETE):
+        return HttpResponseBadRequest("transition not allowed")
+    if job.todos.filter(
+        state__in=[ScanTodo.State.OPEN, ScanTodo.State.CLAIMED],
+    ).exists():
+        return HttpResponseBadRequest("outstanding scan todos must be resolved")
 
     create_cleaned_variant = _coerce_optional_bool(
         payload.get("create_cleaned_variant"),
@@ -2269,9 +2269,7 @@ def scan_job_finish(
     engine = payload.get("engine") if isinstance(payload.get("engine"), str) else None
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
     request_options = (
-        payload.get("request_options")
-        if isinstance(payload.get("request_options"), dict)
-        else None
+        payload.get("request_options") if isinstance(payload.get("request_options"), dict) else None
     )
 
     cleaned_variant = None
@@ -2299,9 +2297,12 @@ def scan_job_finish(
                 model=model,
                 request_options=request_options,
             )
-        except ocr.OCRJobError:
-            # Keep finish behavior stable if OCR cannot be queued.
-            ocr_job = None
+        except ocr.OCRJobError as error:
+            return HttpResponseBadRequest(str(error))
+
+    ok, reason = _apply_scan_job_transition(job, ScanJob.State.COMPLETE)
+    if not ok:  # pragma: no cover - guarded before processing
+        return HttpResponseBadRequest(reason)
 
     response: dict[str, Any] = {
         "job_id": str(job.id),
@@ -2315,8 +2316,8 @@ def scan_job_finish(
     return JsonResponse(response)
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def scan_job_cancel(
     request: HttpRequest,
     job_id: str,
@@ -2334,27 +2335,30 @@ def scan_job_cancel(
     return JsonResponse({"job_id": str(job.id), "state": job.state})
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 @_require_role("admin")
 def admin_only(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "admin"})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
-def upload_file(request: HttpRequest) -> JsonResponse | HttpResponseBadRequest:
+@require_POST
+@login_required
+def upload_file(request: HttpRequest) -> HttpResponseBase:
     uploaded_file = request.FILES.get("file")
     if uploaded_file is None:
         return HttpResponseBadRequest("missing_file")
+    original_name = uploaded_file.name
+    if not original_name:
+        return HttpResponseBadRequest("filename is required")
 
     try:
-        normalized_filename = intake.normalize_filename(uploaded_file.name)
+        normalized_filename = intake.normalize_filename(original_name)
     except intake.ValidationError as exc:
         return HttpResponseBadRequest(str(exc))
     try:
         detected_format, detected_mime = intake.detect_format(
-            uploaded_file.name,
+            original_name,
             uploaded_file.content_type,
         )
     except intake.ValidationError as exc:
@@ -2374,7 +2378,7 @@ def upload_file(request: HttpRequest) -> JsonResponse | HttpResponseBadRequest:
         state=ImportJob.State.DISCOVERED,
         uploader=profile.user,
         source_path=source_path,
-        original_filename=uploaded_file.name,
+        original_filename=original_name,
         normalized_filename=normalized_filename,
         detected_format=detected_format,
         mime_type=detected_mime,
@@ -2387,8 +2391,8 @@ def upload_file(request: HttpRequest) -> JsonResponse | HttpResponseBadRequest:
     return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_GET
+@login_required
 def import_status(
     request: HttpRequest,
     job_id: str,
@@ -2416,9 +2420,9 @@ def import_status(
     return JsonResponse(payload)
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
-def review_queue(request: HttpRequest) -> JsonResponse:
+@require_GET
+@login_required
+def review_queue(request: HttpRequest) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseForbidden()
@@ -2445,9 +2449,9 @@ def review_queue(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"items": payload, "count": len(payload)})
 
 
-@require_GET  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
-def review_detail(request: HttpRequest, task_id: str) -> JsonResponse | HttpResponseNotFound:
+@require_GET
+@login_required
+def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseForbidden()
@@ -2467,12 +2471,12 @@ def review_detail(request: HttpRequest, task_id: str) -> JsonResponse | HttpResp
     return JsonResponse(payload)
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_accept_candidate(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2497,9 +2501,13 @@ def review_accept_candidate(
     try:
         candidate_isbn13 = candidate.isbn13 or None
         if candidate_isbn13:
-            existing_identifier = Identifier.objects.filter(
-                value=candidate_isbn13,
-            ).select_related("book").first()
+            existing_identifier = (
+                Identifier.objects.filter(
+                    value=candidate_isbn13,
+                )
+                .select_related("book")
+                .first()
+            )
             if existing_identifier is not None:
                 book = existing_identifier.book
             else:
@@ -2510,9 +2518,13 @@ def review_accept_candidate(
         if book is None:
             candidate_isbn10 = candidate.isbn10 or None
             if candidate_isbn10:
-                existing_identifier = Identifier.objects.filter(
-                    value=candidate_isbn10,
-                ).select_related("book").first()
+                existing_identifier = (
+                    Identifier.objects.filter(
+                        value=candidate_isbn10,
+                    )
+                    .select_related("book")
+                    .first()
+                )
                 if existing_identifier is not None:
                     book = existing_identifier.book
 
@@ -2521,9 +2533,7 @@ def review_accept_candidate(
                 name.lower() for name in candidate.authors if isinstance(name, str)
             }
             for existing_book in Book.objects.filter(title__iexact=candidate.title):
-                known_authors = [
-                    author.full_name.lower() for author in existing_book.authors.all()
-                ]
+                known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
                 if candidate_author_set.intersection(known_authors):
                     book = existing_book
                     break
@@ -2588,12 +2598,12 @@ def review_accept_candidate(
         return HttpResponseBadRequest(str(exc))
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_mark_unidentified(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2624,12 +2634,12 @@ def review_mark_unidentified(
     return JsonResponse({"task_id": str(task.id), "state": task.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_search_again(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2661,12 +2671,12 @@ def review_search_again(
     return JsonResponse({"task_id": str(task.id), "state": task.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_edit_search_terms(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2712,12 +2722,12 @@ def review_edit_search_terms(
     return JsonResponse({"task_id": str(task.id), "state": task.state})
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_manual_entry(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2752,12 +2762,12 @@ def review_manual_entry(
     )
 
 
-@require_POST  # type: ignore[untyped-decorator]
-@login_required  # type: ignore[untyped-decorator]
+@require_POST
+@login_required
 def review_merge_existing(
     request: HttpRequest,
     task_id: str,
-) -> JsonResponse | HttpResponseBadRequest:
+) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -2791,6 +2801,7 @@ def review_merge_existing(
         decision_payload={"book_id": book_id},
     )
     return JsonResponse({"task_id": str(task.id), "book_id": str(book.id)})
+
 
 def _scan_page_request_payload_for_multipart(request: HttpRequest) -> dict[str, Any]:
     result: dict[str, Any] = {}

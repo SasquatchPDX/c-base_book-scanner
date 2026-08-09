@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from django.utils import timezone
 
 from ebook_server.core import ocr
 from ebook_server.core.models import (
+    AppUserProfile,
     Book,
     FileVariant,
     ProcessingJob,
@@ -26,11 +28,13 @@ from ebook_server.storage import LocalFilesystemStorage
 class _ScriptedOCRClient:
     """Simple OCR client script for unit tests."""
 
+    name = "scripted"
+
     def __init__(self, poll_plan: list[dict[str, object]], outputs: dict[str, bytes]) -> None:
         self.outputs = outputs
         self.poll_plan = poll_plan
         self.poll_calls = 0
-        self.submitted = []
+        self.submitted: list[Path] = []
 
     def submit_job(
         self,
@@ -54,9 +58,9 @@ class _ScriptedOCRClient:
         entry = self.poll_plan[index]
         self.poll_calls += 1
         return ocr.OCRPollResult(
-            status=entry["status"],  # type: ignore[arg-type]
-            artifacts=entry.get("artifacts", []),
-            error=entry.get("error"),
+            status=str(entry["status"]),
+            artifacts=entry.get("artifacts", []),  # type: ignore[arg-type]
+            error=entry.get("error"),  # type: ignore[arg-type]
         )
 
     def download_artifact(self, remote_job_id: str, artifact: ocr.OCRArtifactDescriptor) -> bytes:
@@ -67,7 +71,7 @@ class _ScriptedOCRClient:
         return payload
 
 
-def _profile(ldap_uid: str):
+def _profile(ldap_uid: str) -> AppUserProfile:
     return get_or_create_profile(ldap_uid)
 
 
@@ -147,7 +151,7 @@ def _seed_scan_job_with_single_page(
 
 def _ocr_client_with_payloads(
     outputs: dict[str, bytes],
-    poll_plan: list[dict[str, object]],
+    poll_plan: list[dict[str, Any]],
 ) -> ocr.OCRClientProtocol:
     for artifact in poll_plan:
         artifacts = artifact.get("artifacts")
@@ -162,7 +166,7 @@ def _ocr_client_with_payloads(
 def _install_ocr_client(
     monkeypatch: pytest.MonkeyPatch,
     outputs: dict[str, bytes],
-    poll_plan: list[dict[str, object]],
+    poll_plan: list[dict[str, Any]],
 ) -> None:
     client = _ocr_client_with_payloads(outputs, poll_plan)
     monkeypatch.setattr(ocr, "_get_ocr_client", lambda: client)
@@ -198,7 +202,7 @@ def test_ocr_variant_happy_path_accepts_intermediate_statuses(
             filename="page.pdf",
         ),
     ]
-    poll_plan = [
+    poll_plan: list[dict[str, Any]] = [
         {"status": "accepted"},
         {"status": "running"},
         {"status": "succeeded", "artifacts": artifacts},

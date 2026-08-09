@@ -4,10 +4,10 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
-from django.http import HttpResponse
 from django.test import Client
 from django.utils import timezone
 
@@ -112,7 +112,7 @@ def _request_conversion(
     source_variant: FileVariant,
     target_format: str,
     request_options: dict[str, str] | None = None,
-) -> HttpResponse:
+) -> Any:
     payload = {
         "source_variant_id": source_variant.id,
         "target_format": target_format,

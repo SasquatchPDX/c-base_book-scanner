@@ -29,8 +29,7 @@ def test_multiple_authors_can_attach_to_one_book() -> None:
     book.authors.set([first, second])
 
     assert book.authors.count() == 2
-    assert set(first.books.all()) == {book}
-    assert set(second.books.all()) == {book}
+    assert set(Author.objects.filter(books=book)) == {first, second}
 
 
 @pytest.mark.django_db(transaction=True)
