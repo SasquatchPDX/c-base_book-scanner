@@ -15,7 +15,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 001 | ✅ Done | Architecture/research docs, project skeleton, dependency/tooling baseline, health/readiness and secured Prometheus endpoints, structured logging, CI |
 | 002 | ✅ Done | Local auth role model/profile, LDAP adapter boundary, Django auth backend scaffold, RQ queue module, and starter queue/storage settings + Sprint002 test coverage |
 | 003 | ✅ Done | Canonical book/domain models (Book, Author, Identifier, FileVariant, CoverImage, Storage/Source locations) and baseline migration/test coverage |
-| 004 | ✅ Done | Common upload/intake path with staging, hashing, format-aware metadata extraction, deduplication, durable archive copy, and API status/update behavior; later expanded to all declared digital-book formats |
+| 004 | ✅ Done | Common upload/intake path with staging, hashing, format-aware metadata and cover extraction, deduplication, durable archive copy, and API status behavior; later expanded to all declared digital-book formats |
 | 005 | ✅ Done | Metadata provider abstraction, ISBN normalization/extraction, provider abstraction tests, candidate scoring + persistence, and intake confidence routing with low-confidence review tasks |
 | 006 | ✅ Done | Review queue/workflow complete with manual decision actions (open/pending listing, owner/admin access, accept/manual/merge/unidentified, tests, migration) |
 | 007 | ✅ Done | Source-path ingestion implemented (preview, recursive scan, copy/move behavior, duplicate detection, recoverable failures) |

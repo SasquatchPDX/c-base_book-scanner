@@ -62,7 +62,13 @@ class IdentifierAdmin(admin.ModelAdmin[Identifier]):
 
 @admin.register(CoverImage)
 class CoverImageAdmin(admin.ModelAdmin[CoverImage]):
-    list_display = ("book", "position", "storage_identifier")
+    list_display = (
+        "book",
+        "position",
+        "source_variant",
+        "extractor_tool",
+        "storage_identifier",
+    )
 
 
 @admin.register(FileVariant)

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import io
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import Client
+from django.http import StreamingHttpResponse
+from django.test import Client, override_settings
+from PIL import Image
+from pypdf import PdfWriter
 
 from ebook_server.core import intake
-from ebook_server.core.models import FileVariant, ImportJob, StorageLocation, get_or_create_profile
+from ebook_server.core.models import (
+    CoverImage,
+    FileVariant,
+    ImportJob,
+    StorageLocation,
+    get_or_create_profile,
+)
 from ebook_server.storage import LocalFilesystemStorage
 
 
@@ -23,7 +34,12 @@ def _configure_storage(tmp_path: Path) -> None:
     )
 
 
-def _build_epub(path: Path, title: str = "Sample EPUB") -> None:
+def _build_epub(
+    path: Path,
+    title: str = "Sample EPUB",
+    *,
+    cover_payload: bytes | None = None,
+) -> None:
     with ZipFile(path, "w") as archive:
         archive.writestr(
             "META-INF/container.xml",
@@ -38,6 +54,13 @@ def _build_epub(path: Path, title: str = "Sample EPUB") -> None:
                 b"</container>"
             ),
         )
+        cover_metadata = '<meta name="cover" content="cover-image"/>' if cover_payload else ""
+        cover_manifest = (
+            '<manifest><item id="cover-image" href="images/cover.png" '
+            'media-type="image/png" properties="cover-image"/></manifest>'
+            if cover_payload
+            else ""
+        )
         archive.writestr(
             "OEBPS/content.opf",
             (
@@ -45,10 +68,25 @@ def _build_epub(path: Path, title: str = "Sample EPUB") -> None:
                 f'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
                 f"<dc:title>{title}</dc:title>"
                 f"<dc:creator>Jane Doe</dc:creator>"
+                f"{cover_metadata}"
                 "</metadata>"
+                f"{cover_manifest}"
                 "</package>"
             ).encode(),
         )
+        if cover_payload is not None:
+            archive.writestr("OEBPS/images/cover.png", cover_payload)
+
+
+def _image_bytes(
+    *,
+    size: tuple[int, int] = (320, 480),
+    color: tuple[int, int, int] = (30, 80, 150),
+) -> bytes:
+    stream = io.BytesIO()
+    with Image.new("RGB", size, color) as image:
+        image.save(stream, format="PNG")
+    return stream.getvalue()
 
 
 def _force_stub_provider(
@@ -132,6 +170,55 @@ def test_epub_upload_registers_file_variant(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_epub_upload_extracts_normalized_cover_with_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_data = tmp_path / "cover-app-data"
+    _force_stub_provider(monkeypatch, candidate_title="Covered EPUB", authors=["Jane Doe"])
+    profile = get_or_create_profile("covered-epub-user")
+    client = Client()
+    client.force_login(profile.user)
+    epub_path = tmp_path / "covered.epub"
+    _build_epub(epub_path, "Covered EPUB", cover_payload=_image_bytes())
+
+    with override_settings(APP_DATA_DIR=app_data):
+        _configure_storage(tmp_path)
+        response = client.post(
+            "/imports/upload/",
+            {
+                "file": SimpleUploadedFile(
+                    "covered.epub",
+                    epub_path.read_bytes(),
+                    content_type="application/epub+zip",
+                ),
+            },
+        )
+
+        assert response.status_code == 201
+        job = ImportJob.objects.get(pk=response.json()["job_id"])
+        assert job.file_variant is not None
+        cover = CoverImage.objects.get(book=job.book, position=CoverImage.CoverPosition.FRONT)
+        assert cover.source_variant_id == job.file_variant_id
+        assert cover.extractor_tool == "zipfile+pillow"
+        assert "Pillow" in cover.extractor_version
+        assert cover.mime_type == "image/jpeg"
+        assert job.book is not None
+        job.book.refresh_from_db()
+        assert job.book.front_cover_id == cover.id
+
+        cover_response = client.get(f"/library/books/{job.book_id}/covers/front/")
+        assert cover_response.status_code == 200
+        assert cover_response["Content-Type"] == "image/jpeg"
+        cover_stream = cast(StreamingHttpResponse, cover_response)
+        cover_bytes = b"".join(cast(Iterable[bytes], cover_stream.streaming_content))
+        assert len(cover_bytes) == cover.size_bytes
+        with Image.open(io.BytesIO(cover_bytes)) as image:
+            assert image.format == "JPEG"
+            assert image.size == (320, 480)
+
+
+@pytest.mark.django_db(transaction=True)
 def test_pdf_upload_registers_file_variant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -163,6 +250,110 @@ def test_pdf_upload_registers_file_variant(
     assert job.state == ImportJob.State.COMPLETE
     assert job.file_variant is not None
     assert job.file_variant.mime_type == "application/pdf"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pdf_upload_renders_first_page_cover_with_pdfium(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_data = tmp_path / "pdf-cover-app-data"
+    _force_stub_provider(monkeypatch, candidate_title="Rendered PDF")
+    profile = get_or_create_profile("pdf-cover-user")
+    client = Client()
+    client.force_login(profile.user)
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    pdf_stream = io.BytesIO()
+    writer.write(pdf_stream)
+
+    with override_settings(APP_DATA_DIR=app_data):
+        _configure_storage(tmp_path)
+        response = client.post(
+            "/imports/upload/",
+            {
+                "file": SimpleUploadedFile(
+                    "Rendered PDF.pdf",
+                    pdf_stream.getvalue(),
+                    content_type="application/pdf",
+                ),
+            },
+        )
+
+        assert response.status_code == 201
+        job = ImportJob.objects.get(pk=response.json()["job_id"])
+        cover = CoverImage.objects.get(book=job.book, position=CoverImage.CoverPosition.FRONT)
+        assert cover.source_variant_id == job.file_variant_id
+        assert cover.extractor_tool == "pypdfium2+pillow"
+        assert "pypdfium2" in cover.extractor_version
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cbz_upload_uses_first_page_as_cover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_data = tmp_path / "cbz-cover-app-data"
+    _force_stub_provider(monkeypatch, candidate_title="Covered Comic")
+    profile = get_or_create_profile("cbz-cover-user")
+    client = Client()
+    client.force_login(profile.user)
+    cbz_path = tmp_path / "Covered Comic.cbz"
+    with ZipFile(cbz_path, "w") as archive:
+        archive.writestr("001.png", _image_bytes(color=(170, 40, 30)))
+        archive.writestr("002.png", _image_bytes(color=(20, 130, 60)))
+
+    with override_settings(APP_DATA_DIR=app_data):
+        _configure_storage(tmp_path)
+        response = client.post(
+            "/imports/upload/",
+            {
+                "file": SimpleUploadedFile(
+                    cbz_path.name,
+                    cbz_path.read_bytes(),
+                    content_type="application/vnd.comicbook+zip",
+                ),
+            },
+        )
+
+        assert response.status_code == 201
+        job = ImportJob.objects.get(pk=response.json()["job_id"])
+        cover = CoverImage.objects.get(book=job.book, position=CoverImage.CoverPosition.FRONT)
+        assert cover.source_variant_id == job.file_variant_id
+        assert cover.extractor_tool == "zipfile+pillow"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cover_decompression_warning_does_not_fail_original_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_data = tmp_path / "cover-bomb-app-data"
+    _force_stub_provider(monkeypatch, candidate_title="Large Cover EPUB", authors=["Jane Doe"])
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    profile = get_or_create_profile("cover-bomb-user")
+    client = Client()
+    client.force_login(profile.user)
+    epub_path = tmp_path / "large-cover.epub"
+    _build_epub(epub_path, "Large Cover EPUB", cover_payload=_image_bytes())
+
+    with override_settings(APP_DATA_DIR=app_data):
+        _configure_storage(tmp_path)
+        response = client.post(
+            "/imports/upload/",
+            {
+                "file": SimpleUploadedFile(
+                    epub_path.name,
+                    epub_path.read_bytes(),
+                    content_type="application/epub+zip",
+                ),
+            },
+        )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    assert job.state == ImportJob.State.COMPLETE
+    assert not CoverImage.objects.filter(book=job.book).exists()
 
 
 @pytest.mark.django_db(transaction=True)

@@ -64,7 +64,8 @@ Workflow routes return JSON to API clients and HTML to browsers through content
 negotiation. Rendered-page and form tests protect the browser workflows in CI.
 Normal intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR. Each
 format receives signature/container validation before metadata parsing, and every
-file still goes through external bibliographic verification.
+file still goes through external bibliographic verification. EPUB, PDF, and CBZ
+imports generate bounded normalized front covers when one can be extracted safely.
 
 Artifacts are never addressed by request-supplied absolute paths. Library and
 scan data live below the configured storage root and are intentionally ignored by

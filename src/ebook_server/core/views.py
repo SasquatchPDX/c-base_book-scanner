@@ -1109,6 +1109,9 @@ def _serialize_cover(cover: Any) -> dict[str, Any]:
         "position": cover.position,
         "mime_type": cover.mime_type,
         "size_bytes": cover.size_bytes,
+        "source_variant_id": cover.source_variant_id,
+        "extractor_tool": cover.extractor_tool,
+        "extractor_version": cover.extractor_version,
         "url": f"/library/books/{cover.book_id}/covers/{cover.position}/",
     }
 

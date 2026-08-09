@@ -242,6 +242,15 @@ class CoverImage(models.Model):
     mime_type = models.CharField(max_length=128)
     size_bytes = models.PositiveBigIntegerField()
     sha256 = models.CharField(max_length=64)
+    source_variant = models.ForeignKey(
+        "FileVariant",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="extracted_covers",
+    )
+    extractor_tool = models.CharField(max_length=128, blank=True)
+    extractor_version = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

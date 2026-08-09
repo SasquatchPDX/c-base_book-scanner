@@ -32,6 +32,7 @@ dependencies = [
   "beautifulsoup4>=4.13,<5",
   "charset-normalizer>=3.4,<4",
   "rarfile>=4.2,<5",
+  "pypdfium2>=4.30,<5",
 ]
 
 [project.scripts]

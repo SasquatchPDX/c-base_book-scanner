@@ -90,6 +90,13 @@ handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
 extraction still requires an explicitly configured external archive tool in a
 restricted worker environment.
 
+EPUB, PDF, and CBZ intake attempts front-cover extraction in the ingestion worker.
+PDF pages are rendered by liberal-licensed PDFium bindings; archive images are
+read with member size/compression limits; Pillow warnings for decompression bombs
+are treated as failures. Cover failure is logged and does not fail or alter the
+original import. Generated JPEG covers record their source variant and extractor
+tool versions and are included in storage consistency checks.
+
 Scan finalization (`POST /scan/jobs/<id>/finish/`) is queued and returns a durable
 job identifier. Poll `GET /scan-finalizations/<job-id>/` or inspect the scan-job
 pipeline payload. Finalization requires successful ScanTailor output for every
