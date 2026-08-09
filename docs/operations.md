@@ -83,6 +83,13 @@ Configure the OCR service URL and network policy so only workers can submit jobs
 OCR responses are treated as untrusted artifacts and retain engine/model/language
 provenance.
 
+Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
+Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text
+encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP readers
+handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
+extraction still requires an explicitly configured external archive tool in a
+restricted worker environment.
+
 Scan finalization (`POST /scan/jobs/<id>/finish/`) is queued and returns a durable
 job identifier. Poll `GET /scan-finalizations/<job-id>/` or inspect the scan-job
 pipeline payload. Finalization requires successful ScanTailor output for every

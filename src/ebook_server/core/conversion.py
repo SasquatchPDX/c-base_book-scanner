@@ -174,10 +174,10 @@ FORMAT_TO_MIME: dict[str, str] = {
     "pdf": "application/pdf",
     "txt": "text/plain",
     "html": "text/html",
-    "fb2": "application/fb2",
+    "fb2": "application/x-fictionbook+xml",
     "djvu": "image/vnd.djvu",
-    "cbz": "application/x-cbz",
-    "cbr": "application/x-cbr",
+    "cbz": "application/vnd.comicbook+zip",
+    "cbr": "application/vnd.comicbook-rar",
     "png": "image/png",
     "tiff": "image/tiff",
 }

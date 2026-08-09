@@ -75,8 +75,10 @@ def test_preview_reports_supported_source_files_only(
     source_root = tmp_path / "incoming"
     source_root.mkdir()
     source_file = source_root / "book.pdf"
-    other_file = source_root / "ignore.txt"
+    text_file = source_root / "notes.txt"
+    other_file = source_root / "ignore.docx"
     source_file.write_bytes(b"%PDF-1.4")
+    text_file.write_text("A supported plain-text book.")
     other_file.write_text("skip me")
 
     location = _create_source_root(source_root)
@@ -91,8 +93,7 @@ def test_preview_reports_supported_source_files_only(
     )
     payload = json.loads(stdout.getvalue())
 
-    assert len(payload) == 1
-    assert payload[0]["path"] == str(source_file)
+    assert {item["path"] for item in payload} == {str(source_file), str(text_file)}
 
 
 @pytest.mark.django_db(transaction=True)

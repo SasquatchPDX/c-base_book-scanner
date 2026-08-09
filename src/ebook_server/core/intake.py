@@ -9,13 +9,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from pathlib import Path
+from io import BytesIO
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 from typing import Any, cast
 from urllib.parse import unquote
-from zipfile import ZipFile, is_zipfile
+from zipfile import ZipFile, ZipInfo, is_zipfile
 
+import rarfile
 import structlog
+from bs4 import BeautifulSoup
+from charset_normalizer import from_bytes
 from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
@@ -64,6 +68,42 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
         format_name="pdf",
         mime_type="application/pdf",
     ),
+    ".mobi": SupportedFormat(
+        format_name="mobi",
+        mime_type="application/x-mobipocket-ebook",
+    ),
+    ".txt": SupportedFormat(
+        format_name="txt",
+        mime_type="text/plain",
+    ),
+    ".html": SupportedFormat(
+        format_name="html",
+        mime_type="text/html",
+    ),
+    ".htm": SupportedFormat(
+        format_name="html",
+        mime_type="text/html",
+    ),
+    ".fb2": SupportedFormat(
+        format_name="fb2",
+        mime_type="application/x-fictionbook+xml",
+    ),
+    ".djvu": SupportedFormat(
+        format_name="djvu",
+        mime_type="image/vnd.djvu",
+    ),
+    ".djv": SupportedFormat(
+        format_name="djvu",
+        mime_type="image/vnd.djvu",
+    ),
+    ".cbz": SupportedFormat(
+        format_name="cbz",
+        mime_type="application/vnd.comicbook+zip",
+    ),
+    ".cbr": SupportedFormat(
+        format_name="cbr",
+        mime_type="application/vnd.comicbook-rar",
+    ),
 }
 
 MAX_UPLOAD_BYTES = getattr(
@@ -75,6 +115,9 @@ AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10_000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 
 
 def normalize_filename(raw: str) -> str:
@@ -135,8 +178,93 @@ def validate_container_signature(file_path: str, detected_format: str) -> None:
             if source.read(5) != b"%PDF-":
                 raise ValidationError("file content is not a PDF")
         return
-    if detected_format == "epub" and not is_zipfile(path):
-        raise ValidationError("file content is not an EPUB/ZIP container")
+    if detected_format == "epub":
+        if not is_zipfile(path):
+            raise ValidationError("file content is not an EPUB/ZIP container")
+        with ZipFile(path, "r") as archive:
+            members = _validate_zip_container(archive, container_name="EPUB")
+            if "META-INF/container.xml" not in {info.filename for info in members}:
+                raise ValidationError("EPUB package metadata is missing")
+        return
+    if detected_format == "mobi":
+        with path.open("rb") as source:
+            header = source.read(68)
+        if len(header) < 68 or header[60:68] != b"BOOKMOBI":
+            raise ValidationError("file content is not a MOBI container")
+        return
+    if detected_format in {"txt", "html", "fb2"}:
+        sample = _read_metadata_sample(path)
+        text, _encoding = _decode_text_sample(sample)
+        lowered = text.lstrip("\ufeff\t\r\n ").lower()
+        if detected_format == "html" and not (
+            lowered.startswith("<!doctype html") or "<html" in lowered[:4096]
+        ):
+            raise ValidationError("file content is not HTML")
+        if detected_format == "fb2" and "<fictionbook" not in lowered[:65536]:
+            raise ValidationError("file content is not FictionBook XML")
+        return
+    if detected_format == "djvu":
+        with path.open("rb") as source:
+            header = source.read(16)
+        if (
+            len(header) < 16
+            or header[:8] != b"AT&TFORM"
+            or header[12:16]
+            not in {
+                b"DJVU",
+                b"DJVM",
+            }
+        ):
+            raise ValidationError("file content is not a DjVu container")
+        return
+    if detected_format == "cbz":
+        if not is_zipfile(path):
+            raise ValidationError("file content is not a CBZ/ZIP container")
+        with ZipFile(path, "r") as archive:
+            members = _validate_zip_container(archive, container_name="CBZ")
+            image_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"}
+            if not any(
+                PurePosixPath(info.filename).suffix.lower() in image_suffixes for info in members
+            ):
+                raise ValidationError("CBZ container has no supported page images")
+        return
+    if detected_format == "cbr" and not rarfile.is_rarfile(path):
+        raise ValidationError("file content is not a CBR/RAR container")
+
+
+def _read_metadata_sample(path: Path) -> bytes:
+    with path.open("rb") as source:
+        payload = source.read(MAX_FORMAT_METADATA_BYTES)
+    if not payload:
+        raise ValidationError("document is empty")
+    return payload
+
+
+def _validate_zip_container(archive: ZipFile, *, container_name: str) -> list[ZipInfo]:
+    members = archive.infolist()
+    if len(members) > MAX_ARCHIVE_MEMBERS:
+        raise ValidationError(f"{container_name} archive has too many members")
+    total_uncompressed = 0
+    for info in members:
+        member_path = PurePosixPath(info.filename)
+        if info.filename.startswith(("/", "\\")) or "\\" in info.filename:
+            raise ValidationError(f"{container_name} archive contains an unsafe member path")
+        if ".." in member_path.parts:
+            raise ValidationError(f"{container_name} archive contains an unsafe member path")
+        total_uncompressed += info.file_size
+        if total_uncompressed > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise ValidationError(f"{container_name} archive expands beyond the safe size limit")
+    return members
+
+
+def _decode_text_sample(payload: bytes) -> tuple[str, str]:
+    match = from_bytes(payload).best()
+    if match is None:
+        raise ValidationError("text encoding could not be determined")
+    text = str(match)
+    if match.chaos > 0.3 or "\x00" in text:
+        raise ValidationError("text document contains binary data")
+    return text, str(match.encoding or "unknown")
 
 
 def _default_storage() -> LocalFilesystemStorage:
@@ -330,11 +458,151 @@ def extract_metadata(
             return _extract_pdf_metadata(file_path, original_filename=original_filename)
         if detected_format == "epub":
             return _extract_epub_metadata(file_path, original_filename=original_filename)
+        if detected_format == "txt":
+            return _extract_text_metadata(file_path, original_filename=original_filename)
+        if detected_format == "html":
+            return _extract_html_metadata(file_path, original_filename=original_filename)
+        if detected_format == "fb2":
+            return _extract_fb2_metadata(file_path, original_filename=original_filename)
+        if detected_format == "cbz":
+            return _extract_cbz_metadata(file_path, original_filename=original_filename)
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
         return {"title": Path(original_filename).stem}
     return {"title": Path(original_filename).stem}
+
+
+def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    payload = _read_metadata_sample(Path(file_path))
+    _text, encoding = _decode_text_sample(payload)
+    return {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {"encoding": encoding},
+        "container_type": "txt",
+    }
+
+
+def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    payload = _read_metadata_sample(Path(file_path))
+    text, encoding = _decode_text_sample(payload)
+    soup = BeautifulSoup(text, "html.parser")
+
+    def meta_content(*names: str) -> str | None:
+        wanted = {name.lower() for name in names}
+        for tag in soup.find_all("meta"):
+            key = str(tag.get("name") or tag.get("property") or "").lower()
+            value = tag.get("content")
+            if key in wanted and isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    title = meta_content("og:title", "dc.title")
+    if title is None and soup.title is not None:
+        title = soup.title.get_text(" ", strip=True) or None
+    author = meta_content("author", "dc.creator", "dcterms.creator")
+    return {
+        "title": title or Path(original_filename).stem,
+        "authors": [author] if author else [],
+        "language": meta_content("language", "dc.language"),
+        "description": meta_content("description", "og:description", "dc.description"),
+        "identifier": meta_content("isbn", "dc.identifier", "dcterms.identifier"),
+        "publisher": meta_content("publisher", "dc.publisher"),
+        "raw_metadata": {"encoding": encoding},
+        "container_type": "html",
+    }
+
+
+def _xml_local_name(tag: Any) -> str:
+    raw = str(tag)
+    return raw.rsplit("}", 1)[-1].lower()
+
+
+def _xml_element_text(element: Any, child_name: str | None = None) -> str | None:
+    target = element
+    if child_name is not None:
+        target = next(
+            (child for child in element if _xml_local_name(child.tag) == child_name),
+            None,
+        )
+        if target is None:
+            return None
+    value = " ".join("".join(target.itertext()).split())
+    return value or None
+
+
+def _extract_fb2_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    title: str | None = None
+    language: str | None = None
+    description: str | None = None
+    authors: list[str] = []
+    inside_title_info = False
+    payload = _read_metadata_sample(Path(file_path))
+    for event, element in ET.iterparse(BytesIO(payload), events=("start", "end")):
+        local_name = _xml_local_name(element.tag)
+        if event == "start" and local_name == "title-info":
+            inside_title_info = True
+            continue
+        if event == "end" and inside_title_info:
+            if local_name == "book-title":
+                title = _xml_element_text(element)
+            elif local_name == "lang":
+                language = _xml_element_text(element)
+            elif local_name == "annotation":
+                description = _xml_element_text(element)
+            elif local_name == "author":
+                parts = [
+                    _xml_element_text(element, child_name)
+                    for child_name in ("first-name", "middle-name", "last-name", "nickname")
+                ]
+                author = " ".join(part for part in parts if part)
+                if author:
+                    authors.append(author)
+            elif local_name == "title-info":
+                break
+    return {
+        "title": title or Path(original_filename).stem,
+        "authors": authors,
+        "language": language,
+        "description": description,
+        "raw_metadata": {},
+        "container_type": "fb2",
+    }
+
+
+def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    fallback = {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {},
+        "container_type": "cbz",
+    }
+    with ZipFile(file_path, "r") as archive:
+        member_name = next(
+            (name for name in archive.namelist() if name.lower().endswith("comicinfo.xml")),
+            None,
+        )
+        if member_name is None:
+            return fallback
+        payload = _read_zip_metadata_member(archive, member_name, container_name="CBZ")
+    root = ET.fromstring(payload)
+
+    def value(name: str) -> str | None:
+        element = next(
+            (child for child in root if _xml_local_name(child.tag) == name.lower()),
+            None,
+        )
+        return _xml_element_text(element) if element is not None else None
+
+    authors = [author.strip() for author in (value("Writer") or "").split(",") if author.strip()]
+    return {
+        "title": value("Title") or fallback["title"],
+        "authors": authors,
+        "language": value("LanguageISO"),
+        "description": value("Summary"),
+        "publisher": value("Publisher"),
+        "raw_metadata": {"comic_info": True},
+        "container_type": "cbz",
+    }
 
 
 def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
@@ -412,18 +680,28 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
 
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
     """Read a small EPUB metadata member while rejecting archive-bomb inputs."""
+    return _read_zip_metadata_member(archive, member_name, container_name="EPUB")
+
+
+def _read_zip_metadata_member(
+    archive: ZipFile,
+    member_name: str,
+    *,
+    container_name: str,
+) -> bytes:
+    """Read one bounded metadata member from an untrusted ZIP container."""
     info = archive.getinfo(member_name)
     if info.flag_bits & 0x1:
-        raise ValidationError("encrypted EPUB metadata is not supported")
+        raise ValidationError(f"encrypted {container_name} metadata is not supported")
     if info.file_size > MAX_EPUB_METADATA_MEMBER_BYTES:
-        raise ValidationError("EPUB metadata member exceeds safe size limit")
+        raise ValidationError(f"{container_name} metadata member exceeds safe size limit")
     compressed_size = max(info.compress_size, 1)
     if info.file_size / compressed_size > MAX_EPUB_METADATA_COMPRESSION_RATIO:
-        raise ValidationError("EPUB metadata compression ratio exceeds safe limit")
+        raise ValidationError(f"{container_name} metadata compression ratio exceeds safe limit")
     with archive.open(info, "r") as member:
         payload = member.read(MAX_EPUB_METADATA_MEMBER_BYTES + 1)
     if len(payload) > MAX_EPUB_METADATA_MEMBER_BYTES:
-        raise ValidationError("EPUB metadata member exceeds safe size limit")
+        raise ValidationError(f"{container_name} metadata member exceeds safe size limit")
     return payload
 
 

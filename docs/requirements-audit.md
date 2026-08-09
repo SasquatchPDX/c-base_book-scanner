@@ -41,6 +41,9 @@ sprint or production deployment is complete.
 - Unlinked physical scans now use durable provider lookup and the shared review
   queue. Finishing an unlinked scan automatically starts identification; owner or
   admin review then links the ScanJob to a canonical Book before artifact creation.
+- Normal digital intake now covers EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ,
+  and CBR with format-aware signature checks and bounded mature-library metadata
+  parsing before mandatory external verification.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
@@ -50,8 +53,8 @@ sprint or production deployment is complete.
 - User-facing UI: core workflows are usable server-side, but advanced ScanTailor
   geometry overlays, direct manipulation, richer batch controls, and live updates
   beyond polling still need a focused TypeScript interaction layer.
-- Intake breadth: normal intake currently accepts EPUB and PDF, not every domain
-  format represented by `FileVariant`. Cover/thumbnail extraction is incomplete.
+- Intake presentation: cover/thumbnail extraction is incomplete for imported
+  digital books.
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.
 - Observability: core metrics and structured events are present; deployment alert
