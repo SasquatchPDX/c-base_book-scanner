@@ -50,6 +50,7 @@ Redis.
 - `/library/books/?view=html` — canonical metadata search and browse UI
 - `/imports/upload/` — authenticated upload into the common intake pipeline
 - `/reviews/?view=html` — low-confidence metadata review queue
+- `/review-identifications/<job-id>/` — durable repeat metadata-search status
 - `/scan/jobs/?view=html` — scanner jobs and page capture
 - `/scan/jobs/<id>/workspace/?view=html` — per-page ScanTailor workspace
 - `/scan/jobs/<id>/identify/` — queue public metadata lookup for an unlinked scan

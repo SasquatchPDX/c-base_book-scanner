@@ -161,3 +161,57 @@ def test_candidate_requires_exactly_one_workflow_source() -> None:
             provider_id="invalid",
             title="No source",
         )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_search_again_refreshes_scan_candidates_and_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(identification, "_provider_instances", lambda: [_ScanMetadataProvider()])
+    client, scan_job = _scan_client("scan-search-again-owner")
+    first = client.post(f"/scan/jobs/{scan_job.id}/identify/")
+    task = ReviewTask.objects.get(pk=first.json()["review_task_id"])
+    old_candidate_id = MetadataCandidate.objects.get(scan_job=scan_job).id
+
+    edit = client.post(
+        f"/reviews/{task.id}/edit-search-terms/",
+        {"inferred_title": "Refined Scan", "inferred_authors": "Rita Refiner"},
+    )
+    assert edit.status_code == 200
+
+    class RefinedProvider:
+        provider_id = "refined-scan-stub"
+
+        def search(
+            self,
+            title: str | None = None,
+            *,
+            author: str | None = None,
+            isbn: str | None = None,
+            folder_hint: str | None = None,
+        ) -> list[dict[str, Any]]:
+            del isbn, folder_hint
+            assert title == "Refined Scan"
+            assert author == "Rita Refiner"
+            return [
+                {
+                    "key": "/works/OL-REFINED",
+                    "title": "Refined Result",
+                    "author_name": ["Rita Refiner"],
+                }
+            ]
+
+    monkeypatch.setattr(identification, "_provider_instances", lambda: [RefinedProvider()])
+    response = client.post(f"/reviews/{task.id}/search-again/")
+
+    assert response.status_code == 202
+    assert response.json()["identification_job"]["state"] == ProcessingJob.JobState.SUCCESS
+    scan_job.refresh_from_db()
+    task.refresh_from_db()
+    candidate = MetadataCandidate.objects.get(scan_job=scan_job)
+    assert candidate.id != old_candidate_id
+    assert candidate.title == "Refined Result"
+    assert scan_job.provisional_title == "Refined Scan"
+    assert scan_job.provisional_authors == ["Rita Refiner"]
+    assert task.state == ReviewTask.State.OPEN
+    assert task.decision == ReviewTask.Decision.SEARCH_AGAIN

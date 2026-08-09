@@ -8,7 +8,15 @@ import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client
 
-from ebook_server.core.models import Book, ImportJob, ReviewTask, get_or_create_profile
+from ebook_server.core import review_identification
+from ebook_server.core.models import (
+    Book,
+    ImportJob,
+    MetadataCandidate,
+    ProcessingJob,
+    ReviewTask,
+    get_or_create_profile,
+)
 from ebook_server.storage import LocalFilesystemStorage
 
 
@@ -298,3 +306,150 @@ def test_mark_unidentified_records_decision(
     task.refresh_from_db()
     assert task.state == ReviewTask.State.RESOLVED
     assert task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_search_again_requeries_archived_import_and_replaces_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Client()
+    task, import_job = _start_low_confidence_import(
+        monkeypatch=monkeypatch,
+        client=client,
+        tmp_path=tmp_path,
+        username="uploader-search-again",
+        candidate_title="Old Candidate",
+    )
+    old_candidate_id = import_job.metadata_candidates.get().id
+    assert not Path(import_job.source_path).exists()
+
+    edit = client.post(
+        f"/reviews/{task.id}/edit-search-terms/",
+        {"inferred_title": "Better Search", "inferred_authors": "New Author"},
+    )
+    assert edit.status_code == 200
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Better Candidate",
+        authors=["New Author"],
+    )
+
+    response = client.post(f"/reviews/{task.id}/search-again/")
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["identification_job"]["state"] == ProcessingJob.JobState.SUCCESS
+    assert payload["identification_job"]["candidate_count"] == 1
+    task.refresh_from_db()
+    import_job.refresh_from_db()
+    candidate = MetadataCandidate.objects.get(import_job=import_job)
+    assert candidate.id != old_candidate_id
+    assert candidate.title == "Better Candidate"
+    assert task.state == ReviewTask.State.OPEN
+    assert task.decision == ReviewTask.Decision.SEARCH_AGAIN
+    assert task.inferred_title == "Better Search"
+    assert import_job.state == ImportJob.State.LOW_CONFIDENCE
+
+    status = client.get(f"/review-identifications/{payload['identification_job']['job_id']}/")
+    assert status.status_code == 200
+    assert status.json()["review_task_id"] == task.id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_review_identification_status_enforces_task_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_client = Client()
+    task, _import_job = _start_low_confidence_import(
+        monkeypatch=monkeypatch,
+        client=owner_client,
+        tmp_path=tmp_path,
+        username="review-search-status-owner",
+        candidate_title="Initial Candidate",
+    )
+    _force_stub_provider(monkeypatch, candidate_title="Replacement Candidate")
+    response = owner_client.post(f"/reviews/{task.id}/search-again/")
+    job_id = response.json()["identification_job"]["job_id"]
+
+    other = get_or_create_profile("review-search-status-other")
+    other_client = Client()
+    other_client.force_login(other.user)
+    assert other_client.get(f"/review-identifications/{job_id}/").status_code == 403
+
+    admin = get_or_create_profile("review-search-status-admin", role="admin")
+    admin_client = Client()
+    admin_client.force_login(admin.user)
+    assert admin_client.get(f"/review-identifications/{job_id}/").status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_search_again_dispatch_failure_is_durable_and_reopens_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingQueue:
+        def enqueue(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise RuntimeError("queue unavailable")
+
+    client = Client()
+    task, _import_job = _start_low_confidence_import(
+        monkeypatch=monkeypatch,
+        client=client,
+        tmp_path=tmp_path,
+        username="review-search-dispatch-failure",
+        candidate_title="Initial Candidate",
+    )
+    monkeypatch.setattr(review_identification, "get_queue", lambda: FailingQueue())
+
+    response = client.post(f"/reviews/{task.id}/search-again/")
+
+    assert response.status_code == 400
+    task.refresh_from_db()
+    processing_job = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.REVIEW_IDENTIFICATION)
+    assert processing_job.state == ProcessingJob.JobState.FAILED
+    assert "queue dispatch failed" in processing_job.details["error"]
+    assert task.state == ReviewTask.State.OPEN
+
+
+@pytest.mark.django_db(transaction=True)
+def test_completed_repeat_search_never_reopens_task_resolved_while_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DeferredQueue:
+        call: tuple[Any, tuple[Any, ...], dict[str, Any]] | None = None
+
+        def enqueue(self, function: Any, *args: Any, **kwargs: Any) -> None:
+            self.call = (function, args, kwargs)
+
+    queue = DeferredQueue()
+    client = Client()
+    task, _import_job = _start_low_confidence_import(
+        monkeypatch=monkeypatch,
+        client=client,
+        tmp_path=tmp_path,
+        username="review-search-resolution-race",
+        candidate_title="Initial Candidate",
+    )
+    monkeypatch.setattr(review_identification, "get_queue", lambda: queue)
+    response = client.post(f"/reviews/{task.id}/search-again/")
+    assert response.status_code == 202
+    assert queue.call is not None
+
+    task.refresh_from_db()
+    task.state = ReviewTask.State.RESOLVED
+    task.decision = ReviewTask.Decision.MARK_UNIDENTIFIED
+    task.save(update_fields=["state", "decision", "updated_at"])
+
+    function, args, kwargs = queue.call
+    with pytest.raises(review_identification.ReviewIdentificationError):
+        function(*args, **kwargs)
+
+    task.refresh_from_db()
+    processing_job = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.REVIEW_IDENTIFICATION)
+    assert task.state == ReviewTask.State.RESOLVED
+    assert task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED
+    assert processing_job.state == ProcessingJob.JobState.FAILED

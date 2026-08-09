@@ -47,6 +47,9 @@ sprint or production deployment is complete.
 - EPUB, PDF, and CBZ imports generate normalized front covers with bounded image
   parsing, source-variant lineage, tool versions, storage checks, and graceful
   failure that preserves the original.
+- “Search again” now performs a durable provider re-query for both archived
+  digital imports and physical scans, replaces ranked candidates, preserves the
+  reviewer’s refined terms/decision provenance, and enforces owner/admin access.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.

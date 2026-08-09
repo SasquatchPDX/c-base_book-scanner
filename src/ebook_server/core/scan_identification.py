@@ -98,6 +98,15 @@ def _create_or_refresh_review(
         scan_job=scan_job,
         state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED],
     ).first()
+    is_repeat_search = task is not None and task.decision == ReviewTask.Decision.SEARCH_AGAIN
+    prior_payload = (
+        task.decision_payload
+        if task is not None and isinstance(task.decision_payload, dict)
+        else {}
+    )
+    prior_reviewer = task.reviewer if task is not None else None
+    prior_notes = task.decision_notes if task is not None else ""
+    prior_decided_at = task.decided_at if task is not None else None
     snapshot = [
         {
             "provider_id": candidate.provider_id,
@@ -119,13 +128,18 @@ def _create_or_refresh_review(
         },
         "provider_snapshot": snapshot,
         "state": ReviewTask.State.OPEN,
-        "decision": ReviewTask.Decision.UNRESOLVED,
-        "decision_payload": {"candidate_count": len(candidates)},
+        "decision": (
+            ReviewTask.Decision.SEARCH_AGAIN if is_repeat_search else ReviewTask.Decision.UNRESOLVED
+        ),
+        "decision_payload": {
+            **(prior_payload if is_repeat_search else {}),
+            "candidate_count": len(candidates),
+        },
         "claimed_by": None,
-        "reviewer": None,
+        "reviewer": prior_reviewer if is_repeat_search else None,
         "selected_candidate": None,
-        "decision_notes": "",
-        "decided_at": None,
+        "decision_notes": prior_notes if is_repeat_search else "",
+        "decided_at": prior_decided_at if is_repeat_search else None,
     }
     if task is None:
         return ReviewTask.objects.create(scan_job=scan_job, **values)

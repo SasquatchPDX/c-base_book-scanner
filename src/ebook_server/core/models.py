@@ -654,6 +654,7 @@ class ProcessingJob(models.Model):
         CONVERSION = "conversion", "Conversion"
         OCR = "ocr", "OCR"
         STAGE = "stage", "ScanTailor Stage"
+        REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
 

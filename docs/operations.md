@@ -97,6 +97,12 @@ are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
 
+Reviewers can edit title/author terms and use “Search providers again.” Repeat
+searches are durable `ProcessingJob` records and do not depend on the original
+staging file, which may already have been removed after verified archival. Poll
+`GET /review-identifications/<job-id>/`; terminal dispatch/worker failures reopen
+the task instead of leaving it permanently claimed.
+
 Scan finalization (`POST /scan/jobs/<id>/finish/`) is queued and returns a durable
 job identifier. Poll `GET /scan-finalizations/<job-id>/` or inspect the scan-job
 pipeline payload. Finalization requires successful ScanTailor output for every

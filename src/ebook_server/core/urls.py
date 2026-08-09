@@ -188,4 +188,9 @@ urlpatterns = [
         views.review_edit_search_terms,
         name="review-edit-search-terms",
     ),
+    path(
+        "review-identifications/<uuid:job_id>/",
+        views.review_identification_job_status,
+        name="review-identification-job-status",
+    ),
 ]

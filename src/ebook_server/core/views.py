@@ -46,6 +46,7 @@ from . import (
     conversion,
     intake,
     ocr,
+    review_identification,
     scan_identification,
     scan_pipeline,
     scantailor,
@@ -3239,6 +3240,8 @@ def review_search_again(
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
+    if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
+        return HttpResponseBadRequest("review task is already closed")
 
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
@@ -3257,11 +3260,81 @@ def review_search_again(
             "updated_at",
         ],
     )
-    return _review_action_response(
-        request,
-        {"task_id": str(task.id), "state": task.state},
-        task_id=task.id,
+    try:
+        if task.scan_job_id is not None:
+            scan_job = task.scan_job
+            if scan_job is None:
+                raise scan_identification.ScanIdentificationError("scan job is unavailable")
+            scan_job.provisional_title = task.inferred_title
+            scan_job.provisional_authors = task.inferred_authors
+            scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
+            processing_job = scan_identification.request_scan_identification(
+                scan_job=scan_job,
+                requested_by_user_id=profile.user_id,
+            )
+            job_payload = scan_identification.job_payload(processing_job)
+            status_route = "scan-identification-job-status"
+        else:
+            processing_job = review_identification.request_review_identification(
+                review_task=task,
+                requested_by_user_id=profile.user_id,
+            )
+            job_payload = review_identification.job_payload(processing_job)
+            status_route = "review-identification-job-status"
+    except (
+        review_identification.ReviewIdentificationError,
+        scan_identification.ScanIdentificationError,
+    ) as exc:
+        task.state = ReviewTask.State.OPEN
+        task.save(update_fields=["state", "updated_at"])
+        return HttpResponseBadRequest(str(exc))
+
+    if _wants_html(request):
+        if processing_job.state == ProcessingJob.JobState.SUCCESS:
+            return redirect("review-detail", task_id=task.id)
+        return redirect(status_route, job_id=processing_job.job_id)
+    return JsonResponse(
+        {
+            "task_id": str(task.id),
+            "state": task.state,
+            "identification_job": job_payload,
+        },
+        status=202,
     )
+
+
+@require_GET
+@login_required
+def review_identification_job_status(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.REVIEW_IDENTIFICATION:
+        return HttpResponseNotFound()
+    payload = review_identification.job_payload(job)
+    task_id = payload.get("review_task_id")
+    try:
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
+    except (ReviewTask.DoesNotExist, ValueError, TypeError):
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    if _wants_html(request):
+        if job.state == ProcessingJob.JobState.SUCCESS:
+            return redirect("review-detail", task_id=task.id)
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Metadata search"},
+        )
+    return JsonResponse(payload)
 
 
 @require_POST

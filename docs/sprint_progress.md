@@ -17,7 +17,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 003 | ✅ Done | Canonical book/domain models (Book, Author, Identifier, FileVariant, CoverImage, Storage/Source locations) and baseline migration/test coverage |
 | 004 | ✅ Done | Common upload/intake path with staging, hashing, format-aware metadata and cover extraction, deduplication, durable archive copy, and API status behavior; later expanded to all declared digital-book formats |
 | 005 | ✅ Done | Metadata provider abstraction, ISBN normalization/extraction, provider abstraction tests, candidate scoring + persistence, and intake confidence routing with low-confidence review tasks |
-| 006 | ✅ Done | Review queue/workflow complete with manual decision actions (open/pending listing, owner/admin access, accept/manual/merge/unidentified, tests, migration) |
+| 006 | ✅ Done | Review queue/workflow with owner/admin access, accept/manual/merge/unidentified decisions, editable terms, and durable repeat provider searches for archived imports and scans |
 | 007 | ✅ Done | Source-path ingestion implemented (preview, recursive scan, copy/move behavior, duplicate detection, recoverable failures) |
 | 008 | ✅ Done | Search/browse/detail/download UI and API, cover streaming, completed-variant safeguards, backend-aware storage, and confirmed integrity-aware admin deletion |
 | 009 | ✅ Done | Conversion graph-based orchestration, conversion jobs/status endpoints, conversion job request flow, duplicate output reuse, provenance capture, and tests |
