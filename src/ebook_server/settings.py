@@ -117,6 +117,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "ebook_server.core.middleware.LocalBanMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django.middleware.locale.LocaleMiddleware",
@@ -157,6 +158,9 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+LOGIN_URL = "/accounts/login/"
+LOGIN_REDIRECT_URL = "/library/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 APP_DATA_DIR = Path(settings.storage_root)

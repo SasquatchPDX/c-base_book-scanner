@@ -45,15 +45,20 @@ Redis.
 
 ## Main workflows
 
-- `/library/books/` — canonical metadata search and browse API
+- `/accounts/login/` — LDAP-backed member sign-in
+- `/library/` — member landing page and recent additions
+- `/library/books/?view=html` — canonical metadata search and browse UI
 - `/imports/upload/` — authenticated upload into the common intake pipeline
-- `/reviews/` — low-confidence metadata review queue
-- `/scan/jobs/` — scanner jobs and page capture
-- `/scan/jobs/<id>/workspace/` — per-page ScanTailor stage state
+- `/reviews/?view=html` — low-confidence metadata review queue
+- `/scan/jobs/?view=html` — scanner jobs and page capture
+- `/scan/jobs/<id>/workspace/?view=html` — per-page ScanTailor workspace
 - `/scan/jobs/<id>/finish/` — queue scan packaging and optional OCR
 - `/scan-finalizations/<job-id>/` — durable scan-finalization status
 - `/healthz/` and `/healthz/dependencies/` — liveness/readiness
 - `/admin/` — Django administration for application operators
+
+Workflow routes return JSON to API clients and HTML to browsers through content
+negotiation. Rendered-page and form tests protect the browser workflows in CI.
 
 Artifacts are never addressed by request-supplied absolute paths. Library and
 scan data live below the configured storage root and are intentionally ignored by

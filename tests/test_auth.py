@@ -55,12 +55,59 @@ def test_login_backed_profile_has_no_registration_path() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_ldap_login_page_creates_session_and_logout_clears_it() -> None:
+    client = Client()
+
+    page = client.get("/accounts/login/")
+    signed_in = client.post(
+        "/accounts/login/?next=/library/",
+        {"username": "ldap-web-member", "password": "member-password", "next": "/library/"},
+    )
+
+    assert page.status_code == 200
+    assert b"existing LDAP member credentials" in page.content
+    assert signed_in.status_code == 302
+    assert signed_in["Location"] == "/library/"
+    assert "_auth_user_id" in client.session
+    assert client.get("/library/").status_code == 200
+
+    signed_out = client.post("/accounts/logout/")
+    assert signed_out.status_code == 302
+    assert signed_out["Location"] == "/accounts/login/"
+    assert "_auth_user_id" not in client.session
+
+
+@pytest.mark.django_db(transaction=True)
+def test_login_rejects_invalid_credentials_and_external_redirect() -> None:
+    client = Client()
+    invalid = client.post(
+        "/accounts/login/",
+        {"username": "member", "password": ""},
+    )
+    external_next = client.post(
+        "/accounts/login/",
+        {
+            "username": "member",
+            "password": "valid",
+            "next": "https://attacker.example/steal",
+        },
+    )
+
+    assert invalid.status_code == 401
+    assert b"Invalid credentials" in invalid.content
+    assert external_next.status_code == 302
+    assert external_next["Location"] == "/library/"
+
+
+@pytest.mark.django_db(transaction=True)
 def test_banned_user_profile_denies_library_access() -> None:
     profile = get_or_create_profile("blocked-member", is_disabled=True)
     client = Client()
     client.force_login(profile.user)
     response = client.get("/library/")
     assert response.status_code == 403
+    assert client.get("/scan/jobs/").status_code == 302
+    assert "_auth_user_id" not in client.session
 
 
 @pytest.mark.django_db(transaction=True)

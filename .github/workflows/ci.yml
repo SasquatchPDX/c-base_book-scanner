@@ -16,13 +16,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
       - name: Lint
-        run: uv run ruff check .
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
       - name: Type check
         run: uv run mypy src tests
       - name: Django checks
         run: |
           uv run python manage.py check
           uv run python manage.py makemigrations --check --dry-run
+          uv run python manage.py collectstatic --noinput --dry-run --verbosity 0
       - name: Production configuration check
         env:
           BOOK_SCANNER_ENVIRONMENT: production

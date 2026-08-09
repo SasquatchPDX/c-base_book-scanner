@@ -14,9 +14,10 @@ from uuid import UUID
 
 import redis
 from django.conf import settings as django_settings
-from django.contrib.auth import logout
+from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import ContentFile
+from django.core.paginator import Paginator
 from django.db import connections, transaction
 from django.db.models import Count, Q
 from django.http import (
@@ -29,17 +30,20 @@ from django.http import (
     JsonResponse,
 )
 from django.http.response import HttpResponseBase
+from django.shortcuts import redirect, render
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from ebook_server.jobs import enqueue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import conversion, intake, ocr, scan_pipeline, scantailor
+from . import book_deletion, conversion, intake, ocr, scan_pipeline, scantailor
 from .models import (
     AppUserProfile,
     Author,
     Book,
+    CoverImage,
     FileVariant,
     Identifier,
     ImportJob,
@@ -53,9 +57,46 @@ from .models import (
     ScanTodo,
     StorageLocation,
 )
+from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
 SCANNING_NAMESPACE: Final[str] = "scan-jobs"
+
+
+@require_http_methods(["GET", "POST"])
+def library_login(request: HttpRequest) -> HttpResponseBase:
+    if request.user.is_authenticated:
+        return redirect("library-home")
+    next_url = (
+        request.GET.get("next", "") if request.method == "GET" else request.POST.get("next", "")
+    )
+    error = ""
+    if request.method == "POST":
+        username = request.POST.get("username", "").strip()
+        password = request.POST.get("password", "")
+        user = authenticate(request, username=username, password=password)
+        if user is not None:
+            login(request, user)
+            if next_url and url_has_allowed_host_and_scheme(
+                next_url,
+                allowed_hosts={request.get_host()},
+                require_https=request.is_secure(),
+            ):
+                return redirect(next_url)
+            return redirect("library-home")
+        error = "Invalid credentials or disabled account."
+    return render(
+        request,
+        "core/login.html",
+        {"next": next_url, "error": error},
+        status=401 if error else 200,
+    )
+
+
+@require_POST
+def library_logout(request: HttpRequest) -> HttpResponseBase:
+    logout(request)
+    return redirect("library-login")
 
 
 def _normalize_stage(value: str) -> str | None:
@@ -252,7 +293,7 @@ def _parse_legacy_scan_put_payload(raw_body: bytes) -> dict[str, Any]:
 def _parse_scan_request_payload(request: HttpRequest) -> dict[str, Any]:
     if _is_multipart_request(request):
         return _scan_page_request_payload_for_multipart(request)
-    payload = _json_body(request)
+    payload = _request_payload(request)
     if payload:
         return payload
     result: dict[str, Any] = {}
@@ -674,6 +715,19 @@ def _json_body(request: HttpRequest) -> dict[str, Any]:
     return {}
 
 
+def _request_payload(request: HttpRequest) -> dict[str, Any]:
+    payload = _json_body(request)
+    if payload:
+        return payload
+    return {key: value for key, value in request.POST.items()}
+
+
+def _wants_html(request: HttpRequest) -> bool:
+    if request.GET.get("view") == "html":
+        return True
+    return "text/html" in request.headers.get("Accept", "").lower()
+
+
 def _can_manage_review_task(profile: AppUserProfile, task: ReviewTask) -> bool:
     if profile.role == "admin":
         return True
@@ -718,6 +772,19 @@ def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
         "description": candidate.description,
         "state": candidate.state,
     }
+
+
+def _review_action_response(
+    request: HttpRequest,
+    payload: dict[str, Any],
+    *,
+    task_id: int | None = None,
+) -> HttpResponseBase:
+    if _wants_html(request):
+        if task_id is not None:
+            return redirect("review-detail", task_id=task_id)
+        return redirect("review-queue")
+    return JsonResponse(payload)
 
 
 def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
@@ -820,12 +887,30 @@ def readiness(request: HttpRequest) -> JsonResponse:
 
 @require_GET
 @login_required
-def library_home(request: HttpRequest) -> JsonResponse:
+def library_home(request: HttpRequest) -> HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None:
         return JsonResponse({"detail": "profile_missing"}, status=404)
     if profile.is_disabled:
         return JsonResponse({"detail": "forbidden"}, status=403)
+    if _wants_html(request):
+        recent_books = Book.objects.prefetch_related("authors", "file_variants").order_by(
+            "-created_at",
+        )[:12]
+        return render(
+            request,
+            "core/library_home.html",
+            {
+                "profile": profile,
+                "recent_books": [
+                    _serialize_book(book, include_variants=False) for book in recent_books
+                ],
+                "book_count": Book.objects.count(),
+                "variant_count": FileVariant.objects.filter(
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                ).count(),
+            },
+        )
     return JsonResponse(
         {"status": "ok", "user": request.user.username, "role": profile.role},
     )
@@ -860,7 +945,11 @@ def _serialize_book(
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
-        file_variants = list(book.file_variants.all())
+        file_variants = list(
+            book.file_variants.filter(
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            ),
+        )
         variants = [
             {
                 "id": file_variant.id,
@@ -881,7 +970,12 @@ def _serialize_book(
         )
     else:
         book_payload["formats_available"] = sorted(
-            {variant.format for variant in book.file_variants.all()}
+            {
+                variant.format
+                for variant in book.file_variants.filter(
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                )
+            }
         )
     if include_conversion_options:
         book_payload["conversion_options"] = conversion.conversion_options_for_book(book)
@@ -894,9 +988,9 @@ def _serialize_cover(cover: Any) -> dict[str, Any]:
     return {
         "id": cover.id,
         "position": cover.position,
-        "storage_identifier": cover.storage_identifier,
         "mime_type": cover.mime_type,
         "size_bytes": cover.size_bytes,
+        "url": f"/library/books/{cover.book_id}/covers/{cover.position}/",
     }
 
 
@@ -952,7 +1046,10 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     if language:
         books = books.filter(language__iexact=language)
     if book_format:
-        books = books.filter(file_variants__format__iexact=book_format)
+        books = books.filter(
+            file_variants__format__iexact=book_format,
+            file_variants__processing_state=FileVariant.ProcessingState.COMPLETE,
+        )
 
     sort_map = {
         "created_at": "created_at",
@@ -965,11 +1062,31 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     page = _as_positive_int(request.GET.get("page"), 1)
     page_size = _as_positive_int(request.GET.get("page_size"), 25)
     page_size = min(page_size, 100)
-    start = (page - 1) * page_size
-    end = start + page_size
-
-    total = books.count()
-    serialized = [_serialize_book(book, include_variants=False) for book in books[start:end]]
+    paginator = Paginator(books, page_size)
+    page_object = paginator.get_page(page)
+    page_books = list(page_object.object_list)
+    total = paginator.count
+    serialized = [_serialize_book(book, include_variants=False) for book in page_books]
+    if _wants_html(request):
+        return render(
+            request,
+            "core/library_books.html",
+            {
+                "books": serialized,
+                "page_object": page_object,
+                "count": total,
+                "filters": {
+                    "q": query,
+                    "title": title,
+                    "author": author,
+                    "category": category,
+                    "genre": genre,
+                    "language": language,
+                    "format": book_format,
+                    "sort": sort,
+                },
+            },
+        )
     return JsonResponse(
         {
             "count": total,
@@ -1012,6 +1129,18 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
         {"kind": identifier.kind, "value": identifier.value}
         for identifier in book.identifiers.all()
     ]
+    if _wants_html(request):
+        return render(
+            request,
+            "core/library_book_detail.html",
+            {
+                "book": book,
+                "book_payload": payload,
+                "variants": payload.get("variants", []),
+                "identifiers": payload["identifiers"],
+                "conversion_options": payload.get("conversion_options", []),
+            },
+        )
     return JsonResponse(payload)
 
 
@@ -1020,13 +1149,13 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
 def library_book_download(
     request: HttpRequest,
     book_id: int,
-) -> FileResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
 
     try:
-        book = Book.objects.prefetch_related("file_variants").get(pk=book_id)
+        book = Book.objects.prefetch_related("file_variants__storage_location").get(pk=book_id)
     except Book.DoesNotExist:
         return HttpResponseNotFound()
 
@@ -1035,18 +1164,35 @@ def library_book_download(
     requested_format = request.GET.get("format", "").strip()
     if variant_id:
         try:
-            variant = book.file_variants.get(pk=int(variant_id))
+            variant = book.file_variants.get(
+                pk=int(variant_id),
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            )
         except (ValueError, FileVariant.DoesNotExist):
             return HttpResponseBadRequest("variant_id invalid")
     elif requested_format:
-        variant = book.file_variants.filter(format__iexact=requested_format).order_by("id").first()
-    if variant is None and book.file_variants.exists():
-        variant = book.file_variants.first()
+        variant = (
+            book.file_variants.filter(
+                format__iexact=requested_format,
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            )
+            .order_by("id")
+            .first()
+        )
+    if variant is None and requested_format:
+        return HttpResponseNotFound("requested format not available")
+    if variant is None:
+        variant = book.file_variants.filter(
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+        ).first()
 
     if variant is None:
         return HttpResponseNotFound("variant not available")
 
-    storage = intake._default_storage()
+    try:
+        storage = backend_for_location(variant.storage_location)
+    except StorageConfigurationError:
+        return HttpResponse("variant storage unavailable", status=503)
     try:
         stream = storage.open(variant.storage_identifier)
     except FileNotFoundError:
@@ -1056,6 +1202,90 @@ def library_book_download(
     response["Content-Type"] = variant.mime_type
     response["Content-Length"] = str(variant.size_bytes)
     return response
+
+
+@require_GET
+@login_required
+def library_book_cover(
+    request: HttpRequest,
+    book_id: int,
+    position: str,
+) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    if position not in {"front", "back"}:
+        return HttpResponseBadRequest("invalid cover position")
+    try:
+        cover = CoverImage.objects.select_related("storage_location").get(
+            book_id=book_id,
+            position=position,
+        )
+    except CoverImage.DoesNotExist:
+        return HttpResponseNotFound("cover not available")
+
+    try:
+        storage = backend_for_location(cover.storage_location)
+    except StorageConfigurationError:
+        return HttpResponse("cover storage unavailable", status=503)
+    try:
+        stream = storage.open(cover.storage_identifier)
+    except FileNotFoundError:
+        return HttpResponseNotFound("cover missing")
+
+    response = FileResponse(stream, as_attachment=False, filename=f"{position}-cover")
+    response["Content-Type"] = cover.mime_type
+    response["Content-Length"] = str(cover.size_bytes)
+    response["Cache-Control"] = "private, max-age=3600"
+    response["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@require_http_methods(["GET", "POST"])
+@login_required
+def library_book_delete(request: HttpRequest, book_id: int) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None or not profile.is_admin():
+        return HttpResponseForbidden()
+    try:
+        book = Book.objects.prefetch_related(
+            "file_variants__storage_location",
+            "cover_images__storage_location",
+        ).get(pk=book_id)
+    except Book.DoesNotExist:
+        return HttpResponseNotFound()
+
+    if request.method == "GET":
+        if _wants_html(request):
+            return render(request, "core/book_confirm_delete.html", {"book": book})
+        return JsonResponse(
+            {
+                "book_id": book.id,
+                "title": book.title,
+                "confirmation_required": book.title,
+                "artifact_count": book.file_variants.count() + book.cover_images.count(),
+            },
+        )
+
+    payload = _request_payload(request)
+    if payload.get("confirm_title") != book.title:
+        return HttpResponseBadRequest("confirm_title must exactly match the book title")
+    verify_hashes = _coerce_optional_bool(payload.get("verify_hashes"), default=True)
+    try:
+        report = book_deletion.delete_book_safely(book, verify_hashes=verify_hashes)
+    except book_deletion.BookDeletionError as exc:
+        return HttpResponseBadRequest(str(exc))
+
+    if _wants_html(request):
+        return redirect("library-books")
+    return JsonResponse(
+        {
+            "book_id": report.book_id,
+            "deleted": True,
+            "artifact_count": report.artifact_count,
+            "cleanup_warnings": list(report.cleanup_warnings),
+        },
+    )
 
 
 @require_POST
@@ -1073,7 +1303,7 @@ def library_book_conversion_request(
     except Book.DoesNotExist:
         return HttpResponseNotFound()
 
-    payload = _json_body(request)
+    payload = _request_payload(request)
     raw_source_variant_id = payload.get("source_variant_id")
     source_variant_id: int
     if isinstance(raw_source_variant_id, int):
@@ -1088,7 +1318,10 @@ def library_book_conversion_request(
         return HttpResponseBadRequest("target_format required")
 
     try:
-        source_variant = book.file_variants.get(pk=source_variant_id)
+        source_variant = book.file_variants.get(
+            pk=source_variant_id,
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+        )
     except (ValueError, FileVariant.DoesNotExist):
         return HttpResponseBadRequest("source variant does not belong to book")
 
@@ -1105,6 +1338,8 @@ def library_book_conversion_request(
     except conversion.ConversionError as exc:
         return HttpResponseBadRequest(str(exc))
 
+    if _wants_html(request):
+        return redirect("conversion-job-status", job_id=job.job_id)
     return JsonResponse(conversion.conversion_job_payload(job), status=202)
 
 
@@ -1113,7 +1348,7 @@ def library_book_conversion_request(
 def library_book_ocr_request(
     request: HttpRequest,
     book_id: int,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden | HttpResponseNotFound:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1123,7 +1358,7 @@ def library_book_ocr_request(
     except Book.DoesNotExist:
         return HttpResponseNotFound()
 
-    payload = _json_body(request)
+    payload = _request_payload(request)
     raw_source_variant_id = payload.get("source_variant_id")
     if isinstance(raw_source_variant_id, int):
         source_variant_id = raw_source_variant_id
@@ -1133,7 +1368,10 @@ def library_book_ocr_request(
         return HttpResponseBadRequest("source_variant_id required")
 
     try:
-        source_variant = book.file_variants.get(pk=source_variant_id)
+        source_variant = book.file_variants.get(
+            pk=source_variant_id,
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+        )
     except (ValueError, FileVariant.DoesNotExist):
         return HttpResponseBadRequest("source variant does not belong to book")
 
@@ -1154,6 +1392,8 @@ def library_book_ocr_request(
     except ocr.OCRJobError as exc:
         return HttpResponseBadRequest(str(exc))
 
+    if _wants_html(request):
+        return redirect("ocr-job-status", job_id=job.job_id)
     return JsonResponse(ocr.ocr_job_payload(job), status=202)
 
 
@@ -1162,7 +1402,7 @@ def library_book_ocr_request(
 def conversion_job_status(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1173,7 +1413,14 @@ def conversion_job_status(
         return HttpResponseNotFound()
     if job.job_type != ProcessingJob.JobType.CONVERSION:
         return HttpResponseNotFound()
-    return JsonResponse(conversion.conversion_job_payload(job))
+    payload = conversion.conversion_job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Conversion"},
+        )
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -1181,7 +1428,7 @@ def conversion_job_status(
 def ocr_job_status(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -1192,7 +1439,14 @@ def ocr_job_status(
         return HttpResponseNotFound()
     if job.job_type != ProcessingJob.JobType.OCR:
         return HttpResponseNotFound()
-    return JsonResponse(ocr.ocr_job_payload(job))
+    payload = ocr.ocr_job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "OCR"},
+        )
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -1424,8 +1678,7 @@ def _apply_stage_payload_to_state(
 def scan_job_workspace(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    del request
+) -> HttpResponseBase:
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
@@ -1445,15 +1698,20 @@ def scan_job_workspace(
     for page in job.pages.all().order_by("logical_sequence_number", "side"):
         _ensure_workspace_stage_states(job, page)
         pages.append(_serialize_workspace_page(page))
-    return JsonResponse(
-        {
-            "job_id": str(job.id),
-            "state": job.state,
-            "pages": pages,
-            "count": len(pages),
-            "stage_order": list(scantailor.stage_order()),
-        },
-    )
+    payload = {
+        "job_id": str(job.id),
+        "state": job.state,
+        "pages": pages,
+        "count": len(pages),
+        "stage_order": list(scantailor.stage_order()),
+    }
+    if _wants_html(request):
+        return render(
+            request,
+            "core/scan_workspace.html",
+            {"job": job, "pages": pages, "stage_order": scantailor.stage_order()},
+        )
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -1491,7 +1749,7 @@ def scan_page_stage(
     job_id: str,
     page_id: str,
     stage: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden | HttpResponseNotFound:
+) -> HttpResponseBase:
     if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
@@ -1532,7 +1790,7 @@ def scan_page_stage(
     }:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
 
-    payload = _json_body(request)
+    payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
     if expected_revision is not None and expected_revision != state.revision:
         return _conflict_response(state, expected_revision)
@@ -1562,13 +1820,13 @@ def scan_page_stage(
         state=state,
         requested_by_user_id=profile.user_id,
     )
-    return JsonResponse(
-        {
-            "stage": _serialize_stage_state(state),
-            "job": scantailor.stage_job_payload(processing_job),
-        },
-        status=202,
-    )
+    response_payload = {
+        "stage": _serialize_stage_state(state),
+        "job": scantailor.stage_job_payload(processing_job),
+    }
+    if _wants_html(request):
+        return redirect("scan-job-workspace", job_id=page.scan_job_id)
+    return JsonResponse(response_payload, status=202)
 
 
 @require_POST
@@ -1750,12 +2008,21 @@ def scan_jobs(
         if scanner_id:
             queryset = queryset.filter(scanner_id=scanner_id)
         serializer = _scan_job_payload_with_open_todos if include_open_todos else _scan_job_payload
-        return JsonResponse(
-            {
-                "items": [serializer(job) for job in queryset],
-                "count": queryset.count(),
-            },
-        )
+        response_payload = {
+            "items": [serializer(job) for job in queryset],
+            "count": queryset.count(),
+        }
+        if _wants_html(request):
+            return render(
+                request,
+                "core/scan_jobs.html",
+                {
+                    "jobs": list(queryset),
+                    "states": ScanJob.State.choices,
+                    "books": Book.objects.order_by("title")[:500],
+                },
+            )
+        return JsonResponse(response_payload)
 
     payload = _parse_scan_request_payload(request)
     job_title = _coerce_str_or_none(payload.get("provisional_title")) or ""
@@ -1786,6 +2053,8 @@ def scan_jobs(
         provisional_title=job_title,
         notes=notes,
     )
+    if _wants_html(request):
+        return redirect("scan-job-workspace", job_id=job.id)
     return JsonResponse(_scan_job_payload(job), status=201)
 
 
@@ -1913,7 +2182,7 @@ def scan_todos(
 def scan_page_request_rescan(
     request: HttpRequest,
     page_id: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     if _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid page id")
     profile = _active_library_profile(request)
@@ -1942,6 +2211,8 @@ def scan_page_request_rescan(
         .first()
     )
     if existing_todo is not None:
+        if _wants_html(request):
+            return redirect("scan-job-workspace", job_id=page.scan_job_id)
         return JsonResponse(
             {
                 "todo": _serialize_scan_todo(existing_todo),
@@ -1958,6 +2229,8 @@ def scan_page_request_rescan(
         reason=reason,
         creator=profile.user,
     )
+    if _wants_html(request):
+        return redirect("scan-job-workspace", job_id=page.scan_job_id)
     return JsonResponse(
         {
             "todo": _serialize_scan_todo(todo),
@@ -1973,7 +2246,7 @@ def scan_page_request_rescan(
 def upload_scan_page(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
@@ -2022,6 +2295,8 @@ def upload_scan_page(
         _complete_open_rescan_todos(page)
 
     status_code = 201 if created else 200
+    if _wants_html(request):
+        return redirect("scan-job-workspace", job_id=job.id)
     return JsonResponse(
         {
             "job_id": str(job.id),
@@ -2277,7 +2552,7 @@ def scan_job_resume(
 def scan_job_finish(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
+) -> HttpResponseBase:
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
@@ -2332,6 +2607,8 @@ def scan_job_finish(
         "pipeline": scan_pipeline.pipeline_progress(job),
         "finalization_job": scan_pipeline.finalization_job_payload(finalization_job),
     }
+    if _wants_html(request):
+        return redirect("scan-finalization-job-status", job_id=finalization_job.job_id)
     return JsonResponse(response, status=202)
 
 
@@ -2340,7 +2617,7 @@ def scan_job_finish(
 def scan_finalization_job_status(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponseBase:
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
@@ -2350,7 +2627,14 @@ def scan_finalization_job_status(
         return HttpResponseNotFound()
     if job.job_type != ProcessingJob.JobType.SCAN_FINALIZATION:
         return HttpResponseNotFound()
-    return JsonResponse(scan_pipeline.finalization_job_payload(job))
+    payload = scan_pipeline.finalization_job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Scan finalization"},
+        )
+    return JsonResponse(payload)
 
 
 @require_POST
@@ -2379,9 +2663,19 @@ def admin_only(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "admin"})
 
 
-@require_POST
+@require_http_methods(["GET", "POST"])
 @login_required
 def upload_file(request: HttpRequest) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    if request.method == "GET":
+        return render(
+            request,
+            "core/upload.html",
+            {"max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES},
+        )
+
     uploaded_file = request.FILES.get("file")
     if uploaded_file is None:
         return HttpResponseBadRequest("missing_file")
@@ -2407,9 +2701,6 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
     except intake.ValidationError as exc:
         return HttpResponseBadRequest(str(exc))
 
-    profile = _profile_for_request(request)
-    if profile is None:
-        return HttpResponseBadRequest("forbidden")
     job = ImportJob.objects.create(
         source_type=ImportJob.SourceType.UPLOAD,
         state=ImportJob.State.DISCOVERED,
@@ -2425,6 +2716,8 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         enqueue(intake.process_import_job, str(job.id))
     except Exception as exc:  # pragma: no cover - transport/path specific
         return HttpResponseBadRequest(str(exc))
+    if _wants_html(request):
+        return redirect("imports-status", job_id=job.id)
     return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
 
 
@@ -2433,8 +2726,7 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
 def import_status(
     request: HttpRequest,
     job_id: str,
-) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest:
-    del request
+) -> HttpResponseBase:
     if _coerce_uuid(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
@@ -2454,6 +2746,8 @@ def import_status(
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
     }
+    if _wants_html(request):
+        return render(request, "core/import_status.html", {"job": job, "payload": payload})
     return JsonResponse(payload)
 
 
@@ -2483,6 +2777,12 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
         }
         for task in tasks
     ]
+    if _wants_html(request):
+        return render(
+            request,
+            "core/review_queue.html",
+            {"tasks": list(tasks), "items": payload, "count": len(payload)},
+        )
     return JsonResponse({"items": payload, "count": len(payload)})
 
 
@@ -2505,6 +2805,17 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         _serialize_candidate(candidate)
         for candidate in task.import_job.metadata_candidates.order_by("-score")
     ]
+    if _wants_html(request):
+        return render(
+            request,
+            "core/review_detail.html",
+            {
+                "task": task,
+                "payload": payload,
+                "candidates": task.import_job.metadata_candidates.order_by("-score"),
+                "books": Book.objects.order_by("title")[:250],
+            },
+        )
     return JsonResponse(payload)
 
 
@@ -2525,9 +2836,9 @@ def review_accept_candidate(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    payload = _json_body(request)
-    candidate_id = payload.get("candidate_id")
-    if not isinstance(candidate_id, int):
+    payload = _request_payload(request)
+    candidate_id = _coerce_int(payload.get("candidate_id"), minimum=1)
+    if candidate_id is None:
         return HttpResponseBadRequest("candidate_id required")
 
     try:
@@ -2623,7 +2934,8 @@ def review_accept_candidate(
             decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
             decision_notes=f"Accepted candidate {candidate.id}",
         )
-        return JsonResponse(
+        return _review_action_response(
+            request,
             {
                 "task_id": str(task.id),
                 "job_id": str(task.import_job_id),
@@ -2644,7 +2956,7 @@ def review_mark_unidentified(
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
-    payload = _json_body(request)
+    payload = _request_payload(request)
     try:
         task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
@@ -2668,7 +2980,7 @@ def review_mark_unidentified(
             "updated_at",
         ],
     )
-    return JsonResponse({"task_id": str(task.id), "state": task.state})
+    return _review_action_response(request, {"task_id": str(task.id), "state": task.state})
 
 
 @require_POST
@@ -2680,7 +2992,7 @@ def review_search_again(
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
-    payload = _json_body(request)
+    payload = _request_payload(request)
     try:
         task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
@@ -2705,7 +3017,11 @@ def review_search_again(
             "updated_at",
         ],
     )
-    return JsonResponse({"task_id": str(task.id), "state": task.state})
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "state": task.state},
+        task_id=task.id,
+    )
 
 
 @require_POST
@@ -2717,7 +3033,7 @@ def review_edit_search_terms(
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
-    payload = _json_body(request)
+    payload = _request_payload(request)
     try:
         task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
@@ -2756,7 +3072,11 @@ def review_edit_search_terms(
             "updated_at",
         ],
     )
-    return JsonResponse({"task_id": str(task.id), "state": task.state})
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "state": task.state},
+        task_id=task.id,
+    )
 
 
 @require_POST
@@ -2775,7 +3095,7 @@ def review_manual_entry(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    payload = _json_body(request)
+    payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
     book = _build_manual_book_from_payload(payload)
@@ -2789,7 +3109,8 @@ def review_manual_entry(
         decision=cast(str, ReviewTask.Decision.MANUAL_ENTRY),
         decision_payload=payload,
     )
-    return JsonResponse(
+    return _review_action_response(
+        request,
         {
             "task_id": str(task.id),
             "job_id": str(task.import_job_id),
@@ -2815,7 +3136,7 @@ def review_merge_existing(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    payload = _json_body(request)
+    payload = _request_payload(request)
     raw_book_id = payload.get("book_id")
     if isinstance(raw_book_id, int):
         book_id = raw_book_id
@@ -2837,7 +3158,10 @@ def review_merge_existing(
         decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
         decision_payload={"book_id": book_id},
     )
-    return JsonResponse({"task_id": str(task.id), "book_id": str(book.id)})
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "book_id": str(book.id)},
+    )
 
 
 def _scan_page_request_payload_for_multipart(request: HttpRequest) -> dict[str, Any]:

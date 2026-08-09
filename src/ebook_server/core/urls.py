@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from django.urls import path
+from django.views.generic import RedirectView
 
 from . import views
 
 urlpatterns = [
+    path("", RedirectView.as_view(pattern_name="library-home", permanent=False)),
+    path("accounts/login/", views.library_login, name="library-login"),
+    path("accounts/logout/", views.library_logout, name="library-logout"),
     path("healthz/", views.health),
     path("healthz/dependencies/", views.readiness),
     path("library/", views.library_home, name="library-home"),
@@ -16,6 +20,16 @@ urlpatterns = [
         "library/books/<int:book_id>/download/",
         views.library_book_download,
         name="library-book-download",
+    ),
+    path(
+        "library/books/<int:book_id>/covers/<str:position>/",
+        views.library_book_cover,
+        name="library-book-cover",
+    ),
+    path(
+        "library/books/<int:book_id>/delete/",
+        views.library_book_delete,
+        name="library-book-delete",
     ),
     path("scan/jobs/", views.scan_jobs, name="scan-jobs"),
     path("scan/jobs/<uuid:job_id>/", views.scan_job_detail, name="scan-job-detail"),

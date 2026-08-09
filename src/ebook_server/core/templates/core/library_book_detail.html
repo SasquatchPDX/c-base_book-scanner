@@ -1,0 +1,43 @@
+{% extends "core/base.html" %}
+{% block title %}{{ book.title }} · Hackerspace Library{% endblock %}
+{% block content %}
+  <article class="detail-layout">
+    <aside class="cover-column">
+      {% if book.front_cover_id %}<img class="book-cover"
+     src="{% url 'library-book-cover' book.id 'front' %}"
+     alt="Front cover of {{ book.title }}">{% else %}<div class="cover-placeholder large">{{ book.title|slice:":1" }}</div>{% endif %}
+      {% if book.back_cover_id %}<a href="{% url 'library-book-cover' book.id 'back' %}">View back cover</a>{% endif %}
+    </aside>
+    <div>
+      <p class="eyebrow">{% if book.language %}{{ book.language|upper }}{% else %}Book{% endif %}</p>
+      <h1>{{ book.title }}</h1>
+      {% if book.subtitle %}<p class="subtitle">{{ book.subtitle }}</p>{% endif %}
+      <p class="byline">{% for author in book.authors.all %}{{ author.full_name }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
+      <dl class="metadata">
+        {% if book.publisher %}<div><dt>Publisher</dt><dd>{{ book.publisher }}</dd></div>{% endif %}
+        {% if book.publication_date %}<div><dt>Published</dt><dd>{{ book.publication_date }}</dd></div>{% endif %}
+        {% if book.edition %}<div><dt>Edition</dt><dd>{{ book.edition }}</dd></div>{% endif %}
+        {% for identifier in identifiers %}<div><dt>{{ identifier.kind|upper }}</dt><dd>{{ identifier.value }}</dd></div>{% endfor %}
+      </dl>
+      {% if book.description %}<section class="description"><h2>About</h2><p>{{ book.description|linebreaksbr }}</p></section>{% endif %}
+      <section>
+        <h2>Available files</h2>
+        <div class="variant-list">
+          {% for variant in variants %}
+            <div><div><strong>{{ variant.format|upper }}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
+   href="{% url 'library-book-download' book.id %}?variant_id={{ variant.id }}">Download</a></div>
+{% empty %}<p>No downloadable variants are ready.</p>{% endfor %}
+  </div>
+  </section>
+  {% if conversion_options %}<section><h2>Convert</h2><div class="conversion-grid">
+    {% for option in conversion_options %}<form method="post" action="{% url 'library-book-convert' book.id %}">{% csrf_token %}<input type="hidden"
+       name="source_variant_id"
+       value="{{ option.source_variant_id }}"><input type="hidden" name="target_format" value="{{ option.target_format }}"><button type="submit">{{ option.source_format|upper }} → {{ option.target_format|upper }}</button></form>{% endfor %}
+    </div>
+    </section>
+  {% endif %}
+  {% if request.user.library_profile.role == 'admin' %}<section class="danger-zone"><h2>Administration</h2><p>Deleting a book verifies and removes every managed file and cover.</p><a class="button danger"
+   href="{% url 'library-book-delete' book.id %}?view=html">Delete book…</a></section>{% endif %}
+  </div>
+  </article>
+{% endblock %}

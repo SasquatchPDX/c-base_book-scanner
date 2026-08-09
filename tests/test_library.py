@@ -59,6 +59,7 @@ def _seed_library_variant(
         size_bytes=len(contents),
         sha256="0" * 64,
         source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
     )
 
 
@@ -189,7 +190,15 @@ def test_library_book_cover_and_download(tmp_path: Path) -> None:
     assert response.status_code == 200
     detail = response.json()
     assert detail["cover_front"]["position"] == "front"
-    assert detail["cover_front"]["storage_identifier"]
+    assert detail["cover_front"]["url"] == f"/library/books/{book.id}/covers/front/"
+    assert "storage_identifier" not in detail["cover_front"]
+
+    cover_response = client.get(detail["cover_front"]["url"])
+    assert cover_response.status_code == 200
+    assert cover_response["Content-Type"] == "image/png"
+    cover_stream = cast(StreamingHttpResponse, cover_response)
+    cover_chunks = cast(Iterable[bytes], cover_stream.streaming_content)
+    assert b"".join(cover_chunks) == b"cover"
 
     variant_id = detail["variants"][0]["id"]
     response = client.get(f"/library/books/{book.id}/download/?variant_id={variant_id}")
@@ -202,12 +211,80 @@ def test_library_book_cover_and_download(tmp_path: Path) -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_download_uses_variant_storage_location(tmp_path: Path) -> None:
+    profile = get_or_create_profile("reader-custom-storage")
+    django_settings.APP_DATA_DIR = tmp_path
+    custom_root = tmp_path / "mounted-library"
+    custom_storage = LocalFilesystemStorage(str(custom_root))
+    location = StorageLocation.objects.create(
+        identifier="mounted-books",
+        backend=StorageLocation.BackendType.LOCAL,
+        base_path=str(custom_root),
+    )
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"%PDF-custom-storage")
+    identifier = custom_storage.generate_destination("books/custom", "stored.pdf")
+    custom_storage.store(str(source), identifier)
+
+    book = Book.objects.create(title="Custom storage")
+    variant = FileVariant.objects.create(
+        book=book,
+        format="pdf",
+        mime_type="application/pdf",
+        original_filename="stored.pdf",
+        storage_location=location,
+        storage_identifier=identifier,
+        size_bytes=len(b"%PDF-custom-storage"),
+        sha256="a" * 64,
+        source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    client = Client()
+    client.force_login(profile.user)
+
+    response = client.get(f"/library/books/{book.id}/download/?variant_id={variant.id}")
+
+    assert response.status_code == 200
+    stream = cast(StreamingHttpResponse, response)
+    chunks = cast(Iterable[bytes], stream.streaming_content)
+    assert b"".join(chunks) == b"%PDF-custom-storage"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failed_variant_is_not_advertised_or_downloadable(tmp_path: Path) -> None:
+    profile = get_or_create_profile("reader-stale-variant")
+    storage = _configure_storage(tmp_path)
+    book = Book.objects.create(title="Stale derivative")
+    variant = _seed_library_variant(
+        book,
+        storage,
+        filename="stale.pdf",
+        fmt="pdf",
+        mime="application/pdf",
+        contents=b"%PDF-stale",
+    )
+    variant.processing_state = FileVariant.ProcessingState.FAILED
+    variant.save(update_fields=["processing_state"])
+    client = Client()
+    client.force_login(profile.user)
+
+    detail = client.get(f"/library/books/{book.id}/")
+    download = client.get(f"/library/books/{book.id}/download/?variant_id={variant.id}")
+
+    assert detail.status_code == 200
+    assert detail.json()["variants"] == []
+    assert download.status_code == 400
+
+
+@pytest.mark.django_db(transaction=True)
 def test_library_permissions(tmp_path: Path) -> None:
     book = Book.objects.create(title="Open")
     profile = get_or_create_profile("blocked-reader", is_disabled=True)
     client = Client()
-    client.force_login(profile.user)
-
-    assert client.get("/library/books/").status_code == 403
-    assert client.get(f"/library/books/{book.id}/").status_code == 403
-    assert client.get(f"/library/books/{book.id}/download/?format=pdf").status_code == 403
+    for path in [
+        "/library/books/",
+        f"/library/books/{book.id}/",
+        f"/library/books/{book.id}/download/?format=pdf",
+    ]:
+        client.force_login(profile.user)
+        assert client.get(path).status_code == 403

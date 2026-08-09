@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from django.conf import settings as django_settings
 from django.test import Client
 from django.utils import timezone
 
@@ -66,7 +67,22 @@ class FailingStubConverter:
         raise conversion.ConversionError("simulated converter failure")
 
 
+class EchoStubConverter(StubConverter):
+    def convert(
+        self,
+        *,
+        source_path: Path,
+        destination_path: Path,
+        source_format: str,
+        target_format: str,
+        options: dict[str, str] | None = None,
+    ) -> None:
+        del source_format, target_format, options
+        destination_path.write_bytes(b"converted:" + source_path.read_bytes())
+
+
 def _configure_storage(tmp_path: Path) -> LocalFilesystemStorage:
+    django_settings.APP_DATA_DIR = tmp_path
     StorageLocation.objects.get_or_create(
         identifier="default",
         defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
@@ -102,6 +118,7 @@ def _create_book_with_variant(
         sha256=hashlib.sha256(source_payload).hexdigest(),
         source_type=FileVariant.SourceType.UPLOAD,
         imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
     )
 
 
@@ -133,7 +150,6 @@ def test_conversion_is_exposed_on_book_detail(
 ) -> None:
     profile = get_or_create_profile("conversion-reader")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CONVERTER_REGISTRY",
         {"calibre": StubConverter(b"pdf->txt", "calibre-v1")},
@@ -167,7 +183,6 @@ def test_conversion_direct_route_creates_output_variant(
 ) -> None:
     profile = get_or_create_profile("converter-user")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CONVERTER_REGISTRY",
         {"calibre": StubConverter(b"converted-text", "calibre-v2")},
@@ -213,13 +228,65 @@ def test_conversion_direct_route_creates_output_variant(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_conversion_reads_and_writes_declared_storage_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    django_settings.APP_DATA_DIR = tmp_path
+    custom_root = tmp_path / "network-mount"
+    storage = LocalFilesystemStorage(str(custom_root))
+    location = StorageLocation.objects.create(
+        identifier="network-books",
+        backend=StorageLocation.BackendType.LOCAL,
+        base_path=str(custom_root),
+    )
+    profile = get_or_create_profile("custom-storage-converter")
+    book = Book.objects.create(title="Mounted conversion source")
+    source = tmp_path / "mounted-source.pdf"
+    source.write_bytes(b"%PDF-from-mounted-backend")
+    identifier = storage.generate_destination(f"books/{book.id}", "source.pdf")
+    storage.store(str(source), identifier)
+    variant = FileVariant.objects.create(
+        book=book,
+        format="pdf",
+        mime_type="application/pdf",
+        original_filename="source.pdf",
+        storage_location=location,
+        storage_identifier=identifier,
+        size_bytes=source.stat().st_size,
+        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    monkeypatch.setattr(
+        conversion,
+        "CONVERTER_REGISTRY",
+        {"calibre": EchoStubConverter(b"unused")},
+    )
+    client = Client()
+    client.force_login(profile.user)
+
+    response = _request_conversion(
+        client,
+        book_id=book.id,
+        source_variant=variant,
+        target_format="txt",
+    )
+
+    assert response.status_code == 202
+    output = FileVariant.objects.get(pk=response.json()["output_variant_id"])
+    assert output.storage_location_id == location.id
+    with storage.open(output.storage_identifier) as stream:
+        assert stream.read() == b"converted:%PDF-from-mounted-backend"
+
+
+@pytest.mark.django_db(transaction=True)
 def test_conversion_multi_hop_route_is_used(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = get_or_create_profile("conversion-multihop")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CAPABILITIES",
         (
@@ -264,7 +331,6 @@ def test_conversion_unsupported_pair_is_rejected(
 ) -> None:
     profile = get_or_create_profile("conversion-unsupported")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CONVERTER_REGISTRY",
         {"calibre": StubConverter(b"unused")},
@@ -295,7 +361,6 @@ def test_conversion_failure_is_recorded_as_failed_job(
 ) -> None:
     profile = get_or_create_profile("conversion-fail")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CONVERTER_REGISTRY",
         {"calibre": FailingStubConverter()},
@@ -332,7 +397,6 @@ def test_conversion_reuses_duplicate_output(
 ) -> None:
     profile = get_or_create_profile("conversion-dup")
     storage = _configure_storage(tmp_path)
-    monkeypatch.setattr("ebook_server.core.conversion._default_storage", lambda: storage)
     monkeypatch.setattr(
         "ebook_server.core.conversion.CONVERTER_REGISTRY",
         {"calibre": StubConverter(b"stable-output", "calibre-v3")},

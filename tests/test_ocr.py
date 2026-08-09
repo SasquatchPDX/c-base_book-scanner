@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from django.conf import settings as django_settings
 from django.test import Client
 from django.utils import timezone
 
@@ -35,6 +36,7 @@ class _ScriptedOCRClient:
         self.poll_plan = poll_plan
         self.poll_calls = 0
         self.submitted: list[Path] = []
+        self.submitted_payloads: list[bytes] = []
 
     def submit_job(
         self,
@@ -45,6 +47,7 @@ class _ScriptedOCRClient:
     ) -> str:
         del source_format, source_mime, request
         self.submitted.append(source_path)
+        self.submitted_payloads.append(source_path.read_bytes())
         return "remote-ocr-job"
 
     def poll_job(self, remote_job_id: str) -> ocr.OCRPollResult:
@@ -76,6 +79,7 @@ def _profile(ldap_uid: str) -> AppUserProfile:
 
 
 def _configure_storage(tmp_path: Path) -> LocalFilesystemStorage:
+    django_settings.APP_DATA_DIR = tmp_path
     StorageLocation.objects.get_or_create(
         identifier="default",
         defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
@@ -112,6 +116,7 @@ def _seed_book_variant(
         source_type=FileVariant.SourceType.UPLOAD,
         uploader_id=uploader_id,
         imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
     )
 
 
@@ -237,6 +242,64 @@ def test_ocr_variant_happy_path_accepts_intermediate_statuses(
 
     status_payload = client.get(f"/ocr/{job.job_id}/").json()
     assert status_payload["state"] == ProcessingJob.JobState.SUCCESS
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_reads_source_from_declared_storage_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile("ocr-mounted-source")
+    output_storage = _configure_storage(tmp_path)
+    monkeypatch.setattr(ocr, "_default_ocr_storage", lambda: output_storage)
+    custom_root = tmp_path / "ocr-network-mount"
+    custom_storage = LocalFilesystemStorage(str(custom_root))
+    custom_location = StorageLocation.objects.create(
+        identifier="ocr-network-books",
+        backend=StorageLocation.BackendType.LOCAL,
+        base_path=str(custom_root),
+    )
+    book = Book.objects.create(title="OCR mounted source")
+    source_payload = b"%PDF-ocr-mounted-source"
+    source = tmp_path / "ocr-mounted.pdf"
+    source.write_bytes(source_payload)
+    identifier = custom_storage.generate_destination(f"books/{book.id}", "source.pdf")
+    custom_storage.store(str(source), identifier)
+    variant = FileVariant.objects.create(
+        book=book,
+        format="pdf",
+        mime_type="application/pdf",
+        original_filename="source.pdf",
+        storage_location=custom_location,
+        storage_identifier=identifier,
+        size_bytes=len(source_payload),
+        sha256=hashlib.sha256(source_payload).hexdigest(),
+        source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    scripted_client = _ScriptedOCRClient(
+        [
+            {
+                "status": "succeeded",
+                "artifacts": [ocr.OCRArtifactDescriptor(format="txt", filename="ocr.txt")],
+            },
+        ],
+        {"txt": b"mounted source text"},
+    )
+    monkeypatch.setattr(ocr, "_get_ocr_client", lambda: scripted_client)
+    monkeypatch.setattr(ocr, "_poll_interval", lambda: 0.0)
+    client = Client()
+    client.force_login(profile.user)
+
+    response = client.post(
+        f"/library/books/{book.id}/ocr/",
+        data=json.dumps({"source_variant_id": variant.id, "target_formats": ["txt"]}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 202
+    assert response.json()["state"] == ProcessingJob.JobState.SUCCESS
+    assert scripted_client.submitted_payloads == [source_payload]
 
 
 @pytest.mark.django_db(transaction=True)

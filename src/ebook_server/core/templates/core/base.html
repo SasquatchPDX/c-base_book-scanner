@@ -1,0 +1,34 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Hackerspace Library{% endblock %}</title>
+    <link rel="stylesheet" href="{% static 'core/app.css' %}">
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="{% url 'library-home' %}?view=html">Hackerspace Library</a>
+      <nav aria-label="Main navigation">
+        <a href="{% url 'library-books' %}?view=html">Books</a>
+        <a href="{% url 'imports-upload' %}">Upload</a>
+        <a href="{% url 'review-queue' %}?view=html">Reviews</a>
+        <a href="{% url 'scan-jobs' %}?view=html">Scanning</a>
+        {% if request.user.is_staff %}<a href="/admin/">Admin</a>{% endif %}
+      </nav>
+    <span class="identity">{{ request.user.username }}</span>
+    <form class="logout-form" method="post" action="{% url 'library-logout' %}">
+      {% csrf_token %}
+      <button type="submit">Sign out</button>
+    </form>
+    </header>
+    <main class="page-shell">
+      {% block content %}{% endblock %}
+    </main>
+    <footer>
+      Originals preserved · derived artifacts retain provenance
+    </footer>
+  </body>
+</html>

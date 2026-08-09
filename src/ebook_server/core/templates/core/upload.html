@@ -1,0 +1,13 @@
+{% extends "core/base.html" %}
+{% block title %}Upload a book · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="narrow">
+    <p class="eyebrow">Contribute</p>
+    <h1>Upload a digital book</h1>
+    <p>The original is preserved. Metadata is checked against public bibliographic providers, and uncertain matches enter your review queue.</p>
+    <form class="upload-panel" method="post" enctype="multipart/form-data">{% csrf_token %}<label for="book-file">EPUB or PDF</label><input id="book-file"
+       type="file"
+       name="file"
+       accept=".epub,.pdf,application/epub+zip,application/pdf"
+       required><small>Maximum {{ max_upload_bytes|filesizeformat }}</small><button type="submit">Start import</button></form></div>
+{% endblock %}

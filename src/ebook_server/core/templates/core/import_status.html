@@ -1,0 +1,9 @@
+{% extends "core/base.html" %}
+{% block title %}Import {{ job.original_filename }} · Hackerspace Library{% endblock %}
+{% block head %}
+  {% if job.state != 'complete' and job.state != 'failed' and job.state != 'low_confidence' %}
+    <meta http-equiv="refresh" content="3">
+  {% endif %}
+{% endblock %}
+{% block content %}<div class="narrow"><p class="eyebrow">Import job</p><h1>{{ job.original_filename }}</h1><div class="status-card"><span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>{% if job.last_error %}<p class="error">{{ job.last_error }}</p>{% endif %}<dl class="metadata"><div><dt>Format</dt><dd>{{ job.detected_format|upper }}</dd></div><div><dt>Size</dt><dd>{{ job.size_bytes|filesizeformat }}</dd></div>{% if job.sha256 %}<div><dt>SHA-256</dt><dd class="mono">{{ job.sha256 }}</dd></div>{% endif %}</dl>{% if job.book_id %}<a class="button"
+   href="{% url 'library-book-detail' job.book_id %}?view=html">Open book</a>{% elif job.state == 'low_confidence' %}<a class="button" href="{% url 'review-queue' %}?view=html">Resolve metadata</a>{% endif %}</div></div>{% endblock %}

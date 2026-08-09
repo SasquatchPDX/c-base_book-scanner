@@ -44,6 +44,10 @@ Usernames are escaped for DN or filter use. Unknown LDAP modes and invalid LDAP
 configuration fail closed. The `stub` adapter is strictly a development/test
 facility and accepts any non-empty credentials.
 
+Members sign in at `/accounts/login/` using LDAP credentials. There is no local
+registration or local password. Disabling an `AppUserProfile` invalidates an
+existing web session on its next request.
+
 ## Storage
 
 Mount NFS/SMB storage on the application and worker hosts before processes start,
@@ -61,6 +65,11 @@ uv run python manage.py verify_storage --verify-hashes
 The hash mode is I/O intensive and should run off peak. The command is read-only
 and exits non-zero for missing artifacts, hash mismatches, path errors, or an
 unsupported backend.
+
+Confirmed book deletion is available only to local application admins. It checks
+artifact hashes, moves files into backend-local quarantine, commits the database
+deletion, and purges quarantine. A failed database operation restores moved files.
+Do not manually remove `.trash` content while a deletion request is active.
 
 ## Workers and external tools
 

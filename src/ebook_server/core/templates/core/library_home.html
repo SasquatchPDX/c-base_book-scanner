@@ -1,0 +1,36 @@
+{% extends "core/base.html" %}
+{% block title %}Library · Hackerspace Library{% endblock %}
+{% block content %}
+  <section class="hero">
+    <div>
+      <p class="eyebrow">Shared collection</p>
+      <h1>Books for curious people.</h1>
+      <p>Search the hackerspace collection, download an available format, or contribute another book.</p>
+    </div>
+    <form class="hero-search" action="{% url 'library-books' %}" method="get">
+      <input type="hidden" name="view" value="html">
+      <label for="home-search">Search title, author, or description</label>
+      <div class="input-row">
+        <input id="home-search" name="q" type="search" autofocus>
+        <button type="submit">Search</button>
+      </div>
+    </form>
+  </section>
+  <section class="stats" aria-label="Collection statistics">
+    <div><strong>{{ book_count }}</strong><span>canonical books</span></div>
+    <div><strong>{{ variant_count }}</strong><span>ready file variants</span></div>
+  </section>
+  <section>
+    <div class="section-heading"><h2>Recent additions</h2><a href="{% url 'library-books' %}?view=html">Browse all</a></div>
+    <div class="book-grid">
+      {% for book in recent_books %}
+        <article class="book-card">
+          <div class="cover-placeholder" aria-hidden="true">{{ book.title|slice:":1" }}</div>
+          <h3><a href="{% url 'library-book-detail' book.id %}?view=html">{{ book.title }}</a></h3>
+          <p>{% for author in book.authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
+          <div class="badges">{% for format in book.formats_available %}<span>{{ format|upper }}</span>{% endfor %}</div>
+        </article>
+{% empty %}<p class="empty-state">The collection is empty. Upload the first book.</p>{% endfor %}
+  </div>
+  </section>
+{% endblock %}

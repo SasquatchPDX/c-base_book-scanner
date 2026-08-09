@@ -19,12 +19,12 @@ This file tracks execution status while advancing Sprint documents in order.
 | 005 | ✅ Done | Metadata provider abstraction, ISBN normalization/extraction, provider abstraction tests, candidate scoring + persistence, and intake confidence routing with low-confidence review tasks |
 | 006 | ✅ Done | Review queue/workflow complete with manual decision actions (open/pending listing, owner/admin access, accept/manual/merge/unidentified, tests, migration) |
 | 007 | ✅ Done | Source-path ingestion implemented (preview, recursive scan, copy/move behavior, duplicate detection, recoverable failures) |
-| 008 | ✅ Done | Search/browse/detail/download APIs, filters/sort/pagination, cover serialization, download streaming and tests |
+| 008 | ✅ Done | Search/browse/detail/download UI and API, cover streaming, completed-variant safeguards, backend-aware storage, and confirmed integrity-aware admin deletion |
 | 009 | ✅ Done | Conversion graph-based orchestration, conversion jobs/status endpoints, conversion job request flow, duplicate output reuse, provenance capture, and tests |
 | 010 | ✅ Done | Scan job and scan-page pipeline implemented, API coverage and replacement/version tests in place |
 | 011 | ✅ Done | Rescan queue implemented with page action, todo listing/claim/complete/cancel endpoints, and tests |
 | 012 | ✅ Done | OCR client contract, async submission/polling, accepted/running/success/failure/timeout/malformed handling, variant/scan-job sources, API endpoints, and persistence/integration tests added |
-| 013 | ✅ Done | Persistent per-page/per-stage workspace endpoints, stage orchestration + worker lifecycle, dependency/invalidation scaffolding, migration for `ScanTailorStageState`, and regression tests |
+| 013 | ✅ Done | Server-rendered and API workspace, persistent stage state, worker lifecycle, dependency/invalidation handling, and regression tests |
 | 014 | ✅ Done | Page split and deskew stage algorithms (auto/manual split, skew correction), persistence of output parameters, and regression tests added |
 | 015 | ✅ Done | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
 | 016 | ✅ Done | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
@@ -45,7 +45,7 @@ This file tracks execution status while advancing Sprint documents in order.
 - 010: scan job/page APIs in `src/ebook_server/core/views.py`, `tests/test_scan_jobs.py`.
 - 011: rescan queue and claim/complete actions in `src/ebook_server/core/models.py`, `tests/test_scan_todos.py`.
 - 012: OCR adapters and async polling in `src/ebook_server/core/ocr.py`, `tests/test_ocr.py`.
-- 013: ScanTailor workspace/versioned stage lifecycle in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
+- 013: ScanTailor workspace UI/versioned stage lifecycle in templates, `src/ebook_server/core/scantailor.py`, and `tests/test_scantailor.py`.
 - 014: split and deskew transformations in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
 - 015: content selection and margins in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
 - 016: practical dewarping implementation and fallback handling in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.

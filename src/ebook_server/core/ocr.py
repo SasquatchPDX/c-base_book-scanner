@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import shutil
 import tempfile
 import time
 import zipfile
@@ -24,6 +25,7 @@ from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake
 from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
+from .storage_registry import StorageConfigurationError, backend_for_location
 
 logger = structlog.get_logger(__name__)
 
@@ -528,8 +530,7 @@ def process_ocr_job(job_id: str) -> None:
             ocr_job,
             details=details,
         )
-        if details.get("source_type") == "scan_job":
-            cleanup_paths.append(source_path)
+        cleanup_paths.append(source_path)
         request = OCRJobRequest(
             language=_coerce_str(details.get("request_language")),
             engine=_coerce_str(details.get("engine")),
@@ -639,9 +640,23 @@ def _resolve_source_artifact(
         raise OCRJobError("source variant missing")
     if source_variant.storage_identifier is None:
         raise OCRJobError("source artifact storage missing")
-    source_path = _default_ocr_storage().resolve_location(source_variant.storage_identifier)
-    if not source_path.exists():
-        raise OCRJobError("source artifact missing")
+    try:
+        source_storage = backend_for_location(source_variant.storage_location)
+    except StorageConfigurationError as exc:
+        raise OCRJobError("source storage is unavailable") from exc
+    source_suffix = Path(source_variant.original_filename).suffix or f".{source_variant.format}"
+    with tempfile.NamedTemporaryFile(
+        prefix="ocr-source-",
+        suffix=source_suffix,
+        delete=False,
+    ) as staged_file:
+        source_path = Path(staged_file.name)
+        try:
+            with source_storage.open(source_variant.storage_identifier) as source_stream:
+                shutil.copyfileobj(source_stream, staged_file, length=1 << 20)
+        except FileNotFoundError as exc:
+            source_path.unlink(missing_ok=True)
+            raise OCRJobError("source artifact missing") from exc
     if source_variant.book is not None:
         book = source_variant.book
     return source_path, source_variant.format, source_variant.mime_type, book, source_variant
@@ -667,7 +682,13 @@ def _zip_scan_job_pages(scan_job: ScanJob) -> Path:
                 version = page.active_version()
                 if version is None:
                     continue
-                storage = _default_ocr_storage()
+                if version.storage_location_id is None:
+                    storage = _default_ocr_storage()
+                else:
+                    try:
+                        storage = backend_for_location(version.storage_location)
+                    except StorageConfigurationError:
+                        continue
                 try:
                     with storage.open(version.storage_identifier) as stream:
                         content = stream.read()
@@ -750,7 +771,6 @@ def _materialize_ocr_artifact(
     finally:
         temp_path.unlink(missing_ok=True)
 
-    destination = storage.resolve_location(storage_identifier)
     variant = FileVariant.objects.create(
         book=source_book,
         format=request_format,
@@ -758,7 +778,7 @@ def _materialize_ocr_artifact(
         original_filename=safe_name,
         storage_location=_default_ocr_storage_location(),
         storage_identifier=storage_identifier,
-        size_bytes=destination.stat().st_size,
+        size_bytes=len(content),
         sha256=output_sha,
         source_type=FileVariant.SourceType.OCR,
         uploader=source_variant.uploader if source_variant is not None else None,

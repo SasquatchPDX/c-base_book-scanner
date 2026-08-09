@@ -1,0 +1,7 @@
+{% extends "core/base.html" %}
+{% block title %}{{ kind }} job · Hackerspace Library{% endblock %}
+{% block head %}
+  {% if job.state == 'queued' or job.state == 'running' %}<meta http-equiv="refresh" content="3">{% endif %}
+{% endblock %}
+{% block content %}<div class="narrow"><p class="eyebrow">{{ kind }}</p><h1>Processing job</h1><div class="status-card"><span class="status status-{{ job.state }}">{{ job.get_state_display }}</span><p class="mono">{{ job.job_id }}</p>{% if payload.error %}<p class="error">{{ payload.error }}</p>{% endif %}{% if payload.output_variant_id %}<a class="button"
+   href="{% url 'library-book-detail' job.file_variant.book_id %}?view=html">Return to book</a>{% endif %}</div></div>{% endblock %}

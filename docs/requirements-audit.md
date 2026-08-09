@@ -24,19 +24,27 @@ sprint or production deployment is complete.
   page mutations are locked while finalization runs, failures are retry-aware,
   and status is queryable. Raw captures are rejected as cleaned output unless an
   explicit, provenance-recorded override is requested.
+- Core member workflows now have authenticated server-rendered pages: landing,
+  search/browse, book detail and covers, upload/import status, metadata review,
+  conversions, scan-job creation, page capture, rescan, and ScanTailor stage
+  execution. JSON APIs remain available through content negotiation.
+- Downloads, conversion, and OCR honor each artifact's declared storage backend;
+  stale/failed variants are not advertised or usable. Locally disabled accounts
+  are invalidated even when they still have an old session.
+- Admin book deletion requires exact-title confirmation, verifies managed
+  artifact hashes, quarantines files before the database transaction commits,
+  restores them on failure, and then purges quarantine.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
 
 ## Remaining gaps by requirement area
 
-- User-facing UI: most workflows are JSON endpoints; the server-rendered library,
-  review, scanner, and ScanTailor workspace interfaces described by the sprints
-  are not yet complete.
+- User-facing UI: core workflows are usable server-side, but advanced ScanTailor
+  geometry overlays, direct manipulation, richer batch controls, and live updates
+  beyond polling still need a focused TypeScript interaction layer.
 - Intake breadth: normal intake currently accepts EPUB and PDF, not every domain
   format represented by `FileVariant`. Cover/thumbnail extraction is incomplete.
-- Administration: explicit, confirmed library deletion with storage/database
-  consistency handling is not implemented.
 - Physical pipeline: an unlinked scan job does not yet enter the bibliographic
   identification/review pipeline automatically.
 - Async purity: development intentionally supports synchronous execution without

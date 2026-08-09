@@ -16,10 +16,10 @@ import structlog
 from django.utils import timezone
 
 from ebook_server.jobs import get_queue
-from ebook_server.storage import LocalFilesystemStorage
 
 from . import intake
 from .models import Book, FileVariant, ProcessingJob
+from .storage_registry import StorageConfigurationError, backend_for_location
 
 logger = structlog.get_logger(__name__)
 
@@ -269,7 +269,9 @@ def describe_plan(plan: ConversionPlan) -> list[dict[str, Any]]:
 
 def conversion_options_for_book(book: Book) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
-    for variant in book.file_variants.all():
+    for variant in book.file_variants.filter(
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    ):
         for target_format, route in list_conversion_targets(variant.format).items():
             options.append(
                 {
@@ -281,10 +283,6 @@ def conversion_options_for_book(book: Book) -> list[dict[str, Any]]:
                 },
             )
     return options
-
-
-def _default_storage() -> LocalFilesystemStorage:
-    return intake._default_storage()
 
 
 def request_conversion(
@@ -413,16 +411,25 @@ def _execute_plan(
     route: tuple[ConversionStep, ...],
     request_options: Any | None,
 ) -> FileVariant:
-    storage = _default_storage()
-    source_path = storage.resolve_location(source_variant.storage_identifier)
-    if not source_path.exists():
-        raise ConversionError("source artifact missing")
+    try:
+        storage = backend_for_location(source_variant.storage_location)
+    except StorageConfigurationError as exc:
+        raise ConversionError("source storage is unavailable") from exc
 
     request_options_map: dict[str, Any] = {}
     if isinstance(request_options, dict):
         request_options_map = dict(request_options)
 
     with tempfile.TemporaryDirectory(prefix="ebook-convert-") as workdir:
+        source_suffix = Path(source_variant.original_filename).suffix or f".{source_variant.format}"
+        source_path = Path(workdir) / f"source{source_suffix}"
+        try:
+            with storage.open(source_variant.storage_identifier) as source_stream:
+                with source_path.open("wb") as staged_source:
+                    shutil.copyfileobj(source_stream, staged_source, length=1 << 20)
+        except FileNotFoundError as exc:
+            raise ConversionError("source artifact missing") from exc
+
         current_path = source_path
         converter_chain: list[str] = []
         converter_versions: list[str] = []

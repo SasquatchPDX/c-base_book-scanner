@@ -1,0 +1,27 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in · Hackerspace Library</title>
+    <link rel="stylesheet" href="{% static 'core/app.css' %}">
+  </head>
+  <body class="login-page">
+    <main class="login-shell">
+      <section>
+        <p class="eyebrow">Members only</p>
+        <h1>Hackerspace Library</h1>
+        <p>Use your existing LDAP member credentials. There is no separate library account.</p>
+      </section>
+      <form class="login-panel" method="post">
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{{ next }}">
+        {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+        <label>LDAP username<input name="username" autocomplete="username" required autofocus></label>
+        <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

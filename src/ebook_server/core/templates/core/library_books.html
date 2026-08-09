@@ -1,0 +1,57 @@
+{% extends "core/base.html" %}
+{% block title %}Browse books · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Collection</p>
+      <h1>Browse books</h1>
+    </div>
+    <span>{{ count }} result{{ count|pluralize }}</span>
+  </div>
+  <form class="filter-panel" method="get">
+    <input type="hidden" name="view" value="html">
+    <label class="wide">
+      Search<input name="q"
+       type="search"
+       value="{{ filters.q }}"
+       placeholder="Title, author, description">
+    </label>
+    <label>
+      Author<input name="author" value="{{ filters.author }}">
+    </label>
+    <label>
+      Category<input name="category" value="{{ filters.category }}">
+    </label>
+    <label>
+      Genre<input name="genre" value="{{ filters.genre }}">
+    </label>
+    <label>
+      Language<input name="language" value="{{ filters.language }}">
+    </label>
+    <label>
+      Format<input name="format" value="{{ filters.format }}" placeholder="epub, pdf…">
+    </label>
+    <label>Sort<select name="sort"><option value="-created_at">Newest</option><option value="title" {% if filters.sort == 'title' %}selected{% endif %}>Title A–Z</option><option value="-title" {% if filters.sort == '-title' %}selected{% endif %}>Title Z–A</option></select></label>
+    <button type="submit">Apply filters</button>
+  </form>
+  <div class="list-stack">
+    {% for book in books %}
+      <article class="book-row">
+        <div class="cover-placeholder small" aria-hidden="true">{{ book.title|slice:":1" }}</div>
+        <div class="grow">
+          <h2><a href="{% url 'library-book-detail' book.id %}?view=html">{{ book.title }}</a></h2>
+          {% if book.subtitle %}<p>{{ book.subtitle }}</p>{% endif %}
+          <p class="muted">{% for author in book.authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
+        </div>
+        <div class="badges">{% for format in book.formats_available %}<span>{{ format|upper }}</span>{% empty %}<span>No files</span>{% endfor %}</div>
+      </article>
+{% empty %}<p class="empty-state">No books match these filters.</p>{% endfor %}
+  </div>
+  {% if page_object.paginator.num_pages > 1 %}
+    <nav class="pagination" aria-label="Pagination">
+      {% if page_object.has_previous %}<a href="?view=html&q={{ filters.q|urlencode }}&page={{ page_object.previous_page_number }}">Previous</a>{% endif %}
+      <span>Page {{ page_object.number }} of {{ page_object.paginator.num_pages }}</span>
+      {% if page_object.has_next %}<a href="?view=html&q={{ filters.q|urlencode }}&page={{ page_object.next_page_number }}">Next</a>{% endif %}
+    </nav>
+  {% endif %}
+{% endblock %}
