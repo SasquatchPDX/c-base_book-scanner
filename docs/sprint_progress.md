@@ -2,34 +2,34 @@
 
 This file tracks execution status while advancing Sprint documents in order.
 
-> Historical implementation log: “Done” means the originally recorded coding
-> pass was completed. It is not an acceptance or production-readiness sign-off.
+> Historical implementation log: “Implemented” means the planned coding pass has
+> repository evidence. It is not an acceptance or production-readiness sign-off.
 > The current requirement-by-requirement findings, including remaining UI,
 > pipeline, observability, and integration gaps, are in
 > `docs/requirements-audit.md`.
 
 ## Current snapshot
 
-| Sprint | Status | Completed artifacts |
+| Sprint | Status | Implementation evidence |
 | --- | --- | --- |
-| 001 | ✅ Done | Architecture/research docs, project skeleton, dependency/tooling baseline, health/readiness and secured Prometheus endpoints, structured logging, CI |
-| 002 | ✅ Done | Local auth role model/profile, LDAP adapter boundary, Django auth backend scaffold, RQ queue module, and starter queue/storage settings + Sprint002 test coverage |
-| 003 | ✅ Done | Canonical book/domain models (Book, Author, Identifier, FileVariant, CoverImage, Storage/Source locations) and baseline migration/test coverage |
-| 004 | ✅ Done | Common upload/intake path with staging, hashing, format-aware metadata and cover extraction, deduplication, durable archive copy, and API status behavior; later expanded to all declared digital-book formats |
-| 005 | ✅ Done | Metadata provider abstraction, ISBN normalization/extraction, provider abstraction tests, candidate scoring + persistence, and intake confidence routing with low-confidence review tasks |
-| 006 | ✅ Done | Review queue/workflow with owner/admin access, accept/manual/merge/unidentified decisions, editable terms, and durable repeat provider searches for archived imports and scans |
-| 007 | ✅ Done | Source-path ingestion implemented (preview, recursive scan, copy/move behavior, duplicate detection, recoverable failures) |
-| 008 | ✅ Done | Search/browse/detail/download UI and API, cover streaming, completed-variant safeguards, backend-aware storage, and confirmed integrity-aware admin deletion |
-| 009 | ✅ Done | Conversion graph-based orchestration, conversion jobs/status endpoints, conversion job request flow, duplicate output reuse, provenance capture, and tests |
-| 010 | ✅ Done | Scan job and scan-page pipeline implemented, API coverage and replacement/version tests in place |
-| 011 | ✅ Done | Rescan queue implemented with page action, todo listing/claim/complete/cancel endpoints, and tests |
-| 012 | ✅ Done | OCR client contract, async submission/polling, accepted/running/success/failure/timeout/malformed handling, variant/scan-job sources, API endpoints, and persistence/integration tests added |
-| 013 | ✅ Done | Server-rendered and API workspace, persistent stage state, worker lifecycle, dependency/invalidation handling, and regression tests |
-| 014 | ✅ Done | Page split and deskew stage algorithms (auto/manual split, skew correction), persistence of output parameters, and regression tests added |
-| 015 | ✅ Done | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
-| 016 | ✅ Done | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
-| 017 | ✅ Done | Output/Binarization implemented with pluggable algorithms (Otsu/Sauvola/Wolf/Fox/Window/Grad paths), optional CV2-powered local-threshold handling, zone controls, and regression tests added |
-| 018 | ✅ Done | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
+| 001 | Implemented | Architecture/research docs, project skeleton, dependency/tooling baseline, health/readiness and secured Prometheus endpoints, structured logging, CI |
+| 002 | Implemented | Local auth role model/profile, LDAP adapter boundary, Django auth backend scaffold, RQ queue module, and starter queue/storage settings + Sprint002 test coverage |
+| 003 | Implemented | Canonical book/domain models (Book, Author, Identifier, FileVariant, CoverImage, Storage/Source locations) and baseline migration/test coverage |
+| 004 | Implemented | Common upload/intake path with staging, hashing, format-aware metadata and cover extraction, deduplication, durable archive copy, and API status behavior; later expanded to all declared digital-book formats |
+| 005 | Implemented | Metadata provider abstraction, ISBN normalization/extraction, provider abstraction tests, candidate scoring + persistence, and intake confidence routing with low-confidence review tasks |
+| 006 | Implemented | Review queue/workflow with owner/admin access, accept/manual/merge/unidentified decisions, editable terms, and durable repeat provider searches for archived imports and scans |
+| 007 | Implemented | Source-path ingestion implemented (preview, recursive scan, copy/move behavior, duplicate detection, recoverable failures) |
+| 008 | Implemented | Search/browse/detail/download UI and API, cover streaming, completed-variant safeguards, backend-aware storage, and confirmed integrity-aware admin deletion |
+| 009 | Implemented | Conversion graph-based orchestration, conversion jobs/status endpoints, conversion job request flow, duplicate output reuse, provenance capture, and tests |
+| 010 | Implemented | Scan job and scan-page pipeline implemented, API coverage and replacement/version tests in place |
+| 011 | Implemented | Rescan queue implemented with page action, todo listing/claim/complete/cancel endpoints, and tests |
+| 012 | Implemented | OCR client contract, async submission/polling, accepted/running/success/failure/timeout/malformed handling, variant/scan-job sources, API endpoints, and persistence/integration tests added |
+| 013 | Implemented | Server-rendered and API workspace, persistent stage state, worker lifecycle, dependency/invalidation handling, and regression tests |
+| 014 | Implemented | Page split and deskew stage algorithms (auto/manual split, skew correction), persistence of output parameters, and regression tests added |
+| 015 | Implemented | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
+| 016 | Implemented | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
+| 017 | Implemented | Output/Binarization implemented with pluggable algorithms (Otsu/Sauvola/Wolf/Fox/Window/Grad paths), optional CV2-powered local-threshold handling, zone controls, and regression tests added |
+| 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
 
 ## Sprint evidence checklist (as of 2026-08-08)
 
@@ -54,5 +54,7 @@ This file tracks execution status while advancing Sprint documents in order.
 
 ## Notes
 
-- Sprint001 and Sprint002 are accepted after passing test/lint/type-check checks and baseline docs being checked in.
-- Current focus: ScanTailor-to-library end-to-end hardening (lineage edge-cases, explicit source selection rules, and operational metrics).
+- No sprint should be called acceptance-complete solely from this table; use the
+  requirements audit and a deployment-specific acceptance run.
+- Current remaining work is advanced ScanTailor browser interaction and
+  production-like infrastructure/integration validation.
