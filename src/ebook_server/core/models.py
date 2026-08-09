@@ -93,7 +93,6 @@ class StorageLocation(models.Model):
         LOCAL = "local", "Local filesystem"
         NFS = "nfs", "NFS share"
         SAMBA = "samba", "SMB/Samba share"
-        S3 = "s3", "S3-compatible"
 
     identifier = models.SlugField(max_length=64, unique=True)
     backend = models.CharField(

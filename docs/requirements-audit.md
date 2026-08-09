@@ -50,6 +50,8 @@ sprint or production deployment is complete.
 - “Search again” now performs a durable provider re-query for both archived
   digital imports and physical scans, replaces ranked candidates, preserves the
   reviewer’s refined terms/decision provenance, and enforces owner/admin access.
+- Storage configuration advertises only implemented local, NFS, and Samba mount
+  modes; unknown legacy backend values fail closed during backend resolution.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
@@ -67,9 +69,6 @@ sprint or production deployment is complete.
 - Integration/E2E depth: PostgreSQL, a real LDAP test directory, real worker
   processes, external converter binaries, and a browser-driven full physical-book
   flow need dedicated integration environments.
-- Storage backends: mounted filesystems are supported through local paths, but S3
-  is declared in the model without an implemented backend and should not be
-  advertised as operational.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

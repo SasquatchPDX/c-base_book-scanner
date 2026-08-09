@@ -17,8 +17,12 @@ class StorageConfigurationError(RuntimeError):
 
 def backend_for_location(location: StorageLocation) -> StorageBackend:
     """Build the backend for a database location without exposing paths to callers."""
-    if location.backend == StorageLocation.BackendType.S3:
-        raise StorageConfigurationError("S3 storage backend is not configured")
+    if location.backend not in {
+        StorageLocation.BackendType.LOCAL,
+        StorageLocation.BackendType.NFS,
+        StorageLocation.BackendType.SAMBA,
+    }:
+        raise StorageConfigurationError(f"unsupported storage backend: {location.backend}")
 
     if location.identifier == "default":
         root = Path(settings.APP_DATA_DIR) / "library-artifacts"

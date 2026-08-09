@@ -35,6 +35,10 @@
 - Public metadata providers: discovery and verification (not single-source authority).
 - OCR AI server: asynchronous OCR service (later sprint012).
 
+Storage choices are limited to local paths and externally mounted NFS/Samba
+shares. Unknown legacy backend values fail closed; no unimplemented object-store
+backend is advertised in administration.
+
 ## Sprint001 bootstrap
 
 - Repository now has a runnable Django configuration.
