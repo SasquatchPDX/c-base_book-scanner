@@ -146,7 +146,15 @@ class ImportJobAdmin(admin.ModelAdmin[ImportJob]):
 
 @admin.register(MetadataCandidate)
 class MetadataCandidateAdmin(admin.ModelAdmin[MetadataCandidate]):
-    list_display = ("import_job", "provider_id", "title", "score", "state", "created_at")
+    list_display = (
+        "import_job",
+        "scan_job",
+        "provider_id",
+        "title",
+        "score",
+        "state",
+        "created_at",
+    )
     list_filter = ("provider_id", "state")
 
 
@@ -154,6 +162,7 @@ class MetadataCandidateAdmin(admin.ModelAdmin[MetadataCandidate]):
 class ReviewTaskAdmin(admin.ModelAdmin[ReviewTask]):
     list_display = (
         "import_job",
+        "scan_job",
         "task_type",
         "state",
         "decision",

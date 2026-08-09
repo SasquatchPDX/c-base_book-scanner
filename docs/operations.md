@@ -89,6 +89,14 @@ pipeline payload. Finalization requires successful ScanTailor output for every
 page by default. `allow_raw_pages=true` is an emergency/manual override; it is
 recorded in variant provenance and should not be used for normal production scans.
 
+An unlinked scan is routed through public bibliographic lookup before finalization.
+Operators can start this explicitly with `POST /scan/jobs/<id>/identify/`; a finish
+request starts it automatically when no canonical Book is linked. Poll
+`GET /scan-identifications/<job-id>/`, then resolve the resulting shared
+`ReviewTask` through the normal review queue. Candidate acceptance, manual entry,
+and merge decisions link the ScanJob to the selected Book without inventing a
+placeholder file variant.
+
 ## Routine checks
 
 ```bash

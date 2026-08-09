@@ -52,6 +52,8 @@ Redis.
 - `/reviews/?view=html` — low-confidence metadata review queue
 - `/scan/jobs/?view=html` — scanner jobs and page capture
 - `/scan/jobs/<id>/workspace/?view=html` — per-page ScanTailor workspace
+- `/scan/jobs/<id>/identify/` — queue public metadata lookup for an unlinked scan
+- `/scan-identifications/<job-id>/` — durable scan-identification status
 - `/scan/jobs/<id>/finish/` — queue scan packaging and optional OCR
 - `/scan-finalizations/<job-id>/` — durable scan-finalization status
 - `/healthz/` and `/healthz/dependencies/` — liveness/readiness

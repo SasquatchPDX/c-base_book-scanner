@@ -8,15 +8,17 @@
 
 ## API surface (v1)
 
-- `POST /api/scan/jobs/` -> create job
-- `GET /api/scan/jobs/` -> list open jobs for scanner/operator
-- `GET /api/scan/jobs/{job_id}/` -> detail
-- `POST /api/scan/jobs/{job_id}/pages/` -> upload page
-- `PUT /api/scan/pages/{page_id}/` -> replace/reupload idempotently
+- `POST /scan/jobs/` -> create job
+- `GET /scan/jobs/` -> list open jobs for scanner/operator
+- `GET /scan/jobs/{job_id}/` -> detail
+- `POST /scan/jobs/{job_id}/pages/` -> upload page
+- `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
+- `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
+- `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
 - `POST /scan/jobs/{job_id}/ocr/` -> request OCR from scan pages
 - `GET /ocr/{job_id}/` -> OCR job status/provenance
-- `POST /api/scan/jobs/{job_id}/finish/` -> complete job
+- `POST /scan/jobs/{job_id}/finish/` -> queue identification when unlinked, otherwise finalize
 
 ## Page upload contract
 

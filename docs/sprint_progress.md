@@ -29,7 +29,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 015 | ✅ Done | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
 | 016 | ✅ Done | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
 | 017 | ✅ Done | Output/Binarization implemented with pluggable algorithms (Otsu/Sauvola/Wolf/Fox/Window/Grad paths), optional CV2-powered local-threshold handling, zone controls, and regression tests added |
-| 018 | ✅ Done | Added durable queued scan finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
+| 018 | ✅ Done | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
 
 ## Sprint evidence checklist (as of 2026-08-08)
 
@@ -50,7 +50,7 @@ This file tracks execution status while advancing Sprint documents in order.
 - 015: content selection and margins in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
 - 016: practical dewarping implementation and fallback handling in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
 - 017: output/binarization pipelines and zone controls in `src/ebook_server/core/scantailor.py`, `tests/test_scantailor.py`.
-- 018: scan-job finish, OCR/cleaned variant pipelines, and downstream invalidation in `src/ebook_server/core/scan_pipeline.py`, `src/ebook_server/core/views.py`, `tests/test_scan_jobs.py`.
+- 018: scan identification/review and finish, OCR/cleaned variant pipelines, and downstream invalidation in `src/ebook_server/core/scan_identification.py`, `src/ebook_server/core/scan_pipeline.py`, `src/ebook_server/core/views.py`, `tests/test_scan_identification.py`, and `tests/test_scan_jobs.py`.
 
 ## Notes
 

@@ -94,6 +94,11 @@ urlpatterns = [
         views.scan_job_ocr_request,
         name="scan-job-ocr",
     ),
+    path(
+        "scan/jobs/<uuid:job_id>/identify/",
+        views.scan_job_identification_request,
+        name="scan-job-identify",
+    ),
     path("scan/pages/<uuid:page_id>/", views.scan_page, name="scan-page"),
     path(
         "scan/pages/<uuid:page_id>/rescan/",
@@ -142,6 +147,11 @@ urlpatterns = [
         "scan-finalizations/<uuid:job_id>/",
         views.scan_finalization_job_status,
         name="scan-finalization-job-status",
+    ),
+    path(
+        "scan-identifications/<uuid:job_id>/",
+        views.scan_identification_job_status,
+        name="scan-identification-job-status",
     ),
     path("admin-only/", views.admin_only, name="admin-only"),
     path("imports/upload/", views.upload_file, name="imports-upload"),

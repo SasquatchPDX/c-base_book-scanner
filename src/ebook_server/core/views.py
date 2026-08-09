@@ -41,7 +41,15 @@ from prometheus_client.exposition import CONTENT_TYPE_LATEST
 from ebook_server.jobs import enqueue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import book_deletion, conversion, intake, ocr, scan_pipeline, scantailor
+from . import (
+    book_deletion,
+    conversion,
+    intake,
+    ocr,
+    scan_identification,
+    scan_pipeline,
+    scantailor,
+)
 from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
@@ -213,6 +221,8 @@ def _serialize_scan_job(
         "state": job.state,
         "scanner_id": job.scanner_id,
         "provisional_title": job.provisional_title,
+        "provisional_authors": job.provisional_authors,
+        "expected_page_count": job.expected_page_count,
         "notes": job.notes,
         "book_id": str(job.book_id) if job.book_id else None,
         "operator_id": job.operator_id,
@@ -759,13 +769,38 @@ def _wants_html(request: HttpRequest) -> bool:
 def _can_manage_review_task(profile: AppUserProfile, task: ReviewTask) -> bool:
     if profile.role == "admin":
         return True
-    if task.import_job_id is None:
-        return False
-    return task.import_job.uploader_id == profile.user_id
+    import_job = task.import_job
+    if import_job is not None:
+        return import_job.uploader_id == profile.user_id
+    scan_job = task.scan_job
+    if scan_job is not None:
+        return scan_job.operator_id == profile.user_id
+    return False
+
+
+def _review_owner_id(task: ReviewTask) -> int | None:
+    import_job = task.import_job
+    if import_job is not None:
+        return import_job.uploader_id
+    scan_job = task.scan_job
+    if scan_job is not None:
+        return scan_job.operator_id
+    return None
+
+
+def _review_candidates(task: ReviewTask) -> Any:
+    import_job = task.import_job
+    if import_job is not None:
+        return import_job.metadata_candidates.order_by("-score")
+    scan_job = task.scan_job
+    if scan_job is not None:
+        return scan_job.metadata_candidates.order_by("-score")
+    return MetadataCandidate.objects.none()
 
 
 def _serialize_task(task: ReviewTask) -> dict[str, Any]:
-    uploader_id = task.import_job.uploader_id if task.import_job_id else None
+    source_type = "import" if task.import_job_id is not None else "scan"
+    source_id = task.import_job_id or task.scan_job_id
     return {
         "id": str(task.id),
         "state": task.state,
@@ -777,12 +812,68 @@ def _serialize_task(task: ReviewTask) -> dict[str, Any]:
         "inferred_authors": task.inferred_authors,
         "embedded_metadata": task.embedded_metadata,
         "provider_snapshot": task.provider_snapshot,
-        "uploader_id": uploader_id,
+        "source_type": source_type,
+        "source_id": str(source_id) if source_id is not None else None,
+        "uploader_id": _review_owner_id(task),
         "reviewer_id": task.reviewer_id,
         "resolved_book_id": str(task.resolved_book_id) if task.resolved_book_id else None,
         "created_at": task.created_at.isoformat(),
         "updated_at": task.updated_at.isoformat(),
     }
+
+
+def _resolve_review_source(
+    *,
+    task: ReviewTask,
+    book: Book,
+    reviewer: Any,
+    decision: str,
+    selected_candidate: MetadataCandidate | None = None,
+    decision_notes: str = "",
+    decision_payload: dict[str, Any] | None = None,
+) -> FileVariant | None:
+    import_job = task.import_job
+    if import_job is not None:
+        return intake.resolve_import_with_review_data(
+            job=import_job,
+            review_task=task,
+            book=book,
+            source_type=cast(str, FileVariant.SourceType.UPLOAD),
+            selected_candidate=selected_candidate,
+            reviewer=reviewer,
+            decision=decision,
+            decision_notes=decision_notes,
+            decision_payload=decision_payload,
+        )
+    if task.scan_job_id is None:
+        raise ValueError("review task has no source")
+    with transaction.atomic():
+        scan_job = ScanJob.objects.select_for_update().get(pk=task.scan_job_id)
+        scan_job.book = book
+        scan_job.save(update_fields=["book_id", "updated_at"])
+        task.state = ReviewTask.State.RESOLVED
+        task.decision = decision
+        task.decision_notes = decision_notes
+        task.decided_at = timezone.now()
+        if decision_payload is not None:
+            task.decision_payload = decision_payload
+        task.resolved_book = book
+        task.selected_candidate = selected_candidate
+        task.reviewer = reviewer
+        task.save(
+            update_fields=[
+                "state",
+                "decision",
+                "decision_notes",
+                "decision_payload",
+                "resolved_book_id",
+                "selected_candidate_id",
+                "reviewer_id",
+                "decided_at",
+                "updated_at",
+            ],
+        )
+    return None
 
 
 def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
@@ -2054,6 +2145,16 @@ def scan_jobs(
 
     payload = _parse_scan_request_payload(request)
     job_title = _coerce_str_or_none(payload.get("provisional_title")) or ""
+    raw_authors = payload.get("provisional_authors", [])
+    if isinstance(raw_authors, str):
+        provisional_authors = [
+            author.strip() for author in raw_authors.split(",") if author.strip()
+        ]
+    elif isinstance(raw_authors, list):
+        provisional_authors = [str(author).strip() for author in raw_authors if str(author).strip()]
+    else:
+        provisional_authors = []
+    expected_page_count = _coerce_int(payload.get("expected_page_count"), minimum=1)
     scanner_id = _coerce_str_or_none(payload.get("scanner_id")) or ""
     book_id = _coerce_int(payload.get("book_id"), minimum=1)
     if book_id is not None:
@@ -2079,6 +2180,8 @@ def scan_jobs(
         operator=profile.user,
         book=book,
         provisional_title=job_title,
+        provisional_authors=provisional_authors,
+        expected_page_count=expected_page_count,
         notes=notes,
     )
     if _wants_html(request):
@@ -2181,6 +2284,83 @@ def scan_job_ocr_request(
     except ocr.OCRJobError as exc:
         return HttpResponseBadRequest(str(exc))
     return JsonResponse(ocr.ocr_job_payload(job), status=202)
+
+
+@require_POST
+@login_required
+def scan_job_identification_request(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    if _coerce_uuid(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        scan_job = ScanJob.objects.get(pk=job_id)
+    except (ScanJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+
+    payload = _request_payload(request)
+    title = payload.get("provisional_title")
+    raw_authors = payload.get("provisional_authors")
+    update_fields: list[str] = []
+    if isinstance(title, str) and title.strip():
+        scan_job.provisional_title = title.strip()
+        update_fields.append("provisional_title")
+    if isinstance(raw_authors, str):
+        scan_job.provisional_authors = [
+            author.strip() for author in raw_authors.split(",") if author.strip()
+        ]
+        update_fields.append("provisional_authors")
+    elif isinstance(raw_authors, list):
+        scan_job.provisional_authors = [
+            str(author).strip() for author in raw_authors if str(author).strip()
+        ]
+        update_fields.append("provisional_authors")
+    if update_fields:
+        scan_job.save(update_fields=[*update_fields, "updated_at"])
+
+    try:
+        job = scan_identification.request_scan_identification(
+            scan_job=scan_job,
+            requested_by_user_id=profile.user_id,
+        )
+    except scan_identification.ScanIdentificationError as exc:
+        return HttpResponseBadRequest(str(exc))
+    response_payload = scan_identification.job_payload(job)
+    if _wants_html(request):
+        review_task_id = response_payload.get("review_task_id")
+        if review_task_id is not None:
+            return redirect("review-detail", task_id=review_task_id)
+        return redirect("scan-identification-job-status", job_id=job.job_id)
+    return JsonResponse(response_payload, status=202)
+
+
+@require_GET
+@login_required
+def scan_identification_job_status(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.SCAN_IDENTIFICATION:
+        return HttpResponseNotFound()
+    payload = scan_identification.job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Scan identification"},
+        )
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -2591,6 +2771,33 @@ def scan_job_finish(
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
+    if job.book_id is None:
+        try:
+            identification_job = scan_identification.request_scan_identification(
+                scan_job=job,
+                requested_by_user_id=profile.user_id,
+            )
+        except scan_identification.ScanIdentificationError as exc:
+            return HttpResponseBadRequest(str(exc))
+        identification_payload = scan_identification.job_payload(identification_job)
+        if _wants_html(request):
+            review_task_id = identification_payload.get("review_task_id")
+            if review_task_id is not None:
+                return redirect("review-detail", task_id=review_task_id)
+            return redirect(
+                "scan-identification-job-status",
+                job_id=identification_job.job_id,
+            )
+        return JsonResponse(
+            {
+                "job_id": str(job.id),
+                "state": job.state,
+                "requires_bibliographic_review": True,
+                "identification_job": identification_payload,
+            },
+            status=202,
+        )
+
     payload = _json_body(request)
     if not payload:
         try:
@@ -2789,18 +2996,21 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
     tasks = ReviewTask.objects.select_related(
         "import_job",
         "import_job__uploader",
+        "scan_job",
+        "scan_job__operator",
     ).filter(state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED])
     if profile.role != "admin":
-        tasks = tasks.filter(import_job__uploader=profile.user)
+        tasks = tasks.filter(
+            Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
+        )
     tasks = tasks.order_by("-created_at")
 
     payload = [
         {
             **_serialize_task(task),
-            "candidate_count": task.import_job.metadata_candidates.count(),
+            "candidate_count": _review_candidates(task).count(),
             "candidates": [
-                _serialize_candidate(candidate)
-                for candidate in task.import_job.metadata_candidates.order_by("-score")
+                _serialize_candidate(candidate) for candidate in _review_candidates(task)
             ],
         }
         for task in tasks
@@ -2822,7 +3032,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -2830,8 +3040,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
 
     payload = _serialize_task(task)
     payload["candidates"] = [
-        _serialize_candidate(candidate)
-        for candidate in task.import_job.metadata_candidates.order_by("-score")
+        _serialize_candidate(candidate) for candidate in _review_candidates(task)
     ]
     if _wants_html(request):
         return render(
@@ -2840,7 +3049,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
             {
                 "task": task,
                 "payload": payload,
-                "candidates": task.import_job.metadata_candidates.order_by("-score"),
+                "candidates": _review_candidates(task),
                 "books": Book.objects.order_by("title")[:250],
             },
         )
@@ -2858,7 +3067,7 @@ def review_accept_candidate(
         return HttpResponseBadRequest("forbidden")
 
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -2870,8 +3079,10 @@ def review_accept_candidate(
         return HttpResponseBadRequest("candidate_id required")
 
     try:
-        candidate = MetadataCandidate.objects.get(pk=candidate_id, import_job=task.import_job)
+        candidate = MetadataCandidate.objects.get(pk=candidate_id)
     except MetadataCandidate.DoesNotExist:
+        return HttpResponseBadRequest("candidate not found")
+    if candidate.import_job_id != task.import_job_id or candidate.scan_job_id != task.scan_job_id:
         return HttpResponseBadRequest("candidate not found")
 
     try:
@@ -2952,11 +3163,9 @@ def review_accept_candidate(
                 )
             book.save()
 
-        variant = intake.resolve_import_with_review_data(
-            job=task.import_job,
-            review_task=task,
+        variant = _resolve_review_source(
+            task=task,
             book=book,
-            source_type=cast(str, FileVariant.SourceType.UPLOAD),
             selected_candidate=candidate,
             reviewer=profile.user,
             decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
@@ -2966,9 +3175,9 @@ def review_accept_candidate(
             request,
             {
                 "task_id": str(task.id),
-                "job_id": str(task.import_job_id),
+                "source_id": str(task.import_job_id or task.scan_job_id),
                 "book_id": str(book.id),
-                "file_variant_id": str(variant.id),
+                "file_variant_id": str(variant.id) if variant is not None else None,
             },
         )
     except Exception as exc:  # pragma: no cover
@@ -2986,7 +3195,7 @@ def review_mark_unidentified(
         return HttpResponseBadRequest("forbidden")
     payload = _request_payload(request)
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3022,7 +3231,7 @@ def review_search_again(
         return HttpResponseBadRequest("forbidden")
     payload = _request_payload(request)
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3063,7 +3272,7 @@ def review_edit_search_terms(
         return HttpResponseBadRequest("forbidden")
     payload = _request_payload(request)
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3117,7 +3326,7 @@ def review_manual_entry(
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3128,11 +3337,9 @@ def review_manual_entry(
         return HttpResponseBadRequest("title required")
     book = _build_manual_book_from_payload(payload)
 
-    variant = intake.resolve_import_with_review_data(
-        job=task.import_job,
-        review_task=task,
+    variant = _resolve_review_source(
+        task=task,
         book=book,
-        source_type=cast(str, FileVariant.SourceType.UPLOAD),
         reviewer=profile.user,
         decision=cast(str, ReviewTask.Decision.MANUAL_ENTRY),
         decision_payload=payload,
@@ -3141,9 +3348,9 @@ def review_manual_entry(
         request,
         {
             "task_id": str(task.id),
-            "job_id": str(task.import_job_id),
+            "source_id": str(task.import_job_id or task.scan_job_id),
             "book_id": str(book.id),
-            "variant_id": str(variant.id),
+            "variant_id": str(variant.id) if variant is not None else None,
         },
     )
 
@@ -3158,7 +3365,7 @@ def review_merge_existing(
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
     try:
-        task = ReviewTask.objects.select_related("import_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3177,11 +3384,9 @@ def review_merge_existing(
     except Book.DoesNotExist:
         return HttpResponseBadRequest("book not found")
 
-    intake.resolve_import_with_review_data(
-        job=task.import_job,
-        review_task=task,
+    _resolve_review_source(
+        task=task,
         book=book,
-        source_type=cast(str, FileVariant.SourceType.UPLOAD),
         reviewer=profile.user,
         decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
         decision_payload={"book_id": book_id},

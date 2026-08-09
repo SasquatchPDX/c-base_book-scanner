@@ -373,6 +373,8 @@ class ScanJob(models.Model):
         related_name="scan_jobs",
     )
     provisional_title = models.CharField(max_length=255, blank=True)
+    provisional_authors = models.JSONField(default=list, blank=True)
+    expected_page_count = models.PositiveIntegerField(null=True, blank=True)
     notes = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -643,6 +645,7 @@ class ProcessingJob(models.Model):
         CONVERSION = "conversion", "Conversion"
         OCR = "ocr", "OCR"
         STAGE = "stage", "ScanTailor Stage"
+        SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
 
     class JobState(models.TextChoices):
@@ -782,6 +785,15 @@ class MetadataCandidate(models.Model):
         ImportJob,
         on_delete=models.CASCADE,
         related_name="metadata_candidates",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.CASCADE,
+        related_name="metadata_candidates",
+        null=True,
+        blank=True,
     )
     provider_id = models.CharField(max_length=64)
     provider_ref = models.CharField(max_length=255, blank=True)
@@ -806,17 +818,32 @@ class MetadataCandidate(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["import_job", "score"]),
+            models.Index(fields=["scan_job", "score"]),
             models.Index(fields=["provider_id", "state"]),
         ]
         constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(import_job__isnull=False, scan_job__isnull=True)
+                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                ),
+                name="candidate_has_exactly_one_source",
+            ),
             models.UniqueConstraint(
                 fields=["import_job", "provider_id", "provider_ref"],
+                condition=models.Q(import_job__isnull=False),
                 name="uniq_import_candidate_provider_ref",
+            ),
+            models.UniqueConstraint(
+                fields=["scan_job", "provider_id", "provider_ref"],
+                condition=models.Q(scan_job__isnull=False),
+                name="uniq_scan_candidate_provider_ref",
             ),
         ]
 
     def __str__(self) -> str:
-        return f"{self.import_job_id}:{self.provider_id}:{self.provider_ref}:{self.score}"
+        source_id = self.import_job_id or self.scan_job_id
+        return f"{source_id}:{self.provider_id}:{self.provider_ref}:{self.score}"
 
 
 class ReviewTask(models.Model):
@@ -846,6 +873,15 @@ class ReviewTask(models.Model):
         ImportJob,
         on_delete=models.CASCADE,
         related_name="review_tasks",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.CASCADE,
+        related_name="review_tasks",
+        null=True,
+        blank=True,
     )
     task_type = models.CharField(
         max_length=32,
@@ -918,23 +954,37 @@ class ReviewTask(models.Model):
             models.Index(fields=["created_by", "state"]),
             models.Index(fields=["resolved_book"]),
         ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(import_job__isnull=False, scan_job__isnull=True)
+                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                ),
+                name="review_has_exactly_one_source",
+            ),
+        ]
 
     def is_resolved(self) -> bool:
         return self.state == self.State.RESOLVED
 
     def can_be_resolved_by(self, user: User) -> bool:
-        if self.import_job is None or self.import_job.uploader is None:
-            return False
         try:
             role = user.library_profile.role
         except Exception:
             return False
         if role == UserRole.ADMIN:
             return True
-        return user == self.import_job.uploader
+        import_job = self.import_job
+        if import_job is not None:
+            return user == import_job.uploader
+        scan_job = self.scan_job
+        if scan_job is not None:
+            return user == scan_job.operator
+        return False
 
     def __str__(self) -> str:
-        return f"{self.import_job_id}:{self.task_type}:{self.state}"
+        source_id = self.import_job_id or self.scan_job_id
+        return f"{source_id}:{self.task_type}:{self.state}"
 
 
 def get_or_create_profile(

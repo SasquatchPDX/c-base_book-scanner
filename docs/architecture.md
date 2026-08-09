@@ -23,7 +23,7 @@
 
 - `ebook_server.core`: settings, storage abstraction, health endpoints, bootstrap checks.
 - `ebook_server.library`: bibliographic entities, variants, identifiers, search and import models (future sprint002+).
-- `ebook_server.scan`: scanner protocol, scan jobs/pages, ScanTailor workspace linkage (future sprint010+).
+- `ebook_server.scan`: scanner protocol, scan jobs/pages, ScanTailor workspace, bibliographic review, and finalization pipelines.
 - `ebook_server.jobs`: queue registration and task dispatch layer over RQ.
 - `ebook_server.workers`: asynchronous task code.
 
@@ -40,4 +40,3 @@
 - Repository now has a runnable Django configuration.
 - A health endpoint exists and validates database/storage dependencies by default.
 - Entry points are wired so `ebook-server` runs a Django command (defaults to `check` when no command is supplied).
-

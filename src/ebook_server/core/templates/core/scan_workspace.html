@@ -9,6 +9,7 @@
 {% endblock %}
 {% block content %}
   <div class="section-heading"><div><p class="eyebrow">ScanTailor workspace</p><h1>{{ job.provisional_title|default:"Untitled scan" }}</h1><p>{{ pages|length }} page{{ pages|length|pluralize }} · {% if job.book %}linked to <a href="{% url 'library-book-detail' job.book_id %}?view=html">{{ job.book.title }}</a>{% else %}not linked to a canonical book{% endif %}</p></div><span class="status status-{{ job.state }}">{{ job.get_state_display }}</span></div>
+  {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}<section class="finish-panel"><div><h2>Resolve book identity</h2><p>Search public bibliographic providers and review ranked matches before finalization.</p></div><form method="post" action="{% url 'scan-job-identify' job.id %}">{% csrf_token %}<label>Title<input name="provisional_title" value="{{ job.provisional_title }}" required></label><label>Authors<input name="provisional_authors" value="{{ job.provisional_authors|join:', ' }}"></label><button type="submit">Search metadata</button></form></section>{% endif %}
   {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}<section class="workspace-tools"><form class="inline-form"
       method="post"
       enctype="multipart/form-data"

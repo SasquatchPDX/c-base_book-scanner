@@ -38,6 +38,9 @@ sprint or production deployment is complete.
   queue and workflow state, processing-duration populations, ScanTailor status,
   and metadata-confidence distributions. Provider and worker lifecycle events use
   structured logs with bounded metadata and no document content.
+- Unlinked physical scans now use durable provider lookup and the shared review
+  queue. Finishing an unlinked scan automatically starts identification; owner or
+  admin review then links the ScanJob to a canonical Book before artifact creation.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
@@ -49,8 +52,6 @@ sprint or production deployment is complete.
   beyond polling still need a focused TypeScript interaction layer.
 - Intake breadth: normal intake currently accepts EPUB and PDF, not every domain
   format represented by `FileVariant`. Cover/thumbnail extraction is incomplete.
-- Physical pipeline: an unlinked scan job does not yet enter the bibliographic
-  identification/review pipeline automatically.
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.
 - Observability: core metrics and structured events are present; deployment alert

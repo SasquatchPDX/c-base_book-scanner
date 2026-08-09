@@ -128,7 +128,7 @@ def test_low_confidence_import_creates_open_review_task(
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert task.state == ReviewTask.State.OPEN
     assert task.import_job_id == job.id
-    assert task.import_job.metadata_candidates.count() == 1
+    assert job.metadata_candidates.count() == 1
 
     response = client.get("/reviews/")
     assert response.status_code == 200
@@ -146,7 +146,7 @@ def test_permission_model_for_review_resolution(
     other_client = Client()
     admin_client = Client()
 
-    task, _job = _start_low_confidence_import(
+    task, job = _start_low_confidence_import(
         monkeypatch=monkeypatch,
         client=owner_client,
         tmp_path=tmp_path,
@@ -154,7 +154,7 @@ def test_permission_model_for_review_resolution(
         candidate_title="Not A Match",
     )
 
-    owner_profile = task.import_job.uploader.library_profile
+    owner_profile = job.uploader.library_profile
     other_profile = get_or_create_profile("other-member")
     admin_profile = get_or_create_profile("admin-member", role="admin")
 
@@ -195,7 +195,7 @@ def test_accept_candidate_resolves_import_to_existing_book(
     )
 
     client = Client()
-    task, _job = _start_low_confidence_import(
+    task, import_job = _start_low_confidence_import(
         monkeypatch=monkeypatch,
         client=client,
         tmp_path=tmp_path,
@@ -204,7 +204,7 @@ def test_accept_candidate_resolves_import_to_existing_book(
         isbn_13="9780306406157",
     )
 
-    candidate_id = task.import_job.metadata_candidates.first()
+    candidate_id = import_job.metadata_candidates.first()
     assert candidate_id is not None
     selected_candidate_id = candidate_id.id
 
@@ -216,7 +216,7 @@ def test_accept_candidate_resolves_import_to_existing_book(
     assert response.status_code == 200
 
     task.refresh_from_db()
-    import_job = task.import_job
+    import_job.refresh_from_db()
     assert import_job.state == ImportJob.State.COMPLETE
     assert import_job.book_id == existing_book.id
     assert task.decision == ReviewTask.Decision.ACCEPT_CANDIDATE
@@ -225,7 +225,7 @@ def test_accept_candidate_resolves_import_to_existing_book(
 @pytest.mark.django_db(transaction=True)
 def test_manual_entry_accept_without_isbn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     client = Client()
-    task, _job = _start_low_confidence_import(
+    task, import_job = _start_low_confidence_import(
         monkeypatch=monkeypatch,
         client=client,
         tmp_path=tmp_path,
@@ -240,7 +240,6 @@ def test_manual_entry_accept_without_isbn(tmp_path: Path, monkeypatch: pytest.Mo
     )
     assert response.status_code == 200
 
-    import_job = task.import_job
     import_job.refresh_from_db()
     assert import_job.state == ImportJob.State.COMPLETE
     assert import_job.book is not None
@@ -255,7 +254,7 @@ def test_merge_resolves_task_into_existing_book(
     existing_book = Book.objects.create(title="Library Canonical")
 
     client = Client()
-    task, _job = _start_low_confidence_import(
+    task, import_job = _start_low_confidence_import(
         monkeypatch=monkeypatch,
         client=client,
         tmp_path=tmp_path,
@@ -270,7 +269,6 @@ def test_merge_resolves_task_into_existing_book(
     )
     assert response.status_code == 200
 
-    import_job = task.import_job
     import_job.refresh_from_db()
     assert import_job.state == ImportJob.State.COMPLETE
     assert import_job.book_id == existing_book.id
