@@ -1,0 +1,921 @@
+"""Intake service for upload and metadata-driven identification."""
+
+from __future__ import annotations
+
+import hashlib
+import mimetypes
+import re
+import xml.etree.ElementTree as ET
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, cast
+from urllib.parse import unquote
+from zipfile import ZipFile
+
+from django.conf import settings as django_settings
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+
+from ebook_server.storage import LocalFilesystemStorage
+
+from . import identification
+from .models import (
+    Author,
+    Book,
+    FileVariant,
+    Identifier,
+    ImportJob,
+    MetadataCandidate,
+    ReviewTask,
+    SourceLocation,
+    StorageLocation,
+)
+
+try:
+    from PyPDF2 import PdfReader
+except Exception:  # pragma: no cover - optional dependency availability path
+    PdfReader = None
+
+
+class IntakeError(RuntimeError):
+    """Raised for controlled intake failures."""
+
+
+class ValidationError(ValueError):
+    """Raised when a user-provided intake value is invalid."""
+
+
+@dataclass(frozen=True)
+class SupportedFormat:
+    format_name: str
+    mime_type: str
+
+
+SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
+    ".epub": SupportedFormat(
+        format_name="epub",
+        mime_type="application/epub+zip",
+    ),
+    ".pdf": SupportedFormat(
+        format_name="pdf",
+        mime_type="application/pdf",
+    ),
+}
+
+MAX_UPLOAD_BYTES = getattr(
+    django_settings,
+    "BOOK_SCANNER_MAX_UPLOAD_BYTES",
+    150 * 1024 * 1024,
+)
+AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
+REVIEW_SCORE = identification.REVIEW_SCORE
+
+
+def normalize_filename(raw: str) -> str:
+    """Return a safe basename for storage and user-visible provenance."""
+    if not raw:
+        raise ValidationError("filename is required")
+    decoded = unquote(raw).strip()
+    base = Path(decoded).name
+    if base in {"", ".", ".."} or "\\" in decoded or "/" in decoded:
+        raise ValidationError("dangerous filename")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    safe = safe.strip("._")
+    if not safe:
+        raise ValidationError("unsafe filename")
+    return safe[:220]
+
+
+def detect_format(filename: str, mime_type: str | None = None) -> tuple[str, str]:
+    """Return variant format and MIME type for a candidate file."""
+    extension = Path(filename).suffix.lower()
+    if extension in SUPPORTED_FORMATS:
+        fmt = SUPPORTED_FORMATS[extension]
+        return fmt.format_name, fmt.mime_type
+
+    detected = mimetypes.guess_type(filename)[0]
+    if detected and detected in {fmt.mime_type for fmt in SUPPORTED_FORMATS.values()}:
+        reverse_lookup = next(
+            (
+                supported
+                for supported in SUPPORTED_FORMATS.values()
+                if supported.mime_type == detected
+            ),
+            None,
+        )
+        if reverse_lookup is not None:
+            return reverse_lookup.format_name, reverse_lookup.mime_type
+
+    if mime_type and mime_type in {fmt.mime_type for fmt in SUPPORTED_FORMATS.values()}:
+        reverse_lookup = next(
+            (
+                supported
+                for supported in SUPPORTED_FORMATS.values()
+                if supported.mime_type == mime_type
+            ),
+            None,
+        )
+        if reverse_lookup is not None:
+            return reverse_lookup.format_name, reverse_lookup.mime_type
+
+    raise ValidationError(f"unsupported file format: {filename}")
+
+
+def _default_storage() -> LocalFilesystemStorage:
+    base = django_settings.APP_DATA_DIR
+    return LocalFilesystemStorage(str(base / "library-artifacts"))
+
+
+def _default_storage_location() -> StorageLocation:
+    location, _ = StorageLocation.objects.get_or_create(
+        identifier="default",
+        defaults={
+            "backend": StorageLocation.BackendType.LOCAL,
+            "base_path": "default",
+        },
+    )
+    return location
+
+
+def _source_transfer_mode(job: ImportJob) -> str:
+    if job.source_location is None:
+        return "move"
+    return cast(str, job.source_location.transfer_mode)
+
+
+def _archive_should_preserve_source(job: ImportJob) -> bool:
+    return _source_transfer_mode(job) == "copy"
+
+
+def _verify_archive(storage: LocalFilesystemStorage, location: str, expected_sha: str) -> bool:
+    if not location:
+        return False
+    if not storage.exists(location):
+        return False
+    try:
+        return storage.hash(location) == expected_sha
+    except FileNotFoundError:
+        return False
+
+
+def discover_source_paths(
+    source_location: SourceLocation,
+) -> Iterable[Path]:
+    """Yield candidate files for a configured source location."""
+    root = Path(source_location.root_path).expanduser().resolve()
+    if not root.exists():
+        raise IntakeError(f"source location does not exist: {root}")
+    if not root.is_dir():
+        raise IntakeError(f"source location is not a directory: {root}")
+    candidates: Iterable[Path]
+    if source_location.recursive:
+        candidates = root.rglob("*")
+    else:
+        candidates = (child for child in root.iterdir())
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        yield candidate
+
+
+def _is_supported_file(path: Path) -> bool:
+    try:
+        detect_format(path.name)
+        return True
+    except ValidationError:
+        return False
+
+
+def _make_system_user() -> Any:
+    model = get_user_model()
+    user, _ = model.objects.get_or_create(username="system-source-ingest")
+    return user
+
+
+def create_source_import_job(
+    path: Path,
+    source_location: SourceLocation,
+    *,
+    uploader: Any | None = None,
+    source_type: str | None = None,
+) -> ImportJob:
+    if not path.is_file():
+        raise IntakeError(f"source path is not a file: {path}")
+    if not _is_supported_file(path):
+        raise IntakeError(f"unsupported file format: {path.name}")
+    safe_name = normalize_filename(path.name)
+    source_type = source_type or source_location.default_source_type
+    if source_type not in dict(ImportJob.SourceType.choices):
+        raise IntakeError(f"invalid source job type: {source_type}")
+    if uploader is None:
+        uploader = _make_system_user()
+
+    return ImportJob.objects.create(
+        source_type=source_type,
+        state=ImportJob.State.DISCOVERED,
+        source_location=source_location,
+        uploader=uploader,
+        source_path=str(path),
+        original_filename=path.name,
+        normalized_filename=safe_name,
+    )
+
+
+def discover_source_jobs_for_location(
+    source_location: SourceLocation,
+    *,
+    uploader: Any | None = None,
+) -> list[ImportJob]:
+    jobs: list[ImportJob] = []
+    for candidate in discover_source_paths(source_location):
+        if not _is_supported_file(candidate):
+            continue
+        normalized = str(candidate.resolve())
+        active_job_exists = ImportJob.objects.filter(
+            source_path=normalized,
+            source_location=source_location,
+            state__in=[
+                ImportJob.State.DISCOVERED,
+                ImportJob.State.HASHING,
+                ImportJob.State.METADATA_EXTRACTION,
+                ImportJob.State.SIGNAL_NORMALIZATION,
+                ImportJob.State.EXTERNAL_IDENTIFICATION,
+                ImportJob.State.MATCHED,
+                ImportJob.State.LOW_CONFIDENCE,
+                ImportJob.State.ARCHIVING,
+            ],
+        ).exists()
+        if active_job_exists:
+            continue
+        try:
+            jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
+        except IntakeError:
+            continue
+    return jobs
+
+
+def preview_source_jobs(
+    source_location: SourceLocation,
+) -> list[dict[str, str]]:
+    return [
+        {
+            "source_location_id": str(source_location.id),
+            "path": str(candidate),
+            "filename": candidate.name,
+            "source_type": source_location.default_source_type,
+        }
+        for candidate in discover_source_paths(source_location)
+        if _is_supported_file(candidate)
+    ]
+
+
+def compute_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    file_path = Path(path)
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_upload_to_staging(uploaded_file: Any, staging_root: Path) -> tuple[str, int]:
+    staging_root.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        delete=False,
+        dir=staging_root,
+        prefix="upload-",
+        suffix=".tmp",
+    ) as upload_temp:
+        total = 0
+        for chunk in uploaded_file.chunks():
+            payload = chunk
+            if not isinstance(payload, bytes):
+                payload = payload.encode()
+            total += len(payload)
+            if total > MAX_UPLOAD_BYTES:
+                upload_temp.close()
+                Path(upload_temp.name).unlink(missing_ok=True)
+                raise ValidationError("upload exceeds configured size limit")
+            upload_temp.write(payload)
+        staged_path = upload_temp.name
+    return staged_path, total
+
+
+def extract_metadata(
+    file_path: str,
+    detected_format: str,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    try:
+        if detected_format == "pdf":
+            return _extract_pdf_metadata(file_path, original_filename=original_filename)
+        if detected_format == "epub":
+            return _extract_epub_metadata(file_path, original_filename=original_filename)
+    except Exception:
+        return {"title": Path(original_filename).stem}
+    return {"title": Path(original_filename).stem}
+
+
+def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    if PdfReader is None:
+        return {"title": Path(original_filename).stem}
+    reader = PdfReader(file_path)
+    metadata = reader.metadata or {}
+    metadata_dict = (
+        {str(key): str(value) for key, value in metadata.items()}
+        if hasattr(metadata, "items")
+        else {}
+    )
+    title = metadata.get("/Title") if hasattr(metadata, "get") else None
+    author = metadata.get("/Author") if hasattr(metadata, "get") else None
+    isbn = metadata.get("/ISBN") if hasattr(metadata, "get") else None
+    return {
+        "title": title or Path(original_filename).stem,
+        "publisher": metadata.get("/Publisher") if hasattr(metadata, "get") else None,
+        "language": metadata.get("/Lang") if hasattr(metadata, "get") else None,
+        "authors": [author] if author else [],
+        "identifier": str(isbn) if isbn else None,
+        "raw_metadata": metadata_dict,
+        "container_type": "pdf",
+    }
+
+
+def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    with ZipFile(file_path, "r") as archive:
+        try:
+            container_doc = archive.read("META-INF/container.xml")
+        except KeyError:
+            return {
+                "title": Path(original_filename).stem,
+                "raw_metadata": {},
+                "container_type": "epub",
+            }
+        root = ET.fromstring(container_doc)
+        rootfile = root.find(
+            ".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+        )
+        opf_path = rootfile.attrib.get("full-path") if rootfile is not None else None
+        if not opf_path:
+            return {
+                "title": Path(original_filename).stem,
+                "raw_metadata": {},
+                "container_type": "epub",
+            }
+        if not isinstance(opf_path, str):
+            return {
+                "title": Path(original_filename).stem,
+                "raw_metadata": {},
+                "container_type": "epub",
+            }
+        if opf_path.startswith("/"):
+            opf_path = opf_path[1:]
+        opf_bytes = archive.read(opf_path)
+        opf_root = ET.fromstring(opf_bytes)
+        # Namespace-safe extraction; these fields are best-effort only.
+        title = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title")
+        author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
+        language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
+        description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        identifier = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}identifier")
+        return {
+            "title": title or Path(original_filename).stem,
+            "authors": [author] if author else [],
+            "language": language,
+            "description": description,
+            "identifier": identifier,
+            "raw_metadata": {
+                "container_xml": container_doc.decode("utf-8", errors="ignore"),
+            },
+            "container_type": "epub",
+        }
+
+
+def _find_text_any(root: ET.Element, expression: str) -> str | None:
+    element = root.find(expression)
+    if element is None:
+        return None
+    return "".join(element.itertext()).strip() or None
+
+
+def _save_metadata_candidates(
+    job: ImportJob,
+    candidates: list[identification.IdentificationCandidate],
+) -> None:
+    # Ensure idempotence if jobs are retried.
+    MetadataCandidate.objects.filter(import_job=job).delete()
+    for candidate in candidates:
+        state = MetadataCandidate.CandidateState.REVIEW
+        if candidate.score >= AUTO_ACCEPT_SCORE:
+            state = MetadataCandidate.CandidateState.MATCH
+        MetadataCandidate.objects.create(
+            import_job=job,
+            provider_id=candidate.provider_id,
+            provider_ref=candidate.provider_ref,
+            title=candidate.title,
+            authors=candidate.authors,
+            isbn10=candidate.isbn10 or "",
+            isbn13=candidate.isbn13 or "",
+            score=Decimal(str(candidate.score)),
+            raw_payload=candidate.raw,
+            language=candidate.language or "",
+            publisher=candidate.publisher or "",
+            description=candidate.description or "",
+            publication_year=candidate.publication_year,
+            state=state,
+        )
+
+
+def _create_review_task(
+    *,
+    job: ImportJob,
+    candidates: list[identification.IdentificationCandidate],
+) -> ReviewTask:
+    existing = ReviewTask.objects.filter(
+        import_job=job,
+        state__in=(ReviewTask.State.OPEN, ReviewTask.State.CLAIMED),
+    ).first()
+    signals = identification.build_identification_input(
+        source_path=job.source_path,
+        original_filename=job.original_filename,
+        extracted_metadata=job.evidence if isinstance(job.evidence, dict) else {},
+    )
+    inferred_title = signals.best_title() or Path(job.original_filename).stem
+    inferred_authors = signals.author_hints
+    provider_snapshot = [
+        {
+            "provider_id": candidate.provider_id,
+            "provider_ref": candidate.provider_ref,
+            "score": float(candidate.score),
+        }
+        for candidate in candidates
+    ]
+    if existing is None:
+        return ReviewTask.objects.create(
+            import_job=job,
+            created_by=job.uploader,
+            uploader=job.uploader,
+            source_filename=job.original_filename,
+            source_path_hint=job.source_path,
+            inferred_title=inferred_title,
+            inferred_authors=inferred_authors,
+            embedded_metadata=job.evidence if isinstance(job.evidence, dict) else {},
+            provider_snapshot=provider_snapshot,
+            state=ReviewTask.State.OPEN,
+            decision_payload={"candidate_count": len(candidates)},
+        )
+    existing.claimed_by = None
+    existing.state = ReviewTask.State.OPEN
+    existing.decision = ReviewTask.Decision.UNRESOLVED
+    existing.decision_payload = {"candidate_count": len(candidates)}
+    existing.inferred_title = inferred_title
+    existing.inferred_authors = inferred_authors
+    existing.embedded_metadata = (
+        job.evidence if isinstance(job.evidence, dict) else {}
+    )
+    existing.provider_snapshot = provider_snapshot
+    existing.selected_candidate = None
+    existing.decision_notes = ""
+    existing.decided_at = None
+    existing.reviewer = None
+    existing.save(
+        update_fields=[
+            "state",
+            "decision",
+            "decision_payload",
+            "inferred_title",
+            "inferred_authors",
+            "embedded_metadata",
+            "provider_snapshot",
+            "selected_candidate_id",
+            "decision_notes",
+            "decided_at",
+            "reviewer_id",
+            "updated_at",
+        ],
+    )
+    return existing
+
+
+def _create_or_reuse_file_variant(
+    job: ImportJob,
+    book: Book,
+    *,
+    storage_identifier: str | None = None,
+    source_type: str = "",
+) -> FileVariant:
+    if not source_type:
+        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+    duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+    if duplicate_variant is not None:
+        return duplicate_variant
+
+    storage = _default_storage()
+    storage_id = storage_identifier or job.storage_identifier
+    if not storage_id:
+        if Path(job.source_path).exists():
+            storage_location = _default_storage_location()
+            storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+            storage.store(job.source_path, storage_id)
+            job.storage_location = storage_location
+            job.storage_identifier = storage_id
+        else:
+            raise ValueError("source artifact is unavailable for variant creation")
+
+    if job.storage_location is None:
+        job.storage_location = _default_storage_location()
+
+    if not job.normalized_filename:
+        job.normalized_filename = normalize_filename(job.original_filename)
+
+    return FileVariant.objects.create(
+        book=book,
+        format=job.detected_format,
+        mime_type=job.mime_type,
+        original_filename=job.original_filename,
+        storage_location=job.storage_location,
+        storage_identifier=storage_id,
+        size_bytes=job.size_bytes,
+        sha256=job.sha256,
+        source_type=source_type,
+        uploader=job.uploader,
+        imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+
+
+def _provision_book_from_manual_metadata(
+    *,
+    title: str,
+    authors: list[str] | None = None,
+    publisher: str | None = None,
+    language: str | None = None,
+    description: str | None = None,
+    edition: str | None = None,
+    publication_year: int | None = None,
+    isbn10: str | None = None,
+    isbn13: str | None = None,
+) -> Book:
+    book = Book.objects.create(
+        title=title,
+        publisher=publisher or "",
+        language=language or "",
+        description=description or "",
+        edition=edition or "",
+    )
+    if publication_year:
+        try:
+            book.publication_date = date(publication_year, 1, 1)
+        except ValueError:
+            pass
+    for raw_author in authors or []:
+        author, _ = Author.objects.get_or_create(full_name=raw_author)
+        book.authors.add(author)
+    if isbn10:
+        Identifier.objects.get_or_create(
+            book=book,
+            kind=Identifier.IdentifierType.ISBN10,
+            value=isbn10,
+            defaults={"normalized_value": isbn10},
+        )
+    if isbn13:
+        Identifier.objects.get_or_create(
+            book=book,
+            kind=Identifier.IdentifierType.ISBN13,
+            value=isbn13,
+            defaults={"normalized_value": isbn13},
+        )
+    book.save()
+    return book
+
+
+def resolve_import_with_review_data(
+    *,
+    job: ImportJob,
+    review_task: ReviewTask,
+    book: Book,
+    source_type: str,
+    selected_candidate: MetadataCandidate | None = None,
+    reviewer: Any | None = None,
+    decision: str = "",
+    decision_notes: str = "",
+    decision_payload: dict[str, Any] | None = None,
+) -> FileVariant:
+    if not source_type:
+        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+    if not decision:
+        decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
+    variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
+    review_task.state = ReviewTask.State.RESOLVED
+    review_task.decision = decision
+    review_task.decision_notes = decision_notes
+    review_task.decided_at = timezone.now()
+    if decision_payload is not None:
+        review_task.decision_payload = decision_payload
+    review_task.resolved_book = book
+    review_task.selected_candidate = selected_candidate
+    review_task.reviewer = reviewer
+    review_task.save(
+        update_fields=[
+            "state",
+            "decision",
+            "decision_notes",
+            "decision_payload",
+            "resolved_book_id",
+            "selected_candidate_id",
+            "reviewer_id",
+            "decided_at",
+            "updated_at",
+        ],
+    )
+    job.book = book
+    job.file_variant = variant
+    job.storage_location = variant.storage_location
+    job.storage_identifier = variant.storage_identifier
+    job.state = ImportJob.State.COMPLETE
+    job.save(
+        update_fields=[
+            "state",
+            "book_id",
+            "file_variant_id",
+            "storage_location_id",
+            "storage_identifier",
+            "updated_at",
+        ],
+    )
+    return variant
+
+
+def _provision_book_from_metadata(
+    *,
+    candidate: identification.IdentificationCandidate | None,
+    fallback_title: str,
+    extra_metadata: dict[str, Any],
+) -> Book:
+    if candidate is not None:
+        if candidate.isbn13:
+            identifier = Identifier.objects.filter(
+                value=candidate.isbn13,
+            ).select_related("book").first()
+            if identifier is not None:
+                return identifier.book
+        if candidate.isbn10:
+            identifier = Identifier.objects.filter(
+                value=candidate.isbn10,
+            ).select_related("book").first()
+            if identifier is not None:
+                return identifier.book
+
+        candidate_author_set = {name.lower() for name in candidate.authors}
+        for book in Book.objects.filter(title__iexact=candidate.title):
+            known_authors = [a.full_name.lower() for a in book.authors.all()]
+            if candidate_author_set and candidate_author_set.intersection(known_authors):
+                return book
+
+        book = Book.objects.create(title=candidate.title)
+        for author_name in candidate.authors:
+            author, _ = Author.objects.get_or_create(full_name=author_name)
+            book.authors.add(author)
+        if candidate.isbn10:
+            Identifier.objects.get_or_create(
+                book=book,
+                kind=Identifier.IdentifierType.ISBN10,
+                value=candidate.isbn10,
+                defaults={"normalized_value": candidate.isbn10},
+            )
+        if candidate.isbn13:
+            Identifier.objects.get_or_create(
+                book=book,
+                kind=Identifier.IdentifierType.ISBN13,
+                value=candidate.isbn13,
+                defaults={"normalized_value": candidate.isbn13},
+            )
+        if candidate.publisher:
+            book.publisher = candidate.publisher
+        if candidate.language:
+            book.language = candidate.language
+        if candidate.description:
+            book.description = candidate.description
+        if candidate.publication_year:
+            try:
+                book.publication_date = date(candidate.publication_year, 1, 1)
+            except ValueError:
+                pass
+        book.edition = candidate.edition or book.edition
+        book.save()
+        return book
+
+    # Fallback provisional metadata
+    fallback_title = fallback_title or extra_metadata.get("title") or "Unknown title"
+    return Book.objects.create(title=fallback_title)
+
+
+def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
+    storage_location = _default_storage_location()
+    destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    if _archive_should_preserve_source(job):
+        storage.copy(job.source_path, destination)
+    else:
+        storage.store(job.source_path, destination)
+    job.storage_location = storage_location
+    job.storage_identifier = destination
+    verified = _verify_archive(storage, destination, job.sha256)
+    return destination, verified
+
+
+def _finalize_source_cleanup(job: ImportJob, verified: bool) -> None:
+    if not verified:
+        return
+    if _archive_should_preserve_source(job):
+        return
+    Path(job.source_path).unlink(missing_ok=True)
+
+
+def process_import_job(job_id: str) -> None:
+    """Process one intake job from staging file to durable archive and optional matching."""
+    job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
+    if job.state in {ImportJob.State.COMPLETE, ImportJob.State.FAILED}:
+        return
+
+    source_path = Path(job.source_path)
+    if not source_path.exists():
+        job.last_error = "source file missing"
+        job.state = ImportJob.State.FAILED
+        job.save(update_fields=["state", "last_error", "updated_at"])
+        return
+
+    try:
+        job.state = ImportJob.State.HASHING
+        job.save(update_fields=["state", "updated_at"])
+
+        job.sha256 = compute_sha256(job.source_path)
+        job.size_bytes = source_path.stat().st_size
+        detected_format, mime_type = detect_format(job.original_filename, job.mime_type or None)
+        job.detected_format = detected_format
+        job.mime_type = mime_type
+        if not job.normalized_filename:
+            job.normalized_filename = normalize_filename(job.original_filename)
+        job.state = ImportJob.State.METADATA_EXTRACTION
+        job.save(
+            update_fields=[
+                "state",
+                "sha256",
+                "size_bytes",
+                "detected_format",
+                "mime_type",
+                "updated_at",
+            ],
+        )
+
+        duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+        if duplicate_variant is not None:
+            job.book = duplicate_variant.book
+            job.file_variant = duplicate_variant
+            job.storage_identifier = duplicate_variant.storage_identifier
+            job.storage_location = duplicate_variant.storage_location
+            job.state = ImportJob.State.COMPLETE
+            job.save(
+                update_fields=[
+                    "state",
+                    "book_id",
+                    "file_variant_id",
+                    "storage_identifier",
+                    "storage_location_id",
+                    "updated_at",
+                ],
+            )
+            _finalize_source_cleanup(
+                job,
+                _verify_archive(
+                    _default_storage(),
+                    duplicate_variant.storage_identifier,
+                    job.sha256,
+                ),
+            )
+            return
+
+        job.state = ImportJob.State.SIGNAL_NORMALIZATION
+        metadata = extract_metadata(
+            job.source_path,
+            detected_format,
+            original_filename=job.original_filename,
+        )
+        job.evidence = metadata
+        job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
+        job.save(
+            update_fields=[
+                "evidence",
+                "state",
+                "updated_at",
+            ],
+        )
+
+        signals = identification.build_identification_input(
+            source_path=job.source_path,
+            original_filename=job.original_filename,
+            extracted_metadata=metadata,
+        )
+        candidates = identification.resolve_candidates(signals)
+        _save_metadata_candidates(job, candidates)
+
+        top_candidate = candidates[0] if candidates else None
+        if top_candidate is None or top_candidate.score < REVIEW_SCORE:
+            _create_review_task(job=job, candidates=candidates)
+            job.state = ImportJob.State.LOW_CONFIDENCE
+            job.state = ImportJob.State.ARCHIVING
+            job.save(update_fields=["state", "updated_at"])
+            destination, verified = _archive_source(_default_storage(), job)
+            job.storage_identifier = destination
+            job.storage_location = _default_storage_location()
+            job.save(
+                update_fields=[
+                    "storage_identifier",
+                    "storage_location_id",
+                    "state",
+                    "updated_at",
+                ],
+            )
+            _finalize_source_cleanup(job, verified)
+            if not verified:
+                raise RuntimeError("archive verification failed")
+            job.state = ImportJob.State.LOW_CONFIDENCE
+            job.save(
+                update_fields=[
+                    "state",
+                    "storage_identifier",
+                    "storage_location_id",
+                    "updated_at",
+                ],
+            )
+            return
+
+        storage = _default_storage()
+        storage_location = _default_storage_location()
+        job.state = ImportJob.State.ARCHIVING
+        job.save(update_fields=["state", "updated_at"])
+        destination, verified = _archive_source(storage, job)
+        _finalize_source_cleanup(job, verified)
+        if not verified:
+            raise RuntimeError("archive verification failed")
+
+        book = _provision_book_from_metadata(
+            candidate=top_candidate,
+            fallback_title=top_candidate.title,
+            extra_metadata=metadata,
+        )
+        job.state = ImportJob.State.MATCHED
+        job.storage_identifier = destination
+        job.storage_location = storage_location
+        job.normalized_filename = normalize_filename(
+            f"{book.title}{Path(job.normalized_filename).suffix}",
+        )
+        variant = FileVariant.objects.create(
+            book=book,
+            format=detected_format,
+            mime_type=mime_type,
+            original_filename=job.original_filename,
+            storage_location=storage_location,
+            storage_identifier=destination,
+            size_bytes=job.size_bytes,
+            sha256=job.sha256,
+            source_type=FileVariant.SourceType.UPLOAD,
+            uploader=job.uploader,
+            imported_at=timezone.now(),
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+        )
+
+        job.book = book
+        job.file_variant = variant
+        job.storage_location = storage_location
+        job.storage_identifier = destination
+        job.state = ImportJob.State.COMPLETE
+        job.save(
+            update_fields=[
+                "state",
+                "book_id",
+                "file_variant_id",
+                "storage_location_id",
+                "storage_identifier",
+                "normalized_filename",
+                "updated_at",
+            ],
+        )
+    except Exception as exc:  # pragma: no cover - failure path depends on input surface
+        job.last_error = str(exc)
+        job.state = ImportJob.State.FAILED
+        job.attempt_count += 1
+        job.next_retry_at = datetime.now(tz=UTC)
+        job.save(
+            update_fields=[
+                "state",
+                "last_error",
+                "attempt_count",
+                "next_retry_at",
+                "updated_at",
+            ],
+        )
+        raise
