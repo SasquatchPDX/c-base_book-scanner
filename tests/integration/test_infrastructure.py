@@ -220,8 +220,44 @@ def test_redis_queue_is_consumed_by_real_rq_worker() -> None:
         redis_connection.close()
 
 
+@pytest.mark.parametrize(
+    ("source_format", "mime_type", "source_payload", "expected_fragments"),
+    [
+        (
+            "txt",
+            "text/plain",
+            b"Pinned Pandoc TXT Acceptance Book\n\n"
+            b"This text becomes a real EPUB through Redis and an RQ worker.\n",
+            [
+                "Pinned Pandoc TXT Acceptance Book",
+                "This text becomes a real EPUB through Redis and an RQ worker.",
+            ],
+        ),
+        (
+            "html",
+            "text/html",
+            b"<!doctype html><html><head><title>Pinned Pandoc HTML Acceptance Book</title>"
+            b"</head><body><main><h1>Structured Research Notes</h1>"
+            b"<p>Semantic <em>emphasis</em> survives the worker conversion.</p>"
+            b"<ol><li>Primary source</li><li>Corroborating source</li></ol>"
+            b"</main></body></html>",
+            [
+                "Structured Research Notes",
+                "Semantic emphasis survives the worker conversion.",
+                "Primary source",
+                "Corroborating source",
+            ],
+        ),
+    ],
+    ids=["txt-to-epub", "structured-html-to-epub"],
+)
 @pytest.mark.django_db(transaction=True)
-def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
+def test_member_conversion_runs_through_redis_rq_and_real_pandoc(
+    source_format: str,
+    mime_type: str,
+    source_payload: bytes,
+    expected_fragments: list[str],
+) -> None:
     pandoc_binary = shutil.which("pandoc")
     assert pandoc_binary is not None
 
@@ -234,24 +270,20 @@ def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
         base_path="default",
     )
     profile = get_or_create_profile("pandoc-member")
-    book = Book.objects.create(title="Pinned Pandoc Acceptance Book")
-    source_payload = (
-        b"Pinned Pandoc Acceptance Book\n\n"
-        b"This text becomes a real EPUB through Redis and an RQ worker.\n"
-    )
-    source_staging_path = storage.resolve_location("integration/source.txt")
+    book = Book.objects.create(title=f"Pinned Pandoc {source_format.upper()} Acceptance Book")
+    source_staging_path = storage.resolve_location(f"integration/source.{source_format}")
     source_staging_path.parent.mkdir(parents=True, exist_ok=True)
     source_staging_path.write_bytes(source_payload)
     source_identifier = storage.generate_destination(
         f"books/{book.id}/incoming",
-        "source.txt",
+        f"source.{source_format}",
     )
     storage.store(str(source_staging_path), source_identifier)
     source_variant = FileVariant.objects.create(
         book=book,
-        format="txt",
-        mime_type="text/plain",
-        original_filename="source.txt",
+        format=source_format,
+        mime_type=mime_type,
+        original_filename=f"source.{source_format}",
         storage_location=location,
         storage_identifier=source_identifier,
         size_bytes=len(source_payload),
@@ -300,10 +332,19 @@ def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
         assert output_variant.converter_version == "pandoc 3.9.0.2"
         assert output_variant.job_id == job.job_id
         assert storage.hash(source_identifier) == source_variant.sha256
-        intake.validate_container_signature(
-            str(storage.resolve_location(output_variant.storage_identifier)),
-            "epub",
-        )
+        output_path = storage.resolve_location(output_variant.storage_identifier)
+        intake.validate_container_signature(str(output_path), "epub")
+        assert hashlib.sha256(output_path.read_bytes()).hexdigest() == output_variant.sha256
+        visible_text = _epub_visible_text(output_path)
+        for expected_fragment in expected_fragments:
+            assert expected_fragment in visible_text
+        if source_format == "html":
+            metadata = intake.extract_metadata(
+                str(output_path),
+                "epub",
+                original_filename=output_variant.original_filename,
+            )
+            assert metadata["title"] == book.title
 
         downloaded = client.get(
             f"/library/books/{book.id}/download/?variant_id={output_variant.id}",
@@ -312,9 +353,7 @@ def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
         downloaded_stream = cast(StreamingHttpResponse, downloaded)
         assert (
             b"".join(cast(Iterable[bytes], downloaded_stream.streaming_content))
-            == storage.resolve_location(
-                output_variant.storage_identifier,
-            ).read_bytes()
+            == output_path.read_bytes()
         )
     finally:
         redis_connection.flushdb()

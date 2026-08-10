@@ -71,8 +71,9 @@ existing web session on its next request.
 Developers and CI can run `./scripts/run_infrastructure_tests.sh` to provision
 ephemeral, digest-pinned PostgreSQL, Redis, and seeded OpenLDAP containers. The
 runner applies migrations to PostgreSQL, performs a real LDAP service search and
-member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
-conversion using checksum-verified Pandoc 3.9.0.2, performs EPUB-to-PDF and
+member bind, starts RQ workers that consume Redis jobs, performs real TXT-to-EPUB
+and structured HTML-to-EPUB conversions using checksum-verified Pandoc 3.9.0.2,
+performs EPUB-to-PDF and
 EPUB-to-MOBI conversions using checksum-verified Calibre 9.11.0, validates the
 stored formats and authenticated download, round-trips representative PDF and
 MOBI sources to EPUB with metadata/text quality checks, and verifies authenticated

@@ -99,6 +99,10 @@ sprint or production deployment is complete.
   workers. The resulting EPUBs pass signature/hash checks, retain source/tool/job
   lineage, preserve canonical title metadata, and contain the expected readable
   prose when inspected with Beautiful Soup.
+- The real Pandoc worker fixture now covers both TXT and structured HTML inputs.
+  HTML headings, emphasized prose, ordered-list evidence, EPUB metadata,
+  signature, hash, provenance, and authenticated download are verified across
+  HTTP and Redis/RQ rather than only by unit tests.
 
 ## Remaining gaps by requirement area
 
@@ -109,9 +113,9 @@ sprint or production deployment is complete.
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
 - Integration/E2E depth: recognition-quality validation against the hackerspace
-  AI server and a structured HTML-to-EPUB quality fixture still need dedicated
-  acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB,
-  Calibre EPUB-to-PDF/MOBI and reverse PDF/MOBI-to-EPUB quality, authenticated
+  AI server still needs a site-connected acceptance environment. PostgreSQL,
+  LDAP, Redis/RQ, Pandoc TXT/HTML-to-EPUB, Calibre EPUB-to-PDF/MOBI and reverse
+  PDF/MOBI-to-EPUB quality, authenticated
   converted-file download, Nginx/Uvicorn SSE, concurrent browser editors, the
   browser-driven synthetic physical-book/OCR contract flow, and live dependency
   readiness now have infrastructure-backed CI coverage.
