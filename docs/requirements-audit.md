@@ -82,6 +82,11 @@ sprint or production deployment is complete.
   and proves a stale stage edit receives HTTP 409, visibly reloads the winning
   revision, and cannot silently overwrite it. This path also caught and closed a
   PostgreSQL-only missing-transaction defect in stage-state creation.
+- The infrastructure suite now installs a SHA-512-verified official Calibre
+  9.11.0 release and proves member-requested EPUB-to-PDF and EPUB-to-MOBI routes
+  across Redis and a separately bootstrapped RQ worker. It validates output
+  signatures and hashes, checks source/tool/version/job provenance, and downloads
+  the MOBI through the authenticated library endpoint.
 
 ## Remaining gaps by requirement area
 
@@ -91,11 +96,12 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: Calibre-backed PDF/MOBI routes and a browser-driven full
-  physical-book flow still need dedicated acceptance environments. PostgreSQL,
-  LDAP, Redis/RQ, Pandoc TXT-to-EPUB, authenticated converted-file download,
-  Nginx/Uvicorn SSE, concurrent browser editors, and live dependency readiness
-  now have infrastructure-backed CI coverage.
+- Integration/E2E depth: reverse Calibre PDF/MOBI-to-EPUB quality fixtures and a
+  browser-driven full physical-book flow still need dedicated acceptance
+  environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, Calibre
+  EPUB-to-PDF/MOBI, authenticated converted-file download, Nginx/Uvicorn SSE,
+  concurrent browser editors, and live dependency readiness now have
+  infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

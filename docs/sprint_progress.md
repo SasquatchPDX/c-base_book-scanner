@@ -56,14 +56,15 @@ This file tracks execution status while advancing Sprint documents in order.
 
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
-- Current remaining work is production-like coverage for Calibre routes,
+- Current remaining work is quality-fixture coverage for reverse Calibre routes,
   importing and exercising the supplied monitoring assets, and browser-driven
   full physical-book acceptance. PostgreSQL, seeded OpenLDAP, Redis/RQ, Nginx,
   Uvicorn, Playwright Chromium, and live readiness checks now run in CI.
 - Sprint009 now additionally has a pinned real-Pandoc acceptance path spanning a
   member HTTP request, Redis, a Django-aware RQ worker process, provenance-linked
-  EPUB storage, validation, and authenticated download. Calibre PDF/MOBI routes
-  remain runtime-implemented but binary-unverified.
+  EPUB storage, validation, and authenticated download. Pinned Calibre 9.11.0
+  similarly verifies EPUB-to-PDF and EPUB-to-MOBI; reverse routes remain
+  binary-advertised but need representative quality fixtures.
 - Sprint013 now has a pinned Nginx/Uvicorn/PostgreSQL acceptance path for
   authenticated, unbuffered SSE state updates and clean client disconnects. A
   two-member Playwright scenario additionally proves that stale revisions cannot

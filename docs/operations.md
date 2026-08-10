@@ -72,9 +72,11 @@ Developers and CI can run `./scripts/run_infrastructure_tests.sh` to provision
 ephemeral, digest-pinned PostgreSQL, Redis, and seeded OpenLDAP containers. The
 runner applies migrations to PostgreSQL, performs a real LDAP service search and
 member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
-conversion using checksum-verified Pandoc 3.9.0.2, checks the authenticated
-download, and verifies authenticated live SSE updates through pinned Nginx and a
-separate Uvicorn ASGI process. A Playwright Chromium scenario signs in two LDAP
+conversion using checksum-verified Pandoc 3.9.0.2, performs EPUB-to-PDF and
+EPUB-to-MOBI conversions using checksum-verified Calibre 9.11.0, validates the
+stored formats and authenticated download, and verifies authenticated live SSE
+updates through pinned Nginx and a separate Uvicorn ASGI process. A Playwright
+Chromium scenario signs in two LDAP
 members, creates a scan workspace, uploads a synthetic page, loads the compiled
 editor through Nginx, and proves that optimistic concurrency reloads the winning
 revision after a stale edit receives HTTP 409. Install Chromium with

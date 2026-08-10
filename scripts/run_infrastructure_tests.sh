@@ -5,6 +5,7 @@ book_scanner_project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 book_scanner_compose_file="${book_scanner_project_root}/compose.integration.yml"
 book_scanner_storage_root="$(mktemp -d -t book-scanner-integration.XXXXXX)"
 book_scanner_pandoc_root="$(mktemp -d -t book-scanner-pandoc.XXXXXX)"
+book_scanner_calibre_root="$(mktemp -d -t book-scanner-calibre.XXXXXX)"
 book_scanner_postgres_port="${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-55432}"
 book_scanner_redis_port="${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-56379}"
 book_scanner_ldap_port="${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-55389}"
@@ -37,6 +38,9 @@ book_scanner_cleanup() {
   case "${book_scanner_pandoc_root}" in
     /tmp/book-scanner-pandoc.*) rm -rf -- "${book_scanner_pandoc_root}" ;;
   esac
+  case "${book_scanner_calibre_root}" in
+    /tmp/book-scanner-calibre.*) rm -rf -- "${book_scanner_calibre_root}" ;;
+  esac
   case "${book_scanner_uvicorn_log}" in
     /tmp/book-scanner-uvicorn.*.log) rm -f -- "${book_scanner_uvicorn_log}" ;;
   esac
@@ -66,6 +70,10 @@ cd "${book_scanner_project_root}"
 if ! command -v pandoc >/dev/null 2>&1; then
   "${book_scanner_project_root}/scripts/install_test_pandoc.sh" "${book_scanner_pandoc_root}"
   export PATH="${book_scanner_pandoc_root}/bin:${PATH}"
+fi
+if ! command -v ebook-convert >/dev/null 2>&1; then
+  "${book_scanner_project_root}/scripts/install_test_calibre.sh" "${book_scanner_calibre_root}"
+  export PATH="${book_scanner_calibre_root}/calibre:${PATH}"
 fi
 uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120

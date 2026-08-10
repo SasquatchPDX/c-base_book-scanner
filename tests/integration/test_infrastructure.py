@@ -307,6 +307,125 @@ def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_member_calibre_conversions_produce_valid_pdf_and_mobi() -> None:
+    pandoc_binary = shutil.which("pandoc")
+    calibre_binary = shutil.which("ebook-convert")
+    assert pandoc_binary is not None
+    assert calibre_binary is not None
+
+    storage_root = Path(os.environ["BOOK_SCANNER_STORAGE_ROOT"])
+    django_settings.APP_DATA_DIR = storage_root
+    storage = LocalFilesystemStorage(str(storage_root / "library-artifacts"))
+    location = StorageLocation.objects.create(
+        identifier="default",
+        backend=StorageLocation.BackendType.LOCAL,
+        base_path="default",
+    )
+    profile = get_or_create_profile("calibre-member")
+    book = Book.objects.create(title="Pinned Calibre Acceptance Book")
+    source_text = storage_root / "calibre-source.txt"
+    source_epub = storage_root / "calibre-source.epub"
+    source_text.write_text(
+        "# Pinned Calibre Acceptance Book\n\n"
+        "This EPUB becomes both a PDF and a MOBI through real Calibre workers.\n",
+        encoding="utf-8",
+    )
+    generated = subprocess.run(
+        [
+            pandoc_binary,
+            str(source_text),
+            "--metadata",
+            f"title={book.title}",
+            "-o",
+            str(source_epub),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert generated.returncode == 0, generated.stdout + generated.stderr
+    source_payload = source_epub.read_bytes()
+    source_identifier = storage.generate_destination(
+        f"books/{book.id}/incoming",
+        "source.epub",
+    )
+    storage.store(str(source_epub), source_identifier)
+    source_variant = FileVariant.objects.create(
+        book=book,
+        format="epub",
+        mime_type="application/epub+zip",
+        original_filename="source.epub",
+        storage_location=location,
+        storage_identifier=source_identifier,
+        size_bytes=len(source_payload),
+        sha256=hashlib.sha256(source_payload).hexdigest(),
+        source_type=FileVariant.SourceType.UPLOAD,
+        uploader=profile.user,
+        imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+
+    redis_connection = Redis.from_url(os.environ["BOOK_SCANNER_REDIS_URL"])
+    redis_connection.flushdb()
+    try:
+        client = Client()
+        client.force_login(profile.user)
+        outputs: dict[str, FileVariant] = {}
+        for target_format in ("pdf", "mobi"):
+            requested = client.post(
+                f"/library/books/{book.id}/convert/",
+                data=json.dumps(
+                    {
+                        "source_variant_id": source_variant.id,
+                        "target_format": target_format,
+                    },
+                ),
+                content_type="application/json",
+            )
+            assert requested.status_code == 202
+            job = ProcessingJob.objects.get(job_id=requested.json()["job_id"])
+            assert job.state == ProcessingJob.JobState.QUEUED
+
+            queue = get_queue()
+            assert isinstance(queue, ConfiguredQueue)
+            _run_rq_worker(
+                queue.queue.name,
+                environment=_worker_environment_for_test_database(),
+            )
+
+            job.refresh_from_db()
+            assert job.state == ProcessingJob.JobState.SUCCESS, job.details
+            output_variant = FileVariant.objects.get(pk=job.details["output_variant_id"])
+            outputs[target_format] = output_variant
+            assert output_variant.book_id == book.id
+            assert output_variant.source_variant_id == source_variant.id
+            assert output_variant.source_type == FileVariant.SourceType.CONVERTED
+            assert output_variant.format == target_format
+            assert output_variant.converter_tool == "calibre"
+            assert output_variant.converter_version == "ebook-convert (calibre 9.11.0)"
+            assert output_variant.job_id == job.job_id
+            output_path = storage.resolve_location(output_variant.storage_identifier)
+            intake.validate_container_signature(str(output_path), target_format)
+            assert hashlib.sha256(output_path.read_bytes()).hexdigest() == output_variant.sha256
+
+        downloaded = client.get(
+            f"/library/books/{book.id}/download/?variant_id={outputs['mobi'].id}",
+        )
+        assert downloaded.status_code == 200
+        downloaded_stream = cast(StreamingHttpResponse, downloaded)
+        assert (
+            b"".join(cast(Iterable[bytes], downloaded_stream.streaming_content))
+            == storage.resolve_location(
+                outputs["mobi"].storage_identifier,
+            ).read_bytes()
+        )
+    finally:
+        redis_connection.flushdb()
+        redis_connection.close()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_readiness_uses_live_postgresql_redis_and_storage(tmp_path: Path) -> None:
     with override_settings(APP_DATA_DIR=tmp_path):
         response = Client().get("/healthz/dependencies/")

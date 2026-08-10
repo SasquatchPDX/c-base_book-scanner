@@ -6,9 +6,9 @@ is present on the worker.
 
 | Source | Target | Preferred tool path | Fallback | Quality expectation | Lossy? | OCR required | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| EPUB | MOBI | Calibre `ebook-convert` | `calibre` older path | good for common text EPUBs | yes | no | implemented; Calibre binary acceptance pending |
+| EPUB | MOBI | Calibre `ebook-convert` | `calibre` older path | good for common text EPUBs | yes | no | implemented; Calibre 9.11.0 binary-verified in CI |
 | MOBI | EPUB | Calibre `ebook-convert` | none | good | yes | no | implemented; Calibre binary acceptance pending |
-| EPUB | PDF | Calibre | `ebook-convert` + layout options | good for readable output, variable layout | yes | no | implemented; Calibre binary acceptance pending |
+| EPUB | PDF | Calibre | `ebook-convert` + layout options | good for readable output, variable layout | yes | no | implemented; Calibre 9.11.0 binary-verified in CI |
 | PDF | EPUB | Calibre | `ebook-convert` + OCR-prep if scanned PDF | mixed (scanned PDFs degrade) | yes | optional if scanned | implemented; Calibre binary acceptance pending |
 | HTML | EPUB | Pandoc | Calibre | good for structured HTML | yes | no | implemented; HTML fixture acceptance pending |
 | TXT | EPUB | Pandoc | Calibre | fair (formatting limited) | yes | no | implemented; Pandoc 3.9.0.2 binary-verified in CI |
@@ -22,5 +22,6 @@ is present on the worker.
 
 - Pandoc 3.9.0.2 test archives are fetched from the upstream release and verified
   against the publisher's SHA-256 before execution on amd64 or arm64.
-- Calibre remains optional and runtime-detected; its higher-risk PDF/MOBI routes
-  are not yet supported by a pinned binary acceptance environment.
+- Calibre remains optional and runtime-detected. CI verifies EPUB-to-PDF and
+  EPUB-to-MOBI against pinned Calibre 9.11.0; reverse PDF/MOBI routes still need
+  representative quality fixtures before being treated as deployment-proven.
