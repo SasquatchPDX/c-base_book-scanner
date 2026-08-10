@@ -1,22 +1,26 @@
 # Sprint001 Conversion Research (Initial Matrix)
 
-The matrix below is intentionally explicit about confidence and implementation status. Items marked “not implemented” are planned tasks.
+The matrix below distinguishes runtime implementation from binary-backed
+acceptance evidence. Converter routes are advertised only when their executable
+is present on the worker.
 
 | Source | Target | Preferred tool path | Fallback | Quality expectation | Lossy? | OCR required | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| EPUB | MOBI | Calibre `ebook-convert` | `calibre` older path | good for common text EPUBs | yes | no | research-only |
-| MOBI | EPUB | Calibre `ebook-convert` | none | good | yes | no | research-only |
-| EPUB | PDF | Calibre / Pandoc | `ebook-convert` + layout options | good for readable output, variable layout | yes | no | research-only |
-| PDF | EPUB | Calibre | `ebook-convert` + OCR-prep if scanned PDF | mixed (scanned PDFs degrade) | yes | optional if scanned | research-only |
-| HTML | EPUB | Calibre / Pandoc | BeautifulSoup + ebooklib pipeline | good for structured HTML | yes | no | research-only |
-| TXT | EPUB | Calibre / Pandoc | ebooklib wrapper | fair (formatting limited) | yes | no | research-only |
-| FB2 | EPUB | Calibre / ebook-convert | ebooklib custom extraction | good | yes | no | research-only |
-| DjVu -> EPUB/PDF | DjVuLibre text extraction then conversion | Calibre if supported in deployment | manual fallback | uncertain | yes | maybe | research-only |
-| CBZ/CBR extraction | Unarchive via libarchive/7zip | python-libarchive-c / zipfile/rarfile | n/a | good if source clean | no | no | research-only |
-| scanned images -> PDF | img2pdf | Ghostscript + pdftk alternatives | pillow/pdfkit | good for archival | yes | no | research-only |
-| OCR text -> EPUB/PDF | post-process pipeline into ebooklib/Calibre | custom assembly scripts | good | yes | no | research-only |
+| EPUB | MOBI | Calibre `ebook-convert` | `calibre` older path | good for common text EPUBs | yes | no | implemented; Calibre binary acceptance pending |
+| MOBI | EPUB | Calibre `ebook-convert` | none | good | yes | no | implemented; Calibre binary acceptance pending |
+| EPUB | PDF | Calibre | `ebook-convert` + layout options | good for readable output, variable layout | yes | no | implemented; Calibre binary acceptance pending |
+| PDF | EPUB | Calibre | `ebook-convert` + OCR-prep if scanned PDF | mixed (scanned PDFs degrade) | yes | optional if scanned | implemented; Calibre binary acceptance pending |
+| HTML | EPUB | Pandoc | Calibre | good for structured HTML | yes | no | implemented; HTML fixture acceptance pending |
+| TXT | EPUB | Pandoc | Calibre | fair (formatting limited) | yes | no | implemented; Pandoc 3.9.0.2 binary-verified in CI |
+| FB2 | EPUB | Calibre `ebook-convert` | none | good | yes | no | researched; not advertised |
+| DjVu -> EPUB/PDF | DjVuLibre text extraction then conversion | Calibre if supported in deployment | manual fallback | uncertain | yes | maybe | researched; not advertised |
+| CBZ/CBR extraction | Standard ZIP / RarFile and configured archive tool | libarchive/7zip | n/a | good if source clean | no | no | bounded intake implemented; conversion not advertised |
+| scanned images -> PDF | img2pdf | Ghostscript alternatives | Pillow | good for archival | yes | no | scan packaging implemented and library-backed |
+| OCR text -> EPUB | OCR text then Pandoc | Calibre | good | yes | no | orchestration implemented; full real-service flow pending |
 
 ## Notes
 
-- This matrix is a starting point and will be updated in Sprint009 when actual tool availability is validated in the target environment.
-- The implementation should treat converter availability as runtime-detected and expose unavailable conversions as disabled in UI.
+- Pandoc 3.9.0.2 test archives are fetched from the upstream release and verified
+  against the publisher's SHA-256 before execution on amd64 or arm64.
+- Calibre remains optional and runtime-detected; its higher-risk PDF/MOBI routes
+  are not yet supported by a pinned binary acceptance environment.

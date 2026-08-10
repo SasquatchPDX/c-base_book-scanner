@@ -67,8 +67,9 @@ existing web session on its next request.
 Developers and CI can run `./scripts/run_infrastructure_tests.sh` to provision
 ephemeral, digest-pinned PostgreSQL, Redis, and seeded OpenLDAP containers. The
 runner applies migrations to PostgreSQL, performs a real LDAP service search and
-member bind, starts an RQ worker that consumes a Redis job, checks live readiness,
-and removes the containers on exit.
+member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
+conversion using checksum-verified Pandoc 3.9.0.2, checks the authenticated
+download, and removes the containers on exit.
 
 The suite reserves host ports 55432, 56379, and 55389 by default. Override them
 with `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
@@ -107,6 +108,15 @@ Start RQ workers with the queue name configured by
 when their executable is installed. Install Calibre and/or Pandoc in the worker
 image, run converters without elevated privileges, and apply host/container CPU,
 memory, process, and filesystem limits in addition to the application job timeout.
+Workers must load Django before importing queued application functions:
+
+```bash
+uv run rq worker --config ebook_server.rq_settings \
+  --url redis://localhost:6379/0 ebook-server
+```
+
+Do not grant a worker access to the Docker socket merely to obtain a converter.
+Bake reviewed converter binaries into its restricted image instead.
 
 Configure the OCR service URL and network policy so only workers can submit jobs.
 OCR responses are treated as untrusted artifacts and retain engine/model/language

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,7 @@ def test_conversion_direct_route_creates_output_variant(
     assert output_variant.source_variant_id == variant.id
     assert output_variant.converter_tool == "stub"
     assert output_variant.converter_version == "calibre-v2"
+    assert output_variant.job_id == job.job_id
     assert output_variant.converter_options["request_options"]["quality"] == "high"
 
     status_response = client.get(f"/conversions/{str(job.job_id)}/")
@@ -437,3 +439,45 @@ def test_conversion_reuses_duplicate_output(
         ).count()
         == 1
     )
+
+
+def test_unknown_converter_capability_is_not_advertised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        conversion,
+        "CAPABILITIES",
+        (ConversionCapability("txt", "epub", "missing-converter"),),
+    )
+    monkeypatch.setattr(conversion, "CONVERTER_REGISTRY", {})
+
+    assert conversion.find_conversion_plan("txt", "epub") is None
+    assert conversion.list_conversion_targets("txt") == {}
+
+
+def test_persisted_conversion_route_must_be_connected_and_supported() -> None:
+    with pytest.raises(conversion.ConversionError, match="disconnected"):
+        conversion._validate_route(
+            source_format="txt",
+            target_format="epub",
+            route=(conversion.ConversionStep("html", "epub", "pandoc"),),
+        )
+
+    with pytest.raises(conversion.ConversionError, match="unsupported step"):
+        conversion._validate_route(
+            source_format="txt",
+            target_format="epub",
+            route=(conversion.ConversionStep("txt", "epub", "unregistered"),),
+        )
+
+
+def test_converter_version_uses_bounded_first_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = subprocess.CompletedProcess(
+        args=["pandoc", "--version"],
+        returncode=0,
+        stdout="pandoc 3.9.0.2\nFeatures: +server +lua\n" + ("x" * 200),
+        stderr="",
+    )
+    monkeypatch.setattr(conversion, "_run_conversion_command", lambda *args, **kwargs: output)
+
+    assert conversion.PandocConverter().version() == "pandoc 3.9.0.2"

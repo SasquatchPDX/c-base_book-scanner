@@ -13,7 +13,7 @@ Requirements:
 - Python 3.13
 - Node.js 22.12 or newer (for ScanTailor-Web frontend changes)
 - [uv](https://docs.astral.sh/uv/)
-- Docker with the Compose plugin (for infrastructure integration tests)
+- Docker with the Compose plugin and `curl` (for infrastructure integration tests)
 - PostgreSQL and Redis for a production-like environment
 - optional conversion binaries such as Calibre (`ebook-convert`) and Pandoc
 
@@ -45,15 +45,17 @@ and seeded OpenLDAP containers:
 ```
 
 The runner applies all migrations to PostgreSQL, exercises a live LDAP
-search-and-bind, starts a real RQ worker against Redis, checks dependency
-readiness, and removes its containers on exit. Its known credentials and
-high-numbered ports are isolated test fixtures, not deployment defaults.
+search-and-bind, starts real RQ workers against Redis, converts a member-requested
+TXT file to a downloadable EPUB with a checksum-verified official Pandoc release,
+checks dependency readiness, and removes its containers on exit. Its known
+credentials and high-numbered ports are isolated test fixtures, not deployment
+defaults.
 
 Run the web process and an RQ worker:
 
 ```bash
 uv run python manage.py runserver
-uv run rq worker ebook-server --url redis://localhost:6379/0
+uv run rq worker --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
 ```
 
 The worker applies a 30-minute default job timeout, bounded result retention,

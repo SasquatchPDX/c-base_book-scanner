@@ -79,8 +79,7 @@ class CalibreConverter(Converter):
             check=True,
             capture_output=True,
         )
-        text = output.stdout.strip() if isinstance(output.stdout, str) else ""
-        return text or "calibre-unknown"
+        return _version_summary(output.stdout, fallback="calibre-unknown")
 
     def convert(
         self,
@@ -108,8 +107,7 @@ class PandocConverter(Converter):
             check=True,
             capture_output=True,
         )
-        text = output.stdout.strip() if isinstance(output.stdout, str) else ""
-        return text or "pandoc-unknown"
+        return _version_summary(output.stdout, fallback="pandoc-unknown")
 
     def convert(
         self,
@@ -125,31 +123,6 @@ class PandocConverter(Converter):
             [self.binary, str(source_path), "-o", str(destination_path)],
             check=True,
         )
-
-
-class CopierConverter(Converter):
-    """Internal fallback to explicitly model copy-based transformations."""
-
-    name = "copy"
-    binary = "copy"
-
-    def is_available(self) -> bool:
-        return True
-
-    def version(self) -> str:
-        return "copy-only"
-
-    def convert(
-        self,
-        *,
-        source_path: Path,
-        destination_path: Path,
-        source_format: str,
-        target_format: str,
-        options: Mapping[str, Any] | None = None,
-    ) -> None:
-        _ = (source_format, target_format, options)
-        destination_path.write_bytes(source_path.read_bytes())
 
 
 CONVERTER_REGISTRY: dict[str, Converter] = {
@@ -194,8 +167,8 @@ def _is_known_format(format_name: str) -> bool:
 def _available_graph() -> dict[str, tuple[ConversionStep, ...]]:
     available: list[ConversionStep] = []
     for capability in CAPABILITIES:
-        converter = CONVERTER_REGISTRY.get(capability.converter, CopierConverter())
-        if not converter.is_available():
+        converter = CONVERTER_REGISTRY.get(capability.converter)
+        if converter is None or not converter.is_available():
             continue
         available.append(
             ConversionStep(
@@ -360,6 +333,7 @@ def process_conversion_job(job_id: str) -> None:
             target_format=target_format,
             route=route,
             request_options=details.get("request_options"),
+            processing_job_id=conversion_job.job_id,
         )
         conversion_job.state = ProcessingJob.JobState.SUCCESS
         conversion_job.finished_at = timezone.now()
@@ -410,7 +384,13 @@ def _execute_plan(
     target_format: str,
     route: tuple[ConversionStep, ...],
     request_options: Any | None,
+    processing_job_id: uuid.UUID,
 ) -> FileVariant:
+    _validate_route(
+        source_format=source_variant.format,
+        target_format=target_format,
+        route=route,
+    )
     try:
         storage = backend_for_location(source_variant.storage_location)
     except StorageConfigurationError as exc:
@@ -435,7 +415,9 @@ def _execute_plan(
         converter_versions: list[str] = []
         for index, step in enumerate(route, start=1):
             destination = Path(workdir) / f"step-{index}.{step.target_format}"
-            converter = CONVERTER_REGISTRY.get(step.converter, CopierConverter())
+            converter = CONVERTER_REGISTRY.get(step.converter)
+            if converter is None:
+                raise ConversionError(f"unknown converter: {step.converter}")
             if not converter.is_available():
                 raise ConversionError(f"converter unavailable: {step.converter}")
             converter_chain.append(converter.name)
@@ -500,8 +482,36 @@ def _execute_plan(
                 ],
                 "request_options": request_options_map,
             },
+            job_id=processing_job_id,
             processing_state=FileVariant.ProcessingState.COMPLETE,
         )
+
+
+def _validate_route(
+    *,
+    source_format: str,
+    target_format: str,
+    route: tuple[ConversionStep, ...],
+) -> None:
+    if not route:
+        raise ConversionError("conversion route is empty")
+
+    current_format = _normalize_format(source_format)
+    allowed_capabilities = {
+        (capability.source_format, capability.target_format, capability.converter)
+        for capability in CAPABILITIES
+    }
+    for step in route:
+        if step.source_format != current_format:
+            raise ConversionError("conversion route is disconnected")
+        if (step.source_format, step.target_format, step.converter) not in allowed_capabilities:
+            raise ConversionError("conversion route contains an unsupported step")
+        if step.converter not in CONVERTER_REGISTRY:
+            raise ConversionError(f"unknown converter: {step.converter}")
+        current_format = step.target_format
+
+    if current_format != _normalize_format(target_format):
+        raise ConversionError("conversion route does not reach requested target")
 
 
 def _fail_conversion_job(job: ProcessingJob, message: str) -> None:
@@ -542,6 +552,13 @@ def _run_conversion_command(
             },
         )
     return subprocess.run(command, **kwargs)
+
+
+def _version_summary(raw_output: object, *, fallback: str) -> str:
+    if not isinstance(raw_output, str):
+        return fallback
+    first_line = next((line.strip() for line in raw_output.splitlines() if line.strip()), "")
+    return first_line[:64] or fallback
 
 
 def conversion_job_payload(job: ProcessingJob) -> dict[str, Any]:

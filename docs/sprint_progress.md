@@ -61,3 +61,7 @@ This file tracks execution status while advancing Sprint documents in order.
   assets, and browser-driven concurrency and full-flow acceptance coverage.
   PostgreSQL, seeded OpenLDAP, Redis/RQ worker, and live readiness checks now run
   against digest-pinned containers in CI.
+- Sprint009 now additionally has a pinned real-Pandoc acceptance path spanning a
+  member HTTP request, Redis, a Django-aware RQ worker process, provenance-linked
+  EPUB storage, validation, and authenticated download. Calibre PDF/MOBI routes
+  remain runtime-implemented but binary-unverified.

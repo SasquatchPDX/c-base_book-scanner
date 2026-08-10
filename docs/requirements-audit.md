@@ -66,6 +66,11 @@ sprint or production deployment is complete.
   directory. It applies real PostgreSQL migrations, verifies LDAP search/user
   binds and rejection, runs an actual RQ worker across Redis, and checks live
   database/queue/storage readiness rather than only configuration shape.
+- The infrastructure suite now also installs a checksum-verified official Pandoc
+  release and proves a member-requested TXT-to-EPUB conversion across Redis and a
+  separately bootstrapped Django/RQ worker through authenticated download. Output
+  variants retain source, converter/version, request, and ProcessingJob UUID
+  provenance; unknown or tampered converter routes fail closed.
 
 ## Remaining gaps by requirement area
 
@@ -75,10 +80,11 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: external converter binaries, ASGI/SSE reverse-proxy
+- Integration/E2E depth: Calibre-backed PDF/MOBI routes, ASGI/SSE reverse-proxy
   behavior, and a browser-driven concurrent-editor/full physical-book flow still
-  need dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, and live
-  dependency readiness now have infrastructure-backed CI coverage.
+  need dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc
+  TXT-to-EPUB, authenticated converted-file download, and live dependency
+  readiness now have infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.
