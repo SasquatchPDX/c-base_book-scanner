@@ -12,5 +12,10 @@
     "skipLibCheck": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["frontend/**/*.ts", "vite.config.ts"]
+  "include": [
+    "frontend/**/*.ts",
+    "tests/browser/**/*.ts",
+    "playwright.config.ts",
+    "vite.config.ts"
+  ]
 }

@@ -74,7 +74,12 @@ runner applies migrations to PostgreSQL, performs a real LDAP service search and
 member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
 conversion using checksum-verified Pandoc 3.9.0.2, checks the authenticated
 download, and verifies authenticated live SSE updates through pinned Nginx and a
-separate Uvicorn ASGI process before removing the containers.
+separate Uvicorn ASGI process. A Playwright Chromium scenario signs in two LDAP
+members, creates a scan workspace, uploads a synthetic page, loads the compiled
+editor through Nginx, and proves that optimistic concurrency reloads the winning
+revision after a stale edit receives HTTP 409. Install Chromium with
+`npx playwright install chromium` before running the suite locally. Containers
+are removed when the suite exits.
 
 The suite reserves host ports 55432, 56379, 55389, 58080, and 58081 by default.
 Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with

@@ -76,6 +76,12 @@ sprint or production deployment is complete.
   event is not buffered, a live revision/status change arrives on the same
   connection, required stream headers survive proxying, unauthorized access is
   redirected, and disconnecting a client leaves ASGI health intact.
+- Playwright Chromium now drives two independent members authenticated against
+  seeded OpenLDAP through the Nginx/Uvicorn/PostgreSQL stack. It creates a scan
+  job, uploads a synthetic page, verifies the compiled editor bundle is served,
+  and proves a stale stage edit receives HTTP 409, visibly reloads the winning
+  revision, and cannot silently overwrite it. This path also caught and closed a
+  PostgreSQL-only missing-transaction defect in stage-state creation.
 
 ## Remaining gaps by requirement area
 
@@ -85,11 +91,11 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: Calibre-backed PDF/MOBI routes and a browser-driven
-  concurrent-editor/full physical-book flow still need dedicated acceptance
-  environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, authenticated
-  converted-file download, Nginx/Uvicorn SSE, and live dependency readiness now
-  have infrastructure-backed CI coverage.
+- Integration/E2E depth: Calibre-backed PDF/MOBI routes and a browser-driven full
+  physical-book flow still need dedicated acceptance environments. PostgreSQL,
+  LDAP, Redis/RQ, Pandoc TXT-to-EPUB, authenticated converted-file download,
+  Nginx/Uvicorn SSE, concurrent browser editors, and live dependency readiness
+  now have infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

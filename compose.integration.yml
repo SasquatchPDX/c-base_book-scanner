@@ -57,3 +57,4 @@ services:
       - "${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-58080}:8080"
     volumes:
       - ./deploy/nginx/integration.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./src/staticfiles:/srv/book-scanner/static:ro

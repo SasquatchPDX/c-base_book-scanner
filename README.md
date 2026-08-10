@@ -14,6 +14,7 @@ Requirements:
 - Node.js 22.12 or newer (for ScanTailor-Web frontend changes)
 - [uv](https://docs.astral.sh/uv/)
 - Docker with the Compose plugin and `curl` (for infrastructure integration tests)
+- Playwright Chromium (`npx playwright install chromium`) for browser acceptance
 - PostgreSQL and Redis for a production-like environment
 - optional conversion binaries such as Calibre (`ebook-convert`) and Pandoc
 
@@ -48,9 +49,12 @@ The runner applies all migrations to PostgreSQL, exercises a live LDAP
 search-and-bind, starts real RQ workers against Redis, converts a member-requested
 TXT file to a downloadable EPUB with a checksum-verified official Pandoc release,
 streams authenticated ScanTailor events through pinned Nginx and a separate
-Uvicorn ASGI process, checks dependency readiness, and removes its containers on
-exit. Its known credentials and high-numbered ports are isolated test fixtures,
-not deployment defaults.
+Uvicorn ASGI process, and drives two real LDAP member sessions through a
+concurrent ScanTailor edit. The Chromium scenario uploads a synthetic page and
+verifies that a stale editor receives a visible conflict instead of overwriting
+the latest revision. The runner also checks dependency readiness and removes its
+containers on exit. Its known credentials and high-numbered ports are isolated
+test fixtures, not deployment defaults.
 
 Run the web process and an RQ worker:
 

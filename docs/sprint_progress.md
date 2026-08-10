@@ -31,7 +31,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 017 | Implemented | Pluggable Otsu/Sauvola/Wolf/Fox/Window/Grad output, direct text/picture zones, threshold controls, and regression tests |
 | 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
 
-## Sprint evidence checklist (as of 2026-08-08)
+## Sprint evidence checklist (as of 2026-08-10)
 
 - 001: architecture and migration/test baseline in `docs/`, `src/`, and `tests/test_smoke.py`.
 - 002: auth role model and queue baseline in `src/ebook_server/core/auth.py`, `src/ebook_server/settings.py`, `tests/test_auth.py`.
@@ -56,15 +56,15 @@ This file tracks execution status while advancing Sprint documents in order.
 
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
-- Current remaining work is production-like coverage for external converters
-  and ASGI/SSE proxy behavior, importing and exercising the supplied monitoring
-  assets, and browser-driven concurrency and full-flow acceptance coverage.
-  PostgreSQL, seeded OpenLDAP, Redis/RQ worker, and live readiness checks now run
-  against digest-pinned containers in CI.
+- Current remaining work is production-like coverage for Calibre routes,
+  importing and exercising the supplied monitoring assets, and browser-driven
+  full physical-book acceptance. PostgreSQL, seeded OpenLDAP, Redis/RQ, Nginx,
+  Uvicorn, Playwright Chromium, and live readiness checks now run in CI.
 - Sprint009 now additionally has a pinned real-Pandoc acceptance path spanning a
   member HTTP request, Redis, a Django-aware RQ worker process, provenance-linked
   EPUB storage, validation, and authenticated download. Calibre PDF/MOBI routes
   remain runtime-implemented but binary-unverified.
 - Sprint013 now has a pinned Nginx/Uvicorn/PostgreSQL acceptance path for
-  authenticated, unbuffered SSE state updates and clean client disconnects; the
-  remaining multi-user gap is browser-driven concurrent-editor coverage.
+  authenticated, unbuffered SSE state updates and clean client disconnects. A
+  two-member Playwright scenario additionally proves that stale revisions cannot
+  silently overwrite a concurrent ScanTailor edit.

@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import structlog
 from django.conf import settings as django_settings
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from PIL import Image, UnidentifiedImageError
@@ -213,6 +214,7 @@ def _default_algorithm_version(stage: str) -> str:
     return DEFAULT_STAGE_ALGORITHM_VERSION.get(stage, "placeholder-v1")
 
 
+@transaction.atomic
 def get_or_create_stage_state(
     *,
     scan_job_id: str,
