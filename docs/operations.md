@@ -125,6 +125,11 @@ image, run converters without elevated privileges, and apply host/container CPU,
 memory, process, and filesystem limits in addition to the application job timeout.
 Workers must load Django before importing queued application functions:
 
+Headless Calibre PDF conversion also requires EGL/OpenGL and XCB runtime
+libraries. Set `QT_QPA_PLATFORM=offscreen` in worker environments; the acceptance
+runner enforces this, and CI installs `libegl1`, `libopengl0`, `libxcb-cursor0`,
+and `libxkbcommon-x11-0`.
+
 ```bash
 uv run rq worker --config ebook_server.rq_settings \
   --url redis://localhost:6379/0 ebook-server

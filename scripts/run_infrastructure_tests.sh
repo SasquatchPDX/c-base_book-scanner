@@ -65,6 +65,7 @@ export BOOK_SCANNER_LDAP_SERVICE_BIND_PASSWORD="GoodNewsEveryone"
 export BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE="mail"
 export BOOK_SCANNER_CSRF_TRUSTED_ORIGINS="[\"http://127.0.0.1:${book_scanner_proxy_port}\"]"
 export BOOK_SCANNER_RUN_INFRASTRUCTURE_TESTS="true"
+export QT_QPA_PLATFORM="offscreen"
 
 cd "${book_scanner_project_root}"
 if ! command -v pandoc >/dev/null 2>&1; then

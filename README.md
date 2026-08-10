@@ -15,6 +15,7 @@ Requirements:
 - [uv](https://docs.astral.sh/uv/)
 - Docker with the Compose plugin and `curl` (for infrastructure integration tests)
 - Playwright Chromium (`npx playwright install chromium`) for browser acceptance
+- EGL/OpenGL and XCB runtime libraries required by headless Calibre PDF output
 - PostgreSQL and Redis for a production-like environment
 - optional conversion binaries such as Calibre (`ebook-convert`) and Pandoc
 

@@ -90,5 +90,6 @@ jobs:
           uv sync --frozen
           npm ci
           npx playwright install --with-deps chromium
+          sudo apt-get install --yes libegl1 libopengl0 libxcb-cursor0 libxkbcommon-x11-0
       - name: PostgreSQL, Redis/RQ, LDAP, ASGI, and browser integration
         run: ./scripts/run_infrastructure_tests.sh
