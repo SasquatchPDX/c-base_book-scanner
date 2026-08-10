@@ -1,75 +1,100 @@
-# Sprint001 ScanTailor-Web Survey
+# ScanTailor-Web
 
-## Stage mapping notes
+ScanTailor-Web is a multi-user subsystem within the Django modular monolith. Its
+database state is authoritative; web clients do not coordinate directly with
+workers or with one another. Originals and prior scan-page versions are retained,
+while every processing stage writes a new derived artifact and provenance.
 
-### 1) Page Split
+## Processing pipeline
 
-- Input: raw or near-raw photo scans.
-- Practical baseline options: OpenCV contour/connected-component heuristics + manual overrides.
-- Risk: split confidence varies by source noise; manual override is mandatory.
+Each `(scan job, page, stage)` has a persistent `ScanTailorStageState` containing
+its input lineage, parameters, algorithm/version, revision, worker job, output and
+preview identifiers, checksums, timestamps, and status. The ordered stages are:
 
-### 2) Deskew
+1. Page Split — automatic gutter detection, manual draggable split line, or a
+   single-page pass-through.
+2. Deskew — projection-profile estimation with configurable search bounds or a
+   manual angle.
+3. Select Content — automatic content detection or a draggable/resizable content
+   rectangle.
+4. Margins — per-side/canvas padding and horizontal/vertical alignment.
+5. Dewarping — OpenCV projective correction using detected or draggable control
+   points, with an explicit bypass and deterministic failure behavior.
+6. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
+   plus draggable text/picture zones with independent algorithms.
 
-- Input: single-page images.
-- Practical options: Hough lines / projection profile heuristics plus OCR text-line hints from future OCR modules.
-- Must support manual correction and reset.
+Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
+runs as durable worker jobs. Successful stages record input/output dimensions so
+browser geometry can be mapped between full-resolution source coordinates and a
+scaled display. Stage previews are bounded to 960 pixels; the first stage still
+uses the preserved capture as its input because it has no predecessor preview.
 
-### 3) Select Content
+Changing a stage increments its optimistic-concurrency revision, clears its prior
+error, queues processing, and invalidates every downstream stage. A replacement
+scan page similarly invalidates dependent artifacts without deleting the old page
+version.
 
-- Input: deskewed images.
-- Practical options: adaptive threshold + edge-density bounding candidates.
-- Requires rectangle editing UI and page-level overrides.
+## Browser workspace
 
-4) Margins
+The server-rendered page remains usable without JavaScript through individual Run
+forms. The focused TypeScript component adds:
 
-- Input: content rectangles.
-- Practical options: margin math plus auto-clamp against image bounds.
-- Requires visual preview overlays and per-page/batch defaults.
+- a six-stage navigation surface and per-page editor selection;
+- direct split-line, content-box, dewarp-point, and output-zone manipulation;
+- typed controls for deskew, margins, output algorithms, and threshold settings;
+- selected-page or all-page batch application;
+- preservation of page-level manual exceptions by default;
+- revision-conflict detection that reloads current values instead of overwriting;
+- live stage status, error, revision, and preview availability updates over SSE,
+  with compatibility polling when `EventSource` is unavailable.
 
-### 5) Dewarping
+Interact.js supplies drag/resize behavior. TypeScript, Vite, Vitest, and jsdom
+provide strict compilation, production bundling, and coordinate/parameter tests.
+The browser sends only editable inputs back to Django; dimensions, resolved
+geometry, hashes, and other worker-generated provenance are never echoed as user
+parameters.
 
-- Input: content-corrected page.
-- Practical options: OpenCV grid models and/or projective transformations.
-- Current implementation uses an OpenCV-backed projective transform path with NumPy geometry helpers when available, and degrades to deterministic copy-through when dependencies or detection fail.
-- Keep interface modular so algorithm can be swapped once better library support is selected.
+## HTTP contracts
 
-### 6) Output/Binarization
+- `GET /scan/jobs/<job_id>/workspace/` — HTML workspace or JSON page/stage state.
+- `GET /scan/jobs/<job_id>/workspace/events/` — authenticated SSE state stream.
+- `GET /scan/jobs/<job_id>/pages/<page_id>/stages/` — ordered stage state.
+- `GET|POST /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/` — read/update one
+  stage; POST accepts `expected_revision` and returns `409` on a conflict.
+- `POST /scan/jobs/<job_id>/stages/<stage>/batch/` — apply parameters to selected
+  page IDs or all pages, optionally preserving manual exceptions.
+- `GET /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/preview/` — stage output
+  preview; `?input=true` resolves the correct predecessor/input artifact.
 
-- Input: dewarped pages.
-- Practical options:
-  - Otsu
-  - Sauvola
-  - Wolf
-  - Niblack-derived / local-threshold equivalents
-  - picture/text split heuristics from color/connected components
-- Start with proven OpenCV/skimage building blocks, avoid bespoke implementations unless necessary.
-- Current implementation is configurable across `otsu`, `sauvola`, `wolf`, `fox`, `window`, and `grad`,
-  with manual text/picture zone overrides and fallback behavior when optional CV dependencies are unavailable.
+All routes require authentication. Mutations also require an active local profile
+and an editable scan-job state.
 
-## Data model requirement (all stages)
+## Frontend development
 
-Persist per (job, page, stage):
-- input artifact id
-- algorithm name/version
-- parameters
-- output artifact id
-- status
-- timestamp / processing worker id
-- invalidation lineage
+Node 22.12 or newer is required:
 
-Upstream changes invalidate downstream artifacts.
+```bash
+npm ci
+npm run check
+npm test
+npm run build
+```
 
-## Sprint 013 implementation status
+The generated ES module is committed under
+`src/ebook_server/core/static/core/dist/` so Python packaging and collectstatic do
+not require Node at deployment time. CI rebuilds it and rejects an uncommitted
+bundle difference.
 
-Workspace and orchestration surface:
+## Deployment notes
 
-- `GET /scan/jobs/<job_id>/workspace/` returns page list with per-stage metadata.
-- `GET /scan/jobs/<job_id>/pages/<page_id>/stages/` returns ordered stage state for a page.
-- `GET|POST /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/` reads or updates one stage.
-  - `POST` accepts optimistic-concurrency `expected_revision` and triggers async-style stage processing.
-- `GET /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/preview/` serves generated preview artifacts.
-- `GET /stages/<job_id>/` polls stage-processing job status.
+Serve Django through ASGI for asynchronous SSE connections. The endpoint sends
+`X-Accel-Buffering: no`; reverse proxies must also permit streaming responses and
+use an idle timeout longer than the configured stream lifetime. The defaults poll
+persistent state once per second and reconnect after 45 iterations. Configure
+them with:
 
-Current behavior in Sprint 013 is intentionally placeholder for downstream image transforms:
-processing copies artifacts through stable names and computes hashes so the dependency graph,
-revisioning, and state lifecycle are exercised without adding image-algorithm coupling too early.
+- `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS`
+- `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`
+
+Browser-driven multi-user and full scan-to-library acceptance tests remain part
+of the production-like E2E environment rather than the SQLite unit-test suite.

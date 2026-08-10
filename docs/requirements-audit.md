@@ -55,20 +55,22 @@ sprint or production deployment is complete.
 - Runtime artifacts are no longer tracked by Git. A read-only storage consistency
   command checks missing and hash-mismatched artifacts.
 - Ruff, strict mypy, migrations, tests, and dependency auditing are CI gates.
+- ScanTailor-Web now has a focused strict-TypeScript interaction layer using
+  Interact.js, with direct split/content/dewarp/zone geometry, typed stage
+  controls, selected/all-page batching, preserved manual exceptions, optimistic
+  conflict handling, and authenticated SSE updates with polling fallback.
 
 ## Remaining gaps by requirement area
 
-- User-facing UI: core workflows are usable server-side, but advanced ScanTailor
-  geometry overlays, direct manipulation, richer batch controls, and live updates
-  beyond polling still need a focused TypeScript interaction layer.
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.
 - Observability: core metrics and structured events are present; deployment alert
   rules, dashboards, retention policy, and production scrape verification remain
   operator/integration work.
-- Integration/E2E depth: PostgreSQL, a real LDAP test directory, real worker
-  processes, external converter binaries, and a browser-driven full physical-book
-  flow need dedicated integration environments.
+- Integration/E2E depth: PostgreSQL, a real LDAP test directory, real Redis/RQ
+  worker processes, external converter binaries, ASGI/SSE proxy behavior, and a
+  browser-driven concurrent-editor/full physical-book flow need dedicated
+  integration environments.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

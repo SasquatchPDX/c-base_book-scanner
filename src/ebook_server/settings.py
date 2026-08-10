@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     session_cookie_secure: bool = False
     csrf_cookie_secure: bool = False
     csrf_trusted_origins: list[str] = []
+    scantailor_event_stream_interval_seconds: float = 1.0
+    scantailor_event_stream_max_events: int = 45
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -191,6 +193,8 @@ BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
+SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds
+SCANTAILOR_EVENT_STREAM_MAX_EVENTS = settings.scantailor_event_stream_max_events
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds

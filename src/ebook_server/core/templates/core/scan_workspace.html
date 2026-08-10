@@ -1,21 +1,167 @@
 {% extends "core/base.html" %}
+{% load static %}
 {% block title %}{{ job.provisional_title|default:"Scan workspace" }} · Hackerspace Library{% endblock %}
 {% block head %}
-  {% for page in pages %}
-    {% for stage in page.stages %}
-      {% if stage.status == 'queued' or stage.status == 'running' %}<meta http-equiv="refresh" content="4">{% endif %}
-    {% endfor %}
-  {% endfor %}
+  <script type="module" src="{% static 'core/dist/scantailor-workspace.js' %}"></script>
 {% endblock %}
 {% block content %}
-  <div class="section-heading"><div><p class="eyebrow">ScanTailor workspace</p><h1>{{ job.provisional_title|default:"Untitled scan" }}</h1><p>{{ pages|length }} page{{ pages|length|pluralize }} · {% if job.book %}linked to <a href="{% url 'library-book-detail' job.book_id %}?view=html">{{ job.book.title }}</a>{% else %}not linked to a canonical book{% endif %}</p></div><span class="status status-{{ job.state }}">{{ job.get_state_display }}</span></div>
-  {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}<section class="finish-panel"><div><h2>Resolve book identity</h2><p>Search public bibliographic providers and review ranked matches before finalization.</p></div><form method="post" action="{% url 'scan-job-identify' job.id %}">{% csrf_token %}<label>Title<input name="provisional_title" value="{{ job.provisional_title }}" required></label><label>Authors<input name="provisional_authors" value="{{ job.provisional_authors|join:', ' }}"></label><button type="submit">Search metadata</button></form></section>{% endif %}
-  {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}<section class="workspace-tools"><form class="inline-form"
-      method="post"
-      enctype="multipart/form-data"
-      action="{% url 'scan-job-upload-page' job.id %}">{% csrf_token %}<label>Page image<input type="file" name="file" accept="image/*" required></label><label>Sequence<input type="number" name="logical_sequence_number" min="1" required></label><label>Side<select name="side"><option value="single">Single</option><option value="left">Left</option><option value="right">Right</option></select></label><button type="submit">Upload page</button></form></section>{% endif %}
-  <div class="scan-page-grid">{% for page in pages %}<article class="scan-page-card" id="page-{{ page.id }}"><header><div><strong>Page {{ page.logical_sequence_number }}</strong><span>{{ page.side }}</span></div>{% if page.open_rescan_todos %}<span class="status status-failed">Rescan requested</span>{% endif %}</header>{% if page.thumbnail %}<img src="{{ page.thumbnail }}"
-     alt="Captured page {{ page.logical_sequence_number }}">{% endif %}<div class="stage-list">{% for stage in page.stages %}<div class="stage-row"><div><strong>{{ stage.stage|title }}</strong><span class="status status-{{ stage.status }}">{{ stage.status }}</span>{% if stage.last_error %}<small class="error">{{ stage.last_error }}</small>{% endif %}</div>{% if stage.preview_storage_identifier or stage.output_storage_identifier %}<a href="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}">Preview</a>{% endif %}{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}<form method="post"
-      action="{% url 'scan-job-page-stage' job.id page.id stage.stage %}">{% csrf_token %}<input type="hidden" name="expected_revision" value="{{ stage.revision }}"><input type="hidden" name="algorithm" value="{{ stage.algorithm }}"><button class="small-button" type="submit">Run</button></form>{% endif %}</div>{% endfor %}</div>{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}<form method="post" action="{% url 'scan-page-rescan' page.id %}">{% csrf_token %}<input name="reason" placeholder="Why is a rescan needed?"><button class="secondary" type="submit">Request rescan</button></form>{% endif %}</article>{% empty %}<p class="empty-state">Upload the first page to begin processing.</p>{% endfor %}</div>
-  {% if pages and job.book_id and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}<section class="finish-panel"><div><h2>Finish clean page set</h2><p>Every page needs a successful Output stage. Packaging and optional OCR run in workers.</p></div><form method="post" action="{% url 'scan-job-finish' job.id %}">{% csrf_token %}<label class="checkbox"><input type="checkbox" name="auto_ocr" value="true">Submit cleaned PDF to OCR</label><button type="submit">Queue finalization</button></form></section>{% endif %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">ScanTailor workspace</p>
+      <h1>{{ job.provisional_title|default:"Untitled scan" }}</h1>
+      <p>
+        {{ pages|length }} page{{ pages|length|pluralize }} ·
+        {% if job.book %}
+          linked to <a href="{% url 'library-book-detail' job.book_id %}?view=html">{{ job.book.title }}</a>
+        {% else %}
+          not linked to a canonical book
+        {% endif %}
+      </p>
+    </div>
+    <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
+  </div>
+
+  {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}
+    <section class="finish-panel">
+      <div>
+        <h2>Resolve book identity</h2>
+        <p>Search public bibliographic providers and review ranked matches before finalization.</p>
+      </div>
+      <form method="post" action="{% url 'scan-job-identify' job.id %}">
+        {% csrf_token %}
+        <label>Title<input name="provisional_title" value="{{ job.provisional_title }}" required></label>
+        <label>Authors<input name="provisional_authors" value="{{ job.provisional_authors|join:', ' }}"></label>
+        <button type="submit">Search metadata</button>
+      </form>
+    </section>
+  {% endif %}
+
+  {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
+    <section class="workspace-tools">
+      <form class="inline-form" method="post" enctype="multipart/form-data" action="{% url 'scan-job-upload-page' job.id %}">
+        {% csrf_token %}
+        <label>Page image<input type="file" name="file" accept="image/*" required></label>
+        <label>Sequence<input type="number" name="logical_sequence_number" min="1" required></label>
+        <label>Side<select name="side"><option value="single">Single</option><option value="left">Left</option><option value="right">Right</option></select></label>
+        <button type="submit">Upload page</button>
+      </form>
+    </section>
+  {% endif %}
+
+  {{ pages|json_script:"scantailor-workspace-data" }}
+  <div
+    class="scantailor-shell"
+    data-scantailor-workspace
+    data-editable="{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}true{% else %}false{% endif %}"
+    data-events-url="{% url 'scan-job-workspace-events' job.id %}"
+    data-workspace-url="{% url 'scan-job-workspace' job.id %}"
+  >
+    <aside class="scantailor-sidebar" aria-label="Processing stages">
+      <h2>Stages</h2>
+      <nav class="stage-nav">
+        {% for stage in stage_navigation %}
+          <button type="button" data-stage-select="{{ stage.name }}">{{ forloop.counter }}. {{ stage.label }}</button>
+          <span hidden data-stage="{{ stage.name }}" data-batch-url="{% url 'scan-job-stage-batch' job.id stage.name %}"></span>
+        {% endfor %}
+      </nav>
+      <p class="muted">Select a page below, then edit its stage here.</p>
+      <span class="live-status" data-live-status>Connecting live updates…</span>
+    </aside>
+
+    <section class="scantailor-editor" aria-labelledby="workspace-editor-title">
+      <div class="editor-toolbar">
+        <div>
+          <p class="eyebrow">Interactive preview</p>
+          <h2 id="workspace-editor-title" data-editor-title>Choose a page and stage</h2>
+        </div>
+        <div class="editor-actions">
+          <button type="button" data-save-stage>Save and run</button>
+        </div>
+      </div>
+      <div class="editor-stage-controls" data-stage-controls></div>
+      <div class="geometry-frame">
+        <img data-editor-image alt="Processing-stage input preview" hidden>
+        <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
+      </div>
+      <p class="editor-message" data-editor-message aria-live="polite">Select a page to begin.</p>
+      <div class="batch-toolbar">
+        <label>Batch scope
+          <select data-batch-scope>
+            <option value="selected">Selected pages</option>
+            <option value="all">All pages</option>
+          </select>
+        </label>
+        <label class="checkbox"><input type="checkbox" data-preserve-exceptions checked>Preserve manual exceptions</label>
+        <button type="button" class="secondary" data-batch-stage>Apply stage to batch</button>
+      </div>
+    </section>
+
+  <noscript><p class="status-card">JavaScript enables live previews and direct geometry editing. The individual Run forms below remain available.</p></noscript>
+
+  <div class="page-selection-toolbar">
+    <strong data-selection-count>0 page(s) selected</strong>
+    <button type="button" class="secondary small-button" data-select-all>Select all</button>
+    <button type="button" class="secondary small-button" data-clear-selection>Clear</button>
+  </div>
+  <div class="scan-page-grid">
+    {% for page in pages %}
+      <article class="scan-page-card" id="page-{{ page.id }}">
+        <header>
+          <label class="page-select"><input type="checkbox" data-page-select data-page-id="{{ page.id }}">Page {{ page.logical_sequence_number }} · {{ page.side }}</label>
+          {% if page.open_rescan_todos %}<span class="status status-failed">Rescan requested</span>{% endif %}
+        </header>
+        {% if page.thumbnail %}<img src="{{ page.thumbnail }}" alt="Captured page {{ page.logical_sequence_number }}">{% endif %}
+        <div class="stage-list">
+          {% for stage in page.stages %}
+            <div class="stage-row" data-stage-row data-page-id="{{ page.id }}" data-stage="{{ stage.stage }}">
+              <div>
+                <strong>{{ stage.stage_label }}</strong>
+                <span class="status status-{{ stage.status }}" data-stage-status>{{ stage.status }}</span>
+                <small class="error" data-stage-error {% if not stage.last_error %}hidden{% endif %}>{{ stage.last_error }}</small>
+              </div>
+              <button
+                type="button"
+                class="secondary small-button"
+                data-stage-open
+                data-page-id="{{ page.id }}"
+                data-stage="{{ stage.stage }}"
+                data-stage-url="{% url 'scan-job-page-stage' job.id page.id stage.stage %}"
+                data-input-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}?input=true"
+              >Edit</button>
+              <a data-stage-preview-link {% if not stage.preview_storage_identifier and not stage.output_storage_identifier %}hidden{% endif %} href="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}">Preview</a>
+              {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
+                <form method="post" action="{% url 'scan-job-page-stage' job.id page.id stage.stage %}">
+                  {% csrf_token %}
+                  <input type="hidden" name="expected_revision" value="{{ stage.revision }}">
+                  <input type="hidden" name="algorithm" value="{{ stage.algorithm }}">
+                  <button class="small-button" type="submit">Run</button>
+                </form>
+              {% endif %}
+            </div>
+          {% endfor %}
+        </div>
+        {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
+          <form method="post" action="{% url 'scan-page-rescan' page.id %}">
+            {% csrf_token %}
+            <input name="reason" placeholder="Why is a rescan needed?">
+            <button class="secondary" type="submit">Request rescan</button>
+          </form>
+        {% endif %}
+      </article>
+    {% empty %}
+      <p class="empty-state">Upload the first page to begin processing.</p>
+    {% endfor %}
+  </div>
+  </div>
+
+  {% if pages and job.book_id and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}
+    <section class="finish-panel">
+      <div><h2>Finish clean page set</h2><p>Every page needs a successful Output stage. Packaging and optional OCR run in workers.</p></div>
+      <form method="post" action="{% url 'scan-job-finish' job.id %}">
+        {% csrf_token %}
+        <label class="checkbox"><input type="checkbox" name="auto_ocr" value="true">Submit cleaned PDF to OCR</label>
+        <button type="submit">Queue finalization</button>
+      </form>
+    </section>
+  {% endif %}
 {% endblock %}

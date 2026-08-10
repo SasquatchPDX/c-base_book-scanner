@@ -17,6 +17,20 @@ HTTPS proxy -> Django web -> PostgreSQL
                          -> remote OCR service
 ```
 
+Run the web application through ASGI so ScanTailor server-sent event connections
+remain asynchronous:
+
+```bash
+uv run uvicorn ebook_server.asgi:application --host 127.0.0.1 --port 8000
+```
+
+The HTTPS proxy must pass streaming responses without buffering and keep the SSE
+connection open long enough for its configured lifetime. The application also
+sets `X-Accel-Buffering: no`. Tune the one-second/45-iteration defaults with
+`BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS` and
+`BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`; account for the resulting
+database polling load when sizing large concurrent scanning sessions.
+
 ## Production configuration
 
 Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:

@@ -23,6 +23,7 @@ db.sqlite3
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
+node_modules/
 .coverage
 htmlcov/
 coverage.xml

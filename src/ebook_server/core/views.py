@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
@@ -14,6 +15,7 @@ from typing import Any, Final, cast
 from uuid import UUID
 
 import redis
+from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
@@ -29,6 +31,7 @@ from django.http import (
     HttpResponseForbidden,
     HttpResponseNotFound,
     JsonResponse,
+    StreamingHttpResponse,
 )
 from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
@@ -190,6 +193,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "scan_job_id": str(state.scan_job_id),
         "scan_page_id": str(state.scan_page_id),
         "stage": state.stage,
+        "stage_label": ScanTailorStageState.Stage(state.stage).label,
         "revision": state.revision,
         "status": state.status,
         "algorithm": state.algorithm,
@@ -1675,6 +1679,24 @@ def _scan_workspace_page_payload(job: ScanJob, page: ScanPage) -> dict[str, Any]
     return _serialize_workspace_page(page)
 
 
+def _scan_workspace_event_payload(job_id: str) -> dict[str, Any] | None:
+    job = ScanJob.objects.filter(pk=job_id).only("id", "state", "updated_at").first()
+    if job is None:
+        return None
+    states = ScanTailorStageState.objects.filter(scan_job_id=job_id).order_by(
+        "scan_page__logical_sequence_number",
+        "scan_page__side",
+        "scan_page_id",
+        "stage",
+    )
+    return {
+        "job_id": str(job.id),
+        "state": job.state,
+        "updated_at": job.updated_at.isoformat(),
+        "stages": [_serialize_stage_state(state) for state in states],
+    }
+
+
 def _bind_stage_inputs(state: ScanTailorStageState, page: ScanPage) -> None:
     predecessor_name = scantailor.previous_stage(state.stage)
     if predecessor_name is None:
@@ -1715,6 +1737,13 @@ def _conflict_response(current: ScanTailorStageState, expected_revision: int) ->
 
 
 def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> bool:
+    if stage == "page_split":
+        return (
+            str(parameters.get("split_mode", "")).strip().lower() == "manual"
+            or "split_x" in parameters
+        )
+    if stage == "deskew":
+        return "manual_angle" in parameters
     if stage == "select_content":
         if str(parameters.get("content_mode", "")).strip().lower() == "manual":
             return True
@@ -1788,6 +1817,10 @@ def _apply_stage_payload_to_state(
         elif stage == "margins":
             if _contains_stage_manual_override(stage, merged):
                 merged.setdefault("margins_mode", "manual")
+        elif stage == "output":
+            output_mode = str(merged.get("output_mode", "")).strip().lower()
+            if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
+                state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         state.parameters = merged
 
     _bind_stage_inputs(state, page)
@@ -1829,12 +1862,71 @@ def scan_job_workspace(
         "stage_order": list(scantailor.stage_order()),
     }
     if _wants_html(request):
+        stage_navigation = [
+            {"name": stage, "label": ScanTailorStageState.Stage(stage).label}
+            for stage in scantailor.stage_order()
+        ]
         return render(
             request,
             "core/scan_workspace.html",
-            {"job": job, "pages": pages, "stage_order": scantailor.stage_order()},
+            {"job": job, "pages": pages, "stage_navigation": stage_navigation},
         )
     return JsonResponse(payload)
+
+
+@require_GET
+@login_required
+async def scan_job_workspace_events(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    del request
+    if _coerce_uuid(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+
+    initial_payload = await sync_to_async(
+        _scan_workspace_event_payload,
+        thread_sensitive=True,
+    )(job_id)
+    if initial_payload is None:
+        return HttpResponseNotFound()
+
+    interval = max(
+        0.1,
+        float(getattr(django_settings, "SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS", 1.0)),
+    )
+    max_events = max(
+        1,
+        int(getattr(django_settings, "SCANTAILOR_EVENT_STREAM_MAX_EVENTS", 45)),
+    )
+
+    async def event_stream() -> AsyncIterator[str]:
+        previous: str | None = None
+        for sequence in range(max_events):
+            payload = (
+                initial_payload
+                if sequence == 0
+                else await sync_to_async(
+                    _scan_workspace_event_payload,
+                    thread_sensitive=True,
+                )(job_id)
+            )
+            if payload is None:
+                yield "event: workspace-closed\ndata: {}\n\n"
+                return
+            encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            if encoded != previous:
+                yield f"event: workspace\ndata: {encoded}\n\n"
+                previous = encoded
+            elif sequence % 15 == 0:
+                yield ": keep-alive\n\n"
+            if sequence + 1 < max_events:
+                await asyncio.sleep(interval)
+
+    response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache, no-transform"
+    response["X-Accel-Buffering"] = "no"
+    return response
 
 
 @require_GET
@@ -2073,7 +2165,6 @@ def scan_page_stage_preview(
     page_id: str,
     stage: str,
 ) -> HttpResponseBase:
-    del request
     if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
     normalized_stage = _normalize_stage(stage)
@@ -2089,9 +2180,19 @@ def scan_page_stage_preview(
     except (ScanTailorStageState.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
-    identifier = state.preview_storage_identifier or state.output_storage_identifier
+    wants_input = _coerce_bool(request.GET.get("input"))
+    if wants_input and state.input_stage_state is not None:
+        identifier = (
+            state.input_stage_state.preview_storage_identifier
+            or state.input_stage_state.output_storage_identifier
+        )
+    elif wants_input:
+        identifier = state.input_storage_identifier
+    else:
+        identifier = state.preview_storage_identifier or state.output_storage_identifier
     if not identifier:
-        return HttpResponseNotFound("preview not ready")
+        message = "input preview not ready" if wants_input else "preview not ready"
+        return HttpResponseNotFound(message)
     storage = _default_scan_storage()
     try:
         stream = storage.open(identifier)

@@ -40,6 +40,11 @@ urlpatterns = [
         name="scan-job-workspace",
     ),
     path(
+        "scan/jobs/<uuid:job_id>/workspace/events/",
+        views.scan_job_workspace_events,
+        name="scan-job-workspace-events",
+    ),
+    path(
         "scan/jobs/<uuid:job_id>/pages/<uuid:page_id>/stages/",
         views.scan_page_stages,
         name="scan-job-page-stages",

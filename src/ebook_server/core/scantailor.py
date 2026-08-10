@@ -372,6 +372,25 @@ def _copy_fallback(source_path: Path, output_path: Path, preview_path: Path) -> 
     return {"algorithm": "copy"}
 
 
+def _record_image_dimensions(
+    source_path: Path,
+    output_path: Path,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    recorded = dict(parameters)
+    source, source_loaded = _as_image_if_available(source_path)
+    if source is not None and source_loaded:
+        recorded.setdefault("input_width", source.width)
+        recorded.setdefault("input_height", source.height)
+        source.close()
+    output, output_loaded = _as_image_if_available(output_path)
+    if output is not None and output_loaded:
+        recorded.setdefault("output_width", output.width)
+        recorded.setdefault("output_height", output.height)
+        output.close()
+    return recorded
+
+
 def _run_copy(
     state: ScanTailorStageState,
     source_path: Path,
@@ -446,7 +465,7 @@ def _run_page_split(
     side = state.scan_page.side
 
     if source.width <= source.height:
-        source.save(output_path)
+        source.save(output_path, format="PNG")
         _save_preview(source, preview_path)
         return {
             "resolved_split_mode": "single",
@@ -1601,6 +1620,11 @@ def process_stage_job(job_id: str) -> None:
             if not staged_output.exists() or not staged_preview.exists():
                 raise RuntimeError("processing did not produce expected outputs")
             output_params = output_updates if isinstance(output_updates, dict) else {}
+            output_params = _record_image_dimensions(
+                source_path,
+                staged_output,
+                output_params,
+            )
             if output_params:
                 merged = dict(state.parameters or {})
                 merged.update(output_params)

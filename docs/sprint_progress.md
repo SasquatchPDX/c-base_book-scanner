@@ -24,11 +24,11 @@ This file tracks execution status while advancing Sprint documents in order.
 | 010 | Implemented | Scan job and scan-page pipeline implemented, API coverage and replacement/version tests in place |
 | 011 | Implemented | Rescan queue implemented with page action, todo listing/claim/complete/cancel endpoints, and tests |
 | 012 | Implemented | OCR client contract, async submission/polling, accepted/running/success/failure/timeout/malformed handling, variant/scan-job sources, API endpoints, and persistence/integration tests added |
-| 013 | Implemented | Server-rendered and API workspace, persistent stage state, worker lifecycle, dependency/invalidation handling, and regression tests |
-| 014 | Implemented | Page split and deskew stage algorithms (auto/manual split, skew correction), persistence of output parameters, and regression tests added |
-| 015 | Implemented | Content selection and margin stages implemented with persisted parameters, precedence, and regression tests |
-| 016 | Implemented | Practical dewarping implementation (auto/manual proxy, projective transform path), safe fallback modes, and regression tests for reproducibility/bypass/failure handling |
-| 017 | Implemented | Output/Binarization implemented with pluggable algorithms (Otsu/Sauvola/Wolf/Fox/Window/Grad paths), optional CV2-powered local-threshold handling, zone controls, and regression tests added |
+| 013 | Implemented | Server-rendered/API workspace, strict-TypeScript stage editor, persistent stage state, SSE updates, optimistic conflicts, worker lifecycle, and invalidation handling |
+| 014 | Implemented | Page split and deskew algorithms plus direct split-line/manual-angle controls, persisted dimensions/parameters, and regression tests |
+| 015 | Implemented | Content/margin stages plus draggable content geometry, alignment and batch controls, manual-exception preservation, and regression tests |
+| 016 | Implemented | Practical dewarping with draggable control points, projective transform path, safe fallback modes, and reproducibility/bypass/failure tests |
+| 017 | Implemented | Pluggable Otsu/Sauvola/Wolf/Fox/Window/Grad output, direct text/picture zones, threshold controls, and regression tests |
 | 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
 
 ## Sprint evidence checklist (as of 2026-08-08)
@@ -56,5 +56,6 @@ This file tracks execution status while advancing Sprint documents in order.
 
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
-- Current remaining work is advanced ScanTailor browser interaction and
-  production-like infrastructure/integration validation.
+- Current remaining work is production-like infrastructure/integration
+  validation, operational dashboards/alerts, and browser-driven concurrency and
+  full-flow acceptance coverage.

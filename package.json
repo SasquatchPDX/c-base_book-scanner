@@ -1,0 +1,24 @@
+{
+  "name": "book-scanner-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "interactjs": "^1.10.28"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.8",
+    "jsdom": "^27.4.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

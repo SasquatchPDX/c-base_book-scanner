@@ -123,3 +123,10 @@ def test_scan_job_list_create_and_workspace_render() -> None:
     assert workspace.status_code == 200
     assert b"ScanTailor workspace" in workspace.content
     assert b"Upload the first page" in workspace.content
+    assert b"data-scantailor-workspace" in workspace.content
+    assert b'data-stage-select="page_split"' in workspace.content
+    assert b"data-stage-controls" in workspace.content
+    assert b"data-geometry-layer" in workspace.content
+    assert b"data-batch-scope" in workspace.content
+    assert b"/workspace/events/" in workspace.content
+    assert b"core/dist/scantailor-workspace.js" in workspace.content

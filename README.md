@@ -11,6 +11,7 @@ persistent jobs.
 Requirements:
 
 - Python 3.13
+- Node.js 22.12 or newer (for ScanTailor-Web frontend changes)
 - [uv](https://docs.astral.sh/uv/)
 - PostgreSQL and Redis for a production-like environment
 - optional conversion binaries such as Calibre (`ebook-convert`) and Pandoc
@@ -25,6 +26,10 @@ uv run pytest -q
 uv run mypy src tests
 uv run ruff check .
 uv run pip-audit --skip-editable
+npm ci
+npm run check
+npm test
+npm run build
 ```
 
 Development defaults use SQLite, local artifact storage, synchronous jobs, and
@@ -42,6 +47,11 @@ The worker applies a 30-minute default job timeout, bounded result retention,
 and configured retry intervals. Slow work must not use the no-Redis development
 fallback in a deployed environment; production configuration validation requires
 Redis.
+
+Production web processes should serve `ebook_server.asgi:application` through an
+ASGI server so ScanTailor live event streams do not tie up WSGI threads. The
+repository includes Uvicorn; reverse-proxy requirements are documented in the
+operations guide.
 
 ## Main workflows
 

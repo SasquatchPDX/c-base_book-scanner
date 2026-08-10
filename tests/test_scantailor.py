@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
 from typing import cast
 
 import pytest
+from asgiref.sync import async_to_sync
 from django.http import StreamingHttpResponse
-from django.test import Client
+from django.test import Client, override_settings
 from PIL import Image, ImageDraw
 
-from ebook_server.core import scantailor
+from ebook_server.core import scantailor, views
 from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
 from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
 
@@ -141,6 +142,31 @@ def _stage_preview_size(
         return preview.size
 
 
+def _first_async_stream_chunk(response: StreamingHttpResponse) -> bytes:
+    async def consume() -> bytes:
+        stream = cast(AsyncGenerator[bytes], response.streaming_content)
+        try:
+            return await anext(stream)
+        finally:
+            await stream.aclose()
+
+    return async_to_sync(consume)()
+
+
+@pytest.mark.parametrize(
+    ("stage", "parameters"),
+    [
+        ("page_split", {"split_mode": "manual", "split_x": 200}),
+        ("deskew", {"manual_angle": 1.25}),
+    ],
+)
+def test_batch_exception_detection_includes_manual_early_stages(
+    stage: str,
+    parameters: dict[str, object],
+) -> None:
+    assert views._contains_stage_manual_override(stage, parameters)
+
+
 @pytest.mark.django_db(transaction=True)
 def test_two_users_can_edit_different_scan_jobs() -> None:
     client_a, job_a = _create_scan_job("scan-user-a")
@@ -180,6 +206,87 @@ def test_two_users_can_edit_different_scan_jobs() -> None:
     assert response_b.status_code == 202
     assert response_a.json()["stage"]["scan_job_id"] == str(job_a.id)
     assert response_b.json()["stage"]["scan_job_id"] == str(job_b.id)
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(
+    SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS=0.1,
+    SCANTAILOR_EVENT_STREAM_MAX_EVENTS=1,
+)
+def test_workspace_event_stream_sends_persistent_stage_state() -> None:
+    client, job = _create_scan_job("scan-user-events")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_text_heavy_bytes(),
+        filename="events.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+
+    response = client.get(f"/scan/jobs/{job.id}/workspace/events/")
+
+    assert response.status_code == 200
+    streaming_response = cast(StreamingHttpResponse, response)
+    assert streaming_response["Content-Type"].startswith("text/event-stream")
+    assert streaming_response["X-Accel-Buffering"] == "no"
+    chunk = _first_async_stream_chunk(streaming_response).decode("utf-8")
+    assert chunk.startswith("event: workspace\ndata: ")
+    payload = json.loads(chunk.split("data: ", maxsplit=1)[1])
+    assert payload["job_id"] == str(job.id)
+    assert {state["stage"] for state in payload["stages"]} == set(scantailor.stage_order())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stage_input_preview_and_dimensions_support_geometry_editor() -> None:
+    client, job = _create_scan_job("scan-user-input-preview")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_text_heavy_bytes(width=1200, height=1600),
+        filename="geometry.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+
+    input_response = client.get(
+        f"/scan/jobs/{job.id}/pages/{page.id}/stages/page_split/preview/?input=true",
+    )
+    assert input_response.status_code == 200
+    input_stream = cast(StreamingHttpResponse, input_response)
+    source = Image.open(
+        io.BytesIO(b"".join(cast(Iterable[bytes], input_stream.streaming_content))),
+    )
+    with source:
+        assert source.size == (1200, 1600)
+
+    processed = client.post(
+        _stage_url(str(job.id), str(page.id), "page_split"),
+        data=json.dumps({"parameters": {"split_mode": "single"}}),
+        content_type="application/json",
+    )
+    assert processed.status_code == 202
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
+    assert state.parameters["input_width"] == 1200
+    assert state.parameters["input_height"] == 1600
+    assert state.parameters["output_width"] == 1200
+    assert state.parameters["output_height"] == 1600
+
+    predecessor_preview = client.get(
+        f"/scan/jobs/{job.id}/pages/{page.id}/stages/deskew/preview/?input=true",
+    )
+    assert predecessor_preview.status_code == 200
+    preview_stream = cast(StreamingHttpResponse, predecessor_preview)
+    preview = Image.open(
+        io.BytesIO(b"".join(cast(Iterable[bytes], preview_stream.streaming_content))),
+    )
+    with preview:
+        assert preview.size == (720, 960)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -815,6 +922,7 @@ def test_each_documented_output_algorithm_produces_an_artifact(output_mode: str)
     state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="output")
     assert state.status == ScanTailorStageState.StageStatus.SUCCESS
     assert state.parameters["output_mode"] == output_mode
+    assert state.algorithm == f"binarization_{output_mode}"
     assert state.output_sha256
 
 
