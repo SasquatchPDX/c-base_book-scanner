@@ -13,9 +13,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
+from zipfile import ZipFile
 
 import httpx
 import pytest
+from bs4 import BeautifulSoup
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate
 from django.db import connection, transaction
@@ -81,6 +83,19 @@ def _worker_environment_for_test_database() -> dict[str, str]:
         path=f"/{test_database_name}",
     ).geturl()
     return environment
+
+
+def _epub_visible_text(epub_path: Path) -> str:
+    text_parts: list[str] = []
+    with ZipFile(epub_path) as archive:
+        for member in archive.infolist():
+            if member.file_size > 5 * 1024 * 1024:
+                continue
+            if not member.filename.lower().endswith((".html", ".htm", ".xhtml")):
+                continue
+            document = BeautifulSoup(archive.read(member), "html.parser")
+            text_parts.append(document.get_text(" ", strip=True))
+    return " ".join(" ".join(text_parts).split())
 
 
 def _wait_for_http(url: str, process: subprocess.Popen[str], *, timeout: float = 15.0) -> None:
@@ -307,7 +322,7 @@ def test_member_conversion_runs_through_redis_rq_and_real_pandoc() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_member_calibre_conversions_produce_valid_pdf_and_mobi() -> None:
+def test_member_calibre_conversions_preserve_quality_across_reverse_epub_routes() -> None:
     pandoc_binary = shutil.which("pandoc")
     calibre_binary = shutil.which("ebook-convert")
     assert pandoc_binary is not None
@@ -325,9 +340,14 @@ def test_member_calibre_conversions_produce_valid_pdf_and_mobi() -> None:
     book = Book.objects.create(title="Pinned Calibre Acceptance Book")
     source_text = storage_root / "calibre-source.txt"
     source_epub = storage_root / "calibre-source.epub"
+    chapters = "\n\n".join(
+        f"## Chapter {chapter}\n\n"
+        "This EPUB becomes both a PDF and a MOBI through real Calibre workers. "
+        "Representative prose exercises PDF reflow while preserving readable text."
+        for chapter in range(1, 5)
+    )
     source_text.write_text(
-        "# Pinned Calibre Acceptance Book\n\n"
-        "This EPUB becomes both a PDF and a MOBI through real Calibre workers.\n",
+        f"# Pinned Calibre Acceptance Book\n\n{chapters}\n",
         encoding="utf-8",
     )
     generated = subprocess.run(
@@ -408,6 +428,59 @@ def test_member_calibre_conversions_produce_valid_pdf_and_mobi() -> None:
             output_path = storage.resolve_location(output_variant.storage_identifier)
             intake.validate_container_signature(str(output_path), target_format)
             assert hashlib.sha256(output_path.read_bytes()).hexdigest() == output_variant.sha256
+
+        reverse_outputs: dict[str, FileVariant] = {}
+        for source_format in ("pdf", "mobi"):
+            reverse_source = outputs[source_format]
+            requested = client.post(
+                f"/library/books/{book.id}/convert/",
+                data=json.dumps(
+                    {
+                        "source_variant_id": reverse_source.id,
+                        "target_format": "epub",
+                    },
+                ),
+                content_type="application/json",
+            )
+            assert requested.status_code == 202
+            job = ProcessingJob.objects.get(job_id=requested.json()["job_id"])
+            assert job.state == ProcessingJob.JobState.QUEUED
+
+            queue = get_queue()
+            assert isinstance(queue, ConfiguredQueue)
+            _run_rq_worker(
+                queue.queue.name,
+                environment=_worker_environment_for_test_database(),
+            )
+
+            job.refresh_from_db()
+            assert job.state == ProcessingJob.JobState.SUCCESS, job.details
+            output_variant = FileVariant.objects.get(pk=job.details["output_variant_id"])
+            reverse_outputs[source_format] = output_variant
+            assert output_variant.book_id == book.id
+            assert output_variant.source_variant_id == reverse_source.id
+            assert output_variant.source_type == FileVariant.SourceType.CONVERTED
+            assert output_variant.format == "epub"
+            assert output_variant.converter_tool == "calibre"
+            assert output_variant.converter_version == "ebook-convert (calibre 9.11.0)"
+            assert output_variant.job_id == job.job_id
+
+            output_path = storage.resolve_location(output_variant.storage_identifier)
+            intake.validate_container_signature(str(output_path), "epub")
+            assert hashlib.sha256(output_path.read_bytes()).hexdigest() == output_variant.sha256
+            metadata = intake.extract_metadata(
+                str(output_path),
+                "epub",
+                original_filename=output_variant.original_filename,
+            )
+            assert metadata["title"] == book.title
+            visible_text = _epub_visible_text(output_path)
+            assert book.title in visible_text
+            assert "This EPUB becomes both a PDF and a MOBI through real Calibre workers." in (
+                visible_text
+            )
+
+        assert set(reverse_outputs) == {"pdf", "mobi"}
 
         downloaded = client.get(
             f"/library/books/{book.id}/download/?variant_id={outputs['mobi'].id}",

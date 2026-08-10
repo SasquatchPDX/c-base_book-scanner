@@ -94,6 +94,11 @@ sprint or production deployment is complete.
   cleaned/TXT/searchable-PDF variants, canonical search, and authenticated
   download. OCR service URL/timeout/poll controls are now genuine environment
   settings rather than unreachable worker defaults.
+- Representative four-chapter Calibre fixtures now verify both reverse routes,
+  PDF-to-EPUB and MOBI-to-EPUB, through HTTP, Redis, and separately bootstrapped
+  workers. The resulting EPUBs pass signature/hash checks, retain source/tool/job
+  lineage, preserve canonical title metadata, and contain the expected readable
+  prose when inspected with Beautiful Soup.
 
 ## Remaining gaps by requirement area
 
@@ -103,13 +108,13 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: reverse Calibre PDF/MOBI-to-EPUB quality fixtures and
-  recognition-quality validation against the hackerspace AI server still need
-  dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, Calibre
-  EPUB-to-PDF/MOBI, authenticated converted-file download, Nginx/Uvicorn SSE,
-  concurrent browser editors, the browser-driven synthetic physical-book/OCR
-  contract flow, and live dependency readiness now have infrastructure-backed CI
-  coverage.
+- Integration/E2E depth: recognition-quality validation against the hackerspace
+  AI server and a structured HTML-to-EPUB quality fixture still need dedicated
+  acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB,
+  Calibre EPUB-to-PDF/MOBI and reverse PDF/MOBI-to-EPUB quality, authenticated
+  converted-file download, Nginx/Uvicorn SSE, concurrent browser editors, the
+  browser-driven synthetic physical-book/OCR contract flow, and live dependency
+  readiness now have infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

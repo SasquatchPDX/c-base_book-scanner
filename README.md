@@ -50,7 +50,8 @@ The runner applies all migrations to PostgreSQL, exercises a live LDAP
 search-and-bind, starts real RQ workers against Redis, converts a member-requested
 TXT file to a downloadable EPUB with a checksum-verified official Pandoc release,
 converts a generated EPUB to validated PDF and MOBI variants with a
-checksum-verified official Calibre release,
+checksum-verified official Calibre release, round-trips both formats back to
+EPUB while checking metadata and readable text preservation,
 streams authenticated ScanTailor events through pinned Nginx and a separate
 Uvicorn ASGI process, and drives two real LDAP member sessions through a
 concurrent ScanTailor edit. The Chromium scenario uploads a synthetic page and

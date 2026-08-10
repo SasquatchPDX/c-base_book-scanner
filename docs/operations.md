@@ -74,8 +74,9 @@ runner applies migrations to PostgreSQL, performs a real LDAP service search and
 member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
 conversion using checksum-verified Pandoc 3.9.0.2, performs EPUB-to-PDF and
 EPUB-to-MOBI conversions using checksum-verified Calibre 9.11.0, validates the
-stored formats and authenticated download, and verifies authenticated live SSE
-updates through pinned Nginx and a separate Uvicorn ASGI process. A Playwright
+stored formats and authenticated download, round-trips representative PDF and
+MOBI sources to EPUB with metadata/text quality checks, and verifies authenticated
+live SSE updates through pinned Nginx and a separate Uvicorn ASGI process. A Playwright
 Chromium scenario signs in two LDAP
 members, creates a scan workspace, uploads a synthetic page, loads the compiled
 editor through Nginx, and proves that optimistic concurrency reloads the winning
