@@ -56,6 +56,8 @@ This file tracks execution status while advancing Sprint documents in order.
 
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
-- Current remaining work is production-like infrastructure/integration
-  validation, importing and exercising the supplied monitoring assets, and
-  browser-driven concurrency and full-flow acceptance coverage.
+- Current remaining work is production-like coverage for external converters
+  and ASGI/SSE proxy behavior, importing and exercising the supplied monitoring
+  assets, and browser-driven concurrency and full-flow acceptance coverage.
+  PostgreSQL, seeded OpenLDAP, Redis/RQ worker, and live readiness checks now run
+  against digest-pinned containers in CI.

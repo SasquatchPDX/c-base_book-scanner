@@ -61,6 +61,9 @@ DJANGO_SETTINGS_MODULE = "ebook_server.settings"
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "--reuse-db"
+markers = [
+  "infrastructure: requires the pinned PostgreSQL, Redis, and OpenLDAP test services",
+]
 filterwarnings = [
   "ignore:tagMap is deprecated:DeprecationWarning:ldap3.utils.asn1",
   "ignore:typeMap is deprecated:DeprecationWarning:ldap3.utils.asn1",

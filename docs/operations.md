@@ -62,6 +62,21 @@ Members sign in at `/accounts/login/` using LDAP credentials. There is no local
 registration or local password. Disabling an `AppUserProfile` invalidates an
 existing web session on its next request.
 
+## Infrastructure acceptance environment
+
+Developers and CI can run `./scripts/run_infrastructure_tests.sh` to provision
+ephemeral, digest-pinned PostgreSQL, Redis, and seeded OpenLDAP containers. The
+runner applies migrations to PostgreSQL, performs a real LDAP service search and
+member bind, starts an RQ worker that consumes a Redis job, checks live readiness,
+and removes the containers on exit.
+
+The suite reserves host ports 55432, 56379, and 55389 by default. Override them
+with `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
+`BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
+`BOOK_SCANNER_INTEGRATION_LDAP_PORT` when those ports are occupied. Credentials
+in `compose.integration.yml` belong only to the public seeded test fixtures and
+must never be copied into a deployment.
+
 ## Storage
 
 Mount NFS/SMB storage on the application and worker hosts before processes start,

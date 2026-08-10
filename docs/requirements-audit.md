@@ -62,6 +62,10 @@ sprint or production deployment is complete.
 - Observability now includes recent failure and oldest-active-job metrics,
   validated Prometheus scrape/alert examples, operator runbooks, a bounded-label
   Grafana dashboard, and an explicit 30-day/size-capped retention policy.
+- CI now provisions digest-pinned PostgreSQL, Redis, and a seeded OpenLDAP test
+  directory. It applies real PostgreSQL migrations, verifies LDAP search/user
+  binds and rejection, runs an actual RQ worker across Redis, and checks live
+  database/queue/storage readiness rather than only configuration shape.
 
 ## Remaining gaps by requirement area
 
@@ -71,10 +75,10 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: PostgreSQL, a real LDAP test directory, real Redis/RQ
-  worker processes, external converter binaries, ASGI/SSE proxy behavior, and a
-  browser-driven concurrent-editor/full physical-book flow need dedicated
-  integration environments.
+- Integration/E2E depth: external converter binaries, ASGI/SSE reverse-proxy
+  behavior, and a browser-driven concurrent-editor/full physical-book flow still
+  need dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, and live
+  dependency readiness now have infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

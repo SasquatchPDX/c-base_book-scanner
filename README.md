@@ -13,6 +13,7 @@ Requirements:
 - Python 3.13
 - Node.js 22.12 or newer (for ScanTailor-Web frontend changes)
 - [uv](https://docs.astral.sh/uv/)
+- Docker with the Compose plugin (for infrastructure integration tests)
 - PostgreSQL and Redis for a production-like environment
 - optional conversion binaries such as Calibre (`ebook-convert`) and Pandoc
 
@@ -35,6 +36,18 @@ npm run build
 Development defaults use SQLite, local artifact storage, synchronous jobs, and
 the explicit `stub` LDAP mode. Copy `.env.example` to `.env` and configure
 PostgreSQL, Redis, storage, and LDAP before exercising production-like behavior.
+
+Run the infrastructure suite against ephemeral, digest-pinned PostgreSQL, Redis,
+and seeded OpenLDAP containers:
+
+```bash
+./scripts/run_infrastructure_tests.sh
+```
+
+The runner applies all migrations to PostgreSQL, exercises a live LDAP
+search-and-bind, starts a real RQ worker against Redis, checks dependency
+readiness, and removes its containers on exit. Its known credentials and
+high-numbered ports are isolated test fixtures, not deployment defaults.
 
 Run the web process and an RQ worker:
 
