@@ -8,6 +8,7 @@ book_scanner_pandoc_root="$(mktemp -d -t book-scanner-pandoc.XXXXXX)"
 book_scanner_postgres_port="${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-55432}"
 book_scanner_redis_port="${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-56379}"
 book_scanner_ldap_port="${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-55389}"
+book_scanner_proxy_port="${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-58080}"
 
 book_scanner_compose=(
   docker compose
@@ -36,6 +37,7 @@ trap book_scanner_cleanup EXIT
 export BOOK_SCANNER_INTEGRATION_POSTGRES_PORT="${book_scanner_postgres_port}"
 export BOOK_SCANNER_INTEGRATION_REDIS_PORT="${book_scanner_redis_port}"
 export BOOK_SCANNER_INTEGRATION_LDAP_PORT="${book_scanner_ldap_port}"
+export BOOK_SCANNER_INTEGRATION_PROXY_PORT="${book_scanner_proxy_port}"
 export BOOK_SCANNER_DATABASE_URL="postgresql://book_scanner:book_scanner_integration@127.0.0.1:${book_scanner_postgres_port}/book_scanner_integration"
 export BOOK_SCANNER_REDIS_URL="redis://127.0.0.1:${book_scanner_redis_port}/15"
 export BOOK_SCANNER_STORAGE_ROOT="${book_scanner_storage_root}"

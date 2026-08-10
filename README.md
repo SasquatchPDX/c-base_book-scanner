@@ -47,9 +47,10 @@ and seeded OpenLDAP containers:
 The runner applies all migrations to PostgreSQL, exercises a live LDAP
 search-and-bind, starts real RQ workers against Redis, converts a member-requested
 TXT file to a downloadable EPUB with a checksum-verified official Pandoc release,
-checks dependency readiness, and removes its containers on exit. Its known
-credentials and high-numbered ports are isolated test fixtures, not deployment
-defaults.
+streams authenticated ScanTailor events through pinned Nginx and a separate
+Uvicorn ASGI process, checks dependency readiness, and removes its containers on
+exit. Its known credentials and high-numbered ports are isolated test fixtures,
+not deployment defaults.
 
 Run the web process and an RQ worker:
 
@@ -103,9 +104,10 @@ the worker queue in production.
 
 See [docs/operations.md](docs/operations.md) for production configuration,
 LDAP modes, network mounts, worker operation, consistency verification, and
-security boundaries. Prometheus alert/scrape examples and the provisioned Grafana
-dashboard live in `deploy/`. Architecture and protocol documents live in `docs/`,
-while the sprint specifications remain the authoritative feature requirements.
+security boundaries. Nginx streaming-proxy, Prometheus alert/scrape, and
+provisioned Grafana examples live in `deploy/`. Architecture and protocol
+documents live in `docs/`, while the sprint specifications remain the
+authoritative feature requirements.
 
 ## Current maturity
 

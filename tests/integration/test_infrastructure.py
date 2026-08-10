@@ -7,11 +7,14 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
+import httpx
 import pytest
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate
@@ -23,12 +26,15 @@ from django.utils import timezone
 from redis import Redis
 from rq.job import JobStatus
 
-from ebook_server.core import intake
+import ebook_server.core.intake as intake
 from ebook_server.core.auth import Ldap3Adapter, LdapAuthenticationError
 from ebook_server.core.models import (
     Book,
     FileVariant,
     ProcessingJob,
+    ScanJob,
+    ScanPage,
+    ScanTailorStageState,
     StorageLocation,
     get_or_create_profile,
 )
@@ -75,6 +81,78 @@ def _worker_environment_for_test_database() -> dict[str, str]:
         path=f"/{test_database_name}",
     ).geturl()
     return environment
+
+
+def _wait_for_http(url: str, process: subprocess.Popen[str], *, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = "no response"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            process_output = process.stdout.read() if process.stdout is not None else ""
+            last_error = f"process exited {process.returncode}: {process_output[-2000:]}"
+            break
+        try:
+            response = httpx.get(url, timeout=0.75)
+            if response.status_code < 500:
+                return
+            last_error = f"HTTP {response.status_code}"
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+        time.sleep(0.1)
+    raise AssertionError(f"Uvicorn did not become ready at {url}: {last_error}")
+
+
+@contextmanager
+def _running_uvicorn() -> Iterator[subprocess.Popen[str]]:
+    environment = _worker_environment_for_test_database()
+    environment["BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS"] = "0.2"
+    environment["BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS"] = "30"
+    uvicorn_executable = Path(sys.executable).with_name("uvicorn")
+    process = subprocess.Popen(
+        [
+            str(uvicorn_executable),
+            "ebook_server.asgi:application",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "58081",
+            "--log-level",
+            "warning",
+            "--no-access-log",
+            "--no-server-header",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        _wait_for_http("http://127.0.0.1:58081/healthz/", process)
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def _next_sse_event(lines: Iterable[str]) -> tuple[str, dict[str, object]]:
+    event_name = ""
+    data_lines: list[str] = []
+    for line in lines:
+        if line.startswith("event:"):
+            event_name = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").strip())
+        elif not line and event_name:
+            payload = json.loads("\n".join(data_lines))
+            assert isinstance(payload, dict)
+            return event_name, payload
+    raise AssertionError("SSE stream ended before an event was received")
 
 
 @pytest.mark.django_db(transaction=True)
@@ -238,3 +316,74 @@ def test_readiness_uses_live_postgresql_redis_and_storage(tmp_path: Path) -> Non
     dependencies = {item["name"]: item["status"] for item in payload["dependencies"]}
     assert payload["status"] == "ready"
     assert dependencies == {"database": "ok", "storage": "ok", "queue": "ok"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_authenticated_sse_streams_through_nginx_and_uvicorn() -> None:
+    profile = get_or_create_profile("sse-proxy-member")
+    job = ScanJob.objects.create(
+        operator=profile.user,
+        scanner_id="sse-proxy-test",
+        provisional_title="SSE proxy acceptance",
+    )
+    page = ScanPage.objects.create(
+        scan_job=job,
+        logical_sequence_number=1,
+        side=ScanPage.Side.SINGLE,
+    )
+    stage_state = ScanTailorStageState.objects.create(
+        scan_job=job,
+        scan_page=page,
+        stage=ScanTailorStageState.Stage.PAGE_SPLIT,
+        status=ScanTailorStageState.StageStatus.QUEUED,
+        revision=1,
+    )
+    django_client = Client()
+    django_client.force_login(profile.user)
+    session_cookie = django_client.cookies[django_settings.SESSION_COOKIE_NAME].value
+
+    proxy_port = os.environ["BOOK_SCANNER_INTEGRATION_PROXY_PORT"]
+    proxy_base_url = f"http://127.0.0.1:{proxy_port}"
+    event_path = f"/scan/jobs/{job.id}/workspace/events/"
+    with _running_uvicorn() as uvicorn_process:
+        _wait_for_http(f"{proxy_base_url}/healthz/", uvicorn_process)
+
+        unauthorized = httpx.get(
+            f"{proxy_base_url}{event_path}",
+            follow_redirects=False,
+            timeout=3,
+        )
+        assert unauthorized.status_code == 302
+        assert unauthorized.headers["location"].startswith("/accounts/login/")
+
+        started_at = time.monotonic()
+        with httpx.Client(
+            cookies={django_settings.SESSION_COOKIE_NAME: session_cookie},
+            timeout=httpx.Timeout(5.0, read=3.0),
+        ).stream("GET", f"{proxy_base_url}{event_path}") as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert response.headers["cache-control"] == "no-cache, no-transform"
+            assert response.headers["x-accel-buffering"] == "no"
+
+            lines = response.iter_lines()
+            event_name, initial_payload = _next_sse_event(lines)
+            assert time.monotonic() - started_at < 2.0
+            assert event_name == "workspace"
+            assert initial_payload["job_id"] == str(job.id)
+            initial_stages = initial_payload["stages"]
+            assert isinstance(initial_stages, list)
+            assert initial_stages[0]["revision"] == 1
+
+            stage_state.status = ScanTailorStageState.StageStatus.RUNNING
+            stage_state.revision = 2
+            stage_state.save(update_fields=["status", "revision", "updated_at"])
+
+            event_name, updated_payload = _next_sse_event(lines)
+            assert event_name == "workspace"
+            updated_stages = updated_payload["stages"]
+            assert isinstance(updated_stages, list)
+            assert updated_stages[0]["revision"] == 2
+            assert updated_stages[0]["status"] == ScanTailorStageState.StageStatus.RUNNING
+
+        assert httpx.get(f"{proxy_base_url}/healthz/", timeout=3).status_code == 200

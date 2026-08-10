@@ -65,3 +65,6 @@ This file tracks execution status while advancing Sprint documents in order.
   member HTTP request, Redis, a Django-aware RQ worker process, provenance-linked
   EPUB storage, validation, and authenticated download. Calibre PDF/MOBI routes
   remain runtime-implemented but binary-unverified.
+- Sprint013 now has a pinned Nginx/Uvicorn/PostgreSQL acceptance path for
+  authenticated, unbuffered SSE state updates and clean client disconnects; the
+  remaining multi-user gap is browser-driven concurrent-editor coverage.

@@ -31,6 +31,10 @@ sets `X-Accel-Buffering: no`. Tune the one-second/45-iteration defaults with
 `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`; account for the resulting
 database polling load when sizing large concurrent scanning sessions.
 
+`deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
+a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
+add site TLS/static-file policy, and keep direct Uvicorn access private.
+
 ## Production configuration
 
 Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
@@ -69,14 +73,18 @@ ephemeral, digest-pinned PostgreSQL, Redis, and seeded OpenLDAP containers. The
 runner applies migrations to PostgreSQL, performs a real LDAP service search and
 member bind, starts RQ workers that consume Redis jobs, performs a real TXT-to-EPUB
 conversion using checksum-verified Pandoc 3.9.0.2, checks the authenticated
-download, and removes the containers on exit.
+download, and verifies authenticated live SSE updates through pinned Nginx and a
+separate Uvicorn ASGI process before removing the containers.
 
-The suite reserves host ports 55432, 56379, and 55389 by default. Override them
-with `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
+The suite reserves host ports 55432, 56379, 55389, 58080, and 58081 by default.
+Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with
+`BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
 `BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
-`BOOK_SCANNER_INTEGRATION_LDAP_PORT` when those ports are occupied. Credentials
-in `compose.integration.yml` belong only to the public seeded test fixtures and
-must never be copied into a deployment.
+`BOOK_SCANNER_INTEGRATION_LDAP_PORT`, and
+`BOOK_SCANNER_INTEGRATION_PROXY_PORT` when those ports are occupied. Port 58081
+is the suite-internal host Uvicorn listener. Credentials in
+`compose.integration.yml` belong only to the public seeded test fixtures and must
+never be copied into a deployment.
 
 ## Storage
 

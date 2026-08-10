@@ -96,5 +96,7 @@ them with:
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS`
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`
 
-Browser-driven multi-user and full scan-to-library acceptance tests remain part
-of the production-like E2E environment rather than the SQLite unit-test suite.
+The infrastructure suite verifies authentication, prompt initial and updated
+events, unbuffered Nginx proxying, and client disconnect recovery against a real
+Uvicorn/PostgreSQL deployment boundary. Browser-driven multi-user and full
+scan-to-library acceptance remain the next production-like E2E layer.

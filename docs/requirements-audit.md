@@ -71,6 +71,11 @@ sprint or production deployment is complete.
   separately bootstrapped Django/RQ worker through authenticated download. Output
   variants retain source, converter/version, request, and ProcessingJob UUID
   provenance; unknown or tampered converter routes fail closed.
+- A digest-pinned Nginx proxy and separate Uvicorn process now exercise the
+  authenticated ScanTailor SSE route against PostgreSQL. CI proves the initial
+  event is not buffered, a live revision/status change arrives on the same
+  connection, required stream headers survive proxying, unauthorized access is
+  redirected, and disconnecting a client leaves ASGI health intact.
 
 ## Remaining gaps by requirement area
 
@@ -80,11 +85,11 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: Calibre-backed PDF/MOBI routes, ASGI/SSE reverse-proxy
-  behavior, and a browser-driven concurrent-editor/full physical-book flow still
-  need dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc
-  TXT-to-EPUB, authenticated converted-file download, and live dependency
-  readiness now have infrastructure-backed CI coverage.
+- Integration/E2E depth: Calibre-backed PDF/MOBI routes and a browser-driven
+  concurrent-editor/full physical-book flow still need dedicated acceptance
+  environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, authenticated
+  converted-file download, Nginx/Uvicorn SSE, and live dependency readiness now
+  have infrastructure-backed CI coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.
