@@ -29,7 +29,7 @@ This file tracks execution status while advancing Sprint documents in order.
 | 015 | Implemented | Content/margin stages plus draggable content geometry, alignment and batch controls, manual-exception preservation, and regression tests |
 | 016 | Implemented | Practical dewarping with draggable control points, projective transform path, safe fallback modes, and reproducibility/bypass/failure tests |
 | 017 | Implemented | Pluggable Otsu/Sauvola/Wolf/Fox/Window/Grad output, direct text/picture zones, threshold controls, and regression tests |
-| 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, and downstream invalidation |
+| 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, downstream invalidation, and production-shaped Chromium acceptance for the synthetic physical-book flow |
 
 ## Sprint evidence checklist (as of 2026-08-10)
 

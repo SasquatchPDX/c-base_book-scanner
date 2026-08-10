@@ -80,16 +80,22 @@ Chromium scenario signs in two LDAP
 members, creates a scan workspace, uploads a synthetic page, loads the compiled
 editor through Nginx, and proves that optimistic concurrency reloads the winning
 revision after a stale edit receives HTTP 409. Install Chromium with
-`npx playwright install chromium` before running the suite locally. Containers
-are removed when the suite exits.
+`npx playwright install chromium` before running the suite locally. A second
+scenario processes all six ScanTailor stages, requests and fulfills a rescan,
+accepts a deterministic provider candidate, and crosses the live Redis/RQ and
+HTTP multipart OCR boundaries before searching for and downloading the resulting
+OCR variant. The OCR service is a contract fixture; it validates orchestration
+and provenance, not recognition quality. Containers are removed when the suite
+exits.
 
-The suite reserves host ports 55432, 56379, 55389, 58080, and 58081 by default.
+The suite reserves host ports 55432, 56379, 55389, 58080, 58081, and 58082 by default.
 Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with
 `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
 `BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
 `BOOK_SCANNER_INTEGRATION_LDAP_PORT`, and
-`BOOK_SCANNER_INTEGRATION_PROXY_PORT` when those ports are occupied. Port 58081
-is the suite-internal host Uvicorn listener. Credentials in
+`BOOK_SCANNER_INTEGRATION_PROXY_PORT`; override the OCR fixture port with
+`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 58081 is the suite-internal host
+Uvicorn listener. Credentials in
 `compose.integration.yml` belong only to the public seeded test fixtures and must
 never be copied into a deployment.
 
@@ -138,9 +144,11 @@ uv run rq worker --config ebook_server.rq_settings \
 Do not grant a worker access to the Docker socket merely to obtain a converter.
 Bake reviewed converter binaries into its restricted image instead.
 
-Configure the OCR service URL and network policy so only workers can submit jobs.
-OCR responses are treated as untrusted artifacts and retain engine/model/language
-provenance.
+Configure `BOOK_SCANNER_OCR_SERVICE_URL` and the worker network policy so only
+workers can submit jobs. Bound requests and polling with
+`BOOK_SCANNER_OCR_REQUEST_TIMEOUT`, `BOOK_SCANNER_OCR_MAX_ATTEMPTS`, and
+`BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS`. OCR responses are treated as untrusted
+artifacts and retain engine/model/language provenance.
 
 Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text

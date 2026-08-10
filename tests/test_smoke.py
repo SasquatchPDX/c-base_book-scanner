@@ -83,6 +83,22 @@ def test_production_settings_accept_hardened_configuration() -> None:
     assert production.environment == "production"
 
 
+def test_ocr_worker_settings_can_be_configured_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BOOK_SCANNER_OCR_SERVICE_URL", "http://ocr.example.test:9020")
+    monkeypatch.setenv("BOOK_SCANNER_OCR_REQUEST_TIMEOUT", "12.5")
+    monkeypatch.setenv("BOOK_SCANNER_OCR_MAX_ATTEMPTS", "17")
+    monkeypatch.setenv("BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS", "0.75")
+
+    configured = Settings()
+
+    assert configured.ocr_service_url == "http://ocr.example.test:9020"
+    assert configured.ocr_request_timeout == 12.5
+    assert configured.ocr_max_attempts == 17
+    assert configured.ocr_poll_interval_seconds == 0.75
+
+
 @override_settings(
     BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS=120,
     BOOK_SCANNER_QUEUE_RESULT_TTL_SECONDS=3600,

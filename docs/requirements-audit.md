@@ -87,6 +87,13 @@ sprint or production deployment is complete.
   across Redis and a separately bootstrapped RQ worker. It validates output
   signatures and hashes, checks source/tool/version/job provenance, and downloads
   the MOBI through the authenticated library endpoint.
+- A second Chromium scenario now completes the synthetic physical-book
+  acceptance chain through the production-shaped stack: all six ScanTailor
+  stages, explicit rescan and downstream invalidation, replacement processing,
+  provider-backed human review, Redis/RQ finalization, HTTP multipart OCR,
+  cleaned/TXT/searchable-PDF variants, canonical search, and authenticated
+  download. OCR service URL/timeout/poll controls are now genuine environment
+  settings rather than unreachable worker defaults.
 
 ## Remaining gaps by requirement area
 
@@ -96,12 +103,13 @@ sprint or production deployment is complete.
   retention policy, and runbooks; importing them, verifying a real production
   scrape, and testing the site's Alertmanager notification path remain deployment
   work.
-- Integration/E2E depth: reverse Calibre PDF/MOBI-to-EPUB quality fixtures and a
-  browser-driven full physical-book flow still need dedicated acceptance
-  environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, Calibre
+- Integration/E2E depth: reverse Calibre PDF/MOBI-to-EPUB quality fixtures and
+  recognition-quality validation against the hackerspace AI server still need
+  dedicated acceptance environments. PostgreSQL, LDAP, Redis/RQ, Pandoc TXT-to-EPUB, Calibre
   EPUB-to-PDF/MOBI, authenticated converted-file download, Nginx/Uvicorn SSE,
-  concurrent browser editors, and live dependency readiness now have
-  infrastructure-backed CI coverage.
+  concurrent browser editors, the browser-driven synthetic physical-book/OCR
+  contract flow, and live dependency readiness now have infrastructure-backed CI
+  coverage.
 
 These items keep the full-project goal active; `docs/sprint_progress.md` is a
 historical implementation log rather than an acceptance sign-off.

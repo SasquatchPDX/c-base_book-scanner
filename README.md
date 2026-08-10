@@ -55,9 +55,12 @@ streams authenticated ScanTailor events through pinned Nginx and a separate
 Uvicorn ASGI process, and drives two real LDAP member sessions through a
 concurrent ScanTailor edit. The Chromium scenario uploads a synthetic page and
 verifies that a stale editor receives a visible conflict instead of overwriting
-the latest revision. The runner also checks dependency readiness and removes its
-containers on exit. Its known credentials and high-numbered ports are isolated
-test fixtures, not deployment defaults.
+the latest revision. A second Chromium scenario drives a synthetic physical book
+through every ScanTailor stage, a rescan and downstream invalidation, provider
+review, queued finalization, a separate HTTP OCR contract service, canonical
+search, and authenticated OCR-result download. The runner also checks dependency
+readiness and removes its containers on exit. Its known credentials and
+high-numbered ports are isolated test fixtures, not deployment defaults.
 
 Run the web process and an RQ worker:
 

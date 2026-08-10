@@ -10,8 +10,13 @@ book_scanner_postgres_port="${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-55432}"
 book_scanner_redis_port="${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-56379}"
 book_scanner_ldap_port="${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-55389}"
 book_scanner_proxy_port="${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-58080}"
+book_scanner_ocr_port="${BOOK_SCANNER_INTEGRATION_OCR_PORT:-58082}"
 book_scanner_uvicorn_pid=""
 book_scanner_uvicorn_log="$(mktemp -t book-scanner-uvicorn.XXXXXX.log)"
+book_scanner_ocr_pid=""
+book_scanner_ocr_log="$(mktemp -t book-scanner-ocr.XXXXXX.log)"
+book_scanner_worker_pid=""
+book_scanner_worker_log="$(mktemp -t book-scanner-worker.XXXXXX.log)"
 
 book_scanner_compose=(
   docker compose
@@ -26,10 +31,20 @@ book_scanner_cleanup() {
     "${book_scanner_compose[@]}" ps || true
     "${book_scanner_compose[@]}" logs --no-color || true
     tail -200 "${book_scanner_uvicorn_log}" || true
+    tail -200 "${book_scanner_worker_log}" || true
+    tail -200 "${book_scanner_ocr_log}" || true
   fi
   if [[ -n "${book_scanner_uvicorn_pid}" ]] && kill -0 "${book_scanner_uvicorn_pid}" 2>/dev/null; then
     kill "${book_scanner_uvicorn_pid}"
     wait "${book_scanner_uvicorn_pid}" || true
+  fi
+  if [[ -n "${book_scanner_worker_pid}" ]] && kill -0 "${book_scanner_worker_pid}" 2>/dev/null; then
+    kill "${book_scanner_worker_pid}"
+    wait "${book_scanner_worker_pid}" || true
+  fi
+  if [[ -n "${book_scanner_ocr_pid}" ]] && kill -0 "${book_scanner_ocr_pid}" 2>/dev/null; then
+    kill "${book_scanner_ocr_pid}"
+    wait "${book_scanner_ocr_pid}" || true
   fi
   "${book_scanner_compose[@]}" down --volumes --remove-orphans
   case "${book_scanner_storage_root}" in
@@ -43,6 +58,12 @@ book_scanner_cleanup() {
   esac
   case "${book_scanner_uvicorn_log}" in
     /tmp/book-scanner-uvicorn.*.log) rm -f -- "${book_scanner_uvicorn_log}" ;;
+  esac
+  case "${book_scanner_worker_log}" in
+    /tmp/book-scanner-worker.*.log) rm -f -- "${book_scanner_worker_log}" ;;
+  esac
+  case "${book_scanner_ocr_log}" in
+    /tmp/book-scanner-ocr.*.log) rm -f -- "${book_scanner_ocr_log}" ;;
   esac
   exit "${book_scanner_exit_status}"
 }
@@ -65,6 +86,11 @@ export BOOK_SCANNER_LDAP_SERVICE_BIND_PASSWORD="GoodNewsEveryone"
 export BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE="mail"
 export BOOK_SCANNER_CSRF_TRUSTED_ORIGINS="[\"http://127.0.0.1:${book_scanner_proxy_port}\"]"
 export BOOK_SCANNER_RUN_INFRASTRUCTURE_TESTS="true"
+export BOOK_SCANNER_METADATA_PROVIDERS='["tests.browser_fixtures.BrowserMetadataProvider"]'
+export BOOK_SCANNER_OCR_SERVICE_URL="http://127.0.0.1:${book_scanner_ocr_port}"
+export BOOK_SCANNER_OCR_REQUEST_TIMEOUT="10"
+export BOOK_SCANNER_OCR_MAX_ATTEMPTS="5"
+export BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS="0.1"
 export QT_QPA_PLATFORM="offscreen"
 
 cd "${book_scanner_project_root}"
@@ -84,6 +110,38 @@ uv run pytest -q tests/integration --create-db
 
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS="0.2"
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS="150"
+uv run uvicorn tests.browser_fixtures:ocr_app \
+  --host 127.0.0.1 \
+  --port "${book_scanner_ocr_port}" \
+  --log-level warning \
+  --no-access-log \
+  --no-server-header \
+  >"${book_scanner_ocr_log}" 2>&1 &
+book_scanner_ocr_pid=$!
+
+book_scanner_ocr_ready="false"
+for _ in {1..100}; do
+  if ! kill -0 "${book_scanner_ocr_pid}" 2>/dev/null; then
+    break
+  fi
+  if curl --fail --silent --show-error "http://127.0.0.1:${book_scanner_ocr_port}/healthz" >/dev/null; then
+    book_scanner_ocr_ready="true"
+    break
+  fi
+  sleep 0.2
+done
+if [[ "${book_scanner_ocr_ready}" != "true" ]]; then
+  echo "OCR contract fixture failed to become ready for browser acceptance" >&2
+  exit 1
+fi
+
+uv run rq worker \
+  --config ebook_server.rq_settings \
+  --url "${BOOK_SCANNER_REDIS_URL}" \
+  ebook-server \
+  >"${book_scanner_worker_log}" 2>&1 &
+book_scanner_worker_pid=$!
+
 uv run uvicorn ebook_server.asgi:application \
   --host 0.0.0.0 \
   --port 58081 \

@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     ]
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    ocr_service_url: str = "http://localhost:8020"
+    ocr_request_timeout: float = 30.0
+    ocr_max_attempts: int = 40
+    ocr_poll_interval_seconds: float = 0.2
     secure_ssl_redirect: bool = False
     secure_hsts_seconds: int = 0
     secure_hsts_include_subdomains: bool = True
@@ -191,6 +195,10 @@ BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
+BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
+BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts
+BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS = settings.ocr_poll_interval_seconds
 BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds

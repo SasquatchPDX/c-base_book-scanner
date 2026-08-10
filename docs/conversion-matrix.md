@@ -16,7 +16,7 @@ is present on the worker.
 | DjVu -> EPUB/PDF | DjVuLibre text extraction then conversion | Calibre if supported in deployment | manual fallback | uncertain | yes | maybe | researched; not advertised |
 | CBZ/CBR extraction | Standard ZIP / RarFile and configured archive tool | libarchive/7zip | n/a | good if source clean | no | no | bounded intake implemented; conversion not advertised |
 | scanned images -> PDF | img2pdf | Ghostscript alternatives | Pillow | good for archival | yes | no | scan packaging implemented and library-backed |
-| OCR text -> EPUB | OCR text then Pandoc | Calibre | good | yes | no | orchestration implemented; full real-service flow pending |
+| OCR text -> EPUB | OCR text then Pandoc | Calibre | good | yes | no | orchestration and browser-driven OCR contract flow verified; AI-server recognition quality pending |
 
 ## Notes
 
