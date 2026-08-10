@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: Book Scanner
+    orgId: 1
+    folder: Hackerspace Library
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards/book-scanner

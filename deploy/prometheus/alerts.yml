@@ -1,0 +1,89 @@
+groups:
+  - name: book-scanner-availability
+    interval: 30s
+    rules:
+      - alert: BookScannerMetricsTargetDown
+        expr: up{job="book-scanner"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Book Scanner metrics target is down
+          description: Prometheus has been unable to scrape {{ $labels.instance }} for two minutes.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-metrics-target-down
+      - alert: BookScannerQueueUnavailable
+        expr: ebook_server_queue{measure="enabled"} == 1 and on(queue) ebook_server_queue{measure="up"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Book Scanner cannot reach its RQ queue
+          description: Queue {{ $labels.queue }} is configured but unavailable.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-queue-unavailable
+
+  - name: book-scanner-workflows
+    interval: 1m
+    rules:
+      - alert: BookScannerQueueBacklog
+        expr: ebook_server_queue{measure="depth"} > 25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner queue backlog is sustained
+          description: Queue {{ $labels.queue }} has held more than 25 jobs for 15 minutes.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-queue-backlog
+      - alert: BookScannerQueuedJobStuck
+        expr: ebook_server_processing_job_oldest_age_seconds{state="queued"} > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner job has remained queued
+          description: The oldest {{ $labels.job_type }} job has been queued for over 15 minutes.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-stuck-jobs
+      - alert: BookScannerRunningJobStuck
+        expr: ebook_server_processing_job_oldest_age_seconds{state="running"} > 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner job has run unusually long
+          description: The oldest {{ $labels.job_type }} job has run for over one hour.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-stuck-jobs
+      - alert: BookScannerRecentProcessingFailures
+        expr: ebook_server_processing_job_failures_recent{window="1h"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner processing jobs are failing
+          description: Recent failures were recorded for {{ $labels.job_type }} jobs.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-workflow-failures
+      - alert: BookScannerRecentImportFailures
+        expr: ebook_server_import_failures_recent{window="1h"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner imports are failing
+          description: Recent failures were recorded for {{ $labels.source_type }} imports.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-workflow-failures
+      - alert: BookScannerRecentScanTailorFailures
+        expr: ebook_server_scantailor_failures_recent{window="1h"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: ScanTailor processing stages are failing
+          description: Recent failures were recorded in the {{ $labels.stage }} stage.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-workflow-failures
+      - alert: BookScannerReviewBacklog
+        expr: sum(ebook_server_review_tasks{state=~"open|claimed"}) > 50
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: Book Scanner review backlog is high
+          description: More than 50 review tasks have remained open or claimed for one day.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-review-backlog

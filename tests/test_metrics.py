@@ -39,12 +39,33 @@ def test_metrics_require_bearer_token_and_expose_persistent_job_state() -> None:
         title="Metrics Candidate",
         score=0.72,
     )
+    ImportJob.objects.create(
+        source_type=ImportJob.SourceType.NETWORK_SOURCE,
+        state=ImportJob.State.FAILED,
+        uploader=profile.user,
+        source_path="/staging/failed.epub",
+        original_filename="failed.epub",
+        normalized_filename="failed.epub",
+        detected_format="epub",
+        mime_type="application/epub+zip",
+    )
     started_at = timezone.now() - timedelta(seconds=12)
     ProcessingJob.objects.create(
         job_type=ProcessingJob.JobType.CONVERSION,
         state=ProcessingJob.JobState.SUCCESS,
         started_at=started_at,
         finished_at=started_at + timedelta(seconds=8),
+    )
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.OCR,
+        state=ProcessingJob.JobState.QUEUED,
+        scheduled_at=timezone.now() - timedelta(minutes=12),
+    )
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.OCR,
+        state=ProcessingJob.JobState.FAILED,
+        started_at=started_at,
+        finished_at=timezone.now() - timedelta(minutes=2),
     )
     client = Client()
 
@@ -68,6 +89,12 @@ def test_metrics_require_bearer_token_and_expose_persistent_job_state() -> None:
         "1.0"
     ) in body
     assert 'ebook_server_queue{measure="up",queue="ebook-server"} 1.0' in body
+    assert 'ebook_server_processing_job_oldest_age_seconds{job_type="ocr",state="queued"} ' in body
+    assert 'ebook_server_processing_job_failures_recent{job_type="ocr",window="1h"} 1.0' in body
+    assert (
+        'ebook_server_import_failures_recent{source_type="network_source",window="1h"} 1.0' in body
+    )
+    assert "# HELP ebook_server_scantailor_failures_recent" in body
 
 
 @override_settings(BOOK_SCANNER_METRICS_ENABLED=False)

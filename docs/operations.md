@@ -157,3 +157,50 @@ and metadata-confidence bucket populations by provider. Labels use bounded model
 enums or configured provider IDs; filenames, titles, usernames, and book contents
 are never labels. Structured logs record provider latency/failure and processing
 job lifecycle events without document content.
+
+The deployable scrape example, alert rules, 30-day retention policy, and Grafana
+dashboard are under `deploy/prometheus/` and `deploy/grafana/`. Validate them with
+`promtool`, provision the dashboard against a Prometheus data source whose UID is
+`prometheus`, and complete an actual scrape plus test Alertmanager notification
+before declaring production monitoring accepted.
+
+## Alert runbooks
+
+### Book Scanner metrics target down
+
+Check `/healthz/`, the ASGI process, proxy route, TLS certificate, Prometheus
+target error, and bearer-token file. Do not print the token. Restore scraping,
+then confirm `up{job="book-scanner"}` returns `1`.
+
+### Book Scanner queue unavailable
+
+Check Redis health and network policy from both web and worker hosts, then inspect
+the configured URL and queue name. Avoid switching production to inline execution.
+Once Redis is healthy, verify the queue `up` measure is `1` and workers consume a
+small test job.
+
+### Book Scanner queue backlog
+
+Compare queue depth, worker count, job types, and oldest queued age. Inspect failed
+worker logs and storage latency before scaling workers; do not retry jobs blindly
+when the underlying converter, OCR service, or mount remains unhealthy.
+
+### Book Scanner stuck jobs
+
+Find the durable `ProcessingJob` by type/state and correlate its job ID with
+structured worker logs. Verify worker liveness, timeout settings, external tool or
+OCR response, and storage access. Preserve artifacts and provenance when retrying
+or marking a genuinely abandoned job failed.
+
+### Book Scanner workflow failures
+
+Use the dashboard's 24-hour failure panel to identify the job/source/stage class,
+then inspect bounded structured logs and the durable record's `last_error` or job
+details. Check provider, converter, OCR, storage, and worker dependencies as
+appropriate. Never include document contents in incident notes or metrics labels.
+
+### Book Scanner review backlog
+
+Break the backlog down by task type and age, confirm metadata providers are
+healthy, and assign reviewers. Do not lower confidence thresholds merely to clear
+the queue; uncertain matches must remain explicit human-review work.

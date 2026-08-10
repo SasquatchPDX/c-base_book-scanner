@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
+from datetime import datetime, timedelta
 from typing import Any
 
 from django.conf import settings
 from django.db.models import Count
+from django.utils import timezone
 from prometheus_client.core import GaugeMetricFamily
 from redis import Redis
 from rq import Queue
@@ -25,6 +27,10 @@ from .models import (
 
 JOB_DURATION_BUCKETS: tuple[float, ...] = (1, 5, 15, 60, 300, 900, 1800, 3600)
 CONFIDENCE_BUCKETS: tuple[float, ...] = (0.25, 0.5, 0.55, 0.7, 0.86, 0.95, 1.0)
+RECENT_WINDOWS: tuple[tuple[str, timedelta], ...] = (
+    ("1h", timedelta(hours=1)),
+    ("24h", timedelta(hours=24)),
+)
 
 
 def _group_count_metrics(
@@ -107,6 +113,12 @@ class PersistentStateCollector:
             label_names=("stage", "status"),
         )
 
+        now = timezone.now()
+        yield self._oldest_active_processing_job_metric(now)
+        yield self._recent_processing_failure_metric(now)
+        yield self._recent_import_failure_metric(now)
+        yield self._recent_scantailor_failure_metric(now)
+
         duration_values: dict[tuple[str, str], list[float]] = defaultdict(list)
         jobs = (
             ProcessingJob.objects.exclude(started_at=None)
@@ -149,6 +161,90 @@ class PersistentStateCollector:
         yield confidence_metric
 
         yield self._queue_metric()
+
+    @staticmethod
+    def _oldest_active_processing_job_metric(now: datetime) -> GaugeMetricFamily:
+        metric = GaugeMetricFamily(
+            "ebook_server_processing_job_oldest_age_seconds",
+            "Age of the oldest queued or running processing job.",
+            labels=["job_type", "state"],
+        )
+        oldest: dict[tuple[str, str], float] = {}
+        active = ProcessingJob.objects.filter(
+            state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING],
+        ).values_list("job_type", "state", "scheduled_at", "started_at")
+        for job_type, state, scheduled_at, started_at in active.iterator():
+            reference = (
+                started_at
+                if state == ProcessingJob.JobState.RUNNING and started_at is not None
+                else scheduled_at
+            )
+            age = max(0.0, (now - reference).total_seconds())
+            key = (job_type, state)
+            oldest[key] = max(age, oldest.get(key, 0.0))
+        for (job_type, state), age in oldest.items():
+            metric.add_metric([job_type, state], age)
+        return metric
+
+    @staticmethod
+    def _recent_processing_failure_metric(now: datetime) -> GaugeMetricFamily:
+        metric = GaugeMetricFamily(
+            "ebook_server_processing_job_failures_recent",
+            "Processing jobs that failed within a bounded recent window.",
+            labels=["job_type", "window"],
+        )
+        for window, delta in RECENT_WINDOWS:
+            rows = (
+                ProcessingJob.objects.filter(
+                    state=ProcessingJob.JobState.FAILED,
+                    finished_at__gte=now - delta,
+                )
+                .values("job_type")
+                .annotate(total=Count("id"))
+            )
+            for row in rows:
+                metric.add_metric([str(row["job_type"]), window], float(row["total"]))
+        return metric
+
+    @staticmethod
+    def _recent_import_failure_metric(now: datetime) -> GaugeMetricFamily:
+        metric = GaugeMetricFamily(
+            "ebook_server_import_failures_recent",
+            "Import jobs that failed within a bounded recent window.",
+            labels=["source_type", "window"],
+        )
+        for window, delta in RECENT_WINDOWS:
+            rows = (
+                ImportJob.objects.filter(
+                    state=ImportJob.State.FAILED,
+                    updated_at__gte=now - delta,
+                )
+                .values("source_type")
+                .annotate(total=Count("id"))
+            )
+            for row in rows:
+                metric.add_metric([str(row["source_type"]), window], float(row["total"]))
+        return metric
+
+    @staticmethod
+    def _recent_scantailor_failure_metric(now: datetime) -> GaugeMetricFamily:
+        metric = GaugeMetricFamily(
+            "ebook_server_scantailor_failures_recent",
+            "ScanTailor stages that failed within a bounded recent window.",
+            labels=["stage", "window"],
+        )
+        for window, delta in RECENT_WINDOWS:
+            rows = (
+                ScanTailorStageState.objects.filter(
+                    status=ScanTailorStageState.StageStatus.FAILED,
+                    updated_at__gte=now - delta,
+                )
+                .values("stage")
+                .annotate(total=Count("id"))
+            )
+            for row in rows:
+                metric.add_metric([str(row["stage"]), window], float(row["total"]))
+        return metric
 
     @staticmethod
     def _queue_metric() -> GaugeMetricFamily:

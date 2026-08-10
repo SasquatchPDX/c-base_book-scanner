@@ -28,6 +28,14 @@ jobs:
           npm run build
           npm audit --audit-level=high
           git diff --exit-code -- src/ebook_server/core/static/core/dist
+      - name: Observability assets
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/prometheus/scrape.yml:/etc/prometheus/prometheus.yml:ro" \
+            -v "$PWD/deploy/prometheus/alerts.yml:/etc/prometheus/rules/book-scanner-alerts.yml:ro" \
+            -v /dev/null:/etc/prometheus/secrets/book-scanner-metrics-token:ro \
+            prom/prometheus:v3.13.2@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69 \
+            check config /etc/prometheus/prometheus.yml
       - name: Lint
         run: |
           uv run ruff format --check .

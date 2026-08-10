@@ -57,5 +57,5 @@ This file tracks execution status while advancing Sprint documents in order.
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
 - Current remaining work is production-like infrastructure/integration
-  validation, operational dashboards/alerts, and browser-driven concurrency and
-  full-flow acceptance coverage.
+  validation, importing and exercising the supplied monitoring assets, and
+  browser-driven concurrency and full-flow acceptance coverage.

@@ -59,14 +59,18 @@ sprint or production deployment is complete.
   Interact.js, with direct split/content/dewarp/zone geometry, typed stage
   controls, selected/all-page batching, preserved manual exceptions, optimistic
   conflict handling, and authenticated SSE updates with polling fallback.
+- Observability now includes recent failure and oldest-active-job metrics,
+  validated Prometheus scrape/alert examples, operator runbooks, a bounded-label
+  Grafana dashboard, and an explicit 30-day/size-capped retention policy.
 
 ## Remaining gaps by requirement area
 
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.
-- Observability: core metrics and structured events are present; deployment alert
-  rules, dashboards, retention policy, and production scrape verification remain
-  operator/integration work.
+- Observability acceptance: the repository provides metrics, alerts, dashboard,
+  retention policy, and runbooks; importing them, verifying a real production
+  scrape, and testing the site's Alertmanager notification path remain deployment
+  work.
 - Integration/E2E depth: PostgreSQL, a real LDAP test directory, real Redis/RQ
   worker processes, external converter binaries, ASGI/SSE proxy behavior, and a
   browser-driven concurrent-editor/full physical-book flow need dedicated

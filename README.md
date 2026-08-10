@@ -88,8 +88,9 @@ the worker queue in production.
 
 See [docs/operations.md](docs/operations.md) for production configuration,
 LDAP modes, network mounts, worker operation, consistency verification, and
-security boundaries. Architecture and protocol documents live in `docs/`, while
-the sprint specifications remain the authoritative feature requirements.
+security boundaries. Prometheus alert/scrape examples and the provisioned Grafana
+dashboard live in `deploy/`. Architecture and protocol documents live in `docs/`,
+while the sprint specifications remain the authoritative feature requirements.
 
 ## Current maturity
 
