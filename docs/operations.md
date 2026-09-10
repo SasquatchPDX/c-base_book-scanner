@@ -124,6 +124,35 @@ artifact hashes, moves files into backend-local quarantine, commits the database
 deletion, and purges quarantine. A failed database operation restores moved files.
 Do not manually remove `.trash` content while a deletion request is active.
 
+## Intake status and source imports
+
+Fresh intake persists these phases before executing their work:
+
+```text
+DISCOVERED -> HASHING -> METADATA_EXTRACTION -> SIGNAL_NORMALIZATION
+  -> EXTERNAL_IDENTIFICATION -> MATCHED/LOW_CONFIDENCE -> ARCHIVING
+```
+
+Successful matched imports finish as `COMPLETE`; archived ambiguous imports return
+to `LOW_CONFIDENCE` until human review. Exact duplicates reuse an existing variant
+after hashing and skip metadata lookup. `GET /imports/<job-id>/` reports the
+current persisted phase, not a transition history; a polling client can miss short
+phases. Regression tests read the endpoint at each saved transition.
+
+Configure sources in Django admin. Preview, discovery, and failed-job retry
+currently require the management command:
+
+```bash
+uv run python manage.py ingest_sources --source-id 1 --preview --json
+uv run python manage.py ingest_sources --source-id 1
+uv run python manage.py ingest_sources --source-id 1 --retry-failed
+```
+
+Use the registered source's actual ID. A supported unattended schedule and
+application preview/run/retry pages remain Sprint019 task I. COPY retains its
+source even when review is needed. MOVE cleanup requires a verified archive; for
+duplicates, verification uses the existing variant's declared backend.
+
 ## Workers and external tools
 
 Start RQ workers with the queue name configured by
@@ -149,8 +178,20 @@ Bake reviewed converter binaries into its restricted image instead.
 Configure `BOOK_SCANNER_OCR_SERVICE_URL` and the worker network policy so only
 workers can submit jobs. Bound requests and polling with
 `BOOK_SCANNER_OCR_REQUEST_TIMEOUT`, `BOOK_SCANNER_OCR_MAX_ATTEMPTS`, and
-`BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS`. OCR responses are treated as untrusted
-artifacts and retain engine/model/language provenance.
+`BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS`. The current defaults are 40 polls at
+0.2-second intervals, roughly eight seconds of waiting plus request time. This
+blocking loop occupies an RQ worker until completion or timeout. Sizing the budget
+for real OCR and persisting service-reported engine/model/language/confidence
+remain Sprint019 task E; current variants record requested engine/model/language
+and artifact-level confidence.
+
+OCR clients implement `iter_artifact(remote_job_id, descriptor)` as a bounded
+byte iterator. HTTP downloads and scan ZIP packaging use 1 MiB chunks; inline
+base64 results are decoded in chunks, but the containing JSON response is still
+loaded into memory. Prefer artifact download URLs for whole-book outputs. Workers
+hash downloaded bytes while staging them on disk and remove partial temporary
+files after download failures. Changed results receive separate storage paths
+even when the service repeats a filename, preserving prior outputs.
 
 Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text

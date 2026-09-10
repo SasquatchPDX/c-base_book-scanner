@@ -1,8 +1,69 @@
 # Requirements Audit
 
-This audit compares the implementation to `AGENTS.md` and Sprint001–Sprint018.
+This audit compares the implementation to `AGENTS.md` and Sprint001–Sprint020.
 Passing tests are evidence for the paths they exercise, not proof that an entire
 sprint or production deployment is complete.
+
+## Sprint019 correction pass — 2026-09-10
+
+All 34 project Markdown documents were reread, excluding installed dependency
+documentation and generated caches. Sprint019 is in progress; Sprint020 is a
+future specification, including where its prose assumes Sprint019 is complete.
+Existing working-tree intake and browser-test work was preserved.
+
+Corrections implemented in this pass:
+
+- **A:** the existing strict auto-accept fix remains in place. The two failing
+  COPY/MOVE tests now require review for their weak candidates and verify archive
+  hashes and source retention/deletion. They no longer require unsafe acceptance.
+- **F:** signal normalization, matching, and the pre-archive low-confidence phase
+  are persisted in order. Tests observe both accepted and review paths through the
+  HTTP status endpoint at each saved transition. This is current-state reporting,
+  not an append-only transition history.
+- **L:** duplicate cleanup resolves the variant's declared storage backend.
+  Tests cover valid, corrupt, and missing archives under COPY and MOVE, including
+  a misleading matching artifact on the default backend.
+- **L:** existing-page staging and legacy replacement, scan ZIP packaging, and
+  OCR downloads stream bytes. Tests reject unbounded source reads, verify HTTP
+  response closure, and check partial-download cleanup and failed job state.
+- OCR materialization also used to overwrite an earlier result when a later
+  result reused its filename. New artifacts receive separate namespaces; tests
+  verify prior hashes remain intact and identical results still reuse a variant.
+- **K, partial:** architecture and storage docs now describe the actual module
+  layout and implemented backends. Sprint status and ScanTailor docs distinguish
+  projective correction/manual zones from the deferred algorithms, and remove
+  stale claims that reverse conversion and browser acceptance fixtures are absent.
+- Dependency audits identified vulnerable locked releases. Targeted updates now
+  use [pypdf 6.16.1](https://github.com/py-pdf/pypdf/releases/tag/6.16.1),
+  [sqlparse 0.6.0](https://sqlparse.readthedocs.io/en/latest/changes.html#release-0-6-0-aug-13-2026),
+  and [Vitest 4.1.11](https://github.com/vitest-dev/vitest/security/advisories/GHSA-82fw-gwwq-j7x9).
+  `pip-audit --skip-editable` and `npm audit` report no known vulnerabilities for
+  these lockfiles as of this run.
+
+Validation on 2026-09-10: 186 local Python tests, Ruff lint/format checks, strict
+mypy, Django system/migration checks, TypeScript checks, all four frontend tests,
+and the production frontend build passed. The rebuilt browser bundle is unchanged.
+The infrastructure suite passed all eight tests and all three Chromium workflows
+(digital library, concurrent editors, and the physical-book pipeline) with real
+PostgreSQL, LDAP, Redis/RQ, Nginx, Uvicorn, Pandoc, and Calibre. The OCR service in
+that suite is a contract fixture. Eight infrastructure tests are skipped by the
+local-only run and exercised separately by the infrastructure runner.
+
+The next correction work stays within Sprint019:
+
+| Tasks | Remaining work |
+| --- | --- |
+| B–D | Provider-owned normalization and ISBN lookup, reference-less candidate safety, scoring and threshold tuning, and an effective review-threshold contract |
+| E | Service-reported OCR provenance, defensible polling defaults, and worker occupancy policy |
+| G | Mandatory, transactionally checked stage revisions; existing stale-editor coverage does not prove the concurrent-write contract |
+| H | Converter subprocess timeouts that terminate the process group, and application resource limits |
+| I | Administrator source preview/run/retry pages and supported unattended discovery |
+| J | Accurate advertised algorithm names and quantitative curvature fixtures |
+| K | Further reconciliation as those corrections land |
+
+Curvature correction, automatic zones, taxonomy/search, derived-artifact retention,
+and device/abuse controls remain Sprint020 work. Neither correction sprint nor the
+full project is acceptance-complete.
 
 ## Verified and strengthened
 

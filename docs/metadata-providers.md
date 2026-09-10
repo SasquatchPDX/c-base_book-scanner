@@ -10,6 +10,25 @@ Public lookup must use an abstraction with:
 
 No single provider should be a hard dependency in application logic.
 
+## Current implementation and correction scope
+
+The interface above is the design target. The current protocol exposes `search`
+with an ISBN keyword, and shared normalization still expects Open Library field
+names. Sprint019 tasks B–D cover provider decoupling, scoring, and candidate
+persistence; they remain open.
+
+Digital intake requires `BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT` (default 0.86)
+to link a provider candidate automatically. Lower scores and missing candidates
+create a review task and archive the original without assigning canonical Book
+metadata. The previous threshold correction is protected by upload and COPY/MOVE
+regression tests.
+
+The scorer is not yet tuned for ISBN-less imports: title and author alone
+contribute at most 0.85, author hints can dilute the score, and language/publisher
+comparisons need normalization. `BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
+does not affect intake acceptance. Task D must give that setting a tested role or
+remove it; do not lower auto-accept merely to reduce the review queue.
+
 ## Provider options identified
 
 ### Open Library (primary)

@@ -126,3 +126,11 @@ The repository has broad automated coverage of the API and processing services,
 but the sprint-completion table should not be treated as a production-readiness
 certificate. Remaining requirement gaps and verification evidence are tracked in
 [docs/requirements-audit.md](docs/requirements-audit.md).
+
+[Sprint019](Sprint019.md) is the active correction sprint;
+[Sprint020](Sprint020.md) is planned development. Current corrections cover strict
+metadata review, persisted intake phases, backend-aware duplicate verification,
+and streamed scan/OCR artifacts with preserved output versions. Provider/scoring,
+OCR provenance/polling, concurrency, converter limits, and unattended-import
+corrections remain open. The audit records the distinction between implemented
+behavior, deferred algorithms, and deployment acceptance.

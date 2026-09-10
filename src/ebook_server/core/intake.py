@@ -27,7 +27,7 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from pypdf import PdfReader
 
-from ebook_server.storage import LocalFilesystemStorage
+from ebook_server.storage import LocalFilesystemStorage, StorageBackend
 
 from . import identification
 from .models import (
@@ -41,6 +41,7 @@ from .models import (
     SourceLocation,
     StorageLocation,
 )
+from .storage_registry import backend_for_location
 
 logger = structlog.get_logger(__name__)
 
@@ -293,7 +294,7 @@ def _archive_should_preserve_source(job: ImportJob) -> bool:
     return _source_transfer_mode(job) == "copy"
 
 
-def _verify_archive(storage: LocalFilesystemStorage, location: str, expected_sha: str) -> bool:
+def _verify_archive(storage: StorageBackend, location: str, expected_sha: str) -> bool:
     if not location:
         return False
     if not storage.exists(location):
@@ -1133,7 +1134,7 @@ def process_import_job(job_id: str) -> None:
             _finalize_source_cleanup(
                 job,
                 _verify_archive(
-                    _default_storage(),
+                    backend_for_location(duplicate_variant.storage_location),
                     duplicate_variant.storage_identifier,
                     job.sha256,
                 ),
@@ -1141,14 +1142,13 @@ def process_import_job(job_id: str) -> None:
             _try_extract_front_cover(duplicate_variant)
             return
 
-        job.state = ImportJob.State.SIGNAL_NORMALIZATION
         metadata = extract_metadata(
             job.source_path,
             detected_format,
             original_filename=job.original_filename,
         )
         job.evidence = metadata
-        job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
+        job.state = ImportJob.State.SIGNAL_NORMALIZATION
         job.save(
             update_fields=[
                 "evidence",
@@ -1162,13 +1162,16 @@ def process_import_job(job_id: str) -> None:
             original_filename=job.original_filename,
             extracted_metadata=metadata,
         )
+        job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
+        job.save(update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
         _save_metadata_candidates(job, candidates)
 
         top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < REVIEW_SCORE:
+        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
+            job.save(update_fields=["state", "updated_at"])
             job.state = ImportJob.State.ARCHIVING
             job.save(update_fields=["state", "updated_at"])
             destination, verified = _archive_source(_default_storage(), job)
@@ -1196,6 +1199,8 @@ def process_import_job(job_id: str) -> None:
             )
             return
 
+        job.state = ImportJob.State.MATCHED
+        job.save(update_fields=["state", "updated_at"])
         storage = _default_storage()
         storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
@@ -1210,7 +1215,6 @@ def process_import_job(job_id: str) -> None:
             fallback_title=top_candidate.title,
             extra_metadata=metadata,
         )
-        job.state = ImportJob.State.MATCHED
         job.storage_identifier = destination
         job.storage_location = storage_location
         job.normalized_filename = normalize_filename(

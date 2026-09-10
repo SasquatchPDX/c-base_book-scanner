@@ -102,6 +102,15 @@ if ! command -v ebook-convert >/dev/null 2>&1; then
   "${book_scanner_project_root}/scripts/install_test_calibre.sh" "${book_scanner_calibre_root}"
   export PATH="${book_scanner_calibre_root}/calibre:${PATH}"
 fi
+book_scanner_browser_epub="${book_scanner_storage_root}/browser-digital-library.epub"
+pandoc \
+  "${book_scanner_project_root}/tests/fixtures/browser-digital-library.html" \
+  --from html \
+  --to epub3 \
+  --metadata title="Browser Digital Library" \
+  --metadata author="Ada Digital" \
+  --output "${book_scanner_browser_epub}"
+export BOOK_SCANNER_BROWSER_EPUB_FIXTURE="${book_scanner_browser_epub}"
 uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120
 uv run python manage.py migrate --noinput

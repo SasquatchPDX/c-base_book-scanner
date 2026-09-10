@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 from collections.abc import AsyncIterator, Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
@@ -19,7 +20,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
-from django.core.files.base import ContentFile
+from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
 from django.db.models import Count, Q
@@ -664,10 +665,14 @@ def _stage_scan_page_from_existing_version(page: ScanPage) -> tuple[str, int]:
     active_version = page.active_version()
     if active_version is None:
         raise ValueError("no active page version")
-    storage = _default_scan_storage()
+    storage = (
+        backend_for_location(active_version.storage_location)
+        if active_version.storage_location_id is not None
+        else _default_scan_storage()
+    )
     with storage.open(active_version.storage_identifier) as stream:
         staged_path, size_bytes = _stage_scan_upload(
-            ContentFile(stream.read(), name=active_version.original_filename or "scan-page.bin"),
+            File(stream, name=active_version.original_filename or "scan-page.bin"),
         )
     return staged_path, size_bytes
 
@@ -2648,6 +2653,7 @@ def scan_page(
     payload = _scan_page_request_payload(request)
     requested_checksum = _coerce_str_or_none(payload.get("checksum_sha256"))
     uploaded_file: Any = request.FILES.get("file")
+    active_version: ScanPageVersion | None = None
     if uploaded_file is None:
         if request.content_type == "application/octet-stream":
             legacy_payload = _parse_legacy_scan_put_payload(request.body)
@@ -2656,13 +2662,6 @@ def scan_page(
             active_version = page.active_version()
             if active_version is None:
                 return HttpResponseBadRequest("missing_file")
-            storage = _default_scan_storage()
-            try:
-                with storage.open(active_version.storage_identifier) as source_stream:
-                    source_payload = source_stream.read()
-            except FileNotFoundError:
-                return HttpResponseBadRequest("missing_file")
-            uploaded_file = ContentFile(source_payload, name=active_version.original_filename)
             requested_checksum = _coerce_str_or_none(legacy_payload.get("checksum_sha256"))
         else:
             return HttpResponseBadRequest("missing_file")
@@ -2687,17 +2686,32 @@ def scan_page(
         return HttpResponseBadRequest("job not accepting pages")
 
     try:
-        page, version, created = _store_scan_page(
-            job=job,
-            logical_sequence_number=page.logical_sequence_number,
-            side=page.side,
-            uploaded_file=uploaded_file,
-            uploader_id=profile.user_id,
-            scanner_metadata=scanner_metadata,
-            capture_timestamp=capture_timestamp,
-            requested_checksum=requested_checksum,
-            force_new_version=force_new_version,
-        )
+        with ExitStack() as resources:
+            if active_version is not None:
+                storage = (
+                    backend_for_location(active_version.storage_location)
+                    if active_version.storage_location_id is not None
+                    else _default_scan_storage()
+                )
+                source_stream = resources.enter_context(
+                    storage.open(active_version.storage_identifier),
+                )
+                uploaded_file = File(source_stream, name=active_version.original_filename)
+            page, version, created = _store_scan_page(
+                job=job,
+                logical_sequence_number=page.logical_sequence_number,
+                side=page.side,
+                uploaded_file=uploaded_file,
+                uploader_id=profile.user_id,
+                scanner_metadata=scanner_metadata,
+                capture_timestamp=capture_timestamp,
+                requested_checksum=requested_checksum,
+                force_new_version=force_new_version,
+            )
+    except FileNotFoundError:
+        return HttpResponseBadRequest("missing_file")
+    except StorageConfigurationError:
+        return HttpResponseBadRequest("source storage is unavailable")
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
 

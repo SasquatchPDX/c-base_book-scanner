@@ -10,6 +10,10 @@ This file tracks execution status while advancing Sprint documents in order.
 
 ## Current snapshot
 
+Sprint019 is the active correction sprint and remains in progress. Sprint020 is
+planned work whose prerequisite corrections are not yet complete; its descriptions
+of Sprint019 outcomes are planning assumptions, not evidence of completion.
+
 | Sprint | Status | Implementation evidence |
 | --- | --- | --- |
 | 001 | Implemented | Architecture/research docs, project skeleton, dependency/tooling baseline, health/readiness and secured Prometheus endpoints, structured logging, CI |
@@ -27,9 +31,11 @@ This file tracks execution status while advancing Sprint documents in order.
 | 013 | Implemented | Server-rendered/API workspace, strict-TypeScript stage editor, persistent stage state, SSE updates, optimistic conflicts, worker lifecycle, and invalidation handling |
 | 014 | Implemented | Page split and deskew algorithms plus direct split-line/manual-angle controls, persisted dimensions/parameters, and regression tests |
 | 015 | Implemented | Content/margin stages plus draggable content geometry, alignment and batch controls, manual-exception preservation, and regression tests |
-| 016 | Implemented | Practical dewarping with draggable control points, projective transform path, safe fallback modes, and reproducibility/bypass/failure tests |
-| 017 | Implemented | Pluggable Otsu/Sauvola/Wolf/Fox/Window/Grad output, direct text/picture zones, threshold controls, and regression tests |
+| 016 | Partial | Projective correction, control points, and bypass/failure coverage exist; curvature correction and its fixture baseline remain outstanding |
+| 017 | Partial | Output modes and manual zones exist; `fox` is Niblack, `wolf` is approximate, and automatic segmentation is outstanding |
 | 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, downstream invalidation, and production-shaped Chromium acceptance for the synthetic physical-book flow |
+| 019 | In progress | A and F implemented; L covers backend-aware duplicate verification and streamed scan/OCR artifacts, including preservation of repeated OCR filenames; documentation reconciliation is partial. See the requirements audit for open work |
+| 020 | Planned | Deferred algorithms, taxonomy/search, artifact retention, device identity, abuse controls, and other explicitly scoped development |
 
 ## Sprint evidence checklist (as of 2026-08-10)
 
@@ -56,15 +62,15 @@ This file tracks execution status while advancing Sprint documents in order.
 
 - No sprint should be called acceptance-complete solely from this table; use the
   requirements audit and a deployment-specific acceptance run.
-- Current remaining work is quality-fixture coverage for reverse Calibre routes,
-  importing and exercising the supplied monitoring assets, and browser-driven
-  full physical-book acceptance. PostgreSQL, seeded OpenLDAP, Redis/RQ, Nginx,
-  Uvicorn, Playwright Chromium, and live readiness checks now run in CI.
+- Current remaining corrections are indexed in Sprint019 and the requirements
+  audit. Monitoring acceptance and real AI-server recognition quality still need
+  site-connected runs. Reverse Calibre quality fixtures and browser-driven
+  physical-book acceptance already exist and run in the infrastructure suite.
 - Sprint009 now additionally has a pinned real-Pandoc acceptance path spanning a
   member HTTP request, Redis, a Django-aware RQ worker process, provenance-linked
   EPUB storage, validation, and authenticated download. Pinned Calibre 9.11.0
-  similarly verifies EPUB-to-PDF and EPUB-to-MOBI; reverse routes remain
-  binary-advertised but need representative quality fixtures.
+  similarly verifies EPUB-to-PDF and EPUB-to-MOBI, plus representative reverse
+  PDF/MOBI-to-EPUB metadata and readable-text preservation.
 - Sprint013 now has a pinned Nginx/Uvicorn/PostgreSQL acceptance path for
   authenticated, unbuffered SSE state updates and clean client disconnects. A
   two-member Playwright scenario additionally proves that stale revisions cannot

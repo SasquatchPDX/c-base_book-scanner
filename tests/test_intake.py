@@ -8,6 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db.models.signals import post_save
 from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
 from PIL import Image
@@ -18,6 +19,8 @@ from ebook_server.core.models import (
     CoverImage,
     FileVariant,
     ImportJob,
+    MetadataCandidate,
+    ReviewTask,
     StorageLocation,
     get_or_create_profile,
 )
@@ -167,6 +170,106 @@ def test_epub_upload_registers_file_variant(
     assert job.file_variant.storage_identifier
     storage = LocalFilesystemStorage(str(storage_root / "library-artifacts"))
     assert storage.exists(job.file_variant.storage_identifier)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_candidate_below_auto_accept_threshold_requires_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=["Jane Doe"],
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("borderline-review-user")
+    client = Client()
+    client.force_login(profile.user)
+
+    storage_root = tmp_path / "storage"
+    storage = LocalFilesystemStorage(str(storage_root / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "borderline.epub"
+    _build_epub(epub_path, "Borderline Match")
+    response = client.post(
+        "/imports/upload/",
+        {
+            "file": SimpleUploadedFile(
+                epub_path.name,
+                epub_path.read_bytes(),
+                content_type="application/epub+zip",
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    task = ReviewTask.objects.get(import_job=job)
+
+    assert float(candidate.score) == pytest.approx(0.85)
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert job.file_variant_id is None
+    assert task.state == ReviewTask.State.OPEN
+    assert storage.exists(job.storage_identifier)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("auto_accept_threshold", [0.8, 0.86])
+def test_import_status_exposes_each_processing_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auto_accept_threshold: float,
+) -> None:
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Observed Book",
+        authors=["Jane Doe"],
+        auto_accept_threshold=auto_accept_threshold,
+    )
+    profile = get_or_create_profile("status-observer")
+    client = Client()
+    client.force_login(profile.user)
+    epub_path = tmp_path / "observed.epub"
+    _build_epub(epub_path, "Observed Book")
+    states: list[str] = []
+
+    def observe_status(sender: type[ImportJob], instance: ImportJob, **kwargs: Any) -> None:
+        del sender, kwargs
+        response = client.get(f"/imports/{instance.id}/")
+        assert response.status_code == 200
+        state = response.json()["state"]
+        if not states or states[-1] != state:
+            states.append(state)
+
+    post_save.connect(observe_status, sender=ImportJob)
+    try:
+        with override_settings(APP_DATA_DIR=tmp_path):
+            response = client.post(
+                "/imports/upload/",
+                {"file": SimpleUploadedFile(epub_path.name, epub_path.read_bytes())},
+            )
+        assert response.status_code == 201
+    finally:
+        post_save.disconnect(observe_status, sender=ImportJob)
+
+    accepted = auto_accept_threshold == 0.8
+    assert states == [
+        ImportJob.State.DISCOVERED,
+        ImportJob.State.HASHING,
+        ImportJob.State.METADATA_EXTRACTION,
+        ImportJob.State.SIGNAL_NORMALIZATION,
+        ImportJob.State.EXTERNAL_IDENTIFICATION,
+        ImportJob.State.MATCHED if accepted else ImportJob.State.LOW_CONFIDENCE,
+        ImportJob.State.ARCHIVING,
+        ImportJob.State.COMPLETE if accepted else ImportJob.State.LOW_CONFIDENCE,
+    ]
 
 
 @pytest.mark.django_db(transaction=True)

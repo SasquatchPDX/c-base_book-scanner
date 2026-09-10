@@ -23,6 +23,14 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are:
 6. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
 
+The current dewarping stage corrects perspective on flat pages; it does not
+correct book-spine curvature. Text/picture separation is manual only:
+`zone_mode="auto"` currently applies one algorithm to the whole page. The output
+option named `fox` uses scikit-image's Niblack implementation, and `wolf` uses a
+local-contrast approximation. Correcting those advertised names and establishing
+curvature fixtures remain Sprint019 work; curvature correction and automatic
+segmentation are planned in Sprint020.
+
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
 browser geometry can be mapped between full-resolution source coordinates and a
@@ -98,5 +106,7 @@ them with:
 
 The infrastructure suite verifies authentication, prompt initial and updated
 events, unbuffered Nginx proxying, and client disconnect recovery against a real
-Uvicorn/PostgreSQL deployment boundary. Browser-driven multi-user and full
-scan-to-library acceptance remain the next production-like E2E layer.
+Uvicorn/PostgreSQL deployment boundary. The browser suite also exercises concurrent
+editors and a synthetic scan-to-library workflow against an HTTP OCR contract
+fixture. Recognition quality against the hackerspace AI server remains a separate
+site-connected acceptance requirement.

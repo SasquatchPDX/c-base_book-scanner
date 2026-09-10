@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 from uuid import uuid4
+from zipfile import ZipFile
 
+import httpx
 import pytest
 from django.conf import settings as django_settings
 from django.test import Client
@@ -24,6 +29,7 @@ from ebook_server.core.models import (
     get_or_create_profile,
 )
 from ebook_server.storage import LocalFilesystemStorage
+from tests.streaming_fixtures import BoundedReadStream
 
 
 class _ScriptedOCRClient:
@@ -66,12 +72,78 @@ class _ScriptedOCRClient:
             error=entry.get("error"),  # type: ignore[arg-type]
         )
 
-    def download_artifact(self, remote_job_id: str, artifact: ocr.OCRArtifactDescriptor) -> bytes:
+    def iter_artifact(
+        self,
+        remote_job_id: str,
+        artifact: ocr.OCRArtifactDescriptor,
+    ) -> Iterator[bytes]:
         del remote_job_id
         payload = self.outputs.get(artifact.format)
         if payload is None:
             raise AssertionError(f"unexpected format: {artifact.format}")
-        return payload
+        yield payload
+
+
+@pytest.mark.parametrize(
+    "content_url", [None, "/outputs/result.txt", "https://ocr.test/result.txt"]
+)
+def test_http_ocr_download_streams_and_closes_response(content_url: str | None) -> None:
+    chunk = b"x" * ocr.ARTIFACT_CHUNK_BYTES
+
+    class ResponseStream(httpx.SyncByteStream):
+        sent = 0
+        closed = False
+
+        def __iter__(self) -> Iterator[bytes]:
+            for _ in range(3):
+                self.sent += 1
+                yield chunk
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = ResponseStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        expected = content_url or "/v1/ocr/jobs/remote/artifacts/txt"
+        if expected.startswith("/"):
+            expected = f"https://ocr.test{expected}"
+        assert str(request.url) == expected
+        return httpx.Response(200, stream=stream)
+
+    client = ocr.HttpxOCRClient("https://ocr.test")
+    client._client.close()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
+        client._client = transport
+        chunks = client.iter_artifact(
+            "remote",
+            ocr.OCRArtifactDescriptor(format="txt", content_url=content_url),
+        )
+        assert next(chunks) == chunk
+        assert stream.sent == 1
+        assert list(chunks) == [chunk, chunk]
+        assert stream.closed
+
+
+def test_http_ocr_inline_artifact_decodes_in_bounded_chunks() -> None:
+    payload = b"inline text" * (ocr.ARTIFACT_CHUNK_BYTES // 3)
+    client = ocr.HttpxOCRClient("https://ocr.test")
+    try:
+        chunks = list(
+            client.iter_artifact(
+                "remote",
+                ocr.OCRArtifactDescriptor(format="txt", content=base64.b64encode(payload).decode()),
+            )
+        )
+        assert len(chunks) > 1
+        assert max(map(len, chunks)) <= ocr.ARTIFACT_CHUNK_BYTES
+        assert b"".join(chunks) == payload
+        with pytest.raises(ocr.OCRClientError, match="content_base64 invalid"):
+            list(
+                client.iter_artifact("remote", ocr.OCRArtifactDescriptor(format="txt", content="!"))
+            )
+    finally:
+        client._client.close()
 
 
 def _profile(ldap_uid: str) -> AppUserProfile:
@@ -350,6 +422,137 @@ def test_scan_job_ocr_request_zips_pages_and_materializes_result(
         ).count()
         == 1
     )
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_ocr_scan_archive_streams_each_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: bool,
+) -> None:
+    storage = _configure_storage(tmp_path)
+    content = b"page bytes" * (1 << 19)
+    scan_job = _seed_scan_job_with_single_page(
+        book=Book.objects.create(title="Streaming pages"),
+        storage=storage,
+        payload=content,
+    )
+    streams: list[BoundedReadStream] = []
+    version = scan_job.pages.get().active_version()
+    assert version is not None
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    class PageStream(BoundedReadStream):
+        def read(self, size: int | None = -1) -> bytes:
+            if interrupted and self.tell() > 0:
+                raise FileNotFoundError("mount lost during page read")
+            return super().read(size)
+
+    def open_page(backend: LocalFilesystemStorage, identifier: str) -> BinaryIO:
+        assert backend.root == storage.root
+        assert identifier == version.storage_identifier
+        stream = PageStream(content)
+        streams.append(stream)
+        return cast(BinaryIO, stream)
+
+    monkeypatch.setattr(LocalFilesystemStorage, "open", open_page)
+    if interrupted:
+        with pytest.raises(FileNotFoundError, match="mount lost"):
+            ocr._zip_scan_job_pages(scan_job)
+        assert streams[0].closed
+        assert not list(tmp_path.glob("ocr-scan-pages-*"))
+        return
+    archive = ocr._zip_scan_job_pages(scan_job)
+    try:
+        with ZipFile(archive) as zipped:
+            assert zipped.namelist() == ["0001-single.png"]
+            assert zipped.read("0001-single.png") == content
+        assert len(streams) == 1
+        assert streams[0].closed
+    finally:
+        archive.unlink()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_streamed_artifacts_preserve_versions_and_reuse_duplicates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _configure_storage(tmp_path)
+    book = Book.objects.create(title="Streaming OCR")
+    outputs = {"txt": b"First recognition result"}
+    client = _ScriptedOCRClient([], outputs)
+    monkeypatch.setattr(ocr, "_get_ocr_client", lambda: client)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+    def materialize() -> FileVariant:
+        result = ocr._materialize_ocr_artifact(
+            source_book=book,
+            source_variant=None,
+            artifact=ocr.OCRArtifactDescriptor(format="txt", filename="result.txt"),
+            remote_job_id="same-remote-job",
+            request=ocr.OCRJobRequest(target_formats=["txt"]),
+        )
+        assert not list(tmp_path.glob("ocr-artifact-*"))
+        return FileVariant.objects.get(pk=result[0]["file_variant_id"])
+
+    first = materialize()
+    assert materialize() == first
+    outputs["txt"] = b"Improved recognition result" * (1 << 17)
+    second = materialize()
+    assert materialize() == second
+    assert first.storage_identifier != second.storage_identifier
+    assert FileVariant.objects.filter(book=book).count() == 2
+    assert storage.hash(first.storage_identifier) == first.sha256
+    assert storage.hash(second.storage_identifier) == second.sha256
+    assert b"".join(storage.stream(first.storage_identifier)) == b"First recognition result"
+    assert second.size_bytes == len(outputs["txt"])
+    assert second.sha256 == hashlib.sha256(outputs["txt"]).hexdigest()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_interrupted_download_removes_partial_temporary_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _configure_storage(tmp_path)
+    book = Book.objects.create(title="Interrupted OCR")
+    source = _seed_book_variant(
+        book,
+        storage,
+        fmt="pdf",
+        mime="application/pdf",
+        filename="source.pdf",
+        payload=b"%PDF",
+    )
+
+    class InterruptedClient(_ScriptedOCRClient):
+        def iter_artifact(
+            self,
+            remote_job_id: str,
+            artifact: ocr.OCRArtifactDescriptor,
+        ) -> Iterator[bytes]:
+            yield b"partial output"
+            raise ocr.OCRClientError("download interrupted")
+
+    client = InterruptedClient(
+        [{"status": "succeeded", "artifacts": [ocr.OCRArtifactDescriptor(format="txt")]}],
+        {},
+    )
+    monkeypatch.setattr(ocr, "_get_ocr_client", lambda: client)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    job = ocr.request_ocr_from_variant(
+        source_variant=source,
+        target_formats=["txt"],
+    )
+    job.refresh_from_db()
+    assert job.state == ProcessingJob.JobState.FAILED
+    assert "download interrupted" in job.details["error"]
+    assert not FileVariant.objects.filter(source_type=FileVariant.SourceType.OCR).exists()
+    assert not list(tmp_path.glob("ocr-artifact-*"))
+    assert not list(tmp_path.glob("ocr-source-*"))
+    assert storage.hash(source.storage_identifier) == source.sha256
 
 
 @pytest.mark.django_db(transaction=True)

@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import io
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client
 from PIL import Image
 
-from ebook_server.core import conversion, ocr, scan_pipeline
+from ebook_server.core import conversion, ocr, scan_pipeline, views
 from ebook_server.core.models import (
     Book,
     FileVariant,
@@ -18,7 +19,10 @@ from ebook_server.core.models import (
     ScanJob,
     ScanPage,
     ScanPageVersion,
+    StorageLocation,
 )
+from ebook_server.storage import LocalFilesystemStorage
+from tests.streaming_fixtures import BoundedReadStream
 
 
 class _ScriptedOCRClient:
@@ -52,16 +56,16 @@ class _ScriptedOCRClient:
             error=entry.get("error"),  # type: ignore[arg-type]
         )
 
-    def download_artifact(
+    def iter_artifact(
         self,
         remote_job_id: str,
         artifact: ocr.OCRArtifactDescriptor,
-    ) -> bytes:
+    ) -> Iterator[bytes]:
         del remote_job_id
         payload = self.outputs.get(artifact.format)
         if payload is None:
             raise AssertionError(f"unexpected artifact format: {artifact.format}")
-        return payload
+        yield payload
 
 
 class _InMemoryTextConverter:
@@ -339,6 +343,71 @@ def test_scan_page_replacement_preserves_previous_version() -> None:
     assert latest_version.version == 2
     assert latest_version.is_active is True
     assert old_version.is_active is False
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("entry_point", ["staging", "legacy-replacement"])
+def test_existing_page_streams_from_declared_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_point: str,
+) -> None:
+    monkeypatch.setattr("django.conf.settings.APP_DATA_DIR", tmp_path)
+    client, job = _create_scan_job("streaming-scan")
+    page = ScanPage.objects.create(scan_job=job, logical_sequence_number=1, side="single")
+    location = StorageLocation.objects.create(
+        identifier="external-scans",
+        backend=StorageLocation.BackendType.NFS,
+        base_path=str(tmp_path / "network-scans"),
+    )
+    content = _valid_png_bytes() + b"\0" * (2 << 20)
+    old_version = ScanPageVersion.objects.create(
+        scan_page=page,
+        storage_location=location,
+        storage_identifier="pages/original.png",
+        checksum_sha256=_page_sha(content),
+        mime_type="image/png",
+        size_bytes=len(content),
+        version=1,
+        original_filename="original.png",
+        is_active=True,
+    )
+    streams: list[BoundedReadStream] = []
+
+    def open_page(backend: LocalFilesystemStorage, identifier: str) -> BinaryIO:
+        assert backend.root == location.base_path
+        assert identifier == old_version.storage_identifier
+        stream = BoundedReadStream(content)
+        streams.append(stream)
+        return cast(BinaryIO, stream)
+
+    monkeypatch.setattr(LocalFilesystemStorage, "open", open_page)
+    if entry_point == "staging":
+        staged, size = views._stage_scan_page_from_existing_version(page)
+        try:
+            assert size == len(content)
+            assert Path(staged).read_bytes() == content
+        finally:
+            Path(staged).unlink()
+    else:
+        response = client.put(
+            f"/scan/pages/{page.id}/",
+            data={
+                "checksum_sha256": _page_sha(content),
+                "file": SimpleUploadedFile("legacy.png", b"legacy"),
+            },
+        )
+        assert response.status_code == 201
+        assert page.versions.count() == 2
+        old_version.refresh_from_db()
+        assert not old_version.is_active
+        replacement = page.active_version()
+        assert replacement is not None
+        assert replacement.checksum_sha256 == _page_sha(content)
+        assert replacement.size_bytes == len(content)
+        assert replacement.storage_location_id != location.id
+    assert len(streams) == 1
+    assert streams[0].closed
 
 
 @pytest.mark.django_db(transaction=True)

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import shutil
 import tempfile
 import time
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 import httpx
 import structlog
@@ -28,6 +30,7 @@ from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 logger = structlog.get_logger(__name__)
+ARTIFACT_CHUNK_BYTES = 1 << 20
 
 
 class OCRClientError(RuntimeError):
@@ -94,8 +97,8 @@ class OCRClientProtocol(Protocol):
     def poll_job(self, remote_job_id: str) -> OCRPollResult:
         """Get current status for remote job id."""
 
-    def download_artifact(self, remote_job_id: str, artifact: OCRArtifactDescriptor) -> bytes:
-        """Download artifact bytes."""
+    def iter_artifact(self, remote_job_id: str, artifact: OCRArtifactDescriptor) -> Iterator[bytes]:
+        """Download artifact bytes in bounded chunks."""
 
 
 class HttpxOCRClient:
@@ -158,32 +161,33 @@ class HttpxOCRClient:
             raise OCRClientError(f"OCR poll failed: {exc}") from exc
         return _coerce_poll_payload(raw)
 
-    def download_artifact(self, remote_job_id: str, artifact: OCRArtifactDescriptor) -> bytes:
+    def iter_artifact(self, remote_job_id: str, artifact: OCRArtifactDescriptor) -> Iterator[bytes]:
         if artifact.content:
+            # Decode complete base64 quanta without allocating a second full artifact.
+            encoded_chunk_size = 4 * (ARTIFACT_CHUNK_BYTES // 3)
             try:
-                return base64.b64decode(artifact.content)
-            except Exception as exc:
+                for offset in range(0, len(artifact.content), encoded_chunk_size):
+                    yield base64.b64decode(
+                        artifact.content[offset : offset + encoded_chunk_size],
+                        validate=True,
+                    )
+            except (binascii.Error, ValueError) as exc:
                 raise OCRClientError("artifact content_base64 invalid") from exc
+            return
         if artifact.content_url:
             url = artifact.content_url
             if url.startswith("/"):
                 url = f"{self.base_url}{url}"
-            try:
-                response = self._client.get(url)
+        elif remote_job_id and artifact.format:
+            url = f"{self.base_url}/v1/ocr/jobs/{remote_job_id}/artifacts/{artifact.format}"
+        else:
+            raise OCRClientError("artifact missing content reference")
+        try:
+            with self._client.stream("GET", url) as response:
                 response.raise_for_status()
-                return response.content
-            except (httpx.HTTPError, OSError) as exc:
-                raise OCRClientError(f"OCR artifact fetch failed: {exc}") from exc
-        if remote_job_id and artifact.format:
-            try:
-                response = self._client.get(
-                    f"{self.base_url}/v1/ocr/jobs/{remote_job_id}/artifacts/{artifact.format}",
-                )
-                response.raise_for_status()
-                return response.content
-            except (httpx.HTTPError, OSError) as exc:
-                raise OCRClientError(f"OCR artifact fetch failed: {exc}") from exc
-        raise OCRClientError("artifact missing content reference")
+                yield from response.iter_bytes(chunk_size=ARTIFACT_CHUNK_BYTES)
+        except (httpx.HTTPError, OSError) as exc:
+            raise OCRClientError(f"OCR artifact fetch failed: {exc}") from exc
 
 
 _OCR_CLIENT: OCRClientProtocol | None = None
@@ -689,11 +693,6 @@ def _zip_scan_job_pages(scan_job: ScanJob) -> Path:
                         storage = backend_for_location(version.storage_location)
                     except StorageConfigurationError:
                         continue
-                try:
-                    with storage.open(version.storage_identifier) as stream:
-                        content = stream.read()
-                except FileNotFoundError:
-                    continue
                 extension = _derive_source_extension(
                     mime_type=version.mime_type,
                     fallback=Path(
@@ -702,7 +701,12 @@ def _zip_scan_job_pages(scan_job: ScanJob) -> Path:
                     or ".bin",
                 )
                 filename = f"{page.logical_sequence_number:04d}-{page.side}{extension}"
-                zipped.writestr(filename, content)
+                try:
+                    stream = storage.open(version.storage_identifier)
+                except FileNotFoundError:
+                    continue
+                with stream, zipped.open(filename, "w", force_zip64=True) as member:
+                    shutil.copyfileobj(stream, member, length=ARTIFACT_CHUNK_BYTES)
                 written += 1
         if written == 0:
             archive_path.unlink(missing_ok=True)
@@ -725,51 +729,48 @@ def _materialize_ocr_artifact(
     if request_format not in request.target_formats:
         return []
 
-    content = _get_ocr_client().download_artifact(remote_job_id, artifact)
-    if not content:
-        return []
-    output_sha = hashlib.sha256(content).hexdigest()
-
-    variant_query = FileVariant.objects.filter(
-        book=source_book,
-        format=request_format,
-        source_type=FileVariant.SourceType.OCR,
-        sha256=output_sha,
-    )
-    if source_variant is not None:
-        variant_query = variant_query.filter(source_variant=source_variant)
-    duplicate = variant_query.first()
-    if duplicate is not None:
-        return [
-            {
-                "format": request_format,
-                "file_variant_id": duplicate.id,
-                "filename": duplicate.original_filename,
-                "bytes": duplicate.size_bytes,
-            },
-        ]
-
     safe_name = Path(
         artifact.filename or f"{source_book.id}-ocr.{request_format}",
     ).name
     with tempfile.NamedTemporaryFile(
         prefix="ocr-artifact-",
         suffix=f".{request_format}",
-        delete=False,
     ) as temp:
-        temp.write(content)
-        temp.flush()
-        temp_path = Path(temp.name)
+        digest = hashlib.sha256()
+        size_bytes = 0
+        for chunk in _get_ocr_client().iter_artifact(remote_job_id, artifact):
+            temp.write(chunk)
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        if not size_bytes:
+            return []
+        output_sha = digest.hexdigest()
 
-    storage = _default_ocr_storage()
-    storage_identifier = storage.generate_destination(
-        f"books/{source_book.id}/ocr",
-        safe_name,
-    )
-    try:
-        storage.store(str(temp_path), storage_identifier)
-    finally:
-        temp_path.unlink(missing_ok=True)
+        variant_query = FileVariant.objects.filter(
+            book=source_book,
+            format=request_format,
+            source_type=FileVariant.SourceType.OCR,
+            sha256=output_sha,
+            source_variant=source_variant,
+        )
+        duplicate = variant_query.first()
+        if duplicate is not None:
+            return [
+                {
+                    "format": request_format,
+                    "file_variant_id": duplicate.id,
+                    "filename": duplicate.original_filename,
+                    "bytes": duplicate.size_bytes,
+                },
+            ]
+
+        storage = _default_ocr_storage()
+        storage_identifier = storage.generate_destination(
+            f"books/{source_book.id}/ocr/{uuid4()}",
+            safe_name,
+        )
+        temp.flush()
+        storage.store(temp.name, storage_identifier)
 
     variant = FileVariant.objects.create(
         book=source_book,
@@ -778,7 +779,7 @@ def _materialize_ocr_artifact(
         original_filename=safe_name,
         storage_location=_default_ocr_storage_location(),
         storage_identifier=storage_identifier,
-        size_bytes=len(content),
+        size_bytes=size_bytes,
         sha256=output_sha,
         source_type=FileVariant.SourceType.OCR,
         uploader=source_variant.uploader if source_variant is not None else None,
