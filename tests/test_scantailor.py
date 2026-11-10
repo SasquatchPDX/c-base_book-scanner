@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from ebook_server.core import scantailor, views
 from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
+from ebook_server.core.storage_registry import backend_for_location
 from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
 
 
@@ -1365,10 +1366,17 @@ def test_unreadable_input_fails_the_stage_with_message() -> None:
         str(job.id),
         sequence=1,
         side="single",
-        payload=good[: len(good) // 2],
+        payload=good,
         filename="scan.png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    # Uploads are validated, so simulate later on-disk corruption of the stored original.
+    version = page.active_version()
+    assert version is not None
+    stored = backend_for_location(version.storage_location).resolve_location(
+        version.storage_identifier
+    )
+    Path(stored).write_bytes(good[: len(good) // 2])
     client.post(
         _stage_url(str(job.id), str(page.id), "page_split"),
         data=json.dumps({"parameters": {"split_mode": "single"}}),
