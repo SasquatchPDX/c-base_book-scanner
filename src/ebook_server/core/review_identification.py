@@ -9,7 +9,7 @@ from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, is_stale_running
 
 from . import identification, intake
 from .models import ImportJob, ProcessingJob, ReviewTask
@@ -131,11 +131,15 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             return
         if processing_job.job_type != ProcessingJob.JobType.REVIEW_IDENTIFICATION:
             return
-        if processing_job.state in {
-            ProcessingJob.JobState.RUNNING,
-            ProcessingJob.JobState.SUCCESS,
-        }:
+        if processing_job.state == ProcessingJob.JobState.SUCCESS:
             return
+        if processing_job.state == ProcessingJob.JobState.RUNNING:
+            if not is_stale_running(processing_job):
+                return
+            logger.warning(
+                "stale_running_job_reentered",
+                processing_job_id=str(processing_job.job_id),
+            )
         details = _details(processing_job)
         attempt_count = int(details.get("attempt_count", 0)) + 1
         details = {**details, "attempt_count": attempt_count, "error": ""}

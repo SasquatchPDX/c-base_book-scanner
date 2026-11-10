@@ -145,6 +145,7 @@ if [[ "${book_scanner_ocr_ready}" != "true" ]]; then
 fi
 
 uv run rq worker \
+  --with-scheduler \
   --config ebook_server.rq_settings \
   --url "${BOOK_SCANNER_REDIS_URL}" \
   ebook-server \
