@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
     ocr_poll_interval_seconds: float = 0.2
+    # Optional tuning knobs; None means "use the module default" (see jobs.tunable_setting).
+    ocr_poll_deadline_seconds: float | None = None
+    ocr_poll_interval_start_seconds: float | None = None
+    ocr_poll_interval_max_seconds: float | None = None
+    ocr_submit_timeout: float | None = None
+    ocr_job_timeout_seconds: int | None = None
+    converter_timeout_seconds: int | None = None
     secure_ssl_redirect: bool = False
     secure_hsts_seconds: int = 0
     secure_hsts_include_subdomains: bool = True
@@ -253,6 +260,12 @@ BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts
 BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS = settings.ocr_poll_interval_seconds
+BOOK_SCANNER_OCR_POLL_DEADLINE_SECONDS = settings.ocr_poll_deadline_seconds
+BOOK_SCANNER_OCR_POLL_INTERVAL_START_SECONDS = settings.ocr_poll_interval_start_seconds
+BOOK_SCANNER_OCR_POLL_INTERVAL_MAX_SECONDS = settings.ocr_poll_interval_max_seconds
+BOOK_SCANNER_OCR_SUBMIT_TIMEOUT = settings.ocr_submit_timeout
+BOOK_SCANNER_OCR_JOB_TIMEOUT_SECONDS = settings.ocr_job_timeout_seconds
+BOOK_SCANNER_CONVERTER_TIMEOUT_SECONDS = settings.converter_timeout_seconds
 BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds

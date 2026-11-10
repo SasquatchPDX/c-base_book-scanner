@@ -228,10 +228,8 @@ blocking OCR loop occupies an RQ worker until completion or timeout. Persisting 
 remain Sprint019 task E; current variants record requested engine/model/language
 and artifact-level confidence.
 
-The OCR/converter tuning names above other than the legacy pair are not yet
-fields in `settings.py`. Set them as real process environment variables
-(systemd `Environment=`), not in `.env`, until they are wired in: the `.env`
-loader rejects unknown `BOOK_SCANNER_*` keys.
+All OCR/converter tuning names above are optional `settings.py` fields and may
+be set in `.env` or the process environment; unset values use the defaults.
 
 OCR clients implement `iter_artifact(remote_job_id, descriptor)` as a bounded
 byte iterator. HTTP downloads and scan ZIP packaging use 1 MiB chunks; inline
