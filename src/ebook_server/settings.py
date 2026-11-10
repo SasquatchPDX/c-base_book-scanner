@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import dj_database_url
 import django_stubs_ext
@@ -13,6 +17,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 django_stubs_ext.monkeypatch()
+try:
+    _APP_VERSION = _package_version("ebook-server")
+except PackageNotFoundError:  # pragma: no cover - running from a bare checkout
+    _APP_VERSION = "0"
+DEFAULT_METADATA_USER_AGENT = (
+    f"ebook-server/{_APP_VERSION} (+https://github.com/; self-hosted hackerspace library)"
+)
 DEV_SECRET_KEY = "dev-only-secret-change-me-before-production-0123456789abcdef"
 
 
@@ -24,6 +35,10 @@ class Settings(BaseSettings):
     default_database_url: str = "sqlite:///db.sqlite3"
     database_url: str | None = None
     storage_root: str = str(BASE_DIR / "data" / "storage")
+    storage_require_existing_root: bool = True
+    storage_sentinel_file: str = ""
+    source_min_age_seconds: int = 60
+    ingest_max_auto_attempts: int = 3
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -41,6 +56,9 @@ class Settings(BaseSettings):
     ldap_email_attribute: str = "mail"
     ldap_connect_timeout: float = 5.0
     ldap_start_tls: bool = False
+    ldap_ca_file: str = ""
+    ldap_tls_require_cert: bool = True
+    ldap_username_attribute: str = "uid"
     log_level: str = "INFO"
     metrics_enabled: bool = True
     metrics_bearer_token: SecretStr = SecretStr("")
@@ -48,6 +66,7 @@ class Settings(BaseSettings):
     metadata_providers: list[str] = [
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
     ]
+    metadata_user_agent: str = DEFAULT_METADATA_USER_AGENT
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
     ocr_service_url: str = "http://localhost:8020"
@@ -86,6 +105,18 @@ class Settings(BaseSettings):
             errors.append("redis_url is required for asynchronous work")
         if self.ldap_mode != "ldap":
             errors.append("ldap_mode must be 'ldap'")
+        if self.ldap_mode == "ldap":
+            parsed_uri = urlparse(self.ldap_server_uri.strip())
+            if parsed_uri.scheme not in {"ldap", "ldaps"} or not parsed_uri.hostname:
+                errors.append("ldap_server_uri must be an ldap:// or ldaps:// URI")
+            if not (self.ldap_user_dn_template.strip() or self.ldap_user_search_base.strip()):
+                errors.append("ldap_user_dn_template or ldap_user_search_base is required")
+            if self.ldap_start_tls and parsed_uri.scheme == "ldaps":
+                errors.append("ldap_start_tls cannot be combined with an ldaps:// URI")
+            if self.ldap_ca_file and not Path(self.ldap_ca_file).is_file():
+                errors.append("ldap_ca_file does not exist")
+            if self.ldap_user_dn_template and "{username}" not in self.ldap_user_dn_template:
+                errors.append("ldap_user_dn_template must contain {username}")
         if not self.secure_ssl_redirect:
             errors.append("secure_ssl_redirect must be enabled")
         if not self.session_cookie_secure or not self.csrf_cookie_secure:
@@ -100,6 +131,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if settings.secure_ssl_redirect and not settings.secure_proxy_ssl_header:
+    logging.getLogger(__name__).warning(
+        "SECURE_SSL_REDIRECT is enabled but secure_proxy_ssl_header is off: behind a "
+        "TLS-terminating reverse proxy every request looks like plain HTTP and will "
+        "redirect forever. Set BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true if the proxy "
+        "sends X-Forwarded-Proto.",
+    )
 
 
 SECRET_KEY = settings.secret_key.get_secret_value()
@@ -174,6 +213,18 @@ LOGIN_REDIRECT_URL = "/library/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 APP_DATA_DIR = Path(settings.storage_root)
+STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
+STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
+if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
+    # Development convenience only: production must never create the root itself,
+    # because that is how an unmounted share silently fills the local disk.
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
+BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_METADATA_USER_AGENT = settings.metadata_user_agent
 BOOK_SCANNER_QUEUE_URL = settings.redis_url
 BOOK_SCANNER_QUEUE_NAME = settings.queue_name
 BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS = settings.queue_job_timeout_seconds
@@ -191,6 +242,9 @@ BOOK_SCANNER_LDAP_SERVICE_BIND_PASSWORD = settings.ldap_service_bind_password.ge
 BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE = settings.ldap_email_attribute
 BOOK_SCANNER_LDAP_CONNECT_TIMEOUT = settings.ldap_connect_timeout
 BOOK_SCANNER_LDAP_START_TLS = settings.ldap_start_tls
+BOOK_SCANNER_LDAP_CA_FILE = settings.ldap_ca_file
+BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
+BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept

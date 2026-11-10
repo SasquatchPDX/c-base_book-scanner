@@ -237,7 +237,7 @@ class CoverImage(models.Model):
         on_delete=models.PROTECT,
         related_name="cover_images",
     )
-    storage_identifier = models.CharField(max_length=255)
+    storage_identifier = models.CharField(max_length=512)
     mime_type = models.CharField(max_length=128)
     size_bytes = models.PositiveBigIntegerField()
     sha256 = models.CharField(max_length=64)
@@ -304,7 +304,7 @@ class FileVariant(models.Model):
         on_delete=models.PROTECT,
         related_name="file_variants",
     )
-    storage_identifier = models.CharField(max_length=255)
+    storage_identifier = models.CharField(max_length=512)
     size_bytes = models.PositiveBigIntegerField()
     sha256 = models.CharField(max_length=64)
     source_type = models.CharField(max_length=16, choices=SourceType.choices)
@@ -443,7 +443,7 @@ class ScanPageVersion(models.Model):
         on_delete=models.PROTECT,
         related_name="scan_page_versions",
     )
-    storage_identifier = models.CharField(max_length=255)
+    storage_identifier = models.CharField(max_length=512)
     checksum_sha256 = models.CharField(max_length=64)
     mime_type = models.CharField(max_length=128)
     size_bytes = models.PositiveBigIntegerField()
@@ -595,7 +595,7 @@ class ScanTailorStageState(models.Model):
         null=True,
         blank=True,
     )
-    input_storage_identifier = models.CharField(max_length=255, blank=True)
+    input_storage_identifier = models.CharField(max_length=512, blank=True)
     input_scan_page_version = models.ForeignKey(
         "ScanPageVersion",
         on_delete=models.SET_NULL,
@@ -610,7 +610,7 @@ class ScanTailorStageState(models.Model):
         null=True,
         blank=True,
     )
-    output_storage_identifier = models.CharField(max_length=255, blank=True)
+    output_storage_identifier = models.CharField(max_length=512, blank=True)
     output_size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     output_sha256 = models.CharField(max_length=64, blank=True)
     preview_storage_location = models.ForeignKey(
@@ -620,7 +620,7 @@ class ScanTailorStageState(models.Model):
         null=True,
         blank=True,
     )
-    preview_storage_identifier = models.CharField(max_length=255, blank=True)
+    preview_storage_identifier = models.CharField(max_length=512, blank=True)
     worker_job_id = models.CharField(max_length=64, blank=True)
     last_error = models.TextField(blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -727,7 +727,7 @@ class ImportJob(models.Model):
     mime_type = models.CharField(max_length=255, blank=True)
     size_bytes = models.PositiveBigIntegerField(default=0)
     sha256 = models.CharField(max_length=64, blank=True)
-    storage_identifier = models.CharField(max_length=255, blank=True)
+    storage_identifier = models.CharField(max_length=512, blank=True)
     storage_location = models.ForeignKey(
         StorageLocation,
         on_delete=models.SET_NULL,
@@ -755,6 +755,8 @@ class ImportJob(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     next_retry_at = models.DateTimeField(null=True, blank=True)
+    source_size = models.PositiveBigIntegerField(null=True, blank=True)
+    source_mtime_ns = models.BigIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -996,18 +998,39 @@ class ReviewTask(models.Model):
         return f"{source_id}:{self.task_type}:{self.state}"
 
 
+def canonical_ldap_uid(uid: str) -> str:
+    """Canonical form for a directory uid typed by a user (directories are case-insensitive)."""
+    return uid.strip().casefold()
+
+
 def get_or_create_profile(
     ldap_uid: str,
     *,
     role: str | UserRole = DEFAULT_USER_ROLE,
     is_disabled: bool = False,
 ) -> AppUserProfile:
-    """Create or fetch profile record for an authenticated LDAP identity."""
+    """Create or fetch profile record for an authenticated LDAP identity.
 
+    Lookups are case-insensitive so "Alice" and "alice" resolve to the same account.
+    New accounts are created with the identity exactly as given; callers should pass a
+    canonical uid (the directory's uid attribute, or the casefolded login name).
+    """
+
+    ldap_uid = ldap_uid.strip()
     user_model = get_user_model()
-    user, _ = user_model.objects.get_or_create(username=ldap_uid, defaults={"is_active": True})
+    profile = (
+        AppUserProfile.objects.select_related("user")
+        .filter(ldap_uid__iexact=ldap_uid)
+        .order_by("pk")
+        .first()
+    )
+    if profile is not None:
+        return profile
+    user = user_model.objects.filter(username__iexact=ldap_uid).order_by("pk").first()
+    if user is None:
+        user = user_model.objects.create(username=ldap_uid, is_active=True)
     normalized_role = role.value if isinstance(role, UserRole) else role
-    profile, created = AppUserProfile.objects.get_or_create(
+    profile, _created = AppUserProfile.objects.get_or_create(
         ldap_uid=ldap_uid,
         defaults={
             "user": user,
@@ -1015,12 +1038,4 @@ def get_or_create_profile(
             "is_disabled": is_disabled,
         },
     )
-    if created:
-        return profile
-    changed: list[str] = []
-    if profile.user_id != user.id:
-        profile.user = user
-        changed.append("user")
-    if changed:
-        profile.save(update_fields=changed)
     return profile

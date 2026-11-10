@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import ssl
 from dataclasses import dataclass
+from functools import lru_cache
 from urllib.parse import urlparse
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.backends import BaseBackend
 from django.contrib.auth.models import User
-from ldap3 import BASE, NONE, Connection, Server
+from ldap3 import BASE, NONE, Connection, Server, Tls
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import escape_rdn
 
-from .models import get_or_create_profile
+from .models import canonical_ldap_uid, get_or_create_profile
 
 
 @dataclass(frozen=True)
@@ -53,10 +55,23 @@ class Ldap3Adapter(LdapAdapter):
         parsed = urlparse(raw_uri)
         if parsed.scheme not in {"ldap", "ldaps"} or not parsed.hostname:
             raise LdapAuthenticationError("LDAP server URI is not configured")
+        use_ssl = parsed.scheme == "ldaps"
+        tls: Tls | None = None
+        if use_ssl or settings.BOOK_SCANNER_LDAP_START_TLS:
+            require_cert = bool(getattr(settings, "BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT", True))
+            ca_file = str(getattr(settings, "BOOK_SCANNER_LDAP_CA_FILE", "") or "").strip()
+            try:
+                tls = Tls(
+                    validate=ssl.CERT_REQUIRED if require_cert else ssl.CERT_NONE,
+                    ca_certs_file=ca_file or None,
+                )
+            except LDAPException as exc:
+                raise LdapAuthenticationError("LDAP TLS configuration is invalid") from exc
         self.server = Server(
             parsed.hostname,
             port=parsed.port,
-            use_ssl=parsed.scheme == "ldaps",
+            use_ssl=use_ssl,
+            tls=tls,
             connect_timeout=float(settings.BOOK_SCANNER_LDAP_CONNECT_TIMEOUT),
             get_info=NONE,
         )
@@ -122,25 +137,61 @@ class Ldap3Adapter(LdapAdapter):
         user_dn = self._resolve_user_dn(normalized_username)
         connection = self._connection(user_dn, password)
         email: str | None = None
+        directory_uid: str | None = None
         try:
             email_attribute = str(settings.BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE).strip()
-            if email_attribute and connection.search(
+            uid_attribute = str(
+                getattr(settings, "BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE", "uid") or ""
+            ).strip()
+            attributes = [name for name in (email_attribute, uid_attribute) if name]
+            if attributes and connection.search(
                 user_dn,
                 "(objectClass=*)",
                 search_scope=BASE,
-                attributes=[email_attribute],
+                attributes=attributes,
             ):
                 entry = connection.entries[0]
-                value = entry.entry_attributes_as_dict.get(email_attribute)
-                if isinstance(value, list) and value:
-                    email = str(value[0])
-                elif isinstance(value, str):
-                    email = value
+                attrs = entry.entry_attributes_as_dict
+                email = _first_value(attrs.get(email_attribute)) if email_attribute else None
+                directory_uid = _first_value(attrs.get(uid_attribute)) if uid_attribute else None
         except (LDAPException, IndexError):
-            email = None
+            pass
         finally:
             connection.unbind()
-        return LdapIdentity(username=normalized_username, email=email)
+        # Directories match uids case-insensitively; use the directory's own spelling
+        # (or a casefolded login name) so "Alice" and "alice" are one account.
+        username_out = (directory_uid or "").strip() or canonical_ldap_uid(normalized_username)
+        return LdapIdentity(username=username_out, email=email)
+
+
+def _first_value(value: object) -> str | None:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+_ADAPTER_SETTING_NAMES = (
+    "BOOK_SCANNER_LDAP_SERVER_URI",
+    "BOOK_SCANNER_LDAP_CONNECT_TIMEOUT",
+    "BOOK_SCANNER_LDAP_START_TLS",
+    "BOOK_SCANNER_LDAP_CA_FILE",
+    "BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT",
+)
+
+
+@lru_cache(maxsize=4)
+def _cached_ldap3_adapter(config_key: tuple[object, ...]) -> Ldap3Adapter:
+    del config_key  # only used to key the cache on the effective connection settings
+    return Ldap3Adapter()
+
+
+def get_ldap3_adapter() -> Ldap3Adapter:
+    """Return a shared adapter so each login does not rebuild the Server/TLS objects."""
+    key = tuple(getattr(settings, name, None) for name in _ADAPTER_SETTING_NAMES)
+    return _cached_ldap3_adapter(key)
 
 
 class LdapBackend(BaseBackend):
@@ -153,7 +204,7 @@ class LdapBackend(BaseBackend):
         if mode == "stub":
             self.adapter = StubLdapAdapter()
         elif mode == "ldap":
-            self.adapter = Ldap3Adapter()
+            self.adapter = get_ldap3_adapter()
         else:
             raise LdapAuthenticationError(f"unsupported LDAP mode: {mode}")
 
@@ -171,12 +222,12 @@ class LdapBackend(BaseBackend):
         except (ValueError, LdapAuthenticationError):
             return None
         profile = get_or_create_profile(identity.username)
-        if profile.is_disabled:
+        if profile.is_disabled or not profile.user.is_active:
             return None
         if identity.email and profile.user.email != identity.email:
             profile.user.email = identity.email
             profile.user.save(update_fields=["email"])
-        return User.objects.get(username=identity.username)
+        return profile.user
 
     def get_user(self, user_id: int) -> User | None:
         try:

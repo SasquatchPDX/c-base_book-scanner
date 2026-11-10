@@ -42,7 +42,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from ebook_server.jobs import enqueue
-from ebook_server.storage import LocalFilesystemStorage
+from ebook_server.storage import LocalFilesystemStorage, check_storage_root, probe_storage_writable
 
 from . import (
     book_deletion,
@@ -859,10 +859,12 @@ def _check_database() -> DependencyResult:
 
 
 def _check_storage() -> DependencyResult:
-    storage = LocalFilesystemStorage(str(django_settings.APP_DATA_DIR))
     try:
-        storage_root = storage.resolve_location("")
-        storage_root.mkdir(parents=True, exist_ok=True)
+        storage_root = Path(django_settings.APP_DATA_DIR)
+        if not getattr(django_settings, "STORAGE_REQUIRE_EXISTING_ROOT", False):
+            storage_root.mkdir(parents=True, exist_ok=True)
+        check_storage_root(root=storage_root)
+        probe_storage_writable(storage_root)
         return DependencyResult(name="storage", status="ok", details={"root": str(storage_root)})
     except Exception as exc:  # pragma: no cover
         return DependencyResult(name="storage", status="down", details={"error": str(exc)})

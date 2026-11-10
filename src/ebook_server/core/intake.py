@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -24,10 +25,16 @@ from defusedxml import ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
+from django.db import models as django_models
 from django.utils import timezone
 from pypdf import PdfReader
 
-from ebook_server.storage import LocalFilesystemStorage, StorageBackend
+from ebook_server.storage import (
+    LocalFilesystemStorage,
+    StorageBackend,
+    cap_filename,
+    ensure_path_storage_ready,
+)
 
 from . import identification
 from .models import (
@@ -133,7 +140,16 @@ def normalize_filename(raw: str) -> str:
     safe = safe.strip("._")
     if not safe:
         raise ValidationError("unsafe filename")
-    return safe[:220]
+    return cap_filename(safe)
+
+
+def _fit(model: type[django_models.Model], field_name: str, value: str | None) -> str:
+    """Truncate ``value`` to the model field's max_length (PostgreSQL rejects overflow)."""
+    text = value or ""
+    max_length = getattr(model._meta.get_field(field_name), "max_length", None)
+    if max_length and len(text) > max_length:
+        return text[:max_length].rstrip()
+    return text
 
 
 def detect_format(filename: str, mime_type: str | None = None) -> tuple[str, str]:
@@ -319,8 +335,18 @@ def discover_source_paths(
         candidates = root.rglob("*")
     else:
         candidates = (child for child in root.iterdir())
+    min_age = float(getattr(django_settings, "BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS", 60))
+    now = time.time()
     for candidate in candidates:
-        if not candidate.is_file():
+        relative_parts = candidate.relative_to(root).parts
+        if any(part.startswith((".", "~")) for part in relative_parts):
+            continue
+        try:
+            if not candidate.is_file():
+                continue
+            if min_age > 0 and now - candidate.stat().st_mtime < min_age:
+                continue  # possibly still being written
+        except OSError:
             continue
         yield candidate
 
@@ -357,6 +383,7 @@ def create_source_import_job(
     if uploader is None:
         uploader = _make_system_user()
 
+    stat = path.stat()
     return ImportJob.objects.create(
         source_type=source_type,
         state=ImportJob.State.DISCOVERED,
@@ -365,7 +392,37 @@ def create_source_import_job(
         source_path=str(path),
         original_filename=path.name,
         normalized_filename=safe_name,
+        source_size=stat.st_size,
+        source_mtime_ns=stat.st_mtime_ns,
     )
+
+
+def _already_handled(source_location: SourceLocation, path: Path, normalized: str) -> bool:
+    """True when this exact file version was imported, or has failed too often to retry."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return True
+    same_version = django_models.Q(source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns)
+    jobs = ImportJob.objects.filter(source_path=normalized, source_location=source_location)
+    if jobs.filter(same_version, state=ImportJob.State.COMPLETE).exists():
+        return True
+    failed = jobs.filter(
+        same_version | django_models.Q(source_size__isnull=True),
+        state=ImportJob.State.FAILED,
+    )
+    failures = failed.count()
+    if failures == 0:
+        return False
+    max_attempts = int(getattr(django_settings, "BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS", 3))
+    if failures >= max_attempts:
+        return True
+    latest = failed.order_by("-updated_at").first()
+    if latest is not None:
+        backoff = timedelta(minutes=15 * 2 ** (failures - 1))
+        if timezone.now() - latest.updated_at < backoff:
+            return True
+    return False
 
 
 def discover_source_jobs_for_location(
@@ -392,7 +449,7 @@ def discover_source_jobs_for_location(
                 ImportJob.State.ARCHIVING,
             ],
         ).exists()
-        if active_job_exists:
+        if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
         try:
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
@@ -426,6 +483,7 @@ def compute_sha256(path: str) -> str:
 
 
 def write_upload_to_staging(uploaded_file: Any, staging_root: Path) -> tuple[str, int]:
+    ensure_path_storage_ready(staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         delete=False,
@@ -665,7 +723,12 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
-        identifier = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}identifier")
+        identifier = _pick_epub_identifier(
+            [
+                (element.attrib, "".join(element.itertext()).strip())
+                for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}identifier")
+            ],
+        )
         return {
             "title": title or Path(original_filename).stem,
             "authors": [author] if author else [],
@@ -677,6 +740,26 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             },
             "container_type": "epub",
         }
+
+
+def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
+    """Choose the best dc:identifier: an ISBN anywhere in the list beats the first entry.
+
+    Calibre-produced EPUBs commonly list a UUID first and the ISBN later.
+    """
+    texts = [(attrs, text) for attrs, text in entries if text]
+    if not texts:
+        return None
+    for attrs, text in texts:  # explicitly marked ISBNs first
+        scheme = " ".join(str(value) for value in attrs.values()).lower()
+        if ("isbn" in scheme or "isbn" in text.lower()) and identification.normalize_isbns(text):
+            return text
+    for _attrs, text in texts:
+        if "uuid" in text.lower():
+            continue
+        if identification.normalize_isbns(text):
+            return text
+    return texts[0][1]
 
 
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
@@ -726,15 +809,15 @@ def _save_metadata_candidates(
         MetadataCandidate.objects.create(
             import_job=job,
             provider_id=candidate.provider_id,
-            provider_ref=candidate.provider_ref,
-            title=candidate.title,
+            provider_ref=_fit(MetadataCandidate, "provider_ref", candidate.provider_ref),
+            title=_fit(MetadataCandidate, "title", candidate.title),
             authors=candidate.authors,
-            isbn10=candidate.isbn10 or "",
-            isbn13=candidate.isbn13 or "",
+            isbn10=_fit(MetadataCandidate, "isbn10", candidate.isbn10),
+            isbn13=_fit(MetadataCandidate, "isbn13", candidate.isbn13),
             score=Decimal(str(candidate.score)),
             raw_payload=candidate.raw,
-            language=candidate.language or "",
-            publisher=candidate.publisher or "",
+            language=_fit(MetadataCandidate, "language", candidate.language),
+            publisher=_fit(MetadataCandidate, "publisher", candidate.publisher),
             description=candidate.description or "",
             publication_year=candidate.publication_year,
             state=state,
@@ -755,7 +838,11 @@ def _create_review_task(
         original_filename=job.original_filename,
         extracted_metadata=job.evidence if isinstance(job.evidence, dict) else {},
     )
-    inferred_title = signals.best_title() or Path(job.original_filename).stem
+    inferred_title = _fit(
+        ReviewTask,
+        "inferred_title",
+        signals.best_title() or Path(job.original_filename).stem,
+    )
     inferred_authors = signals.author_hints
     provider_snapshot = [
         {
@@ -894,11 +981,11 @@ def _provision_book_from_manual_metadata(
     isbn13: str | None = None,
 ) -> Book:
     book = Book.objects.create(
-        title=title,
-        publisher=publisher or "",
-        language=language or "",
+        title=_fit(Book, "title", title),
+        publisher=_fit(Book, "publisher", publisher),
+        language=_fit(Book, "language", language),
         description=description or "",
-        edition=edition or "",
+        edition=_fit(Book, "edition", edition),
     )
     if publication_year:
         try:
@@ -906,7 +993,7 @@ def _provision_book_from_manual_metadata(
         except ValueError:
             pass
     for raw_author in authors or []:
-        author, _ = Author.objects.get_or_create(full_name=raw_author)
+        author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
     if isbn10:
         Identifier.objects.get_or_create(
@@ -1018,9 +1105,11 @@ def _provision_book_from_metadata(
             if candidate_author_set and candidate_author_set.intersection(known_authors):
                 return book
 
-        book = Book.objects.create(title=candidate.title)
+        book = Book.objects.create(title=_fit(Book, "title", candidate.title))
         for author_name in candidate.authors:
-            author, _ = Author.objects.get_or_create(full_name=author_name)
+            author, _ = Author.objects.get_or_create(
+                full_name=_fit(Author, "full_name", author_name),
+            )
             book.authors.add(author)
         if candidate.isbn10:
             Identifier.objects.get_or_create(
@@ -1037,9 +1126,9 @@ def _provision_book_from_metadata(
                 defaults={"normalized_value": candidate.isbn13},
             )
         if candidate.publisher:
-            book.publisher = candidate.publisher
+            book.publisher = _fit(Book, "publisher", candidate.publisher)
         if candidate.language:
-            book.language = candidate.language
+            book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
         if candidate.publication_year:
@@ -1047,13 +1136,13 @@ def _provision_book_from_metadata(
                 book.publication_date = date(candidate.publication_year, 1, 1)
             except ValueError:
                 pass
-        book.edition = candidate.edition or book.edition
+        book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book
 
     # Fallback provisional metadata
     fallback_title = fallback_title or extra_metadata.get("title") or "Unknown title"
-    return Book.objects.create(title=fallback_title)
+    return Book.objects.create(title=_fit(Book, "title", fallback_title))
 
 
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
@@ -1077,10 +1166,25 @@ def _finalize_source_cleanup(job: ImportJob, verified: bool) -> None:
     Path(job.source_path).unlink(missing_ok=True)
 
 
+def _failed_job_retry_due(job: ImportJob) -> bool:
+    """A FAILED job may be re-run by a queue retry while retry attempts remain.
+
+    The failure handler records ``next_retry_at`` and increments ``attempt_count`` before
+    re-raising, so RQ's scheduled retry arrives here with the job still FAILED. Jobs that
+    failed without being scheduled for retry (``next_retry_at`` unset, e.g. source file
+    missing) and jobs past the retry budget stay failed until an operator resets them
+    (``ingest_sources --retry-failed``).
+    """
+    max_retries = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_RETRY_MAX", 0))
+    return job.next_retry_at is not None and job.attempt_count <= max_retries
+
+
 def process_import_job(job_id: str) -> None:
     """Process one intake job from staging file to durable archive and optional matching."""
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
-    if job.state in {ImportJob.State.COMPLETE, ImportJob.State.FAILED}:
+    if job.state == ImportJob.State.COMPLETE:
+        return
+    if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
 
     source_path = Path(job.source_path)
