@@ -316,3 +316,19 @@ def test_thumbnail_is_downscaled_jpeg_cached_and_uses_version_storage(
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should be cached")),
     )
     assert client.get(f"/scan/pages/{page.id}/image/").status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_storage_outage_during_upload_is_retryable_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ebook_server.storage import StorageUnavailableError
+
+    client, job = _create_scan_job("capture-outage")
+
+    def _unmounted(*_args: Any, **_kwargs: Any) -> Any:
+        raise StorageUnavailableError("storage root is not mounted")
+
+    monkeypatch.setattr(views, "_stage_scan_upload", _unmounted)
+    response = _post_page(client, job, _png_for(b"outage"))
+    assert response.status_code == 503
+    assert response.json() == {"error": "storage unavailable", "retryable": True}
+    assert not ScanPage.objects.filter(scan_job=job).exists()

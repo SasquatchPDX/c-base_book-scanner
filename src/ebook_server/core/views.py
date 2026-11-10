@@ -15,6 +15,7 @@ from typing import Any, Final, cast
 from uuid import UUID, uuid4
 
 import redis
+import structlog
 from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate, login, logout
@@ -77,6 +78,8 @@ from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
 SCANNING_NAMESPACE: Final[str] = "scan-jobs"
+
+logger = structlog.get_logger(__name__)
 
 
 @require_http_methods(["GET", "POST"])
@@ -1495,6 +1498,8 @@ def library_book_download(
         stream = storage.open(variant.storage_identifier)
     except FileNotFoundError:
         return HttpResponseNotFound("variant missing")
+    except OSError:
+        return HttpResponse("storage unavailable", status=503)
 
     response = FileResponse(stream, as_attachment=True, filename=variant.original_filename)
     response["Content-Type"] = variant.mime_type
@@ -1530,6 +1535,8 @@ def library_book_cover(
         stream = storage.open(cover.storage_identifier)
     except FileNotFoundError:
         return HttpResponseNotFound("cover missing")
+    except OSError:
+        return HttpResponse("storage unavailable", status=503)
 
     response = FileResponse(stream, as_attachment=False, filename=f"{position}-cover")
     response["Content-Type"] = cover.mime_type
@@ -2379,6 +2386,8 @@ def scan_page_stage_preview(
         stream = storage.open(identifier)
     except FileNotFoundError:
         return HttpResponseNotFound("preview artifact missing")
+    except OSError:
+        return HttpResponse("storage unavailable", status=503)
     return FileResponse(stream, as_attachment=False, filename=Path(identifier).name)
 
 
@@ -2789,6 +2798,9 @@ def upload_scan_page(
         )
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
+    except OSError:
+        logger.exception("scan page storage failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "storage unavailable", "retryable": True}, status=503)
 
     if created:
         _complete_open_rescan_todos(page)
@@ -2865,6 +2877,9 @@ def scan_page(
         )
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
+    except OSError:
+        logger.exception("scan page storage failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "storage unavailable", "retryable": True}, status=503)
 
     if created:
         _complete_open_rescan_todos(page)
@@ -3221,6 +3236,8 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         source_path, size_bytes = intake.write_upload_to_staging(uploaded_file, staging_root)
     except intake.ValidationError as exc:
         return HttpResponseBadRequest(str(exc))
+    except OSError:
+        return HttpResponse("storage unavailable", status=503)
 
     job = ImportJob.objects.create(
         source_type=ImportJob.SourceType.UPLOAD,
