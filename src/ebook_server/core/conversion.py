@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -13,9 +15,11 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from django.conf import settings as django_settings
+from django.db import close_old_connections
 from django.utils import timezone
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, is_stale_running, tunable_setting
 
 from . import intake
 from .models import Book, FileVariant, ProcessingJob
@@ -285,17 +289,24 @@ def request_conversion(
             "requested_by_user_id": requested_by_user_id,
         },
     )
-    _dispatch_conversion_job(str(job.job_id))
+    _dispatch_conversion_job(job)
     job.refresh_from_db()
     return job
 
 
-def _dispatch_conversion_job(job_id: str) -> None:
-    queue = get_queue()
-    if queue is None:
-        process_conversion_job(job_id)
-        return
-    queue.enqueue(process_conversion_job, job_id)
+def _dispatch_conversion_job(job: ProcessingJob) -> None:
+    job_id = str(job.job_id)
+    try:
+        queue = get_queue()
+        if queue is None:
+            process_conversion_job(job_id)
+            return
+        queue.enqueue(process_conversion_job, job_id)
+    except Exception as exc:
+        logger.exception("conversion_dispatch_failed", processing_job_id=job_id)
+        job.refresh_from_db()
+        if job.state in {ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING}:
+            _fail_conversion_job(job, f"conversion dispatch failed: {exc}")
 
 
 def process_conversion_job(job_id: str) -> None:
@@ -303,7 +314,11 @@ def process_conversion_job(job_id: str) -> None:
         conversion_job = ProcessingJob.objects.select_related("file_variant").get(job_id=job_id)
     except ProcessingJob.DoesNotExist:
         return
-    if conversion_job.state == ProcessingJob.JobState.SUCCESS:
+    if conversion_job.state in {ProcessingJob.JobState.SUCCESS, ProcessingJob.JobState.FAILED}:
+        return
+    if conversion_job.state == ProcessingJob.JobState.RUNNING and not is_stale_running(
+        conversion_job
+    ):
         return
 
     details = conversion_job.details if isinstance(conversion_job.details, dict) else {}
@@ -351,6 +366,7 @@ def process_conversion_job(job_id: str) -> None:
             target_format=target_format,
         )
     except Exception as exc:  # pragma: no cover - defensive path
+        close_old_connections()
         _fail_conversion_job(conversion_job, str(exc))
 
 
@@ -530,28 +546,77 @@ def _fail_conversion_job(job: ProcessingJob, message: str) -> None:
     )
 
 
+STDERR_TAIL_BYTES = 2000
+DEFAULT_CONVERTER_TIMEOUT_SECONDS = 1800
+VERSION_PROBE_TIMEOUT_SECONDS = 30
+
+
+def _converter_timeout_seconds() -> float:
+    """Per-command timeout, kept below the RQ job timeout so we fail with context."""
+    queue_timeout = float(getattr(django_settings, "BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS", 3600))
+    configured = tunable_setting(
+        "BOOK_SCANNER_CONVERTER_TIMEOUT_SECONDS", DEFAULT_CONVERTER_TIMEOUT_SECONDS
+    )
+    return max(1.0, min(float(configured), queue_timeout - 60.0))
+
+
+def _stderr_tail(raw: bytes | str | None) -> str:
+    if not raw:
+        return ""
+    data = raw.encode("utf-8", "replace") if isinstance(raw, str) else raw
+    return data[-STDERR_TAIL_BYTES:].decode("utf-8", "replace").strip()
+
+
+def _kill_process_group(process: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        process.kill()
+
+
 def _run_conversion_command(
     command: list[str],
     check: bool = False,
     capture_output: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    kwargs: dict[str, Any] = {"check": check}
-    if capture_output:
-        kwargs.update(
-            {
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "text": True,
-            },
+    """Run a converter with a timeout, killing its whole process group on expiry.
+
+    stderr is always captured (bounded tail) so failures carry the converter's own
+    message; stdout is only kept when the caller asks for it.
+    """
+    effective_timeout = timeout if timeout is not None else _converter_timeout_seconds()
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            stderr=stderr_file,
+            text=True,
+            start_new_session=True,
         )
-    else:
-        kwargs.update(
-            {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-            },
+        try:
+            stdout, _ = process.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_group(process)
+            process.communicate()
+            stderr_file.seek(max(0, stderr_file.seek(0, os.SEEK_END) - STDERR_TAIL_BYTES))
+            tail = _stderr_tail(stderr_file.read())
+            raise ConversionError(
+                f"{Path(command[0]).name} timed out after {int(effective_timeout)}s"
+                + (f": {tail}" if tail else ""),
+            ) from exc
+        except BaseException:
+            _kill_process_group(process)
+            process.wait()
+            raise
+        stderr_file.seek(max(0, stderr_file.seek(0, os.SEEK_END) - STDERR_TAIL_BYTES))
+        tail = _stderr_tail(stderr_file.read())
+    if check and process.returncode != 0:
+        raise ConversionError(
+            f"{Path(command[0]).name} exited with status {process.returncode}"
+            + (f": {tail}" if tail else ""),
         )
-    return subprocess.run(command, **kwargs)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, tail)
 
 
 def _version_summary(raw_output: object, *, fallback: str) -> str:

@@ -3,8 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import shutil
 import tempfile
+import threading
 from collections.abc import Iterator
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 from uuid import uuid4
@@ -28,8 +32,16 @@ from ebook_server.core.models import (
     StorageLocation,
     get_or_create_profile,
 )
+from ebook_server.jobs import ocr_job_timeout_seconds
 from ebook_server.storage import LocalFilesystemStorage
 from tests.streaming_fixtures import BoundedReadStream
+
+_FAST_SCHEDULE = ocr.PollSchedule(
+    deadline_seconds=5.0, interval_start=0.0, interval_max=0.0, backoff=1.0
+)
+_TIMEOUT_SCHEDULE = ocr.PollSchedule(
+    deadline_seconds=0.05, interval_start=0.01, interval_max=0.01, backoff=1.0
+)
 
 
 class _ScriptedOCRClient:
@@ -132,7 +144,10 @@ def test_http_ocr_inline_artifact_decodes_in_bounded_chunks() -> None:
         chunks = list(
             client.iter_artifact(
                 "remote",
-                ocr.OCRArtifactDescriptor(format="txt", content=base64.b64encode(payload).decode()),
+                ocr.OCRArtifactDescriptor(
+                    format="txt",
+                    content_base64=base64.b64encode(payload).decode(),
+                ),
             )
         )
         assert len(chunks) > 1
@@ -140,7 +155,9 @@ def test_http_ocr_inline_artifact_decodes_in_bounded_chunks() -> None:
         assert b"".join(chunks) == payload
         with pytest.raises(ocr.OCRClientError, match="content_base64 invalid"):
             list(
-                client.iter_artifact("remote", ocr.OCRArtifactDescriptor(format="txt", content="!"))
+                client.iter_artifact(
+                    "remote", ocr.OCRArtifactDescriptor(format="txt", content_base64="!")
+                )
             )
     finally:
         client._client.close()
@@ -247,7 +264,7 @@ def _install_ocr_client(
 ) -> None:
     client = _ocr_client_with_payloads(outputs, poll_plan)
     monkeypatch.setattr(ocr, "_get_ocr_client", lambda: client)
-    monkeypatch.setattr(ocr, "_poll_interval", lambda: 0.0)
+    monkeypatch.setattr(ocr, "_poll_schedule", lambda: _FAST_SCHEDULE)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -359,7 +376,7 @@ def test_ocr_reads_source_from_declared_storage_backend(
         {"txt": b"mounted source text"},
     )
     monkeypatch.setattr(ocr, "_get_ocr_client", lambda: scripted_client)
-    monkeypatch.setattr(ocr, "_poll_interval", lambda: 0.0)
+    monkeypatch.setattr(ocr, "_poll_schedule", lambda: _FAST_SCHEDULE)
     client = Client()
     client.force_login(profile.user)
 
@@ -611,7 +628,7 @@ def test_ocr_timeout_is_recorded(
     profile = _profile("ocr-timeout")
     storage = _configure_storage(tmp_path)
     monkeypatch.setattr(ocr, "_default_ocr_storage", lambda: storage)
-    monkeypatch.setattr(ocr, "_poll_limit", lambda: 2)
+    monkeypatch.setattr(ocr, "_poll_schedule", lambda: _TIMEOUT_SCHEDULE)
     book = Book.objects.create(title="Timeout OCR")
     variant = _seed_book_variant(
         book,
@@ -667,7 +684,7 @@ def test_ocr_malformed_poll_payload_is_recorded(
         outputs={"txt": b"ignored"},
         poll_plan=poll_plan,
     )
-    monkeypatch.setattr(ocr, "_poll_limit", lambda: 1)
+    monkeypatch.setattr(ocr, "_poll_schedule", lambda: _TIMEOUT_SCHEDULE)
 
     client = Client()
     client.force_login(profile.user)
@@ -680,3 +697,321 @@ def test_ocr_malformed_poll_payload_is_recorded(
     payload = response.json()
     assert payload["state"] == ProcessingJob.JobState.FAILED
     assert payload["error"]
+
+
+class _FakeOCRService:
+    """Tiny real HTTP OCR service whose poll responses are scripted per request."""
+
+    def __init__(self, poll_script: list[Any]) -> None:
+        # Each entry: dict (JSON body, 200) or int (HTTP error status).
+        self.poll_script = list(poll_script)
+        self.polls = 0
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return
+
+            def _send(self, status: int, body: bytes, ctype: str = "application/json") -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                self._send(200, b'{"job_id": "fake-1"}')
+
+            def do_GET(self) -> None:
+                if self.path.endswith("/artifacts/txt"):
+                    self._send(200, b"fake artifact text", "text/plain")
+                    return
+                index = min(outer.polls, len(outer.poll_script) - 1)
+                outer.polls += 1
+                entry = outer.poll_script[index]
+                if isinstance(entry, int):
+                    self._send(entry, b"bad gateway", "text/plain")
+                else:
+                    self._send(200, json.dumps(entry).encode())
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _seed_ocr_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> FileVariant:
+    profile = _profile(name)
+    storage = _configure_storage(tmp_path)
+    monkeypatch.setattr(ocr, "_default_ocr_storage", lambda: storage)
+    book = Book.objects.create(title=name)
+    return _seed_book_variant(
+        book,
+        storage,
+        fmt="pdf",
+        mime="application/pdf",
+        filename="book.pdf",
+        payload=b"source",
+        uploader_id=profile.user_id,
+    )
+
+
+def _run_ocr_against(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service: _FakeOCRService,
+    *,
+    schedule: ocr.PollSchedule,
+    formats: list[str],
+) -> ProcessingJob:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, f"ocr-http-{uuid4().hex[:8]}")
+    http_client = ocr.HttpxOCRClient(service.url)
+    monkeypatch.setattr(ocr, "_get_ocr_client", lambda: http_client)
+    monkeypatch.setattr(ocr, "_poll_schedule", lambda: schedule)
+    try:
+        return ocr.request_ocr_from_variant(source_variant=variant, target_formats=formats)
+    finally:
+        http_client._client.close()
+
+
+_DONE = {"status": "done", "artifacts": [{"format": "txt", "filename": "o.txt"}]}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_tolerates_unknown_status_and_transient_502(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _FakeOCRService(
+        [
+            {"status": "waiting"},
+            {"status": "preprocessing"},
+            502,
+            {"status": "running"},
+            502,
+            502,
+            _DONE,
+        ]
+    )
+    try:
+        schedule = ocr.PollSchedule(
+            deadline_seconds=10.0, interval_start=0.01, interval_max=0.02, max_consecutive_errors=3
+        )
+        job = _run_ocr_against(tmp_path, monkeypatch, service, schedule=schedule, formats=["txt"])
+    finally:
+        service.close()
+    assert job.state == ProcessingJob.JobState.SUCCESS, job.details
+    assert service.polls == 7
+    assert len(job.details["output_variants"]) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_fails_after_too_many_consecutive_transport_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _FakeOCRService([502])
+    try:
+        schedule = ocr.PollSchedule(
+            deadline_seconds=10.0, interval_start=0.0, interval_max=0.0, max_consecutive_errors=3
+        )
+        job = _run_ocr_against(tmp_path, monkeypatch, service, schedule=schedule, formats=["txt"])
+    finally:
+        service.close()
+    assert job.state == ProcessingJob.JobState.FAILED
+    assert "3 times in a row" in job.details["error"]
+    assert service.polls == 3
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_poll_budget_is_wall_clock_not_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 60 "running" polls would exceed the old 40-attempt budget.
+    service = _FakeOCRService([{"status": "running"}] * 60 + [_DONE])
+    try:
+        schedule = ocr.PollSchedule(
+            deadline_seconds=30.0, interval_start=0.0, interval_max=0.0, backoff=1.0
+        )
+        job = _run_ocr_against(tmp_path, monkeypatch, service, schedule=schedule, formats=["txt"])
+    finally:
+        service.close()
+    assert job.state == ProcessingJob.JobState.SUCCESS
+    assert service.polls == 61
+
+
+def test_ocr_default_schedule_is_real_world_viable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(django_settings, "BOOK_SCANNER_OCR_MAX_ATTEMPTS", 40, raising=False)
+    monkeypatch.setattr(
+        django_settings, "BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS", 0.2, raising=False
+    )
+    schedule = ocr._poll_schedule()
+    assert schedule.deadline_seconds >= 20 * 60
+    assert schedule.deadline_seconds < ocr_job_timeout_seconds()
+    assert schedule.interval_start >= 1.0
+    assert schedule.interval_max >= 10.0
+
+
+def test_ocr_legacy_attempt_settings_still_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(django_settings, "BOOK_SCANNER_OCR_MAX_ATTEMPTS", 5, raising=False)
+    monkeypatch.setattr(
+        django_settings, "BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS", 0.1, raising=False
+    )
+    schedule = ocr._poll_schedule()
+    assert schedule.deadline_seconds == pytest.approx(0.5)
+    assert schedule.interval_start == schedule.interval_max == 0.1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_fails_when_no_requested_format_is_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, "ocr-nooutput")
+    _install_ocr_client(
+        monkeypatch,
+        outputs={"html": b"<p>x</p>"},
+        poll_plan=[
+            {"status": "succeeded", "artifacts": [ocr.OCRArtifactDescriptor(format="html")]}
+        ],
+    )
+    job = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    assert job.state == ProcessingJob.JobState.FAILED
+    assert "no usable output" in job.details["error"]
+
+    _install_ocr_client(monkeypatch, outputs={}, poll_plan=[{"status": "succeeded"}])
+    job2 = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    assert job2.state == ProcessingJob.JobState.FAILED
+
+
+def test_http_ocr_plain_inline_content_is_text_not_base64() -> None:
+    client = ocr.HttpxOCRClient("https://ocr.test")
+    try:
+        text = "Hello wörld, plain text with spaces!"
+        chunks = list(
+            client.iter_artifact("r", ocr.OCRArtifactDescriptor(format="txt", content=text))
+        )
+        assert b"".join(chunks) == text.encode()
+    finally:
+        client._client.close()
+    parsed = ocr._coerce_poll_payload(
+        {
+            "status": "done",
+            "artifacts": [
+                {"format": "txt", "content": "plain"},
+                {"format": "pdf", "content_base64": "UEs="},
+            ],
+        }
+    )
+    assert parsed.artifacts[0].content == "plain"
+    assert parsed.artifacts[0].content_base64 is None
+    assert parsed.artifacts[1].content_base64 == "UEs="
+
+
+def test_http_ocr_submit_uses_longer_write_timeout() -> None:
+    client = ocr.HttpxOCRClient("https://ocr.test")
+    try:
+        assert client._submit_timeout.write is not None
+        assert client._submit_timeout.write >= 300
+        assert client._submit_timeout.read is not None
+        assert client._submit_timeout.read >= 300
+        assert client._submit_timeout.connect == client.timeout_seconds
+    finally:
+        client._client.close()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_dispatch_failure_marks_job_failed_and_dedupes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, "ocr-dispatch")
+
+    class DeadQueue:
+        def enqueue(self, func: Any, *args: Any, **kwargs: Any) -> None:
+            raise ConnectionError("redis down")
+
+    monkeypatch.setattr(ocr, "get_queue", lambda: DeadQueue())
+    failed = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    assert failed.state == ProcessingJob.JobState.FAILED
+    assert "redis down" in failed.details["error"]
+
+    calls: list[dict[str, Any]] = []
+
+    class OkQueue:
+        def enqueue(self, func: Any, *args: Any, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(ocr, "get_queue", lambda: OkQueue())
+    first = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    again = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    other = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["pdf"])
+    assert first.pk == again.pk
+    assert other.pk != first.pk
+    assert len(calls) == 2
+    assert calls[0]["job_timeout"] == ocr_job_timeout_seconds() >= 7200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_stale_running_job_is_reentered_but_fresh_one_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, "ocr-stale")
+    _install_ocr_client(
+        monkeypatch,
+        outputs={"txt": b"ok"},
+        poll_plan=[{"status": "succeeded", "artifacts": [ocr.OCRArtifactDescriptor(format="txt")]}],
+    )
+    job = ProcessingJob.objects.create(
+        file_variant=variant,
+        job_type=ProcessingJob.JobType.OCR,
+        state=ProcessingJob.JobState.RUNNING,
+        started_at=timezone.now(),
+        details={
+            "source_type": "variant",
+            "source_variant_id": variant.id,
+            "book_id": variant.book_id,
+            "target_formats": ["txt"],
+        },
+    )
+    ocr.process_ocr_job(str(job.job_id))
+    job.refresh_from_db()
+    assert job.state == ProcessingJob.JobState.RUNNING  # live worker: untouched
+
+    job.started_at = timezone.now() - timedelta(days=1)
+    job.save(update_fields=["started_at"])
+    ocr.process_ocr_job(str(job.job_id))
+    job.refresh_from_db()
+    assert job.state == ProcessingJob.JobState.SUCCESS
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_source_staging_cleans_temp_file_on_unexpected_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, "ocr-leak")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(shutil, "copyfileobj", boom)
+    job = ProcessingJob.objects.create(
+        file_variant=variant,
+        job_type=ProcessingJob.JobType.OCR,
+        details={
+            "source_type": "variant",
+            "source_variant_id": variant.id,
+            "book_id": variant.book_id,
+        },
+    )
+    with pytest.raises(PermissionError):
+        ocr._resolve_source_artifact(job, details=job.details)
+    assert list(scratch.iterdir()) == []

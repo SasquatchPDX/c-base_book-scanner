@@ -116,7 +116,13 @@ def _install_ocr_client(
 ) -> None:
     client = _ScriptedOCRClient(poll_plan, outputs)
     monkeypatch.setattr(ocr, "_get_ocr_client", lambda: client)
-    monkeypatch.setattr(ocr, "_poll_interval", lambda: 0.0)
+    monkeypatch.setattr(
+        ocr,
+        "_poll_schedule",
+        lambda: ocr.PollSchedule(
+            deadline_seconds=5.0, interval_start=0.0, interval_max=0.0, backoff=1.0
+        ),
+    )
 
 
 def _create_stub_converter(monkeypatch: pytest.MonkeyPatch) -> None:

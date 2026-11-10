@@ -67,8 +67,15 @@ Run the web process and an RQ worker:
 
 ```bash
 uv run python manage.py runserver
-uv run rq worker --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
+uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
 ```
+
+`--with-scheduler` is required: job retries use delays, and in rq 2.x a delayed
+retry is only re-queued by a worker started with a scheduler. Run it on at least
+one worker. (Without it the app falls back to immediate retries and logs
+`rq_scheduler_not_running_retries_immediate`.) If a worker is killed mid-job,
+run `uv run python manage.py recover_stale_jobs` (dry run) and add `--apply`;
+see `docs/operations.md`.
 
 The worker applies a 30-minute default job timeout, bounded result retention,
 and configured retry intervals. Slow work must not use the no-Redis development

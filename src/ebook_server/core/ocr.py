@@ -19,10 +19,16 @@ from uuid import uuid4
 import httpx
 import structlog
 from django.conf import settings as django_settings
+from django.db import close_old_connections
 from django.utils import timezone
 from pydantic import BaseModel, Field
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import (
+    get_queue,
+    is_stale_running,
+    ocr_job_timeout_seconds,
+    tunable_setting,
+)
 from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake
@@ -34,7 +40,15 @@ ARTIFACT_CHUNK_BYTES = 1 << 20
 
 
 class OCRClientError(RuntimeError):
-    """Raised for OCR service transport or protocol failures."""
+    """Raised for OCR service transport or protocol failures.
+
+    ``transient`` marks failures worth retrying while polling (network errors,
+    timeouts, HTTP 5xx/408/429); other failures abort the OCR job immediately.
+    """
+
+    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 class OCRMalformedResponseError(RuntimeError):
@@ -65,6 +79,7 @@ class OCRArtifactDescriptor:
     confidence: float | None = None
     content: str | None = None
     content_url: str | None = None
+    content_base64: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,7 +128,15 @@ class HttpxOCRClient:
             base_url or _setting("BOOK_SCANNER_OCR_SERVICE_URL", "http://localhost:8020")
         ).rstrip("/")
         self.timeout_seconds = float(_setting("BOOK_SCANNER_OCR_REQUEST_TIMEOUT", 30))
+        self.submit_timeout_seconds = float(tunable_setting("BOOK_SCANNER_OCR_SUBMIT_TIMEOUT", 300))
         self._client = httpx.Client(timeout=self.timeout_seconds)
+        # Uploading a large PDF/zip needs far longer read/write windows than a poll.
+        long_timeout = max(self.timeout_seconds, self.submit_timeout_seconds)
+        self._submit_timeout = httpx.Timeout(
+            self.timeout_seconds,
+            read=long_timeout,
+            write=long_timeout,
+        )
 
     def submit_job(
         self,
@@ -143,10 +166,11 @@ class HttpxOCRClient:
                         ),
                     },
                     data={"payload": json.dumps(payload)},
+                    timeout=self._submit_timeout,
                 )
             response.raise_for_status()
             raw = response.json()
-        except (httpx.HTTPError, OSError) as exc:
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             raise OCRClientError(f"OCR submit failed: {exc}") from exc
         return _coerce_remote_job_id(raw)
 
@@ -158,21 +182,32 @@ class HttpxOCRClient:
             response.raise_for_status()
             raw = response.json()
         except (httpx.HTTPError, OSError) as exc:
-            raise OCRClientError(f"OCR poll failed: {exc}") from exc
+            raise OCRClientError(
+                f"OCR poll failed: {exc}",
+                transient=_is_transient_http_error(exc),
+            ) from exc
+        except ValueError as exc:  # invalid JSON body, often a proxy error page
+            raise OCRClientError(f"OCR poll returned invalid JSON: {exc}", transient=True) from exc
         return _coerce_poll_payload(raw)
 
     def iter_artifact(self, remote_job_id: str, artifact: OCRArtifactDescriptor) -> Iterator[bytes]:
-        if artifact.content:
+        if artifact.content_base64:
             # Decode complete base64 quanta without allocating a second full artifact.
             encoded_chunk_size = 4 * (ARTIFACT_CHUNK_BYTES // 3)
             try:
-                for offset in range(0, len(artifact.content), encoded_chunk_size):
+                for offset in range(0, len(artifact.content_base64), encoded_chunk_size):
                     yield base64.b64decode(
-                        artifact.content[offset : offset + encoded_chunk_size],
+                        artifact.content_base64[offset : offset + encoded_chunk_size],
                         validate=True,
                     )
             except (binascii.Error, ValueError) as exc:
                 raise OCRClientError("artifact content_base64 invalid") from exc
+            return
+        if artifact.content:
+            # Plain inline ``content`` is text, not base64.
+            encoded = artifact.content.encode("utf-8")
+            for offset in range(0, len(encoded), ARTIFACT_CHUNK_BYTES):
+                yield encoded[offset : offset + ARTIFACT_CHUNK_BYTES]
             return
         if artifact.content_url:
             url = artifact.content_url
@@ -188,6 +223,13 @@ class HttpxOCRClient:
                 yield from response.iter_bytes(chunk_size=ARTIFACT_CHUNK_BYTES)
         except (httpx.HTTPError, OSError) as exc:
             raise OCRClientError(f"OCR artifact fetch failed: {exc}") from exc
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code >= 500 or code in {408, 425, 429}
+    return True
 
 
 _OCR_CLIENT: OCRClientProtocol | None = None
@@ -334,13 +376,14 @@ def _coerce_poll_payload(payload: object) -> OCRPollResult:
                 else None,
                 confidence=_coerce_optional_float(raw_artifact.get("confidence")),
                 content=(
+                    raw_artifact.get("content")
+                    if isinstance(raw_artifact.get("content"), str)
+                    else None
+                ),
+                content_base64=(
                     raw_artifact.get("content_base64")
                     if isinstance(raw_artifact.get("content_base64"), str)
-                    else (
-                        raw_artifact.get("content")
-                        if isinstance(raw_artifact.get("content"), str)
-                        else None
-                    )
+                    else None
                 ),
                 content_url=(
                     raw_artifact.get("content_url")
@@ -409,12 +452,71 @@ def _derive_source_extension(*, mime_type: str, fallback: str = ".bin") -> str:
     return mapping.get(mime_type.lower(), fallback)
 
 
-def _poll_limit() -> int:
-    return max(1, int(_setting("BOOK_SCANNER_OCR_MAX_ATTEMPTS", 40)))
+_LEGACY_MAX_ATTEMPTS_DEFAULT = 40
+_LEGACY_POLL_INTERVAL_DEFAULT = 0.2
+DEFAULT_POLL_DEADLINE_SECONDS = 25 * 60
+DEFAULT_POLL_INTERVAL_START_SECONDS = 2.0
+DEFAULT_POLL_INTERVAL_MAX_SECONDS = 15.0
+DEFAULT_POLL_BACKOFF = 1.5
+DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS = 6
 
 
-def _poll_interval() -> float:
-    return float(_setting("BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS", 0.2))
+@dataclass(frozen=True)
+class PollSchedule:
+    """Wall-clock polling budget for one remote OCR run."""
+
+    deadline_seconds: float
+    interval_start: float
+    interval_max: float
+    backoff: float = DEFAULT_POLL_BACKOFF
+    max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS
+
+
+def _poll_schedule() -> PollSchedule:
+    """Resolve the polling schedule.
+
+    Defaults give a ~25 minute wall-clock deadline with 2s..15s backoff. The old
+    attempt-based settings are honoured only when an operator changed them from
+    their historic defaults (40 attempts / 0.2s), in which case the deadline is
+    attempts * interval and the interval is fixed.
+    """
+    legacy_attempts = int(_setting("BOOK_SCANNER_OCR_MAX_ATTEMPTS", _LEGACY_MAX_ATTEMPTS_DEFAULT))
+    legacy_interval = float(
+        _setting("BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS", _LEGACY_POLL_INTERVAL_DEFAULT),
+    )
+    legacy_overridden = (
+        legacy_attempts != _LEGACY_MAX_ATTEMPTS_DEFAULT
+        or legacy_interval != _LEGACY_POLL_INTERVAL_DEFAULT
+    )
+    explicit_deadline = tunable_setting("BOOK_SCANNER_OCR_POLL_DEADLINE_SECONDS", None)
+    if legacy_overridden and explicit_deadline is None:
+        interval = max(0.0, legacy_interval)
+        return PollSchedule(
+            deadline_seconds=max(1, legacy_attempts) * max(interval, 0.001),
+            interval_start=interval,
+            interval_max=interval,
+            backoff=1.0,
+        )
+    deadline = float(explicit_deadline or DEFAULT_POLL_DEADLINE_SECONDS)
+    # Keep the poll budget safely below the RQ job timeout so the OCR job fails
+    # cleanly (and records why) instead of being killed mid-poll.
+    deadline = min(deadline, max(1.0, ocr_job_timeout_seconds() - 120.0))
+    start = float(
+        tunable_setting(
+            "BOOK_SCANNER_OCR_POLL_INTERVAL_START_SECONDS",
+            DEFAULT_POLL_INTERVAL_START_SECONDS,
+        ),
+    )
+    cap = float(
+        tunable_setting(
+            "BOOK_SCANNER_OCR_POLL_INTERVAL_MAX_SECONDS", DEFAULT_POLL_INTERVAL_MAX_SECONDS
+        ),
+    )
+    return PollSchedule(
+        deadline_seconds=deadline,
+        interval_start=start,
+        interval_max=max(start, cap),
+    )
 
 
 def request_ocr_from_variant(
@@ -448,13 +550,17 @@ def request_ocr_from_variant(
         "request_options": dict(request.options),
         "requested_by_user_id": requested_by_user_id,
     }
+    existing = _find_active_ocr_job(source_variant, request.target_formats)
+    if existing is not None:
+        logger.info("ocr_deduplicated", processing_job_id=str(existing.job_id))
+        return existing
     job = ProcessingJob.objects.create(
         file_variant=source_variant,
         job_type=ProcessingJob.JobType.OCR,
         state=ProcessingJob.JobState.QUEUED,
         details=details,
     )
-    _dispatch_ocr_job(str(job.job_id))
+    _dispatch_ocr_job(job)
     job.refresh_from_db()
     return job
 
@@ -495,17 +601,42 @@ def request_ocr_from_scan_job(
         state=ProcessingJob.JobState.QUEUED,
         details=details,
     )
-    _dispatch_ocr_job(str(job.job_id))
+    _dispatch_ocr_job(job)
     job.refresh_from_db()
     return job
 
 
-def _dispatch_ocr_job(job_id: str) -> None:
-    queue = get_queue()
-    if queue is None:
-        process_ocr_job(job_id)
-        return
-    queue.enqueue(process_ocr_job, job_id)
+def _find_active_ocr_job(
+    source_variant: FileVariant,
+    target_formats: list[str],
+) -> ProcessingJob | None:
+    """Return an in-flight OCR job for the same source variant and formats."""
+    candidates = ProcessingJob.objects.filter(
+        job_type=ProcessingJob.JobType.OCR,
+        file_variant=source_variant,
+        state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING],
+    ).order_by("-scheduled_at")
+    for candidate in candidates:
+        if is_stale_running(candidate):
+            continue
+        if _ensure_dict(candidate.details).get("target_formats") == target_formats:
+            return candidate
+    return None
+
+
+def _dispatch_ocr_job(job: ProcessingJob) -> None:
+    job_id = str(job.job_id)
+    try:
+        queue = get_queue()
+        if queue is None:
+            process_ocr_job(job_id)
+            return
+        queue.enqueue(process_ocr_job, job_id, job_timeout=ocr_job_timeout_seconds())
+    except Exception as exc:
+        logger.exception("ocr_dispatch_failed", processing_job_id=job_id)
+        job.refresh_from_db()
+        if job.state in {ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING}:
+            _fail_ocr_job(job, f"OCR dispatch failed: {exc}")
 
 
 def process_ocr_job(job_id: str) -> None:
@@ -515,7 +646,10 @@ def process_ocr_job(job_id: str) -> None:
         return
     if ocr_job.job_type != ProcessingJob.JobType.OCR:
         return
-    if ocr_job.state == ProcessingJob.JobState.SUCCESS:
+    if ocr_job.state in {ProcessingJob.JobState.SUCCESS, ProcessingJob.JobState.FAILED}:
+        return
+    if ocr_job.state == ProcessingJob.JobState.RUNNING and not is_stale_running(ocr_job):
+        logger.warning("ocr_already_running", processing_job_id=str(ocr_job.job_id))
         return
 
     details = _ensure_dict(ocr_job.details)
@@ -549,18 +683,33 @@ def process_ocr_job(job_id: str) -> None:
             request=request,
         )
 
+        # The poll loop can run for many minutes; the DB connection may have been
+        # dropped by the server in the meantime.
+        close_old_connections()
         output_variants: list[dict[str, Any]] = []
-        if request_artifacts:
-            for artifact in request_artifacts:
-                output_variants.extend(
-                    _materialize_ocr_artifact(
-                        source_book=book,
-                        source_variant=source_variant,
-                        artifact=artifact,
-                        remote_job_id=remote_job_id,
-                        request=request,
-                    ),
+        for artifact in request_artifacts or []:
+            produced = _materialize_ocr_artifact(
+                source_book=book,
+                source_variant=source_variant,
+                artifact=artifact,
+                remote_job_id=remote_job_id,
+                request=request,
+            )
+            if not produced:
+                logger.warning(
+                    "ocr_artifact_skipped",
+                    processing_job_id=str(ocr_job.job_id),
+                    artifact_format=artifact.format,
+                    requested_formats=request.target_formats,
                 )
+            output_variants.extend(produced)
+        if not output_variants:
+            offered = sorted({artifact.format for artifact in request_artifacts or []})
+            raise OCRClientError(
+                "OCR service finished but returned no usable output "
+                f"(requested {request.target_formats}, offered {offered or 'none'})",
+            )
+        close_old_connections()
 
         details = {
             **details,
@@ -579,6 +728,7 @@ def process_ocr_job(job_id: str) -> None:
             output_count=len(output_variants),
         )
     except Exception as exc:  # pragma: no cover - defensive
+        close_old_connections()
         _fail_ocr_job(ocr_job, str(exc))
     finally:
         for cleanup_path in cleanup_paths:
@@ -599,18 +749,48 @@ def _submit_and_poll(
         source_mime=source_mime,
         request=request,
     )
-    for _ in range(_poll_limit()):
-        poll = client.poll_job(remote_job_id)
-        remote_status = _normalize_remote_status(poll.status)
-        if remote_status == "running":
-            time.sleep(_poll_interval())
-            continue
-        if remote_status == "failed":
-            raise OCRClientError(poll.error or "ocr failed")
-        if remote_status == "succeeded":
-            return remote_job_id, poll.artifacts
-        raise OCRClientError(f"unexpected OCR status: {poll.status}")
-    raise OCRClientError("OCR polling timed out")
+    schedule = _poll_schedule()
+    close_old_connections()
+    started = time.monotonic()
+    interval = schedule.interval_start
+    consecutive_errors = 0
+    while True:
+        try:
+            poll = client.poll_job(remote_job_id)
+        except OCRClientError as exc:
+            if not exc.transient:
+                raise
+            consecutive_errors += 1
+            logger.warning(
+                "ocr_poll_transient_error",
+                remote_job_id=remote_job_id,
+                consecutive_errors=consecutive_errors,
+                error=str(exc),
+            )
+            if consecutive_errors >= schedule.max_consecutive_errors:
+                raise OCRClientError(
+                    f"OCR polling failed {consecutive_errors} times in a row: {exc}",
+                ) from exc
+        else:
+            consecutive_errors = 0
+            remote_status = _normalize_remote_status(poll.status)
+            if remote_status == "failed":
+                raise OCRClientError(poll.error or "ocr failed")
+            if remote_status == "succeeded":
+                return remote_job_id, poll.artifacts
+            if remote_status == "malformed":
+                logger.warning(
+                    "ocr_unknown_status_treated_as_running",
+                    remote_job_id=remote_job_id,
+                    status=poll.status,
+                )
+        elapsed = time.monotonic() - started
+        if elapsed >= schedule.deadline_seconds:
+            raise OCRClientError(
+                f"OCR polling timed out after {int(elapsed)}s (remote job {remote_job_id})",
+            )
+        time.sleep(min(interval, max(0.0, schedule.deadline_seconds - elapsed)))
+        interval = min(schedule.interval_max, interval * schedule.backoff)
 
 
 def _resolve_source_artifact(
@@ -661,6 +841,9 @@ def _resolve_source_artifact(
         except FileNotFoundError as exc:
             source_path.unlink(missing_ok=True)
             raise OCRJobError("source artifact missing") from exc
+        except BaseException:
+            source_path.unlink(missing_ok=True)
+            raise
     if source_variant.book is not None:
         book = source_variant.book
     return source_path, source_variant.format, source_variant.mime_type, book, source_variant

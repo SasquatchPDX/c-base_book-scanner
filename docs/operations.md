@@ -168,22 +168,70 @@ runner enforces this, and CI installs `libegl1`, `libopengl0`, `libxcb-cursor0`,
 and `libxkbcommon-x11-0`.
 
 ```bash
-uv run rq worker --config ebook_server.rq_settings \
+uv run rq worker --with-scheduler --config ebook_server.rq_settings \
   --url redis://localhost:6379/0 ebook-server
 ```
+
+**`--with-scheduler` is mandatory on at least one worker.** Failed jobs retry
+with delays (`BOOK_SCANNER_QUEUE_RETRY_INTERVALS`); in rq 2.x a retry with an
+interval goes to the scheduled registry and only a worker started with
+`--with-scheduler` ever moves it back to the queue. Without one, a retrying
+job (for example scan finalization) would sit forever with its ScanJob in
+FINALIZING. As a safeguard `ConfiguredQueue` checks for the scheduler's Redis
+lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
+(no delay) when none exists, logging `rq_scheduler_not_running_retries_immediate`.
+Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
+no scheduler lock is present.
+
+### Recovering from killed workers
+
+A worker killed mid-job (OOM, `kill -9`, host restart) leaves its
+ProcessingJob RUNNING and, for finalization, the ScanJob FINALIZING. Jobs whose
+`started_at` is older than their timeout plus five minutes are treated as stale
+and are re-entered automatically if RQ redelivers them. To clean up manually:
+
+```bash
+uv run python manage.py recover_stale_jobs          # dry run: lists what it would change
+uv run python manage.py recover_stale_jobs --apply  # act
+```
+
+`--apply` marks stale RUNNING jobs, and QUEUED jobs with no matching RQ job
+(for example after a Redis flush), as FAILED with an explanatory error, and
+returns ScanJobs stuck in FINALIZING with no live finalization job to their
+prior state so Finish can be retried. It does not re-queue anything itself;
+re-request OCR/conversion/identification from the UI afterwards.
 
 Do not grant a worker access to the Docker socket merely to obtain a converter.
 Bake reviewed converter binaries into its restricted image instead.
 
 Configure `BOOK_SCANNER_OCR_SERVICE_URL` and the worker network policy so only
-workers can submit jobs. Bound requests and polling with
-`BOOK_SCANNER_OCR_REQUEST_TIMEOUT`, `BOOK_SCANNER_OCR_MAX_ATTEMPTS`, and
-`BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS`. The current defaults are 40 polls at
-0.2-second intervals, roughly eight seconds of waiting plus request time. This
-blocking loop occupies an RQ worker until completion or timeout. Sizing the budget
-for real OCR and persisting service-reported engine/model/language/confidence
+workers can submit jobs. Polling is bounded by a wall-clock deadline, not an
+attempt count: by default 25 minutes (`BOOK_SCANNER_OCR_POLL_DEADLINE_SECONDS`),
+polling every 2 seconds and backing off by 1.5x to a 15-second cap
+(`BOOK_SCANNER_OCR_POLL_INTERVAL_START_SECONDS` / `..._MAX_SECONDS`). Unknown
+non-terminal remote statuses (`waiting`, `preprocessing`, ...) are treated as
+running with a warning; up to six consecutive transport errors or 5xx/408/429
+responses during polling are tolerated before the job fails. Uploads use a
+separate long read/write timeout (`BOOK_SCANNER_OCR_SUBMIT_TIMEOUT`, default
+300 s) while `BOOK_SCANNER_OCR_REQUEST_TIMEOUT` (30 s) covers polls and
+downloads. OCR jobs get their own RQ timeout (`BOOK_SCANNER_OCR_JOB_TIMEOUT_SECONDS`,
+default 7200 s); the poll deadline is clamped to stay below it. The legacy
+`BOOK_SCANNER_OCR_MAX_ATTEMPTS` / `BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS` are
+honoured only if changed from their old defaults (40 / 0.2), giving a fixed
+interval and an attempts x interval deadline. An OCR run that yields no usable
+output in the requested formats fails instead of reporting success, and an
+equivalent active OCR job for the same source variant and formats is reused
+rather than starting another remote run. Converter subprocesses have a timeout
+(`BOOK_SCANNER_CONVERTER_TIMEOUT_SECONDS`, default 1800 s, always below the queue
+job timeout) and their stderr tail is included in the failure message. The
+blocking OCR loop occupies an RQ worker until completion or timeout. Persisting service-reported engine/model/language/confidence
 remain Sprint019 task E; current variants record requested engine/model/language
 and artifact-level confidence.
+
+The OCR/converter tuning names above other than the legacy pair are not yet
+fields in `settings.py`. Set them as real process environment variables
+(systemd `Environment=`), not in `.env`, until they are wired in: the `.env`
+loader rejects unknown `BOOK_SCANNER_*` keys.
 
 OCR clients implement `iter_artifact(remote_job_id, descriptor)` as a bounded
 byte iterator. HTTP downloads and scan ZIP packaging use 1 MiB chunks; inline

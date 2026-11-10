@@ -14,9 +14,10 @@ from django.conf import settings as django_settings
 from django.db import connection, transaction
 from django.db.models import Q
 from django.utils import timezone
+from PIL import Image
 from rq import get_current_job
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake, ocr
@@ -289,6 +290,31 @@ def _collect_cleaned_sources(
     return entries
 
 
+def _normalize_page_image(path: Path, scratch: Path, index: int) -> Path:
+    """Return a path img2pdf can embed, flattening transparency onto white."""
+    try:
+        with Image.open(path) as image:
+            has_alpha = image.mode in {"RGBA", "LA", "PA"} or (
+                image.mode == "P" and "transparency" in image.info
+            )
+            if not has_alpha:
+                return path
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            flattened = scratch / f"page-{index:05d}.jpg"
+            dpi = image.info.get("dpi")
+            background.save(
+                flattened,
+                format="JPEG",
+                quality=95,
+                **({"dpi": dpi} if isinstance(dpi, tuple) else {}),
+            )
+            return flattened
+    except OSError as exc:
+        raise ScanPipelineError(f"cannot read page image {path.name}: {exc}") from exc
+
+
 def _build_pdf_from_images(image_paths: Sequence[Path]) -> Path:
     with tempfile.NamedTemporaryFile(
         prefix="scan-cleaned-",
@@ -301,7 +327,16 @@ def _build_pdf_from_images(image_paths: Sequence[Path]) -> Path:
         if not image_paths:
             raise ScanPipelineError("no page images available")
 
-        destination.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
+        # Stream straight to disk: hundreds of high-resolution pages must never be
+        # held in memory at once. Alpha-channel pages (which img2pdf rejects) are
+        # flattened to RGB in a scratch directory first.
+        with tempfile.TemporaryDirectory(prefix="scan-pdf-norm-") as scratch:
+            normalized = [
+                str(_normalize_page_image(path, Path(scratch), index))
+                for index, path in enumerate(image_paths)
+            ]
+            with destination.open("wb") as output_stream:
+                img2pdf.convert(normalized, outputstream=output_stream)
         return destination
     except Exception:
         destination.unlink(missing_ok=True)
@@ -558,11 +593,15 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
             return
         if processing_job.job_type != ProcessingJob.JobType.SCAN_FINALIZATION:
             return
-        if processing_job.state in {
-            ProcessingJob.JobState.RUNNING,
-            ProcessingJob.JobState.SUCCESS,
-        }:
+        if processing_job.state == ProcessingJob.JobState.SUCCESS:
             return
+        if processing_job.state == ProcessingJob.JobState.RUNNING:
+            if not is_stale_running(processing_job):
+                return
+            logger.warning(
+                "stale_running_job_reentered",
+                processing_job_id=str(processing_job.job_id),
+            )
         details = _coerce_details(processing_job)
         attempt_count = int(details.get("attempt_count", 0)) + 1
         details = {**details, "attempt_count": attempt_count, "error": ""}
