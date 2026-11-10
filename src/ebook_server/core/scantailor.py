@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
-import statistics
 import tempfile
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from math import hypot
 from pathlib import Path
 from typing import Any, Final
@@ -18,8 +17,7 @@ from django.conf import settings as django_settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from PIL import Image, UnidentifiedImageError
-from skimage.filters import threshold_niblack, threshold_sauvola
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
@@ -129,11 +127,10 @@ def _compute_sha256(path: Path) -> str:
 
 
 def _build_output_name(state: ScanTailorStageState, *, preview: bool = False) -> str:
-    source_identifier = _resolve_input_identifier(state)
-    suffix = Path(source_identifier).suffix if source_identifier else ".bin"
-    if preview:
-        return f"preview{suffix}"
-    return f"output{suffix}"
+    # Every stage writes PNG data regardless of the input format, so the artifact
+    # name must carry the extension of the format actually written.
+    del state
+    return "preview.png" if preview else "output.png"
 
 
 def _output_namespace(state: ScanTailorStageState) -> str:
@@ -324,33 +321,115 @@ def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> N
         state.input_stage_state = None
 
 
+class ImageLoadError(RuntimeError):
+    """Raised when a stage input cannot be decoded as an image."""
+
+
+DEFAULT_DPI: Final[int] = 300
+
+
+def _flatten_on_white(image: Image.Image) -> Image.Image:
+    """Composite an image with an alpha channel onto an opaque white background."""
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    background.alpha_composite(rgba)
+    flattened = background.convert("RGB")
+    if image.mode in {"LA", "La"}:
+        return flattened.convert("L")
+    return flattened
+
+
+def _high_depth_to_uint8(image: Image.Image) -> Image.Image:
+    """Scale 16/32-bit single-channel images down to 8-bit instead of clamping."""
+    array = np.asarray(image)
+    if array.dtype == np.uint8:
+        return Image.fromarray(array, mode="L")
+    if np.issubdtype(array.dtype, np.floating):
+        peak = float(array.max()) if array.size else 0.0
+        scaled = array * 255.0 if peak <= 1.0 else array
+        return Image.fromarray(np.clip(scaled, 0, 255).astype(np.uint8), mode="L")
+    peak_int = int(array.max()) if array.size else 0
+    if peak_int <= 255:
+        return Image.fromarray(array.astype(np.uint8), mode="L")
+    scale = 65535.0 if peak_int <= 65535 else float(peak_int)
+    scaled = array.astype(np.float64) * (255.0 / scale)
+    return Image.fromarray(np.clip(np.rint(scaled), 0, 255).astype(np.uint8), mode="L")
+
+
+def _sanitize_dpi(raw: object) -> tuple[int, int] | None:
+    if not isinstance(raw, tuple | list) or len(raw) < 2:
+        return None
+    try:
+        x_dpi, y_dpi = float(raw[0]), float(raw[1])
+    except (TypeError, ValueError):
+        return None
+    if not (36 <= x_dpi <= 4800 and 36 <= y_dpi <= 4800):
+        return None
+    return int(round(x_dpi)), int(round(y_dpi))
+
+
+def _normalise_image(image: Image.Image) -> Image.Image:
+    """Return an 8-bit ``L`` or ``RGB`` image, whatever the source mode was."""
+    mode = image.mode
+    if mode in {"L", "RGB"}:
+        return image
+    if mode in {"I;16", "I;16L", "I;16B", "I;16N", "I", "F"}:
+        return _high_depth_to_uint8(image)
+    if mode == "1":
+        return image.convert("L")
+    if mode in {"RGBA", "LA", "La", "RGBa", "PA"}:
+        return _flatten_on_white(image)
+    if mode == "P":
+        if "transparency" in image.info:
+            return _flatten_on_white(image.convert("RGBA"))
+        return image.convert("RGB")
+    return image.convert("RGB")
+
+
+def _load_image(path: Path) -> Image.Image:
+    """Decode ``path`` into a normalised 8-bit L/RGB image or raise ImageLoadError.
+
+    Shared by every stage: applies EXIF orientation, scales 16-bit data to 8-bit,
+    converts CMYK/palette/YCbCr to RGB and flattens transparency onto white.
+    Source DPI (if any) is kept in ``image.info["dpi"]``.
+    """
+    try:
+        with Image.open(path) as opened:
+            opened.load()
+            dpi = _sanitize_dpi(opened.info.get("dpi"))
+            oriented = ImageOps.exif_transpose(opened)
+            image = _normalise_image(oriented)
+            if image is opened:
+                image = opened.copy()
+    except (OSError, UnidentifiedImageError, ValueError, SyntaxError) as exc:
+        raise ImageLoadError(f"cannot read image {path.name}: {exc}") from exc
+    image.info["dpi"] = dpi or (DEFAULT_DPI, DEFAULT_DPI)
+    return image
+
+
 def _as_image_if_available(path: Path) -> tuple[Image.Image | None, bool]:
     try:
-        image = Image.open(path)
-        image.load()
-        return image, True
-    except (OSError, UnidentifiedImageError):
+        return _load_image(path), True
+    except ImageLoadError:
         return None, False
 
 
-def _row_dark_counts(image: Image.Image, threshold: int = 180) -> list[int]:
-    width, height = image.size
-    binary = image.point(lambda value: 1 if value < threshold else 0)
-    pixels = list(binary.getdata())
-    rows: list[int] = []
-    for y in range(height):
-        row_slice = pixels[y * width : (y + 1) * width]
-        rows.append(sum(row_slice))
-    return rows
+def _dpi_of(image: Image.Image) -> tuple[int, int]:
+    return _sanitize_dpi(image.info.get("dpi")) or (DEFAULT_DPI, DEFAULT_DPI)
 
 
-def _projection_score(image: Image.Image) -> float:
-    rows = _row_dark_counts(image)
-    if not rows:
-        return 0.0
-    if len(rows) == 1:
-        return float(rows[0])
-    return statistics.pvariance(rows)
+def _save_png(image: Image.Image, path: Path, dpi: tuple[int, int]) -> None:
+    image.save(path, format="PNG", dpi=dpi)
+
+
+def _paper_fill(image: Image.Image) -> int | tuple[int, int, int]:
+    """Background colour for new pixels: bright paper level of the image itself."""
+    small = _thumbnail(image, size=300)
+    array = np.asarray(small)
+    if array.ndim == 2:
+        return int(np.percentile(array, 90))
+    levels = np.percentile(array.reshape(-1, array.shape[2]), 90, axis=0)
+    return (int(levels[0]), int(levels[1]), int(levels[2]))
 
 
 def _thumbnail(image: Image.Image, size: int = 1200) -> Image.Image:
@@ -368,10 +447,16 @@ def _save_preview(source: Image.Image, preview_path: Path) -> None:
         preview_image.save(preview_path, format="PNG")
 
 
-def _copy_fallback(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
-    shutil.copy2(source_path, output_path)
-    shutil.copy2(source_path, preview_path)
+def _passthrough(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
+    """Copy a stage input through unchanged (re-encoded as normalised PNG)."""
+    image = _load_image(source_path)
+    _save_png(image, output_path, _dpi_of(image))
+    _save_preview(image, preview_path)
     return {"algorithm": "copy"}
+
+
+def _copy_fallback(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
+    return _passthrough(source_path, output_path, preview_path)
 
 
 def _record_image_dimensions(
@@ -379,16 +464,17 @@ def _record_image_dimensions(
     output_path: Path,
     parameters: dict[str, Any],
 ) -> dict[str, Any]:
+    """Record current input/output sizes; always overwrite so they never go stale."""
     recorded = dict(parameters)
     source, source_loaded = _as_image_if_available(source_path)
     if source is not None and source_loaded:
-        recorded.setdefault("input_width", source.width)
-        recorded.setdefault("input_height", source.height)
+        recorded["input_width"] = source.width
+        recorded["input_height"] = source.height
         source.close()
     output, output_loaded = _as_image_if_available(output_path)
     if output is not None and output_loaded:
-        recorded.setdefault("output_width", output.width)
-        recorded.setdefault("output_height", output.height)
+        recorded["output_width"] = output.width
+        recorded["output_height"] = output.height
         output.close()
     return recorded
 
@@ -403,49 +489,99 @@ def _run_copy(
     return _copy_fallback(source_path, output_path, preview_path)
 
 
-def _auto_split_position(
-    image: Image.Image,
-    *,
-    minimum_gap_ratio: float = 0.22,
-) -> int | None:
+@dataclass(frozen=True)
+class SplitResult:
+    x: int
+    confidence: float
+    method: str
+
+
+MIN_SPLIT_CONFIDENCE: Final[float] = 0.08
+
+
+def _column_darkness_profile(gray: np.ndarray) -> np.ndarray:
+    """Per-column mean darkness in 0..1, normalised to the image's own paper/ink range."""
+    height = gray.shape[0]
+    rows = gray[int(height * 0.05) : max(int(height * 0.95), 1)]
+    paper = float(np.percentile(rows, 99))
+    ink = float(np.percentile(rows, 1))
+    span = paper - ink
+    if span < 20.0:
+        return np.zeros(gray.shape[1], dtype=np.float64)
+    darkness = np.clip((paper - rows.astype(np.float32)) / span, 0.0, 1.0)
+    return np.asarray(darkness.mean(axis=0), dtype=np.float64)
+
+
+def _find_gutter(image: Image.Image) -> SplitResult | None:
+    """Locate the page gutter in a spread.
+
+    Works on the per-column darkness profile of the central band (30-70% of the
+    width). A gutter shows up either as a narrow dark ridge (binding shadow) or as a
+    narrow bright valley between two text blocks (flat scan). Whichever contrasts
+    more with its surroundings wins; if neither does, no split is reported.
+    """
     width, height = image.size
     if width < 96 or width <= height:
         return None
-
-    grayscale = image.convert("L")
-    band_left = max(0, width // 2 - width // 10)
-    band_right = min(width, width // 2 + width // 10)
-    sample_step = max(1, height // 120)
-    row_positions = range(0, height, sample_step)
-
-    pixels = [
-        int(value[0]) if isinstance(value, tuple) else int(value)
-        for value in grayscale.get_flattened_data()
+    scale = min(1.0, 1000.0 / width)
+    gray = np.asarray(image.convert("L"))
+    if scale < 1.0:
+        gray = cv2.resize(
+            gray, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA
+        )
+    small_w = gray.shape[1]
+    profile = _column_darkness_profile(gray)
+    smooth_w = max(1, int(small_w * 0.006))
+    kernel = np.ones(smooth_w) / smooth_w
+    profile = np.convolve(np.pad(profile, smooth_w, mode="edge"), kernel, mode="same")[
+        smooth_w:-smooth_w
     ]
 
-    best_value: int | None = None
-    best_x: int | None = None
-    for x in range(band_left, band_right):
-        darkness = 0
-        for y in row_positions:
-            if pixels[(y * width) + x] < 220:
-                darkness += 1
-        if best_value is None or darkness < best_value:
-            best_value = darkness
-            best_x = x
-
-    if best_x is None or best_value is None:
+    inner = max(2, int(small_w * 0.04))
+    outer = max(inner + 2, int(small_w * 0.12))
+    lo = int(small_w * 0.30)
+    hi = int(small_w * 0.70)
+    best_strength = 0.0
+    best_kind = ""
+    candidates: list[tuple[float, str, int]] = []
+    ridge = np.full(small_w, -1.0)
+    valley = np.full(small_w, -1.0)
+    for x in range(max(lo, outer), min(hi, small_w - outer)):
+        neighbours = np.concatenate(
+            (profile[x - outer : x - inner], profile[x + inner : x + outer + 1])
+        )
+        level = float(neighbours.mean())
+        ridge[x] = float(profile[x]) - level
+        valley[x] = level - float(profile[x])
+    for kind, strength_map in (("ridge", ridge), ("valley", valley)):
+        peak = float(strength_map.max())
+        candidates.append((peak, kind, int(strength_map.argmax())))
+    best_strength, best_kind, _ = max(candidates)
+    if best_strength <= 0.0:
         return None
+    strength_map = ridge if best_kind == "ridge" else valley
+    # centre of the plateau of near-maximal responses (flat gaps are wide, not 1px)
+    near = np.flatnonzero(strength_map >= best_strength * 0.9)
+    # keep the run of indexes that contains the argmax
+    peak_index = int(strength_map.argmax())
+    run = [int(i) for i in near if abs(int(i) - peak_index) <= int(small_w * 0.05)]
+    centre = (min(run) + max(run)) / 2.0 if run else float(peak_index)
+    x_full = int(round(centre / (gray.shape[1] / width)))
+    return SplitResult(x=x_full, confidence=round(best_strength, 4), method=best_kind)
 
-    # Keep split near center so tiny border variations don't trigger odd cuts.
-    gutter_margin = width // 12
-    if best_x < gutter_margin or best_x > width - gutter_margin:
+
+def _auto_split_position(
+    image: Image.Image,
+    *,
+    minimum_confidence: float = MIN_SPLIT_CONFIDENCE,
+) -> int | None:
+    result = _find_gutter(image)
+    if result is None or result.confidence < minimum_confidence:
         return None
-
-    if best_value > height * minimum_gap_ratio:
+    width = image.width
+    if not (width * 0.25 <= result.x <= width * 0.75):
         return None
-
-    return best_x
+    return result.x
 
 
 def _run_page_split(
@@ -454,11 +590,7 @@ def _run_page_split(
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "resolved_split_mode": "fallback_copy",
-        }
+    source = _load_image(source_path)
 
     parameters = dict(state.parameters or {})
     split_mode = str(parameters.get("split_mode", "auto")).strip().lower()
@@ -466,8 +598,9 @@ def _run_page_split(
         split_mode = "auto"
     side = state.scan_page.side
 
+    dpi = _dpi_of(source)
     if source.width <= source.height:
-        source.save(output_path, format="PNG")
+        _save_png(source, output_path, dpi)
         _save_preview(source, preview_path)
         return {
             "resolved_split_mode": "single",
@@ -476,6 +609,8 @@ def _run_page_split(
         }
 
     split_x = None
+    split_confidence: float | None = None
+    split_method = split_mode
     if split_mode == "manual":
         split_x = _coerce_int(parameters.get("split_x"), -1)
         if split_x < 0:
@@ -483,7 +618,19 @@ def _run_page_split(
     elif split_mode == "single":
         split_x = None
     else:
-        split_x = _auto_split_position(source.convert("L"))
+        gutter = _find_gutter(source)
+        if gutter is not None:
+            split_confidence = gutter.confidence
+            split_method = gutter.method
+            if (
+                gutter.confidence >= MIN_SPLIT_CONFIDENCE
+                and source.width * 0.25 <= gutter.x <= source.width * 0.75
+            ):
+                split_x = gutter.x
+        else:
+            split_confidence = 0.0
+        if split_x is None:
+            split_method = "center_fallback"
 
     resolved = split_mode
     output = source
@@ -519,15 +666,18 @@ def _run_page_split(
         split_detected = None
 
     with output as out:
-        out.save(output_path, format="PNG")
+        _save_png(out, output_path, dpi)
         _save_preview(out, preview_path)
 
-    updates = {
+    updates: dict[str, Any] = {
         "split_mode": split_mode,
         "resolved_split_side": output_side,
         "source_width": source.width,
         "source_height": source.height,
     }
+    if split_confidence is not None:
+        updates["split_confidence"] = split_confidence
+        updates["split_method"] = split_method
     if split_detected is not None:
         updates["resolved_split_x"] = split_detected
         updates["resolved_width"] = output.width
@@ -538,10 +688,6 @@ def _run_page_split(
             **updates,
         },
     )
-
-
-def _deskew_score(image: Image.Image) -> float:
-    return _projection_score(image.convert("L"))
 
 
 def _candidate_angles(start: float, stop: float, step: float) -> list[float]:
@@ -557,21 +703,71 @@ def _candidate_angles(start: float, stop: float, step: float) -> list[float]:
     return values
 
 
+def _ink_mask(gray: np.ndarray) -> np.ndarray | None:
+    """Boolean ink mask using a per-image Otsu threshold, or None for blank pages."""
+    low, high = np.percentile(gray, [0.5, 99.5])
+    if high - low < max(6.0, 0.12 * float(high)):
+        return None
+    threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dark = gray[gray <= threshold]
+    light = gray[gray > threshold]
+    if dark.size == 0 or light.size == 0:
+        return None
+    if float(light.mean()) - float(dark.mean()) < max(6.0, 0.2 * float(light.mean())):
+        return None
+    return np.asarray(gray <= threshold)
+
+
+def _rotated_row_score(mask: np.ndarray, angle: float) -> float:
+    height, width = mask.shape
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, 1.0)
+    rotated = cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_LINEAR, borderValue=0)
+    return float(np.var(rotated.sum(axis=1, dtype=np.float64)))
+
+
 def _estimate_deskew_angle(image: Image.Image, parameters: dict[str, Any]) -> float:
+    """Return the CCW rotation (degrees, PIL ``rotate`` convention) that straightens text.
+
+    The returned value is exactly what ``_run_deskew`` applies and what the UI seeds
+    ``manual_angle`` with, so auto and manual agree. 0.0 is returned for blank or
+    ambiguous pages (tie / negligible improvement).
+    """
     min_angle = _coerce_float(parameters.get("angle_min", -7.0), -7.0)
     max_angle = _coerce_float(parameters.get("angle_max", 7.0), 7.0)
     step = _coerce_float(parameters.get("angle_step", 1.0), 1.0)
+    if step <= 0:
+        step = 1.0
 
-    working = _thumbnail(image.convert("L"), size=900)
+    gray = np.asarray(_thumbnail(image.convert("L"), size=900))
+    mask = _ink_mask(gray)
+    if mask is None:
+        return 0.0
+    mask_u8 = mask.astype(np.uint8)
+
+    def score(angle: float) -> float:
+        return _rotated_row_score(mask_u8, angle)
+
+    baseline = score(0.0)
     best_angle = 0.0
-    best_score = -1.0
+    best_score = baseline
     for angle in _candidate_angles(min_angle, max_angle, step):
-        rotated = working.rotate(-angle, expand=True, fillcolor=255)
-        score = _deskew_score(rotated)
-        if score > best_score:
-            best_score = score
+        value = score(angle)
+        if value > best_score * 1.0001 and value > best_score:
+            best_score = value
             best_angle = angle
-    return best_angle
+    # refine around the coarse optimum with a finer step
+    fine = step / 4.0
+    if best_angle != 0.0 or best_score > baseline:
+        for angle in _candidate_angles(best_angle - step, best_angle + step, fine):
+            if not (min_angle <= angle <= max_angle):
+                continue
+            value = score(angle)
+            if value > best_score:
+                best_score = value
+                best_angle = angle
+    if best_score < baseline * 1.02:
+        return 0.0
+    return float(round(best_angle, 3))
 
 
 def _run_deskew(
@@ -580,11 +776,7 @@ def _run_deskew(
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "deskew_mode": "fallback_copy",
-        }
+    source = _load_image(source_path)
 
     parameters = dict(state.parameters or {})
 
@@ -596,8 +788,16 @@ def _run_deskew(
         angle = _estimate_deskew_angle(source, parameters)
         mode = "auto"
 
-    output = source.rotate(angle, expand=True, fillcolor=255)
-    output.save(output_path, format="PNG")
+    if abs(angle) < 1e-9:
+        output = source
+    else:
+        output = source.rotate(
+            angle,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,
+            fillcolor=_paper_fill(source),
+        )
+    _save_png(output, output_path, _dpi_of(source))
     _save_preview(output, preview_path)
 
     return _as_recorded_parameters(
@@ -615,11 +815,7 @@ def _run_select_content(
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "content_mode": "copy-fallback",
-        }
+    source = _load_image(source_path)
 
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("content_mode", "auto")).strip().lower()
@@ -652,7 +848,7 @@ def _run_select_content(
     left, top, right, bottom = detected_box
     output = source.crop((left, top, right, bottom))
     with output as out:
-        out.save(output_path, format="PNG")
+        _save_png(out, output_path, _dpi_of(source))
         _save_preview(out, preview_path)
 
     return _as_recorded_parameters(
@@ -732,15 +928,68 @@ def _coerce_box(
 
 
 def _detect_content_box(image: Image.Image) -> tuple[int, int, int, int]:
-    grayscale = image.convert("L")
-    threshold = 200
-    dark = grayscale.point(lambda value: 255 if value < threshold else 0)
-    bbox = dark.getbbox()
+    """Bounding box of real content: per-image Otsu threshold, specks filtered out."""
     width, height = image.size
-    if bbox is None:
-        return (0, 0, width, height)
+    full = (0, 0, width, height)
+    scale = min(1.0, 1600.0 / max(width, height))
+    gray = np.asarray(image.convert("L"))
+    if scale < 1.0:
+        gray = cv2.resize(
+            gray,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    mask = _ink_mask(gray)
+    if mask is None:
+        return full
+    offset_x = offset_y = 0
+    small_h, small_w = mask.shape
+    ring = max(2, int(min(small_h, small_w) * 0.02))
+    ring_mask = np.ones_like(mask)
+    ring_mask[ring:-ring, ring:-ring] = False
+    if float(mask[ring_mask].mean()) > 0.6:
+        # Dark surroundings (table, scanner lid): ink is only meaningful on the page,
+        # so restrict the search to the largest light region first.
+        light = cv2.morphologyEx(
+            (~mask).astype(np.uint8),
+            cv2.MORPH_OPEN,
+            np.ones((5, 5), np.uint8),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(light, connectivity=4)
+        if count <= 1:
+            return full
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        px, py, pw, ph = (int(stats[biggest, i]) for i in range(4))
+        inset_x, inset_y = max(1, int(pw * 0.01)), max(1, int(ph * 0.01))
+        offset_x, offset_y = px + inset_x, py + inset_y
+        region = gray[offset_y : py + ph - inset_y, offset_x : px + pw - inset_x]
+        if region.size == 0:
+            return full
+        mask = _ink_mask(region)
+        if mask is None:
+            return full
+    mask_u8 = mask.astype(np.uint8)
+    small_h, small_w = mask_u8.shape
+    # Group neighbouring glyphs, then drop groups with too little ink (dust specks).
+    grow = max(3, small_w // 150) | 1
+    grouped = cv2.dilate(mask_u8, np.ones((grow, grow), np.uint8))
+    count, labels = cv2.connectedComponents(grouped, connectivity=8)
+    if count <= 1:
+        return full
+    ink_per_label = np.bincount(labels[mask], minlength=count)
+    min_ink = max(12, int(small_w * small_h * 2e-5))
+    keep = ink_per_label >= min_ink
+    keep[0] = False
+    kept = keep[labels] & mask
+    ys, xs = np.nonzero(kept)
+    if ys.size == 0:
+        return full
+    inv = 1.0 / scale
+    left = int((xs.min() + offset_x) * inv)
+    right = int(min(width, (xs.max() + offset_x + 1) * inv + 1))
+    top = int((ys.min() + offset_y) * inv)
+    bottom = int(min(height, (ys.max() + offset_y + 1) * inv + 1))
 
-    left, top, right, bottom = bbox
     pad_x = max(1, (right - left) // 120)
     pad_y = max(1, (bottom - top) // 120)
     left = max(0, left - pad_x)
@@ -760,11 +1009,7 @@ def _run_margins(
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "margins_mode": "fallback_copy",
-        }
+    source = _load_image(source_path)
 
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("margins_mode", "auto")).strip().lower()
@@ -796,18 +1041,9 @@ def _run_margins(
     align_x = str(parameters.get("align_x", "center")).strip().lower()
     align_y = str(parameters.get("align_y", "center")).strip().lower()
 
-    if source.mode in {"1", "RGB", "RGBA"}:
-        background_mode = source.mode if source.mode == "RGBA" else source.mode
-    else:
-        source = source.convert("RGB")
-        background_mode = "RGB"
-
-    if background_mode == "RGBA":
-        canvas = Image.new("RGBA", (target_w, target_h), (255, 255, 255, 255))
-    elif background_mode == "L":
-        canvas = Image.new("L", (target_w, target_h), 255)
-    else:
-        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+    # The loader guarantees L or RGB; pad with the page's own paper colour.
+    fill = _paper_fill(source)
+    canvas = Image.new(source.mode, (target_w, target_h), fill)
 
     spare_x = max(0, target_w - (source.width + left + right))
     spare_y = max(0, target_h - (source.height + top + bottom))
@@ -832,7 +1068,7 @@ def _run_margins(
     offset_x = left + extra_x
     offset_y = top + extra_y
     canvas.paste(source, (offset_x, offset_y))
-    canvas.save(output_path, format="PNG")
+    _save_png(canvas, output_path, _dpi_of(source))
     _save_preview(canvas, preview_path)
 
     return _as_recorded_parameters(
@@ -1003,20 +1239,7 @@ def _run_perspective_dewarp(
             "dewarp_mode": "bypass",
         }
 
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        if mode == "manual":
-            resolved_points = _coerce_dewarp_points(parameters.get("dewarp_points"), (0, 0))
-            fallback_payload = _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "manual",
-            }
-            if resolved_points is not None:
-                fallback_payload["dewarp_source_points"] = _ordered_quad_points(resolved_points)
-                fallback_payload["dewarp_warning"] = "fallback_copy"
-            return fallback_payload
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "fallback_copy",
-        }
+    source = _load_image(source_path)
 
     if cv2 is None or np is None:
         if mode == "manual":
@@ -1054,6 +1277,7 @@ def _run_perspective_dewarp(
     try:
         width, height = _estimate_target_dimensions(source_quad)
         src = np.array(source.convert("RGB"))
+        paper = _paper_fill(source.convert("RGB"))
         source_matrix = np.array(source_quad, dtype=np.float32)
         destination_matrix = np.array(
             [
@@ -1071,10 +1295,10 @@ def _run_perspective_dewarp(
             (width, height),
             flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255),
+            borderValue=paper,
         )
         output = Image.fromarray(warped)
-        output.save(output_path, format="PNG")
+        _save_png(output, output_path, _dpi_of(source))
         _save_preview(output, preview_path)
         recorded_mode = "manual" if mode == "manual" else "auto"
         return {
@@ -1170,6 +1394,11 @@ def _pil_otsu_threshold(image: Image.Image) -> int:
     return best_threshold
 
 
+def _odd_window(window_size: int) -> int:
+    block = max(3, window_size)
+    return block if block % 2 == 1 else block + 1
+
+
 def _binarize_with_cv2(
     grayscale: Any,
     source: Image.Image,
@@ -1196,51 +1425,47 @@ def _binarize_with_cv2(
         )
         output = threshold
     elif mode == "window":
-        block = max(3, window_size)
-        if block % 2 == 0:
-            block += 1
-        output = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            block,
-            k,
-        )
+        # Local-mean threshold with a *relative* offset below the mean: paper noise
+        # stays white, only pixels clearly darker than their surroundings turn black.
+        block = _odd_window(window_size)
+        local_mean = cv2.blur(gray.astype(np.float32), (block, block))
+        threshold = local_mean * (1.0 - min(max(k, 0.0), 1.0) * 0.5)
+        output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
     elif mode == "fox":
-        block = max(3, window_size)
-        if block % 2 == 0:
-            block += 1
-        threshold = threshold_niblack(  # type: ignore[no-untyped-call]
-            gray,
-            window_size=block,
-            k=k,
-        )
-        output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
+        # Niblack-style (mean - k*std) with a floor on the offset so flat, noisy
+        # paper (std ~ 0) is not split in half by noise around its own mean.
+        block = _odd_window(window_size)
+        gray_f = gray.astype(np.float32)
+        local_mean = cv2.blur(gray_f, (block, block))
+        local_sq = cv2.blur(gray_f * gray_f, (block, block))
+        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+        offset = np.maximum(abs(k) * local_std, 0.12 * local_mean)
+        output = (gray_f > (local_mean - offset)).astype(np.uint8) * 255
     elif mode == "sauvola":
-        block = max(3, window_size)
-        if block % 2 == 0:
-            block += 1
-        threshold = threshold_sauvola(  # type: ignore[no-untyped-call]
-            gray,
-            window_size=block,
-            k=k,
-            r=max(r, 1.0),
-        )
-        output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
+        # T = m * (1 + k * (s / r - 1)); box filters keep this fast on 24MP scans.
+        block = _odd_window(window_size)
+        gray_f = gray.astype(np.float32)
+        local_mean = cv2.blur(gray_f, (block, block))
+        local_sq = cv2.blur(gray_f * gray_f, (block, block))
+        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+        threshold = local_mean * (1.0 + k * (local_std / max(r, 1.0) - 1.0))
+        output = (gray_f > threshold).astype(np.uint8) * 255
     elif mode == "wolf":
-        # Wolf-like approximation from local contrast.
-        block = max(3, window_size)
-        if block % 2 == 0:
-            block += 1
-        mean = cv2.blur(gray.astype(np.float32), (block, block))
-        sq_mean = cv2.blur((gray.astype(np.float32) ** 2), (block, block))
-        std = np.sqrt(np.maximum(sq_mean - (mean * mean), 0.0))
-        global_mean = np.mean(gray)
-        global_std = np.std(gray)
-        threshold = (1.0 - (std / (global_std + 1e-9))) * mean + (k * std)
-        threshold = threshold + (global_mean - mean) * (global_std / max(r, 1.0))
-        output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
+        # Wolf-Jolion: T = (1-a)*m + a*Min + a*(s/Smax)*(m - Min)
+        block = _odd_window(window_size)
+        gray_f = gray.astype(np.float32)
+        local_mean = cv2.blur(gray_f, (block, block))
+        local_sq = cv2.blur(gray_f * gray_f, (block, block))
+        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+        floor = float(np.percentile(gray_f[::4, ::4], 1))
+        max_std = max(float(local_std.max()), 1e-3)
+        a_coeff = min(max(k, 0.0), 1.0)
+        threshold = (
+            (1.0 - a_coeff) * local_mean
+            + a_coeff * floor
+            + a_coeff * (local_std / max_std) * (local_mean - floor)
+        )
+        output = (gray_f > threshold).astype(np.uint8) * 255
     elif mode == "grad":
         # Gradient-aware fallback for bleed-through and uneven lighting.
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -1276,11 +1501,7 @@ def _run_output(
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source, image_loaded = _as_image_if_available(source_path)
-    if source is None or not image_loaded:
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "output_mode": "fallback_copy",
-        }
+    source = _load_image(source_path)
 
     parameters = dict(state.parameters or {})
     output_mode = _coerce_output_mode(parameters.get("output_mode"), default="otsu")
@@ -1385,7 +1606,7 @@ def _run_output(
     if keep_color and result.mode != "RGB":
         result = result.convert("RGB")
 
-    result.save(output_path, format="PNG")
+    _save_png(result, output_path, _dpi_of(source))
     _save_preview(result, preview_path)
     output_payload: dict[str, Any] = {
         "output_mode": output_mode,
@@ -1585,10 +1806,21 @@ def process_stage_job(job_id: str) -> None:
     now = timezone.now()
     job.state = ProcessingJob.JobState.RUNNING
     job.started_at = now
+    started_revision = state.revision
+    claimed = ScanTailorStageState.objects.filter(
+        id=state.id,
+        revision=started_revision,
+    ).update(
+        status=ScanTailorStageState.StageStatus.RUNNING,
+        started_at=now,
+        updated_at=now,
+    )
+    if not claimed:
+        _supersede_stage_job(job, details, "stage revision changed before job start")
+        return
     state.status = ScanTailorStageState.StageStatus.RUNNING
     state.started_at = now
     job.save(update_fields=["state", "started_at"])
-    state.save(update_fields=["status", "started_at", "updated_at"])
     logger.info(
         "scantailor_stage_started",
         processing_job_id=str(job.job_id),
@@ -1611,8 +1843,8 @@ def process_stage_job(job_id: str) -> None:
 
         runner = _resolve_stage_algorithm(state)
         with tempfile.TemporaryDirectory(prefix="stages-") as tempdir:
-            staged_output = Path(tempdir) / Path(source_path).name
-            staged_preview = Path(tempdir) / f"preview-{Path(source_path).name}"
+            staged_output = Path(tempdir) / "output.png"
+            staged_preview = Path(tempdir) / "preview.png"
             output_updates = runner(
                 state,
                 source_path,
@@ -1631,6 +1863,9 @@ def process_stage_job(job_id: str) -> None:
                 merged = dict(state.parameters or {})
                 merged.update(output_params)
                 state.parameters = merged
+            if _locked_if_current(state.id, started_revision) is None:
+                _supersede_stage_job(job, details, "stage edited while job was running")
+                return
             storage.store(str(staged_output), artifact_identifier)
             storage.store(str(staged_preview), preview_identifier)
 
@@ -1638,30 +1873,34 @@ def process_stage_job(job_id: str) -> None:
         output_size = artifact_path.stat().st_size
         output_sha = _compute_sha256(artifact_path)
 
-        state.output_storage_location = storage_location
-        state.preview_storage_location = storage_location
-        state.output_storage_identifier = artifact_identifier
-        state.preview_storage_identifier = preview_identifier
-        state.output_size_bytes = output_size
-        state.output_sha256 = output_sha
-        state.status = ScanTailorStageState.StageStatus.SUCCESS
-        state.finished_at = timezone.now()
-        state.last_error = ""
-        state.save(
-            update_fields=[
-                "output_storage_location",
-                "preview_storage_location",
-                "output_storage_identifier",
-                "preview_storage_identifier",
-                "output_size_bytes",
-                "output_sha256",
-                "status",
-                "finished_at",
-                "last_error",
-                "parameters",
-                "updated_at",
-            ],
-        )
+        with transaction.atomic():
+            if _locked_if_current(state.id, started_revision) is None:
+                _supersede_stage_job(job, details, "stage edited while job was running")
+                return
+            state.output_storage_location = storage_location
+            state.preview_storage_location = storage_location
+            state.output_storage_identifier = artifact_identifier
+            state.preview_storage_identifier = preview_identifier
+            state.output_size_bytes = output_size
+            state.output_sha256 = output_sha
+            state.status = ScanTailorStageState.StageStatus.SUCCESS
+            state.finished_at = timezone.now()
+            state.last_error = ""
+            state.save(
+                update_fields=[
+                    "output_storage_location",
+                    "preview_storage_location",
+                    "output_storage_identifier",
+                    "preview_storage_identifier",
+                    "output_size_bytes",
+                    "output_sha256",
+                    "status",
+                    "finished_at",
+                    "last_error",
+                    "parameters",
+                    "updated_at",
+                ],
+            )
 
         job.state = ProcessingJob.JobState.SUCCESS
         job.finished_at = timezone.now()
@@ -1680,12 +1919,46 @@ def process_stage_job(job_id: str) -> None:
             stage=state.stage,
             output_size_bytes=output_size,
         )
-    except Exception as exc:  # pragma: no cover - defensive path
-        state.status = ScanTailorStageState.StageStatus.FAILED
-        state.last_error = str(exc)
-        state.finished_at = timezone.now()
-        state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
+    except Exception as exc:
+        with transaction.atomic():
+            if _locked_if_current(state.id, started_revision) is not None:
+                state.status = ScanTailorStageState.StageStatus.FAILED
+                state.last_error = str(exc)
+                state.finished_at = timezone.now()
+                state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc))
+
+
+def _locked_if_current(state_id: int, revision: int) -> ScanTailorStageState | None:
+    """Lock the stage row; return it only if this job's run is still the current one.
+
+    A user edit bumps ``revision`` (and re-queues the state); an upstream edit flips
+    the status to INVALIDATED. In either case this job's result is stale and must not
+    overwrite the newer parameters/status.
+    """
+    with transaction.atomic():
+        fresh = ScanTailorStageState.objects.select_for_update().filter(id=state_id).first()
+        if fresh is None:
+            return None
+        if fresh.revision != revision:
+            return None
+        if fresh.status != ScanTailorStageState.StageStatus.RUNNING:
+            return None
+        return fresh
+
+
+def _supersede_stage_job(job: ProcessingJob, details: dict[str, Any], reason: str) -> None:
+    """Close a job whose stage was edited meanwhile, leaving the stage row untouched."""
+    job.state = ProcessingJob.JobState.SUCCESS
+    job.finished_at = timezone.now()
+    job.details = {**details, "superseded": True, "superseded_reason": reason}
+    job.save(update_fields=["state", "finished_at", "details"])
+    logger.info(
+        "scantailor_stage_superseded",
+        processing_job_id=str(job.job_id),
+        stage=details.get("stage"),
+        reason=reason,
+    )
 
 
 def _fail_stage_job(job: ProcessingJob, message: str) -> None:
