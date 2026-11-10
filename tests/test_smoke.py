@@ -73,6 +73,8 @@ def test_production_settings_accept_hardened_configuration() -> None:
         database_url="postgresql://ebook:secret@database/library",
         redis_url="redis://redis:6379/0",
         ldap_mode="ldap",
+        ldap_server_uri="ldaps://ldap.example.test",
+        ldap_user_dn_template="uid={username},ou=people,dc=example,dc=test",
         secure_ssl_redirect=True,
         session_cookie_secure=True,
         csrf_cookie_secure=True,

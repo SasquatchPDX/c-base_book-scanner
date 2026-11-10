@@ -5,11 +5,12 @@ from __future__ import annotations
 import importlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -19,6 +20,11 @@ from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import token_set_ratio
 
 logger = structlog.get_logger(__name__)
+
+MAX_AUTHOR_LOOKUPS = 5
+MAX_RETRY_AFTER_SECONDS = 5.0
+REQUEST_TIMEOUT_SECONDS = 5
+DEFAULT_USER_AGENT = "ebook-server (self-hosted hackerspace library)"
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -256,7 +262,11 @@ class OpenLibraryMetadataProvider:
             if isbn_candidate:
                 return [isbn_candidate]
 
-        query_parts = [part for part in (title, author, folder_hint) if part]
+        # The folder name is only a last-resort hint: for web uploads it is a constant
+        # such as "uploads", and adding it to the query makes real titles match nothing.
+        query_parts = [part for part in (title, author) if part]
+        if not query_parts and folder_hint:
+            query_parts = [folder_hint]
         if not query_parts:
             return []
         return self._query_search(" ".join(query_parts))
@@ -275,7 +285,37 @@ class OpenLibraryMetadataProvider:
             return None
         if not isinstance(payload, dict):
             return None
+        payload = dict(payload)
+        payload["_queried_isbn"] = isbn
+        names = self._resolve_author_names(payload)
+        if names:
+            payload["author_name"] = names
         return payload
+
+    def _resolve_author_names(self, payload: dict[str, Any]) -> list[str]:
+        """Resolve edition ``authors: [{key}]`` references to names (bounded, best effort)."""
+        raw_authors = payload.get("authors")
+        if not isinstance(raw_authors, list):
+            return []
+        names: list[str] = []
+        for entry in raw_authors[:MAX_AUTHOR_LOOKUPS]:
+            key = entry.get("key") if isinstance(entry, dict) else None
+            if not isinstance(key, str) or not re.fullmatch(r"/authors/OL\d+A", key):
+                continue
+            try:
+                author_payload = self._get_json(f"https://openlibrary.org{key}.json")
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "metadata_provider_request_failed",
+                    provider_id=self.provider_id,
+                    operation="author",
+                    error_type=type(exc).__name__,
+                )
+                continue
+            name = author_payload.get("name") if isinstance(author_payload, dict) else None
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+        return names
 
     def _query_search(self, query: str) -> list[dict[str, Any]]:
         encoded = urlencode({"q": query, "limit": "5"})
@@ -294,11 +334,31 @@ class OpenLibraryMetadataProvider:
         return docs if isinstance(docs, list) else []
 
     def _get_json(self, url: str) -> Any:
-        request = Request(url, headers={"User-Agent": "ebook-server"})
-        with urlopen(request, timeout=5) as response:
-            if response.status >= 400:
-                raise URLError(f"provider error {response.status}")
-            return json.loads(response.read().decode("utf-8"))
+        user_agent = str(
+            getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
+        )
+        for attempt in range(2):
+            request = Request(url, headers={"User-Agent": user_agent})
+            try:
+                with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                    if response.status >= 400:
+                        raise URLError(f"provider error {response.status}")
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                if exc.code != 429 or attempt == 1:
+                    raise
+                time.sleep(_retry_after_seconds(exc))
+        raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
+
+
+def _retry_after_seconds(error: HTTPError) -> float:
+    """Bounded Retry-After (seconds form only) for a 429 response."""
+    raw = error.headers.get("Retry-After") if error.headers else None
+    try:
+        delay = float(raw) if raw is not None else 1.0
+    except ValueError:
+        delay = 1.0
+    return min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS)
 
 
 def _provider_instances() -> list[MetadataProvider]:
@@ -370,8 +430,12 @@ def _query_provider(
         )
         if hits:
             return hits
+        # The ISBN lookup does not depend on the title; do not repeat it per title hint.
+        isbn = None
 
-    # As a fallback, try non-title search if only identifiers were available.
+    if signals.title_hints:
+        return []
+    # No title hints at all: try identifiers / author / folder alone.
     return provider.search(
         title=None,
         author=author,
@@ -412,15 +476,41 @@ def _normalize_candidate(
     elif isinstance(payload.get("isbn_13"), str):
         isbn13 = _normalize_identifier(payload["isbn_13"])
 
+    queried_isbn = _normalize_identifier(str(payload.get("_queried_isbn") or ""))
+    if queried_isbn is not None:
+        # Edition records can list several ISBNs; the one we looked up must be the one
+        # the candidate carries, otherwise the ISBN-match score bonus is lost.
+        if len(queried_isbn) == 10:
+            isbn10 = queried_isbn
+            isbn13 = _isbn10_to_isbn13(queried_isbn)
+        else:
+            isbn13 = queried_isbn
+            isbn10 = next(
+                (
+                    value
+                    for value in _as_str_list(payload.get("isbn_10"))
+                    if (normalized := _normalize_identifier(value))
+                    and len(normalized) == 10
+                    and _isbn10_to_isbn13(normalized) == queried_isbn
+                ),
+                None,
+            )
+            if isbn10 is not None:
+                isbn10 = _normalize_identifier(isbn10)
+
     publisher = None
-    raw_publisher = payload.get("publisher")
+    raw_publisher = payload.get("publisher") or payload.get("publishers")
     if isinstance(raw_publisher, list) and raw_publisher:
-        publisher = normalize_text(raw_publisher[0])
+        publisher = normalize_text(str(raw_publisher[0]))
     elif isinstance(raw_publisher, str):
         publisher = normalize_text(raw_publisher)
 
     publication_year = None
     raw_publish = payload.get("first_publish_year")
+    if raw_publish is None and isinstance(payload.get("publish_date"), str):
+        year_match = re.search(r"\b(1[0-9]{3}|20[0-9]{2})\b", payload["publish_date"])
+        if year_match:
+            raw_publish = int(year_match.group(1))
     if isinstance(raw_publish, int):
         publication_year = raw_publish
     elif isinstance(raw_publish, str) and raw_publish.isdigit():
@@ -453,6 +543,14 @@ def _normalize_candidate(
         raw=payload,
     )
     return _apply_scoring(signals, candidate)
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return []
 
 
 def _title_match_score(left: str, right: str) -> float:

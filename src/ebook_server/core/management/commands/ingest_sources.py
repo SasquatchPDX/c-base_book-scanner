@@ -74,7 +74,16 @@ class Command(BaseCommand):
                 job.state = ImportJob.State.DISCOVERED
                 job.last_error = ""
                 job.next_retry_at = None
-                job.save(update_fields=["state", "last_error", "next_retry_at", "updated_at"])
+                job.attempt_count = 0
+                job.save(
+                    update_fields=[
+                        "state",
+                        "last_error",
+                        "next_retry_at",
+                        "attempt_count",
+                        "updated_at",
+                    ],
+                )
                 enqueue(intake.process_import_job, str(job.id))
                 retried.append(str(job.id))
 
