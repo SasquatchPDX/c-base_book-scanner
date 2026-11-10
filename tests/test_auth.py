@@ -106,7 +106,7 @@ def test_banned_user_profile_denies_library_access() -> None:
     client.force_login(profile.user)
     response = client.get("/library/")
     assert response.status_code == 403
-    assert client.get("/scan/jobs/").status_code == 302
+    assert client.get("/scan/jobs/", HTTP_ACCEPT="text/html").status_code == 302
     assert "_auth_user_id" not in client.session
 
 

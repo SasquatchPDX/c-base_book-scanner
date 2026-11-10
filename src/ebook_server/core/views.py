@@ -7,13 +7,12 @@ import json
 import re
 import secrets
 from collections.abc import AsyncIterator, Callable
-from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import redis
 from asgiref.sync import sync_to_async
@@ -248,11 +247,20 @@ def _serialize_scan_job(
     return payload
 
 
-def _normalize_scan_side(raw_side: str | None) -> str:
-    raw = (raw_side or "").strip().lower()
-    if raw in {ScanPage.Side.SINGLE, ScanPage.Side.LEFT, ScanPage.Side.RIGHT}:
-        return raw
-    return ScanPage.Side.SINGLE
+_SCAN_SIDE_ALIASES: Final[dict[str, str]] = {
+    "": ScanPage.Side.SINGLE,
+    "single": ScanPage.Side.SINGLE,
+    "s": ScanPage.Side.SINGLE,
+    "left": ScanPage.Side.LEFT,
+    "l": ScanPage.Side.LEFT,
+    "right": ScanPage.Side.RIGHT,
+    "r": ScanPage.Side.RIGHT,
+}
+
+
+def _normalize_scan_side(raw_side: str | None) -> str | None:
+    """Return the canonical side, or ``None`` for an unrecognised value."""
+    return _SCAN_SIDE_ALIASES.get((raw_side or "").strip().lower())
 
 
 def _parse_json_field(payload: dict[str, Any], key: str) -> dict[str, Any]:
@@ -297,35 +305,40 @@ def _normalize_scanner_metadata(raw: Any) -> dict[str, Any]:
 
 
 def _parse_capture_ts(raw: Any) -> datetime | None:
-    if raw is None:
+    """Parse a capture timestamp; raise ``ValueError`` if provided but invalid."""
+    if raw is None or isinstance(raw, bool):
+        if isinstance(raw, bool):
+            raise ValueError("invalid capture_timestamp")
         return None
+    value: float | None = None
     if isinstance(raw, (int, float)):
-        return datetime.fromtimestamp(raw, tz=UTC)
-    if isinstance(raw, str):
-        normalized = raw.strip().replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(normalized)
-        except ValueError:
+        value = float(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text:
             return None
-    return None
-
-
-def _parse_legacy_scan_put_payload(raw_body: bytes) -> dict[str, Any]:
-    if not raw_body:
-        return {}
-    body = raw_body.decode(errors="replace").strip()
-    if not (body.startswith("{") and body.endswith("}")):
-        return {}
-    if "'file':" not in body:
-        return {}
-    result: dict[str, Any] = {}
-    checksum_match = re.search(
-        r"'checksum_sha256'\s*:\s*'([a-fA-F0-9]{40,64})'",
-        body,
-    )
-    if checksum_match is not None:
-        result["checksum_sha256"] = checksum_match.group(1)
-    return result
+        try:
+            value = float(text)
+        except ValueError:
+            value = None
+        if value is None:
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("invalid capture_timestamp") from None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+    else:
+        raise ValueError("invalid capture_timestamp")
+    if value != value or value in {float("inf"), float("-inf")}:
+        raise ValueError("invalid capture_timestamp")
+    if abs(value) > 1e11:
+        value /= 1000.0
+    try:
+        return datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError("invalid capture_timestamp") from None
 
 
 def _parse_scan_request_payload(request: HttpRequest) -> dict[str, Any]:
@@ -476,17 +489,60 @@ def _cleanup_staged_upload(path: str) -> None:
     Path(path).unlink(missing_ok=True)
 
 
+_SCAN_IMAGE_FORMATS: Final[dict[str, tuple[str, str]]] = {
+    "JPEG": ("image/jpeg", ".jpg"),
+    "PNG": ("image/png", ".png"),
+    "TIFF": ("image/tiff", ".tif"),
+    "BMP": ("image/bmp", ".bmp"),
+    "WEBP": ("image/webp", ".webp"),
+}
+_SCAN_IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset(
+    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+)
+
+
+def _sniff_scan_image(path: str) -> tuple[str, str]:
+    """Validate an image with Pillow; return ``(mime_type, extension)``."""
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            image_format = image.format or ""
+            image.verify()
+    except Exception as exc:  # Pillow raises many types for corrupt input.
+        raise ValueError("invalid image") from exc
+    known = _SCAN_IMAGE_FORMATS.get(image_format)
+    if known is None:
+        raise ValueError("invalid image")
+    return known
+
+
+def _sanitize_client_filename(raw_name: str | None, fallback_extension: str) -> str:
+    """Return a safe client filename that always carries an image extension."""
+    name = Path((raw_name or "").replace("\\", "/")).name.strip()
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    suffix = Path(name).suffix.lower()
+    if not name or suffix not in _SCAN_IMAGE_EXTENSIONS:
+        stem = Path(name).stem if name else "page"
+        name = f"{stem or 'page'}{fallback_extension}"
+    if len(name) > 120:
+        suffix = Path(name).suffix
+        name = f"{Path(name).stem[: 120 - len(suffix)]}{suffix}"
+    return name
+
+
 def _build_page_storage_destination(
     *,
     scan_job_id: str,
     logical_sequence_number: int,
     side: str,
-    version: int,
-    original_name: str,
+    checksum_sha256: str,
+    safe_name: str,
 ) -> str:
-    safe_name = Path(original_name).name
+    """Unique per-upload destination so copies never collide or need the job lock."""
     return _default_scan_storage().generate_destination(
-        f"{SCANNING_NAMESPACE}/{scan_job_id}/{logical_sequence_number:04d}-{side}-v{version}",
+        f"{SCANNING_NAMESPACE}/{scan_job_id}/{logical_sequence_number:04d}-{side}/"
+        f"{checksum_sha256[:16]}-{uuid4().hex[:8]}",
         safe_name,
     )
 
@@ -495,27 +551,17 @@ def _append_version(
     *,
     page: ScanPage,
     uploader_id: int | None,
-    staged_path: str,
+    destination: str,
+    original_filename: str,
     checksum_sha256: str,
     mime_type: str,
     size_bytes: int,
     capture_timestamp: datetime | None,
     scanner_metadata: dict[str, Any],
 ) -> ScanPageVersion:
+    """DB-only: record an already-stored artifact as the next active version."""
     latest = page.versions.order_by("version").last()
     next_version = (latest.version + 1) if latest is not None else 1
-    storage = _default_scan_storage()
-    destination = _build_page_storage_destination(
-        scan_job_id=str(page.scan_job_id),
-        logical_sequence_number=page.logical_sequence_number,
-        side=page.side,
-        version=next_version,
-        original_name=Path(staged_path).name,
-    )
-    storage.store(staged_path, destination)
-    size = size_bytes
-    if size <= 0:
-        size = Path(staged_path).stat().st_size
     page.versions.filter(is_active=True).update(is_active=False)
     return ScanPageVersion.objects.create(
         scan_page=page,
@@ -523,12 +569,12 @@ def _append_version(
         storage_identifier=destination,
         checksum_sha256=checksum_sha256,
         mime_type=mime_type,
-        size_bytes=size,
+        size_bytes=size_bytes,
         capture_timestamp=capture_timestamp,
         scanner_metadata=scanner_metadata,
         version=next_version,
         uploader_id=uploader_id,
-        original_filename=Path(staged_path).name,
+        original_filename=original_filename,
         is_active=True,
     )
 
@@ -592,6 +638,24 @@ def _scan_page_request_payload(request: HttpRequest) -> dict[str, Any]:
     return payload
 
 
+def _find_duplicate_version(
+    job_id: Any,
+    logical_sequence_number: int,
+    side: str,
+    checksum_sha256: str,
+) -> ScanPageVersion | None:
+    return (
+        ScanPageVersion.objects.filter(
+            scan_page__scan_job_id=job_id,
+            scan_page__logical_sequence_number=logical_sequence_number,
+            scan_page__side=side,
+            checksum_sha256=checksum_sha256,
+        )
+        .order_by("-version")
+        .first()
+    )
+
+
 def _store_scan_page(
     job: ScanJob,
     logical_sequence_number: int,
@@ -604,10 +668,33 @@ def _store_scan_page(
     force_new_version: bool = False,
 ) -> tuple[ScanPage, ScanPageVersion, bool]:
     staged_path, size_bytes = _stage_scan_upload(uploaded_file)
+    storage = _default_scan_storage()
+    destination: str | None = None
     try:
         checksum_sha256 = intake.compute_sha256(staged_path)
         if requested_checksum is not None and requested_checksum.lower() != checksum_sha256.lower():
             raise ValueError("checksum mismatch")
+        mime_type, image_extension = _sniff_scan_image(staged_path)
+        original_filename = _sanitize_client_filename(
+            getattr(uploaded_file, "name", None),
+            image_extension,
+        )
+        if size_bytes <= 0:
+            size_bytes = Path(staged_path).stat().st_size
+
+        # Copy the (large) bytes to their final location BEFORE taking the job lock.
+        # A clearly-duplicate upload needs no copy at all.
+        if force_new_version or (
+            _find_duplicate_version(job.pk, logical_sequence_number, side, checksum_sha256) is None
+        ):
+            destination = _build_page_storage_destination(
+                scan_job_id=str(job.pk),
+                logical_sequence_number=logical_sequence_number,
+                side=side,
+                checksum_sha256=checksum_sha256,
+                safe_name=original_filename,
+            )
+            storage.store(staged_path, destination)
 
         with transaction.atomic():
             locked_job = ScanJob.objects.select_for_update().get(pk=job.pk)
@@ -632,6 +719,9 @@ def _store_scan_page(
                     .order_by("-version")
                     .first()
                 )
+            if locked_job.state == ScanJob.State.OPEN:
+                locked_job.state = ScanJob.State.CAPTURING
+                locked_job.save(update_fields=["state", "updated_at"])
             if existing_version is not None:
                 if not existing_version.is_active:
                     page.versions.filter(is_active=True).update(is_active=False)
@@ -640,12 +730,24 @@ def _store_scan_page(
                 page.refresh_from_db()
                 return page, existing_version, False
 
+            if destination is None:
+                # Duplicate vanished between the pre-check and the lock; rare.
+                destination = _build_page_storage_destination(
+                    scan_job_id=str(job.pk),
+                    logical_sequence_number=logical_sequence_number,
+                    side=side,
+                    checksum_sha256=checksum_sha256,
+                    safe_name=original_filename,
+                )
+                storage.store(staged_path, destination)
+
             version = _append_version(
                 page=page,
                 uploader_id=uploader_id,
-                staged_path=staged_path,
+                destination=destination,
+                original_filename=original_filename,
                 checksum_sha256=checksum_sha256,
-                mime_type=getattr(uploaded_file, "content_type", "application/octet-stream"),
+                mime_type=mime_type,
                 size_bytes=size_bytes,
                 capture_timestamp=capture_timestamp,
                 scanner_metadata=scanner_metadata,
@@ -656,9 +758,55 @@ def _store_scan_page(
                 reason="source changed",
             )
             scan_pipeline.invalidate_scan_job_library_artifacts(page.scan_job)
+            destination = None  # The DB row now owns the stored file.
             return page, version, True
     finally:
         _cleanup_staged_upload(staged_path)
+        if destination is not None:
+            # Duplicate upload or DB failure: do not leave an orphaned copy behind.
+            try:
+                storage.delete(destination)
+            except OSError:
+                pass
+
+
+SCAN_THUMBNAIL_MAX_EDGE: Final[int] = 1600
+
+
+def _scan_thumbnail_cache_path(version: ScanPageVersion) -> Path:
+    return (
+        Path(django_settings.APP_DATA_DIR)
+        / SCANNING_STORAGE_ROOT
+        / "thumbnails"
+        / f"{version.id}-{version.checksum_sha256[:32]}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
+    )
+
+
+def _render_scan_thumbnail(version: ScanPageVersion, cache_path: Path) -> None:
+    """Generate a downscaled, browser-displayable JPEG for a page version."""
+    from PIL import Image, ImageOps
+
+    storage = (
+        backend_for_location(version.storage_location)
+        if version.storage_location_id is not None
+        else _default_scan_storage()
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
+    try:
+        with storage.open(version.storage_identifier) as stream, Image.open(stream) as source:
+            image = ImageOps.exif_transpose(source) or source
+            if image.mode in {"I;16", "I;16L", "I;16B", "I"}:
+                image = image.convert("I").point(lambda value: value * (1 / 256)).convert("L")
+            elif image.mode == "F":
+                image = image.point(lambda value: value * 255).convert("L")
+            elif image.mode not in {"RGB", "L"}:
+                image = image.convert("RGB")
+            image.thumbnail((SCAN_THUMBNAIL_MAX_EDGE, SCAN_THUMBNAIL_MAX_EDGE))
+            image.convert("RGB").save(temp_path, format="JPEG", quality=85)
+        temp_path.replace(cache_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _stage_scan_page_from_existing_version(page: ScanPage) -> tuple[str, int]:
@@ -774,6 +922,22 @@ def _wants_html(request: HttpRequest) -> bool:
     if request.GET.get("view") == "html":
         return True
     return "text/html" in request.headers.get("Accept", "").lower()
+
+
+def scan_api_login_required(view: Callable[..., Any]) -> Callable[..., Any]:
+    """Like ``login_required`` but API clients get 401 JSON instead of a login redirect.
+
+    Browsers (``Accept: text/html`` or ``?view=html``) keep the redirect.
+    """
+    redirecting = login_required(view)
+
+    @wraps(view)
+    def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
+        if request.user.is_authenticated or _wants_html(request):
+            return redirecting(request, *args, **kwargs)
+        return JsonResponse({"error": "authentication required"}, status=401)
+
+    return wrapper
 
 
 def _can_manage_review_task(profile: AppUserProfile, task: ReviewTask) -> bool:
@@ -1632,14 +1796,24 @@ def _scan_job_transition_allowed(job: ScanJob, target_state: str) -> bool:
 
 
 def _apply_scan_job_transition(job: ScanJob, target_state: str) -> tuple[bool, str]:
+    """Move ``job`` to ``target_state`` under a row lock; already-there is a no-op success."""
     if target_state not in dict(ScanJob.State.choices):
         return False, "invalid state"
-    if not _scan_job_transition_allowed(job, target_state):
-        return False, "transition not allowed"
-    job.state = target_state
-    if target_state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
-        job.finished_at = timezone.now()
-    job.save(update_fields=["state", "finished_at", "updated_at"])
+    with transaction.atomic():
+        locked = ScanJob.objects.select_for_update().get(pk=job.pk)
+        if locked.state == target_state:
+            job.state = locked.state
+            job.finished_at = locked.finished_at
+            return True, ""
+        if not _scan_job_transition_allowed(locked, target_state):
+            job.state = locked.state
+            return False, "transition not allowed"
+        locked.state = target_state
+        if target_state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
+            locked.finished_at = timezone.now()
+        locked.save(update_fields=["state", "finished_at", "updated_at"])
+    job.state = locked.state
+    job.finished_at = locked.finished_at
     return True, ""
 
 
@@ -1835,7 +2009,7 @@ def _apply_stage_payload_to_state(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_job_workspace(
     request: HttpRequest,
     job_id: str,
@@ -1935,7 +2109,7 @@ async def scan_job_workspace_events(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_page_stages(
     request: HttpRequest,
     job_id: str,
@@ -1963,7 +2137,7 @@ def scan_page_stages(
 
 
 @require_http_methods(["GET", "POST"])
-@login_required
+@scan_api_login_required
 def scan_page_stage(
     request: HttpRequest,
     job_id: str,
@@ -2050,7 +2224,7 @@ def scan_page_stage(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_stage_batch(
     request: HttpRequest,
     job_id: str,
@@ -2163,7 +2337,7 @@ def scan_job_stage_batch(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_page_stage_preview(
     request: HttpRequest,
     job_id: str,
@@ -2207,7 +2381,7 @@ def scan_page_stage_preview(
 
 
 @require_http_methods(["GET", "POST"])
-@login_required
+@scan_api_login_required
 def scan_jobs(
     request: HttpRequest,
 ) -> HttpResponseBase:
@@ -2300,7 +2474,7 @@ def scan_jobs(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_job_detail(
     request: HttpRequest,
     job_id: str,
@@ -2323,7 +2497,7 @@ def scan_job_detail(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_job_todos(
     request: HttpRequest,
     job_id: str,
@@ -2359,7 +2533,7 @@ def scan_job_todos(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_ocr_request(
     request: HttpRequest,
     job_id: str,
@@ -2397,7 +2571,7 @@ def scan_job_ocr_request(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_identification_request(
     request: HttpRequest,
     job_id: str,
@@ -2449,7 +2623,7 @@ def scan_job_identification_request(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_identification_job_status(
     request: HttpRequest,
     job_id: str,
@@ -2474,7 +2648,7 @@ def scan_identification_job_status(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_todos(
     request: HttpRequest,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseForbidden:
@@ -2496,7 +2670,7 @@ def scan_todos(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_page_request_rescan(
     request: HttpRequest,
     page_id: str,
@@ -2560,7 +2734,7 @@ def scan_page_request_rescan(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def upload_scan_page(
     request: HttpRequest,
     job_id: str,
@@ -2591,7 +2765,12 @@ def upload_scan_page(
     if logical_sequence_number is None:
         return HttpResponseBadRequest("logical_sequence_number required")
     side = _normalize_scan_side(_coerce_str_or_none(payload.get("side")))
-    capture_timestamp = _parse_capture_ts(payload.get("capture_timestamp"))
+    if side is None:
+        return HttpResponseBadRequest("invalid side (expected left, right or single)")
+    try:
+        capture_timestamp = _parse_capture_ts(payload.get("capture_timestamp"))
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
     scanner_metadata = _normalize_scanner_metadata(payload.get("scanner_metadata"))
     requested_checksum = _coerce_str_or_none(payload.get("checksum_sha256"))
 
@@ -2632,7 +2811,7 @@ def upload_scan_page(
 
 
 @require_http_methods(["GET", "PUT"])
-@login_required
+@scan_api_login_required
 def scan_page(
     request: HttpRequest,
     page_id: str,
@@ -2652,31 +2831,17 @@ def scan_page(
 
     payload = _scan_page_request_payload(request)
     requested_checksum = _coerce_str_or_none(payload.get("checksum_sha256"))
-    uploaded_file: Any = request.FILES.get("file")
-    active_version: ScanPageVersion | None = None
+    _, uploaded_files = _multipart_data(request)
+    uploaded_file: Any = uploaded_files.get("file")
     if uploaded_file is None:
-        if request.content_type == "application/octet-stream":
-            legacy_payload = _parse_legacy_scan_put_payload(request.body)
-            if not legacy_payload:
-                return HttpResponseBadRequest("missing_file")
-            active_version = page.active_version()
-            if active_version is None:
-                return HttpResponseBadRequest("missing_file")
-            requested_checksum = _coerce_str_or_none(legacy_payload.get("checksum_sha256"))
-        else:
-            return HttpResponseBadRequest("missing_file")
+        return HttpResponseBadRequest("missing_file")
 
-    capture_timestamp = _parse_capture_ts(payload.get("capture_timestamp"))
+    try:
+        capture_timestamp = _parse_capture_ts(payload.get("capture_timestamp"))
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
     scanner_metadata = _normalize_scanner_metadata(payload.get("scanner_metadata"))
     job = page.scan_job
-
-    force_new_version = False
-    if request.content_type == "application/octet-stream" and request.body:
-        legacy_payload = _parse_legacy_scan_put_payload(request.body)
-        if legacy_payload:
-            force_new_version = True
-            # Legacy compatibility mode cannot verify content hash when body is form-string-encoded.
-            requested_checksum = None
 
     if job.state not in {
         ScanJob.State.OPEN,
@@ -2686,32 +2851,16 @@ def scan_page(
         return HttpResponseBadRequest("job not accepting pages")
 
     try:
-        with ExitStack() as resources:
-            if active_version is not None:
-                storage = (
-                    backend_for_location(active_version.storage_location)
-                    if active_version.storage_location_id is not None
-                    else _default_scan_storage()
-                )
-                source_stream = resources.enter_context(
-                    storage.open(active_version.storage_identifier),
-                )
-                uploaded_file = File(source_stream, name=active_version.original_filename)
-            page, version, created = _store_scan_page(
-                job=job,
-                logical_sequence_number=page.logical_sequence_number,
-                side=page.side,
-                uploaded_file=uploaded_file,
-                uploader_id=profile.user_id,
-                scanner_metadata=scanner_metadata,
-                capture_timestamp=capture_timestamp,
-                requested_checksum=requested_checksum,
-                force_new_version=force_new_version,
-            )
-    except FileNotFoundError:
-        return HttpResponseBadRequest("missing_file")
-    except StorageConfigurationError:
-        return HttpResponseBadRequest("source storage is unavailable")
+        page, version, created = _store_scan_page(
+            job=job,
+            logical_sequence_number=page.logical_sequence_number,
+            side=page.side,
+            uploaded_file=uploaded_file,
+            uploader_id=profile.user_id,
+            scanner_metadata=scanner_metadata,
+            capture_timestamp=capture_timestamp,
+            requested_checksum=requested_checksum,
+        )
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
 
@@ -2734,7 +2883,7 @@ def scan_page(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_todo_claim(
     request: HttpRequest,
     todo_id: int,
@@ -2767,7 +2916,7 @@ def scan_todo_claim(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_todo_complete(
     request: HttpRequest,
     todo_id: int,
@@ -2790,7 +2939,7 @@ def scan_todo_complete(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_todo_cancel(
     request: HttpRequest,
     todo_id: int,
@@ -2810,12 +2959,11 @@ def scan_todo_cancel(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_page_thumbnail(
     request: HttpRequest,
     page_id: str,
 ) -> HttpResponseBase:
-    del request
     if _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid page id")
     try:
@@ -2825,19 +2973,30 @@ def scan_page_thumbnail(
     version = page.active_version()
     if version is None:
         return HttpResponseNotFound("no page version")
-    storage = _default_scan_storage()
-    try:
-        stream = storage.open(version.storage_identifier)
-    except FileNotFoundError:
-        return HttpResponseNotFound("artifact missing")
 
-    response = FileResponse(stream, as_attachment=False, filename=version.original_filename)
-    response["Content-Type"] = version.mime_type or "application/octet-stream"
+    etag = f'"{version.checksum_sha256[:32]}-{version.id}-{SCAN_THUMBNAIL_MAX_EDGE}"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+    if request.headers.get("If-None-Match") == etag:
+        return HttpResponse(status=304, headers=headers)
+
+    cache_path = _scan_thumbnail_cache_path(version)
+    if not cache_path.exists():
+        try:
+            _render_scan_thumbnail(version, cache_path)
+        except (FileNotFoundError, StorageConfigurationError):
+            return HttpResponseNotFound("artifact missing")
+        except Exception:  # undecodable image data
+            return HttpResponse("unsupported image", status=415)
+
+    response = FileResponse(cache_path.open("rb"), as_attachment=False)
+    response["Content-Type"] = "image/jpeg"
+    for key, value in headers.items():
+        response[key] = value
     return response
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_pause(
     request: HttpRequest,
     job_id: str,
@@ -2856,7 +3015,7 @@ def scan_job_pause(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_resume(
     request: HttpRequest,
     job_id: str,
@@ -2875,7 +3034,7 @@ def scan_job_resume(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_finish(
     request: HttpRequest,
     job_id: str,
@@ -2952,7 +3111,13 @@ def scan_job_finish(
             request_options=request_options,
         )
     except scan_pipeline.ScanPipelineError as error:
-        return HttpResponseBadRequest(str(error))
+        message = str(error)
+        body: dict[str, Any] = {"error": message}
+        if message.startswith("missing processed output"):
+            _, _, id_part = message.partition(": ")
+            body["missing_pages"] = [item.strip() for item in id_part.split(",") if item.strip()]
+            body["hint"] = "run ScanTailor stages or resend with allow_raw_pages=true"
+        return JsonResponse(body, status=400)
 
     job.refresh_from_db()
     response: dict[str, Any] = {
@@ -2967,7 +3132,7 @@ def scan_job_finish(
 
 
 @require_GET
-@login_required
+@scan_api_login_required
 def scan_finalization_job_status(
     request: HttpRequest,
     job_id: str,
@@ -2992,7 +3157,7 @@ def scan_finalization_job_status(
 
 
 @require_POST
-@login_required
+@scan_api_login_required
 def scan_job_cancel(
     request: HttpRequest,
     job_id: str,
@@ -3588,8 +3753,31 @@ def review_merge_existing(
     )
 
 
+def _multipart_data(request: HttpRequest) -> tuple[Any, Any]:
+    """Return ``(fields, files)`` for a multipart request of any method.
+
+    Django only parses multipart bodies for POST; PUT bodies must be parsed by hand.
+    """
+    if request.method == "POST":
+        return request.POST, request.FILES
+    cached = getattr(request, "_scan_multipart", None)
+    if cached is None:
+        from django.http.multipartparser import MultiPartParser, MultiPartParserError
+
+        try:
+            parser = MultiPartParser(
+                request.META,
+                request,  # type: ignore[arg-type]
+                request.upload_handlers,
+                request.encoding,
+            )
+            cached = parser.parse()
+        except (MultiPartParserError, ValueError):
+            cached = ({}, {})
+        request._scan_multipart = cached  # type: ignore[attr-defined]
+    return cached
+
+
 def _scan_page_request_payload_for_multipart(request: HttpRequest) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in request.POST.items():
-        result[key] = value
-    return result
+    fields, _ = _multipart_data(request)
+    return {key: value for key, value in fields.items()}

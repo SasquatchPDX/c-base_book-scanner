@@ -9,6 +9,7 @@ from typing import Any, BinaryIO, cast
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client
+from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from PIL import Image
 
 from ebook_server.core import conversion, ocr, scan_pipeline, views
@@ -179,6 +180,39 @@ def _black_png_bytes() -> bytes:
     return stream.getvalue()
 
 
+def _png_for(label: bytes) -> bytes:
+    """Return a small, valid and distinct PNG derived from ``label``."""
+    digest = hashlib.sha256(label).digest()
+    image = Image.new("RGB", (16, 16), (digest[0], digest[1], digest[2]))
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def _put_scan_page(
+    client: Client,
+    page_id: object,
+    payload: bytes,
+    *,
+    filename: str = "replacement.png",
+    **fields: str,
+) -> Any:
+    """Send a real multipart PUT, as a non-Django client would."""
+    body = encode_multipart(
+        BOUNDARY,
+        {
+            "checksum_sha256": _page_sha(payload),
+            **fields,
+            "file": SimpleUploadedFile(filename, payload, content_type="image/png"),
+        },
+    )
+    return client.put(
+        f"/scan/pages/{page_id}/",
+        data=body,
+        content_type=MULTIPART_CONTENT,
+    )
+
+
 def _upload_scan_page(
     client: Client,
     job_id: str,
@@ -189,6 +223,8 @@ def _upload_scan_page(
     filename: str,
     content_type: str = "image/png",
 ) -> Any:
+    if not payload.startswith(b"\x89PNG"):
+        payload = _png_for(payload)
     return client.post(
         f"/scan/jobs/{job_id}/pages/",
         data={
@@ -324,13 +360,7 @@ def test_scan_page_replacement_preserves_previous_version() -> None:
     first_active = detail.json()["active_version"]["version"]
     assert first_active == 1
 
-    second_upload = client.put(
-        f"/scan/pages/{first_page.id}/",
-        data={
-            "checksum_sha256": _page_sha(b"version-2"),
-            "file": SimpleUploadedFile("v2.png", b"version-2", content_type="image/png"),
-        },
-    )
+    second_upload = _put_scan_page(client, first_page.id, _png_for(b"version-2"), filename="v2.png")
     assert second_upload.status_code == 201
 
     versions = ScanPageVersion.objects.filter(scan_page=first_page).order_by("version")
@@ -390,22 +420,20 @@ def test_existing_page_streams_from_declared_backend(
         finally:
             Path(staged).unlink()
     else:
-        response = client.put(
-            f"/scan/pages/{page.id}/",
-            data={
-                "checksum_sha256": _page_sha(content),
-                "file": SimpleUploadedFile("legacy.png", b"legacy"),
-            },
-        )
+        new_content = _png_for(b"fresh-replacement")
+        response = _put_scan_page(client, page.id, new_content, filename="fresh.png")
         assert response.status_code == 201
         assert page.versions.count() == 2
         old_version.refresh_from_db()
         assert not old_version.is_active
         replacement = page.active_version()
         assert replacement is not None
-        assert replacement.checksum_sha256 == _page_sha(content)
-        assert replacement.size_bytes == len(content)
+        assert replacement.checksum_sha256 == _page_sha(new_content)
+        assert replacement.size_bytes == len(new_content)
+        assert replacement.original_filename == "fresh.png"
         assert replacement.storage_location_id != location.id
+        assert streams == []  # PUT never re-reads the previous version
+        return
     assert len(streams) == 1
     assert streams[0].closed
 
@@ -545,7 +573,7 @@ def test_scan_finalization_failure_restores_job_and_can_retry(
 
     job.refresh_from_db()
     processing_job = ProcessingJob.objects.get(job_id=finalization_job_id)
-    assert job.state == ScanJob.State.OPEN
+    assert job.state == ScanJob.State.CAPTURING
     assert processing_job.state == ProcessingJob.JobState.FAILED
     assert processing_job.details["attempt_count"] == 1
 
@@ -733,17 +761,7 @@ def test_page_replacement_invalidates_scan_job_library_derivatives(
         for variant in (ocr_variants + converted_variants)
     )
 
-    replacement = client.put(
-        f"/scan/pages/{page.id}/",
-        data={
-            "checksum_sha256": _page_sha(_black_png_bytes()),
-            "file": SimpleUploadedFile(
-                "after.png",
-                _black_png_bytes(),
-                content_type="image/png",
-            ),
-        },
-    )
+    replacement = _put_scan_page(client, page.id, _black_png_bytes(), filename="after.png")
     assert replacement.status_code == 201
 
     cleaned_variant.refresh_from_db()

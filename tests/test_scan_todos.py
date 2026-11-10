@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ebook_server.core.models import ScanPage, ScanTodo
-from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
+from tests.test_scan_jobs import _create_scan_job, _png_for, _put_scan_page, _upload_scan_page
 
 
 @pytest.mark.django_db(transaction=True)
@@ -127,15 +127,7 @@ def test_replacement_upload_completes_open_rescan_todos() -> None:
     )
     assert todo_response.status_code == 201
 
-    replace_response = client.put(
-        f"/scan/pages/{page.id}/",
-        data=(
-            "{'file': 'replacement.png', "
-            "'checksum_sha256':"
-            "'1111111111111111111111111111111111111111111111111111111111111111'}"
-        ),
-        content_type="application/octet-stream",
-    )
+    replace_response = _put_scan_page(client, page.id, _png_for(b"replacement"))
     assert replace_response.status_code == 201
 
     todo_completed = ScanTodo.objects.filter(scan_page=page).values_list("state", flat=True)
