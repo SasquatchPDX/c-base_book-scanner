@@ -1,4 +1,4 @@
-"""LDAP authentication adapter boundary."""
+"""Authentication adapter boundary: LDAP, or local passwords while LDAP is turned off."""
 
 from __future__ import annotations
 
@@ -45,6 +45,27 @@ class StubLdapAdapter(LdapAdapter):
         if not password:
             raise ValueError("password required")
         return LdapIdentity(username=username, email=f"{username}@example.invalid")
+
+
+class LocalPasswordAdapter(LdapAdapter):
+    """LDAP turned off: authenticate against passwords stored in the local database.
+
+    Accounts are created with ``manage.py set_local_password``. Unknown users and users
+    without a usable password are rejected; there is no self-registration.
+    """
+
+    def authenticate(self, username: str, password: str) -> LdapIdentity:
+        uid = canonical_ldap_uid(username)
+        if not uid or not password:
+            raise LdapAuthenticationError("username and password are required")
+        user = get_user_model().objects.filter(username__iexact=uid).order_by("pk").first()
+        if user is None:
+            # Run the hasher anyway so response time does not reveal which accounts exist.
+            get_user_model()().set_password(password)
+            raise LdapAuthenticationError("invalid credentials")
+        if not user.has_usable_password() or not user.check_password(password):
+            raise LdapAuthenticationError("invalid credentials")
+        return LdapIdentity(username=user.username, email=user.email or None)
 
 
 class Ldap3Adapter(LdapAdapter):
@@ -205,6 +226,8 @@ class LdapBackend(BaseBackend):
             self.adapter = StubLdapAdapter()
         elif mode == "ldap":
             self.adapter = get_ldap3_adapter()
+        elif mode == "local":
+            self.adapter = LocalPasswordAdapter()
         else:
             raise LdapAuthenticationError(f"unsupported LDAP mode: {mode}")
 

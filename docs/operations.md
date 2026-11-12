@@ -42,13 +42,35 @@ Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
 - the development secret is replaced;
 - explicit allowed hosts are configured;
 - PostgreSQL and Redis URLs are supplied;
-- LDAP mode is `ldap`;
+- the authentication mode is `ldap` or `local` (`stub` is rejected);
 - HTTPS redirect, secure cookies, and HSTS are enabled.
 
 When TLS terminates at a trusted reverse proxy, set
 `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` and ensure that untrusted clients
 cannot inject `X-Forwarded-Proto`. HSTS preload is optional and should only be
 enabled after its long-lived operational consequences are understood.
+
+## Authentication modes
+
+`BOOK_SCANNER_LDAP_MODE` selects how members sign in at `/accounts/login/`:
+
+- `local` — **LDAP turned off.** Accounts and hashed passwords live in the
+  application database. Nothing contacts a directory, and none of the LDAP
+  settings are needed. There is no self-registration; an operator creates each
+  account (or resets its password) with:
+
+  ```bash
+  uv run python manage.py set_local_password <username>           # prompts twice
+  uv run python manage.py set_local_password <username> --admin   # library admin + /admin/
+  echo "$PASSWORD" | uv run python manage.py set_local_password scanner --password-stdin
+  ```
+
+  Usernames are case-insensitive. Disabling an `AppUserProfile` blocks login and
+  ends existing sessions, exactly as in LDAP mode. Accounts keep working if you
+  later switch to `ldap` mode, provided the directory uid matches the username.
+- `ldap` — authenticate against the directory described below.
+- `stub` — accepts any non-empty credentials; development and tests only.
+  Production settings refuse to start with it.
 
 ## LDAP
 
@@ -62,8 +84,8 @@ Usernames are escaped for DN or filter use. Unknown LDAP modes and invalid LDAP
 configuration fail closed. The `stub` adapter is strictly a development/test
 facility and accepts any non-empty credentials.
 
-Members sign in at `/accounts/login/` using LDAP credentials. There is no local
-registration or local password. Disabling an `AppUserProfile` invalidates an
+In `ldap` mode members sign in at `/accounts/login/` using LDAP credentials, and
+there is no local registration or local password. Disabling an `AppUserProfile` invalidates an
 existing web session on its next request.
 
 ## Infrastructure acceptance environment

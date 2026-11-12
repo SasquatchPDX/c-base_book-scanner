@@ -2,7 +2,8 @@
 
 A Django-based shared e-book library and physical-book processing pipeline. The
 application keeps canonical bibliographic `Book` records separate from stored
-`FileVariant` artifacts, authenticates against LDAP, and coordinates ingestion,
+`FileVariant` artifacts, authenticates against LDAP (or local accounts while LDAP
+is turned off), and coordinates ingestion,
 conversion, scanning, ScanTailor-style image processing, and remote OCR through
 persistent jobs.
 
@@ -37,7 +38,10 @@ npm run build
 
 Development defaults use SQLite, local artifact storage, synchronous jobs, and
 the explicit `stub` LDAP mode. Copy `.env.example` to `.env` and configure
-PostgreSQL, Redis, storage, and LDAP before exercising production-like behavior.
+PostgreSQL, Redis, storage, and authentication before exercising production-like
+behavior. `.env.example` defaults to `BOOK_SCANNER_LDAP_MODE=local` (LDAP turned
+off); create accounts with `uv run python manage.py set_local_password <username>
+[--admin]`. See the operations guide for switching to `ldap`.
 
 Run the infrastructure suite against ephemeral, digest-pinned PostgreSQL, Redis,
 and seeded OpenLDAP containers:
@@ -89,7 +93,7 @@ operations guide.
 
 ## Main workflows
 
-- `/accounts/login/` — LDAP-backed member sign-in
+- `/accounts/login/` — member sign-in (local accounts or LDAP)
 - `/library/` — member landing page and recent additions
 - `/library/books/?view=html` — canonical metadata search and browse UI
 - `/imports/upload/` — authenticated upload into the common intake pipeline

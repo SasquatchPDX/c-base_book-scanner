@@ -145,15 +145,22 @@ merged, and pushed to `master` (`ab322f7..e689195`, 10 commits).
    uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
    ```
 
-3. LDAP certificates are now validated. If the directory uses a private CA, set
-   `BOOK_SCANNER_LDAP_CA_FILE`. For a lab directory only, you can opt out with
-   `BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT=false`.
+3. **LDAP is turned off** (update 2026-11-12). Set `BOOK_SCANNER_LDAP_MODE=local`
+   (the `.env.example` default); no LDAP settings are needed. Accounts and
+   passwords live in the local database. If LDAP is turned back on later, note
+   that certificates are validated: set `BOOK_SCANNER_LDAP_CA_FILE` for a private
+   CA.
 4. Production refuses to write unless the storage root already exists. Optionally
    run `touch <storage-root>/.ebook-server-root` and set
    `BOOK_SCANNER_STORAGE_SENTINEL_FILE=.ebook-server-root`.
-5. Create the first admin with
-   `uv run python manage.py promote_admin <your-uid> --superuser`.
-6. The scanner device logs in as an LDAP member and must send a CSRF token and
+5. Create your admin account and a separate account for the scanner:
+
+   ```bash
+   uv run python manage.py set_local_password <your-name> --admin
+   uv run python manage.py set_local_password scanner
+   ```
+
+6. The scanner device logs in with its local account and must send a CSRF token and
    `Referer` header on every unsafe request. Over HTTPS, its origin must be listed
    in `BOOK_SCANNER_CSRF_TRUSTED_ORIGINS`. The full steps are under "Client
    recipe" in `docs/scanner-protocol.md`.

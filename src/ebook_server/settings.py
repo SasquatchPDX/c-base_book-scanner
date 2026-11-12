@@ -110,8 +110,8 @@ class Settings(BaseSettings):
             errors.append("PostgreSQL database_url is required")
         if not self.redis_url:
             errors.append("redis_url is required for asynchronous work")
-        if self.ldap_mode != "ldap":
-            errors.append("ldap_mode must be 'ldap'")
+        if self.ldap_mode not in {"ldap", "local"}:
+            errors.append("ldap_mode must be 'ldap' or 'local'")
         if self.ldap_mode == "ldap":
             parsed_uri = urlparse(self.ldap_server_uri.strip())
             if parsed_uri.scheme not in {"ldap", "ldaps"} or not parsed_uri.hostname:
