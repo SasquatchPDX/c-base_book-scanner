@@ -48,7 +48,9 @@ from ebook_server.storage import LocalFilesystemStorage, check_storage_root, pro
 from . import (
     book_deletion,
     conversion,
+    identification,
     intake,
+    metadata_search,
     ocr,
     review_identification,
     scan_identification,
@@ -1070,7 +1072,50 @@ def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
         "publication_year": candidate.publication_year,
         "description": candidate.description,
         "state": candidate.state,
+        "search_id": str(candidate.search_id) if candidate.search_id else None,
     }
+
+
+def _active_search_job(task: ReviewTask) -> ProcessingJob | None:
+    """A queued or running repeat search for this review task, if any."""
+    if task.import_job_id is not None:
+        queryset = ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.REVIEW_IDENTIFICATION,
+            details__review_task_id=task.id,
+        )
+    elif task.scan_job_id is not None:
+        queryset = ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.SCAN_IDENTIFICATION,
+            details__scan_job_id=str(task.scan_job_id),
+        )
+    else:
+        return None
+    return (
+        queryset.filter(state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING])
+        .order_by("-scheduled_at")
+        .first()
+    )
+
+
+def _apply_search_terms(task: ReviewTask, payload: dict[str, Any]) -> list[str]:
+    """Store edited title/author search terms from a review form; return changed fields."""
+    changed: list[str] = []
+    inferred_title = payload.get("inferred_title")
+    if isinstance(inferred_title, str) and inferred_title.strip():
+        task.inferred_title = inferred_title.strip()
+        changed.append("inferred_title")
+    raw_inferred_authors = payload.get("inferred_authors")
+    if isinstance(raw_inferred_authors, str):
+        task.inferred_authors = [
+            author.strip() for author in raw_inferred_authors.split(",") if author.strip()
+        ]
+        changed.append("inferred_authors")
+    elif isinstance(raw_inferred_authors, list):
+        task.inferred_authors = [
+            str(author).strip() for author in raw_inferred_authors if str(author).strip()
+        ]
+        changed.append("inferred_authors")
+    return changed
 
 
 def _review_action_response(
@@ -3346,7 +3391,19 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     payload["candidates"] = [
         _serialize_candidate(candidate) for candidate in _review_candidates(task)
     ]
+    searches = metadata_search.searches_for_task(task)
+    active_job = _active_search_job(task)
+    providers = identification.configured_providers()
+    payload["searches"] = [metadata_search.serialize_search(search) for search in searches]
+    payload["configured_providers"] = providers
+    payload["active_search"] = (
+        {"job_id": str(active_job.job_id), "state": active_job.state} if active_job else None
+    )
     if _wants_html(request):
+        unsearched = [c for c in _review_candidates(task) if c.search_id is None]
+        searching = active_job is not None or any(
+            search.state == search.State.RUNNING for search in searches
+        )
         return render(
             request,
             "core/review_detail.html",
@@ -3354,6 +3411,14 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "candidates": _review_candidates(task),
+                "searches": searches,
+                "latest_search": searches[0] if searches else None,
+                "earlier_searches": searches[1:],
+                "unsearched_candidates": unsearched,
+                "active_search_job": active_job,
+                "searching": searching,
+                "configured_providers": providers,
+                "status_labels": metadata_search.STATUS_LABELS,
                 "books": Book.objects.order_by("title")[:250],
             },
         )
@@ -3539,6 +3604,8 @@ def review_search_again(
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
 
+    # The refine form submits its fields with the search, so edited terms are kept.
+    term_fields = _apply_search_terms(task, payload)
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
@@ -3554,6 +3621,7 @@ def review_search_again(
             "reviewer_id",
             "decided_at",
             "updated_at",
+            *term_fields,
         ],
     )
     try:
@@ -3569,14 +3637,12 @@ def review_search_again(
                 requested_by_user_id=profile.user_id,
             )
             job_payload = scan_identification.job_payload(processing_job)
-            status_route = "scan-identification-job-status"
         else:
             processing_job = review_identification.request_review_identification(
                 review_task=task,
                 requested_by_user_id=profile.user_id,
             )
             job_payload = review_identification.job_payload(processing_job)
-            status_route = "review-identification-job-status"
     except (
         review_identification.ReviewIdentificationError,
         scan_identification.ScanIdentificationError,
@@ -3586,9 +3652,8 @@ def review_search_again(
         return HttpResponseBadRequest(str(exc))
 
     if _wants_html(request):
-        if processing_job.state == ProcessingJob.JobState.SUCCESS:
-            return redirect("review-detail", task_id=task.id)
-        return redirect(status_route, job_id=processing_job.job_id)
+        # The review page shows queued/running searches and refreshes itself.
+        return redirect("review-detail", task_id=task.id)
     return JsonResponse(
         {
             "task_id": str(task.id),
@@ -3623,13 +3688,8 @@ def review_identification_job_status(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
     if _wants_html(request):
-        if job.state == ProcessingJob.JobState.SUCCESS:
-            return redirect("review-detail", task_id=task.id)
-        return render(
-            request,
-            "core/processing_job.html",
-            {"job": job, "payload": payload, "kind": "Metadata search"},
-        )
+        # Results, provider outcomes and errors are shown on the review page.
+        return redirect("review-detail", task_id=task.id)
     return JsonResponse(payload)
 
 
@@ -3650,19 +3710,7 @@ def review_edit_search_terms(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    inferred_title = payload.get("inferred_title")
-    if isinstance(inferred_title, str) and inferred_title.strip():
-        task.inferred_title = inferred_title.strip()
-
-    raw_inferred_authors = payload.get("inferred_authors")
-    if isinstance(raw_inferred_authors, str):
-        task.inferred_authors = [
-            author.strip() for author in raw_inferred_authors.split(",") if author.strip()
-        ]
-    elif isinstance(raw_inferred_authors, list):
-        task.inferred_authors = [
-            str(author).strip() for author in raw_inferred_authors if str(author).strip()
-        ]
+    _apply_search_terms(task, payload)
 
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS

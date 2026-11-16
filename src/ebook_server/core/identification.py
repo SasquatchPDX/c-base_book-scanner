@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -89,6 +89,64 @@ _PUBLISHER_NOISE = {
     "media",
     "brand",
 }
+
+
+class ProviderRequestError(RuntimeError):
+    """A provider request failed (unreachable, timed out, HTTP error, bad response).
+
+    Distinct from "no results": a provider that answers with nothing returns ``[]``.
+    """
+
+
+PROVIDER_STATUS_RESULTS = "results"
+PROVIDER_STATUS_NO_RESULTS = "no_results"
+PROVIDER_STATUS_ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ProviderOutcome:
+    """What one provider did during one identification run."""
+
+    provider_id: str
+    label: str
+    status: str
+    candidate_count: int = 0
+    duration_ms: int = 0
+    error: str = ""
+    requests: tuple[dict[str, Any], ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "label": self.label,
+            "status": self.status,
+            "candidate_count": self.candidate_count,
+            "duration_ms": self.duration_ms,
+            "error": self.error,
+            "requests": [dict(item) for item in self.requests],
+        }
+
+
+def describe_request_error(exc: BaseException) -> str:
+    """Short, user-facing reason for a failed provider request (no URLs, no payload)."""
+    if isinstance(exc, ProviderRequestError):
+        return str(exc)
+    if isinstance(exc, HTTPError):
+        if exc.code == 429:
+            return "rate limited (HTTP 429)"
+        if exc.code >= 500:
+            return f"provider unavailable (HTTP {exc.code})"
+        return f"HTTP {exc.code}"
+    if isinstance(exc, URLError):
+        reason = exc.reason
+        if isinstance(reason, TimeoutError):
+            return "timed out"
+        return f"unreachable ({reason})"
+    if isinstance(exc, TimeoutError):
+        return "timed out"
+    if isinstance(exc, ValueError):
+        return "invalid response"
+    return type(exc).__name__
 
 
 class MetadataProvider(Protocol):
@@ -336,6 +394,17 @@ class OpenLibraryMetadataProvider:
     """Public Open Library metadata provider (primary external source)."""
 
     provider_id = "openlibrary"
+    label = "Open Library"
+
+    def __init__(self) -> None:
+        # Per-run log of the requests made, read by resolve_candidates_with_report.
+        self.request_log: list[dict[str, Any]] = []
+
+    def _log(self, request: str, status: str, *, count: int = 0, error: str = "") -> None:
+        entry: dict[str, Any] = {"request": request, "status": status, "count": count}
+        if error:
+            entry["error"] = error
+        self.request_log.append(entry)
 
     def search(
         self,
@@ -346,8 +415,13 @@ class OpenLibraryMetadataProvider:
         folder_hint: str | None = None,
         language: str | None = None,
     ) -> list[dict[str, Any]]:
+        isbn_error: ProviderRequestError | None = None
         if isbn:
-            isbn_candidate = self._query_isbn(isbn)
+            try:
+                isbn_candidate = self._query_isbn(isbn)
+            except ProviderRequestError as exc:
+                isbn_error = exc  # still try the title search below
+                isbn_candidate = None
             if isbn_candidate:
                 return [isbn_candidate]
 
@@ -357,23 +431,27 @@ class OpenLibraryMetadataProvider:
         if not query_parts and folder_hint:
             query_parts = [folder_hint]
         if not query_parts:
+            if isbn_error is not None:
+                raise isbn_error
             return []
         return self._query_search(" ".join(query_parts), language=language)
 
     def _query_isbn(self, isbn: str) -> dict[str, Any] | None:
         url = f"https://openlibrary.org/isbn/{isbn}.json"
+        request = f"ISBN {isbn}"
         try:
             payload = self._get_json(url)
+        except HTTPError as exc:
+            if exc.code == 404:
+                self._log(request, PROVIDER_STATUS_NO_RESULTS)
+                return None
+            self._request_failed(request, "isbn", exc)
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="isbn",
-                error_type=type(exc).__name__,
-            )
-            return None
+            self._request_failed(request, "isbn", exc)
         if not isinstance(payload, dict):
+            self._log(request, PROVIDER_STATUS_NO_RESULTS)
             return None
+        self._log(request, PROVIDER_STATUS_RESULTS, count=1)
         payload = dict(payload)
         payload["_queried_isbn"] = isbn
         names = self._resolve_author_names(payload)
@@ -412,18 +490,30 @@ class OpenLibraryMetadataProvider:
             params["lang"] = language  # prefers editions in the file's language
         encoded = urlencode(params)
         url = f"https://openlibrary.org/search.json?{encoded}"
+        request = f'search "{query}"' + (f" (lang={params['lang']})" if "lang" in params else "")
         try:
             payload = self._get_json(url)
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="search",
-                error_type=type(exc).__name__,
-            )
-            return []
+            self._request_failed(request, "search", exc)
         docs = payload.get("docs", []) if isinstance(payload, dict) else []
-        return docs if isinstance(docs, list) else []
+        docs = docs if isinstance(docs, list) else []
+        self._log(
+            request,
+            PROVIDER_STATUS_RESULTS if docs else PROVIDER_STATUS_NO_RESULTS,
+            count=len(docs),
+        )
+        return docs
+
+    def _request_failed(self, request: str, operation: str, exc: BaseException) -> NoReturn:
+        reason = describe_request_error(exc)
+        logger.warning(
+            "metadata_provider_request_failed",
+            provider_id=self.provider_id,
+            operation=operation,
+            error_type=type(exc).__name__,
+        )
+        self._log(request, PROVIDER_STATUS_ERROR, error=reason)
+        raise ProviderRequestError(f"{self.label}: {reason}") from exc
 
     def _get_json(self, url: str) -> Any:
         user_agent = str(
@@ -453,92 +543,187 @@ def _retry_after_seconds(error: HTTPError) -> float:
     return min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS)
 
 
-def _provider_instances() -> list[MetadataProvider]:
+def _configured_provider_refs() -> list[str]:
     configured = getattr(
         django_settings,
         "BOOK_SCANNER_METADATA_PROVIDERS",
         ["ebook_server.core.identification.OpenLibraryMetadataProvider"],
     )
+    return [ref for ref in configured if isinstance(ref, str) and ref != "_disabled_"]
+
+
+def _load_provider(provider_ref: str) -> MetadataProvider:
+    module_path, _, symbol = provider_ref.rpartition(".")
+    module = importlib.import_module(module_path)
+    cls = getattr(module, symbol)
+    return cast(MetadataProvider, cls())
+
+
+def _provider_instances() -> list[MetadataProvider]:
     providers: list[MetadataProvider] = []
-    for provider_ref in configured:
-        if provider_ref == "_disabled_":
-            continue
-        module_path, _, symbol = provider_ref.rpartition(".")
+    for provider_ref in _configured_provider_refs():
         try:
-            module = importlib.import_module(module_path)
-            cls = getattr(module, symbol)
-            provider = cls()
-            providers.append(provider)
-        except (ImportError, AttributeError, TypeError):
+            providers.append(_load_provider(provider_ref))
+        except (ImportError, AttributeError, TypeError, ValueError):
             continue
     return providers
 
 
+def _provider_load_errors() -> list[tuple[str, str]]:
+    """Configured providers that cannot be instantiated: (reference, reason)."""
+    errors: list[tuple[str, str]] = []
+    for provider_ref in _configured_provider_refs():
+        try:
+            _load_provider(provider_ref)
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            errors.append((provider_ref, f"{type(exc).__name__}: {exc}"))
+    return errors
+
+
+def provider_label(provider: Any) -> str:
+    label = getattr(provider, "label", None)
+    return label if isinstance(label, str) and label else str(provider.provider_id)
+
+
+def configured_providers() -> list[dict[str, Any]]:
+    """Providers a search will ask, plus configured ones that fail to load."""
+    providers = [
+        {"provider_id": provider.provider_id, "label": provider_label(provider), "available": True}
+        for provider in _provider_instances()
+    ]
+    providers.extend(
+        {"provider_id": ref, "label": ref, "available": False, "error": reason}
+        for ref, reason in _provider_load_errors()
+    )
+    return providers
+
+
 def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandidate]:
+    return resolve_candidates_with_report(signals)[0]
+
+
+def resolve_candidates_with_report(
+    signals: IdentificationInput,
+) -> tuple[list[IdentificationCandidate], list[ProviderOutcome]]:
+    """Ask every provider; return ranked candidates and what each provider did."""
+    outcomes: list[ProviderOutcome] = [
+        ProviderOutcome(
+            provider_id=ref,
+            label=ref,
+            status=PROVIDER_STATUS_ERROR,
+            error=f"provider could not be loaded ({reason})",
+        )
+        for ref, reason in _provider_load_errors()
+    ]
     raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
     for provider in _provider_instances():
         started_at = perf_counter()
+        calls: list[str] = []
+        error = ""
+        raw_list: list[dict[str, Any]] = []
         try:
-            raw_list = _query_provider(provider, signals)
+            raw_list = _query_provider(provider, signals, calls)
         except Exception as exc:  # provider boundary: one provider must not abort intake
-            logger.exception(
+            error = describe_request_error(exc)
+            logger.warning(
                 "metadata_provider_failed",
                 provider_id=provider.provider_id,
                 duration_seconds=perf_counter() - started_at,
                 error_type=type(exc).__name__,
             )
-            continue
+        duration_ms = int((perf_counter() - started_at) * 1000)
+        logged = getattr(provider, "request_log", None)
+        requests = (
+            tuple(dict(item) for item in logged if isinstance(item, dict))
+            if isinstance(logged, list) and logged
+            else tuple({"request": call} for call in calls)
+        )
+        if error:
+            status = PROVIDER_STATUS_ERROR
+        elif raw_list:
+            status = PROVIDER_STATUS_RESULTS
+        else:
+            status = PROVIDER_STATUS_NO_RESULTS
+        outcomes.append(
+            ProviderOutcome(
+                provider_id=provider.provider_id,
+                label=provider_label(provider),
+                status=status,
+                candidate_count=len(raw_list),
+                duration_ms=duration_ms,
+                error=error,
+                requests=requests,
+            )
+        )
         logger.info(
             "metadata_provider_completed",
             provider_id=provider.provider_id,
+            status=status,
             candidate_count=len(raw_list),
-            duration_seconds=perf_counter() - started_at,
+            duration_seconds=duration_ms / 1000,
         )
         for candidate in raw_list:
             raw_candidates.append((provider, candidate))
 
-    normalized: list[IdentificationCandidate] = []
-    for provider, payload in raw_candidates:
-        normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
-
+    normalized = [
+        _normalize_candidate(provider.provider_id, payload, signals)
+        for provider, payload in raw_candidates
+    ]
     normalized.sort(key=lambda item: item.score, reverse=True)
-    return normalized
+    return normalized, outcomes
+
+
+def _describe_call(title: str | None, author: str | None, isbn: str | None) -> str:
+    parts = []
+    if isbn:
+        parts.append(f"ISBN {isbn}")
+    if title:
+        parts.append(f'title "{title}"')
+    if author:
+        parts.append(f'author "{author}"')
+    return " + ".join(parts) or "no search terms"
 
 
 def _query_provider(
     provider: MetadataProvider,
     signals: IdentificationInput,
+    calls: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Try the title hints in turn; a failed request does not stop later attempts.
+
+    Raises the last request error when nothing was found and a request failed, so
+    an unreachable provider is reported as an error rather than as "no results".
+    """
+    calls = calls if calls is not None else []
     isbn = signals.isbns[0] if signals.isbns else None
     author = signals.best_author()
     folder_hint = signals.folder_hints[0] if signals.folder_hints else None
     extra: dict[str, Any] = {}
     if signals.language and _accepts_keyword(provider.search, "language"):
         extra["language"] = signals.language
+    last_error: Exception | None = None
 
-    for title in signals.title_hints[:3]:
-        hits = provider.search(
-            title=title,
-            author=author,
-            isbn=isbn,
-            folder_hint=folder_hint,
-            **extra,
-        )
+    attempts: list[str | None] = list(signals.title_hints[:3]) or [None]
+    for title in attempts:
+        calls.append(_describe_call(title, author, isbn))
+        try:
+            hits = provider.search(
+                title=title,
+                author=author,
+                isbn=isbn,
+                folder_hint=folder_hint,
+                **extra,
+            )
+        except ProviderRequestError as exc:
+            last_error = exc
+            hits = []
         if hits:
             return hits
         # The ISBN lookup does not depend on the title; do not repeat it per title hint.
         isbn = None
-
-    if signals.title_hints:
-        return []
-    # No title hints at all: try identifiers / author / folder alone.
-    return provider.search(
-        title=None,
-        author=author,
-        isbn=isbn,
-        folder_hint=folder_hint,
-        **extra,
-    )
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def _signal_language(extracted_metadata: dict[str, Any]) -> str | None:

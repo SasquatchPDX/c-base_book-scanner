@@ -61,7 +61,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
     )
     provider = _Provider()
-    monkeypatch.setattr("ebook_server.core.identification.resolve_candidates", provider)
+    monkeypatch.setattr(
+        "ebook_server.core.identification.resolve_candidates_with_report",
+        lambda signals: (provider(signals), []),
+    )
     root = tmp_path / "share"
     location = SourceLocation.objects.create(
         name="member",

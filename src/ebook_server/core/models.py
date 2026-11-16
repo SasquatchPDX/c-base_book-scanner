@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import ClassVar, Final
+from typing import Any, ClassVar, Final
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.timezone import now
 
 
@@ -853,6 +854,94 @@ class ImportJob(models.Model):
         return f"{self.id}:{self.state}"
 
 
+class MetadataSearch(models.Model):
+    """One identification run against the configured metadata providers.
+
+    Records the search terms, what every provider did (results / no results /
+    error and why) and, through ``candidates``, what it returned. Runs are kept so
+    a failed or empty repeat search never hides earlier results.
+    """
+
+    class Trigger(models.TextChoices):
+        INTAKE = "intake", "Import"
+        REVIEW = "review", "Review search"
+        SCAN = "scan", "Scan identification"
+
+    class State(models.TextChoices):
+        RUNNING = "running", "Running"
+        COMPLETE = "complete", "Complete"
+        FAILED = "failed", "Failed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_job = models.ForeignKey(
+        "ImportJob",
+        on_delete=models.CASCADE,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        "ScanJob",
+        on_delete=models.CASCADE,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    review_task = models.ForeignKey(
+        "ReviewTask",
+        on_delete=models.SET_NULL,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    processing_job_id = models.UUIDField(null=True, blank=True)
+    trigger = models.CharField(max_length=16, choices=Trigger.choices)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.RUNNING)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    query = models.JSONField(default=dict, blank=True)
+    providers = models.JSONField(default=list, blank=True)
+    candidate_count = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["import_job", "-started_at"]),
+            models.Index(fields=["scan_job", "-started_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.trigger}:{self.id}:{self.state}"
+
+    PROVIDER_STATUS_LABELS: ClassVar[dict[str, str]] = {
+        "results": "Results",
+        "no_results": "No results",
+        "error": "Error",
+        "pending": "Waiting",
+    }
+
+    @property
+    def provider_errors(self) -> list[dict[str, Any]]:
+        return [p for p in self.providers if isinstance(p, dict) and p.get("status") == "error"]
+
+    @property
+    def provider_rows(self) -> list[dict[str, Any]]:
+        """Provider outcomes with a display label for their status."""
+        return [
+            {**p, "status_label": self.PROVIDER_STATUS_LABELS.get(str(p.get("status")), "")}
+            for p in self.providers
+            if isinstance(p, dict)
+        ]
+
+
 class MetadataCandidate(models.Model):
     """Candidate bibliographic matches returned during identification."""
 
@@ -872,6 +961,13 @@ class MetadataCandidate(models.Model):
         ScanJob,
         on_delete=models.CASCADE,
         related_name="metadata_candidates",
+        null=True,
+        blank=True,
+    )
+    search = models.ForeignKey(
+        "MetadataSearch",
+        on_delete=models.SET_NULL,
+        related_name="candidates",
         null=True,
         blank=True,
     )
@@ -909,15 +1005,16 @@ class MetadataCandidate(models.Model):
                 ),
                 name="candidate_has_exactly_one_source",
             ),
+            # Unique per search run: repeated searches may return the same record.
             models.UniqueConstraint(
-                fields=["import_job", "provider_id", "provider_ref"],
+                fields=["import_job", "search", "provider_id", "provider_ref"],
                 condition=models.Q(import_job__isnull=False),
-                name="uniq_import_candidate_provider_ref",
+                name="uniq_import_candidate_search_provider_ref",
             ),
             models.UniqueConstraint(
-                fields=["scan_job", "provider_id", "provider_ref"],
+                fields=["scan_job", "search", "provider_id", "provider_ref"],
                 condition=models.Q(scan_job__isnull=False),
-                name="uniq_scan_candidate_provider_ref",
+                name="uniq_scan_candidate_search_provider_ref",
             ),
         ]
 

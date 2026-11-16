@@ -1,0 +1,13 @@
+<article>
+  <div>
+    <strong>{{ candidate.title }}</strong>
+    <p>{{ candidate.authors|join:", "|default:"Unknown author" }}</p>
+    <p class="muted">
+      {% if candidate.publication_year %}{{ candidate.publication_year }} · {% endif %}{% if candidate.publisher %}{{ candidate.publisher }} · {% endif %}{% if candidate.language %}{{ candidate.language }} · {% endif %}{% if candidate.isbn13 %}ISBN {{ candidate.isbn13 }} · {% elif candidate.isbn10 %}ISBN {{ candidate.isbn10 }} · {% endif %}confidence {{ candidate.score }}
+    </p>
+    <p class="muted small">{{ candidate.provider_id }}{% if candidate.provider_id == "openlibrary" and candidate.provider_ref|slice:":1" == "/" %} · <a href="https://openlibrary.org{{ candidate.provider_ref }}" target="_blank" rel="noopener noreferrer">view record</a>{% endif %}</p>
+  </div>
+  {% if task.state != "resolved" and task.state != "cancelled" %}
+  <form method="post" action="{% url 'review-accept-candidate' task.id %}">{% csrf_token %}<input type="hidden" name="candidate_id" value="{{ candidate.id }}"><button type="submit">Accept</button></form>
+  {% endif %}
+</article>

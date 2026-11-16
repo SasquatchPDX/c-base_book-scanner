@@ -1,0 +1,46 @@
+<div class="search-run">
+  <p class="search-meta">
+    <span class="status status-{{ search.state }}">{{ search.get_state_display }}</span>
+    {{ search.get_trigger_display }} · {{ search.started_at|date:"Y-m-d H:i:s" }}{% if search.requested_by %} · by {{ search.requested_by.get_username }}{% endif %}
+  </p>
+  <p class="search-terms">Searched for:
+    {% for title in search.query.title_hints %}<span class="term">title “{{ title }}”</span>{% endfor %}
+    {% if search.query.author %}<span class="term">author “{{ search.query.author }}”</span>{% endif %}
+    {% for isbn in search.query.isbns %}<span class="term">ISBN {{ isbn }}</span>{% endfor %}
+    {% if search.query.language %}<span class="term">language {{ search.query.language }}</span>{% endif %}
+    {% if not search.query.title_hints and not search.query.author and not search.query.isbns %}<span class="muted">no search terms</span>{% endif %}
+  </p>
+  {% if search.state == "failed" %}<p class="error">The search failed: {{ search.error }}</p>{% endif %}
+  <div class="table-scroll">
+    <table class="provider-table">
+      <thead><tr><th>Provider</th><th>Outcome</th><th>Requests</th></tr></thead>
+      <tbody>
+        {% for provider in search.provider_rows %}
+        <tr>
+          <td>{{ provider.label }}</td>
+          <td>
+            <span class="status provider-{{ provider.status }}">{{ provider.status_label }}</span>
+            {% if provider.status == "results" %}{{ provider.candidate_count }} candidate{{ provider.candidate_count|pluralize }}{% endif %}
+            {% if provider.error %}<div class="error">{{ provider.error }}</div>{% endif %}
+            {% if provider.duration_ms %}<div class="muted small">{{ provider.duration_ms }} ms</div>{% endif %}
+          </td>
+          <td>
+            {% for request in provider.requests %}
+            <div class="request-line">{{ request.request }}{% if request.status == "results" %} → {{ request.count }} found{% elif request.status == "no_results" %} → nothing found{% elif request.status == "error" %} → <span class="error">{{ request.error }}</span>{% endif %}</div>
+            {% empty %}<span class="muted">–</span>{% endfor %}
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="3" class="muted">No providers are configured.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="candidate-list">
+    {% for candidate in search.candidates.all %}
+      {% include "core/_metadata_candidate.html" %}
+    {% empty %}
+      {% if search.state == "complete" %}<p class="muted">This search returned no candidates.{% if search.provider_errors %} Some providers failed, so this may be incomplete.{% endif %}</p>{% endif %}
+    {% endfor %}
+  </div>
+</div>

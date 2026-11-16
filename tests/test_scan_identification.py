@@ -208,9 +208,11 @@ def test_search_again_refreshes_scan_candidates_and_hints(
     assert response.json()["identification_job"]["state"] == ProcessingJob.JobState.SUCCESS
     scan_job.refresh_from_db()
     task.refresh_from_db()
-    candidate = MetadataCandidate.objects.get(scan_job=scan_job)
+    search_id = response.json()["identification_job"]["search_id"]
+    candidate = MetadataCandidate.objects.get(scan_job=scan_job, search_id=search_id)
     assert candidate.id != old_candidate_id
     assert candidate.title == "Refined Result"
+    assert MetadataCandidate.objects.filter(pk=old_candidate_id).exists()
     assert scan_job.provisional_title == "Refined Scan"
     assert scan_job.provisional_authors == ["Rita Refiner"]
     assert task.state == ReviewTask.State.OPEN

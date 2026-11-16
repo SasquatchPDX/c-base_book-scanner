@@ -11,8 +11,8 @@ from rq import get_current_job
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import identification, intake
-from .models import ImportJob, ProcessingJob, ReviewTask
+from . import identification, intake, metadata_search
+from .models import ImportJob, MetadataSearch, ProcessingJob, ReviewTask
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +33,8 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
         "review_task_id": details.get("review_task_id"),
         "import_job_id": details.get("import_job_id"),
         "candidate_count": details.get("candidate_count", 0),
+        "search_id": details.get("search_id"),
+        "providers": details.get("providers", []),
         "attempt_count": details.get("attempt_count", 0),
         "error": details.get("error", ""),
         "scheduled_at": job.scheduled_at.isoformat(),
@@ -150,6 +152,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
     task: ReviewTask | None = None
+    search: MetadataSearch | None = None
     try:
         task = ReviewTask.objects.select_related("import_job").get(pk=details["review_task_id"])
         if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
@@ -157,9 +160,20 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         import_job = task.import_job
         if import_job is None:
             raise ReviewIdentificationError("review task is not for an import")
-        candidates = identification.resolve_candidates(_review_signals(task, import_job))
+        signals = _review_signals(task, import_job)
+        search = metadata_search.start_search(
+            trigger=MetadataSearch.Trigger.REVIEW,
+            signals=signals,
+            import_job=import_job,
+            review_task=task,
+            requested_by_id=details.get("requested_by_user_id"),
+            processing_job_id=processing_job.job_id,
+        )
+        candidates = metadata_search.run_search(search, signals)
         with transaction.atomic():
-            intake._save_metadata_candidates(import_job, candidates)
+            intake._save_metadata_candidates(
+                import_job, candidates, search=search, keep_previous=True
+            )
             task.provider_snapshot = [
                 {
                     "provider_id": candidate.provider_id,
@@ -191,6 +205,8 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             processing_job.details = {
                 **details,
                 "candidate_count": len(candidates),
+                "search_id": str(search.id),
+                "providers": search.providers,
                 "error": "",
             }
             processing_job.save(update_fields=["state", "finished_at", "details"])
@@ -202,6 +218,8 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             candidate_count=len(candidates),
         )
     except Exception as exc:
+        if search is not None and search.state == MetadataSearch.State.RUNNING:
+            metadata_search.fail_search(search, str(exc) or type(exc).__name__)
         rq_job = get_current_job() if raise_on_error else None
         retry_pending = bool(
             rq_job is not None and rq_job.retries_left is not None and rq_job.retries_left > 0

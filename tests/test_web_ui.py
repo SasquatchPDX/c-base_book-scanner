@@ -92,7 +92,8 @@ def test_review_queue_and_resolution_form_render_and_redirect() -> None:
     assert detail.status_code == 200
     assert candidate.title.encode() in detail.content
     assert b"Manual metadata" in detail.content
-    assert b"Search providers again" in detail.content
+    assert b"search providers" in detail.content
+    assert b"Provider searches" in detail.content
     assert resolved.status_code == 302
     assert resolved["Location"] == "/reviews/"
 

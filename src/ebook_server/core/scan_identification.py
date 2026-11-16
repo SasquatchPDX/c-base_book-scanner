@@ -12,8 +12,8 @@ from rq import get_current_job
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import identification
-from .models import MetadataCandidate, ProcessingJob, ReviewTask, ScanJob
+from . import identification, metadata_search
+from .models import MetadataCandidate, MetadataSearch, ProcessingJob, ReviewTask, ScanJob
 
 logger = structlog.get_logger(__name__)
 
@@ -35,6 +35,8 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
         "scan_job_id": details.get("scan_job_id"),
         "review_task_id": details.get("review_task_id"),
         "candidate_count": details.get("candidate_count", 0),
+        "search_id": details.get("search_id"),
+        "providers": details.get("providers", []),
         "attempt_count": details.get("attempt_count", 0),
         "error": details.get("error", ""),
         "scheduled_at": job.scheduled_at.isoformat(),
@@ -64,12 +66,17 @@ def _signals(scan_job: ScanJob) -> identification.IdentificationInput:
 def _save_candidates(
     scan_job: ScanJob,
     candidates: list[identification.IdentificationCandidate],
+    *,
+    search: MetadataSearch | None = None,
 ) -> None:
-    MetadataCandidate.objects.filter(scan_job=scan_job).delete()
+    # Earlier runs are kept (grouped by search) so a failed repeat search hides nothing.
+    if search is None:
+        MetadataCandidate.objects.filter(scan_job=scan_job, search__isnull=True).delete()
     for index, candidate in enumerate(candidates, start=1):
         provider_ref = candidate.provider_ref or f"result-{index}"
         MetadataCandidate.objects.create(
             scan_job=scan_job,
+            search=search,
             provider_id=candidate.provider_id,
             provider_ref=provider_ref,
             title=candidate.title,
@@ -237,20 +244,33 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         processing_job.details = details
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
+    search: MetadataSearch | None = None
     try:
         scan_job = ScanJob.objects.select_related("operator").get(pk=details["scan_job_id"])
         if scan_job.book_id is not None:
             raise ScanIdentificationError("scan job is already linked to a book")
-        candidates = identification.resolve_candidates(_signals(scan_job))
+        signals = _signals(scan_job)
+        search = metadata_search.start_search(
+            trigger=MetadataSearch.Trigger.SCAN,
+            signals=signals,
+            scan_job=scan_job,
+            requested_by_id=details.get("requested_by_user_id"),
+            processing_job_id=processing_job.job_id,
+        )
+        candidates = metadata_search.run_search(search, signals)
         with transaction.atomic():
-            _save_candidates(scan_job, candidates)
+            _save_candidates(scan_job, candidates, search=search)
             task = _create_or_refresh_review(scan_job, candidates)
+            search.review_task = task
+            search.save(update_fields=["review_task"])
             processing_job.state = ProcessingJob.JobState.SUCCESS
             processing_job.finished_at = timezone.now()
             processing_job.details = {
                 **details,
                 "candidate_count": len(candidates),
                 "review_task_id": task.id,
+                "search_id": str(search.id),
+                "providers": search.providers,
                 "error": "",
             }
             processing_job.save(update_fields=["state", "finished_at", "details"])
@@ -262,6 +282,8 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             review_task_id=task.id,
         )
     except Exception as exc:
+        if search is not None and search.state == MetadataSearch.State.RUNNING:
+            metadata_search.fail_search(search, str(exc) or type(exc).__name__)
         rq_job = get_current_job() if raise_on_error else None
         retry_pending = bool(
             rq_job is not None and rq_job.retries_left is not None and rq_job.retries_left > 0

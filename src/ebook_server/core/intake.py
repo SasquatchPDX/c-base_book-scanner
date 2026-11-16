@@ -37,7 +37,7 @@ from ebook_server.storage import (
     ensure_path_storage_ready,
 )
 
-from . import identification, source_layout
+from . import identification, metadata_search, source_layout
 from .languages import detect_language, normalize_language
 from .models import (
     Author,
@@ -46,6 +46,7 @@ from .models import (
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ReviewTask,
     SourceLocation,
     StorageLocation,
@@ -881,15 +882,27 @@ def _find_text_any(root: ET.Element, expression: str) -> str | None:
 def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
+    *,
+    search: MetadataSearch | None = None,
+    keep_previous: bool = False,
 ) -> None:
-    # Ensure idempotence if jobs are retried.
-    MetadataCandidate.objects.filter(import_job=job).delete()
+    """Store a search run's candidates.
+
+    Intake replaces its own earlier candidates (idempotent retries); repeat review
+    searches keep earlier runs so a failed or empty search never hides them.
+    """
+    if not keep_previous:
+        MetadataCandidate.objects.filter(import_job=job).filter(
+            django_models.Q(search__isnull=True)
+            | django_models.Q(search__trigger=MetadataSearch.Trigger.INTAKE)
+        ).delete()
     for candidate in candidates:
         state = MetadataCandidate.CandidateState.REVIEW
         if candidate.score >= AUTO_ACCEPT_SCORE:
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             import_job=job,
+            search=search,
             provider_id=candidate.provider_id,
             provider_ref=_fit(MetadataCandidate, "provider_ref", candidate.provider_ref),
             title=_fit(MetadataCandidate, "title", candidate.title),
@@ -1515,12 +1528,19 @@ def process_import_job(job_id: str) -> None:
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
         job.save(update_fields=["state", "updated_at"])
-        candidates = identification.resolve_candidates(signals)
-        _save_metadata_candidates(job, candidates)
+        search = metadata_search.start_search(
+            trigger=MetadataSearch.Trigger.INTAKE,
+            signals=signals,
+            import_job=job,
+        )
+        candidates = metadata_search.run_search(search, signals)
+        _save_metadata_candidates(job, candidates, search=search)
 
         top_candidate = candidates[0] if candidates else None
         if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
-            _create_review_task(job=job, candidates=candidates)
+            review_task = _create_review_task(job=job, candidates=candidates)
+            search.review_task = review_task
+            search.save(update_fields=["review_task"])
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
             job.state = ImportJob.State.ARCHIVING

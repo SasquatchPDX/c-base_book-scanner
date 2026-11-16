@@ -309,7 +309,7 @@ def test_mark_unidentified_records_decision(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_search_again_requeries_archived_import_and_replaces_candidates(
+def test_search_again_requeries_archived_import_and_keeps_earlier_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -343,9 +343,12 @@ def test_search_again_requeries_archived_import_and_replaces_candidates(
     assert payload["identification_job"]["candidate_count"] == 1
     task.refresh_from_db()
     import_job.refresh_from_db()
-    candidate = MetadataCandidate.objects.get(import_job=import_job)
+    # The new run's candidates are linked to its recorded search; earlier ones are kept.
+    search_id = payload["identification_job"]["search_id"]
+    candidate = MetadataCandidate.objects.get(import_job=import_job, search_id=search_id)
     assert candidate.id != old_candidate_id
     assert candidate.title == "Better Candidate"
+    assert MetadataCandidate.objects.filter(pk=old_candidate_id).exists()
     assert task.state == ReviewTask.State.OPEN
     assert task.decision == ReviewTask.Decision.SEARCH_AGAIN
     assert task.inferred_title == "Better Search"
