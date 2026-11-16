@@ -137,11 +137,54 @@ class SourceLocation(models.Model):
         default=SourceType.NETWORK_SOURCE,
     )
     default_metadata = models.JSONField(default=dict, blank=True)
+
+    class AuthorNameOrder(models.TextChoices):
+        AUTO = "auto", 'Auto ("Last, First" when a comma is present)'
+        FIRST_LAST = "first_last", "First Last (never reorder)"
+        LAST_FIRST = "last_first", "Last First (reorder even without comma)"
+
+    path_layouts = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Ordered list of path templates relative to the source root (file extension "
+            "stripped). First match supplies identification hints. Placeholders: {author}, "
+            "{authors}, {title}, {series}, {*}; '**' = any folders. Examples: "
+            '["{author}/**"], ["{author}/{title} ({*})/{*}"], ["{title} - {author}"]. '
+            "Leave empty when the collection has no consistent structure."
+        ),
+    )
+    author_name_order = models.CharField(
+        max_length=16,
+        choices=AuthorNameOrder.choices,
+        default=AuthorNameOrder.AUTO,
+    )
+    layout_ignore_values = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            'Captured folder/file values that are not real names, e.g. ["Unknown", '
+            '"Misc"]. Compared case-insensitively; an ignored value yields no hint.'
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self) -> str:
         return self.name
+
+    def clean(self) -> None:
+        from django.core.exceptions import ValidationError
+
+        from .source_layout import validate_templates
+
+        errors = validate_templates(self.path_layouts)
+        if errors:
+            raise ValidationError({"path_layouts": errors})
+        if not isinstance(self.layout_ignore_values, list) or not all(
+            isinstance(value, str) for value in self.layout_ignore_values
+        ):
+            raise ValidationError({"layout_ignore_values": "must be a JSON list of strings"})
 
 
 class Book(models.Model):

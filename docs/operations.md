@@ -170,6 +170,43 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Folder layouts (author/title from paths)
+
+Members organise collections differently, so each source can declare how its
+folders are structured (Django admin → Source locations → "Folder layout").
+`path_layouts` is an ordered JSON list of templates matched against the path
+relative to the source root, without the file extension; the first template
+that yields a non-ignored value supplies hints:
+
+| Collection | `path_layouts` |
+|---|---|
+| `Austen, Jane/Pride and Prejudice.txt` | `["{author}/**"]` |
+| Calibre library `Jane Austen/Emma (12)/Emma - Jane Austen.epub` | `["{author}/{title} ({*})/{*}"]` |
+| flat `Emma - Jane Austen.epub` | `["{title} - {author}"]` |
+| mixed: author folders plus loose `Author - Title` files | `["{author}/**", "{author} - {title}"]` |
+| `Genre/Weber, David & Evans, Linda/Hell's Gate.epub` | `["{*}/{authors}/{title}"]` |
+
+Placeholders: `{author}`, `{authors}` (split on `&`, `;`, `and`, `und`),
+`{title}`, `{series}`, `{*}` (ignored text within one folder/file name); `**`
+spans folders (zero or more in the middle, one or more at the end).
+`author_name_order` controls name reordering: `auto` turns `Last, First` into
+`First Last`, `last_first` also reorders names without a comma, `first_last`
+never reorders. `layout_ignore_values` lists captured values that are not names
+(for example `["Unknown", "Misc", "Cliff Notes"]`). Sources without layouts
+behave as before.
+
+Path hints are stored in the import evidence under `path_layout` and are only
+*evidence* for the external lookup: they add an author hint (replacing the
+ambiguous filename split guesses) and a title hint after the embedded title. They
+never bypass provider verification or review thresholds. Check a layout before
+importing:
+
+```bash
+uv run python manage.py ingest_sources --source-id 1 --preview
+```
+
+Each row shows `[layout: author=[...] title=... series=...]` or `[layout: no match]`.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for

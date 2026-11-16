@@ -32,6 +32,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Evidence key holding hints from the source's configured folder layout
+# (see core.source_layout); written by intake, read when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
 
 
 class MetadataProvider(Protocol):
@@ -204,9 +207,9 @@ def build_identification_input(
     if isinstance(metadata_title, str) and normalize_text(metadata_title):
         title_hints = [metadata_title] + filename_title_hints
     else:
-        title_hints = filename_title_hints
+        title_hints = list(filename_title_hints)
 
-    author_hints = filename_author_hints
+    author_hints = list(filename_author_hints)
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:
@@ -214,6 +217,29 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if isinstance(layout, dict):
+        layout_title = layout.get("title")
+        if isinstance(layout_title, str) and layout_title.strip():
+            # After an embedded title (usually best), before raw filename guesses.
+            position = (
+                1 if isinstance(metadata_title, str) and normalize_text(metadata_title) else 0
+            )
+            title_hints.insert(position, layout_title.strip())
+        layout_authors = [
+            author.strip()
+            for author in layout.get("authors") or []
+            if isinstance(author, str) and author.strip()
+        ]
+        if layout_authors:
+            # A configured layout is a deliberate statement about where the author is;
+            # the filename split guesses (both halves of "A - B") would dilute scoring.
+            embedded: list[str] = []
+            if isinstance(metadata_authors, list):
+                embedded = [a.strip() for a in metadata_authors if isinstance(a, str) and a.strip()]
+            known = {normalize_text(h) for h in embedded}
+            author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
