@@ -25,7 +25,7 @@
     <div class="book-grid">
       {% for book in recent_books %}
         <article class="book-card">
-          <div class="cover-placeholder" aria-hidden="true">{{ book.title|slice:":1" }}</div>
+          {% if book.cover_front %}<img class="cover-thumb" src="{{ book.cover_front.url }}" alt="Front cover of {{ book.title }}" loading="lazy" decoding="async">{% else %}<div class="cover-placeholder" aria-hidden="true">{{ book.title|slice:":1" }}</div>{% endif %}
           <h3><a href="{% url 'library-book-detail' book.id %}?view=html">{{ book.title }}</a></h3>
           <p>{% for author in book.authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
           <div class="badges">{% for format in book.formats_available %}<span>{{ format|upper }}</span>{% endfor %}</div>
