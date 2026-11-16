@@ -1104,6 +1104,7 @@ def resolve_import_with_review_data(
     decision: str = "",
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    propagate_to_siblings: bool = True,
 ) -> FileVariant:
     if not source_type:
         source_type = cast(str, FileVariant.SourceType.UPLOAD)
@@ -1148,7 +1149,147 @@ def resolve_import_with_review_data(
             "updated_at",
         ],
     )
+    if propagate_to_siblings:
+        _propagate_book_to_siblings(job, book)
     return variant
+
+
+SIBLING_EVIDENCE_KEY = "format_sibling_of"
+_SIBLING_OPEN_REVIEW = (ReviewTask.State.OPEN, ReviewTask.State.CLAIMED)
+
+
+def _sibling_jobs(job: ImportJob) -> list[ImportJob]:
+    """Import jobs for other formats of the same book: same folder, same file name.
+
+    Only for source imports whose source location enables ``group_sibling_formats``.
+    """
+    location = job.source_location
+    if location is None or not location.group_sibling_formats or not job.source_path:
+        return []
+    path = Path(job.source_path)
+    stem = path.stem.casefold()
+    candidates = (
+        ImportJob.objects.filter(
+            source_location=location,
+            source_path__startswith=f"{path.parent}/",
+        )
+        .exclude(source_path=job.source_path)
+        .select_related("book")
+        .order_by("created_at")
+    )
+    return [
+        candidate
+        for candidate in candidates
+        if Path(candidate.source_path).parent == path.parent
+        and Path(candidate.source_path).stem.casefold() == stem
+    ]
+
+
+def _resolved_sibling(job: ImportJob) -> ImportJob | None:
+    for sibling in _sibling_jobs(job):
+        if sibling.state == ImportJob.State.COMPLETE and sibling.book_id is not None:
+            return sibling
+    return None
+
+
+def _archive_and_complete_with_book(
+    job: ImportJob,
+    book: Book | None,
+    *,
+    provision: Any = None,
+) -> Book:
+    """Archive the source, then link it to ``book`` (or the one ``provision()`` returns)."""
+    storage = _default_storage()
+    storage_location = _default_storage_location()
+    job.state = ImportJob.State.ARCHIVING
+    job.save(update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(storage, job)
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    if book is None:
+        book = provision()
+    if book is None:
+        raise RuntimeError("no book to link the archived source to")
+    job.storage_identifier = destination
+    job.storage_location = storage_location
+    job.normalized_filename = normalize_filename(
+        f"{book.title}{Path(job.normalized_filename).suffix}",
+    )
+    variant = FileVariant.objects.create(
+        book=book,
+        format=job.detected_format,
+        mime_type=job.mime_type,
+        original_filename=job.original_filename,
+        storage_location=storage_location,
+        storage_identifier=destination,
+        size_bytes=job.size_bytes,
+        sha256=job.sha256,
+        source_type=FileVariant.SourceType.UPLOAD,
+        uploader=job.uploader,
+        imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    _try_extract_front_cover(variant)
+    job.book = book
+    job.file_variant = variant
+    job.state = ImportJob.State.COMPLETE
+    job.save(
+        update_fields=[
+            "state",
+            "book_id",
+            "file_variant_id",
+            "storage_location_id",
+            "storage_identifier",
+            "normalized_filename",
+            "updated_at",
+        ],
+    )
+    return book
+
+
+def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
+    """Attach other formats of the same book that are waiting in review.
+
+    Siblings not processed yet pick the book up themselves (``_resolved_sibling``).
+    A failure here never undoes the already completed ``job``.
+    """
+    for sibling in _sibling_jobs(job):
+        if sibling.state != ImportJob.State.LOW_CONFIDENCE or not sibling.storage_identifier:
+            continue
+        task = sibling.review_tasks.filter(state__in=_SIBLING_OPEN_REVIEW).first()
+        if task is None:
+            continue
+        try:
+            resolve_import_with_review_data(
+                job=sibling,
+                review_task=task,
+                book=book,
+                source_type=cast(str, FileVariant.SourceType.UPLOAD),
+                decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
+                decision_notes=(
+                    f"Same folder and file name as '{job.original_filename}': "
+                    "attached as another format of the same book."
+                ),
+                decision_payload={
+                    "rule": "group_sibling_formats",
+                    SIBLING_EVIDENCE_KEY: str(job.id),
+                },
+                propagate_to_siblings=False,
+            )
+        except Exception:
+            logger.exception(
+                "intake_sibling_propagation_failed",
+                import_job_id=str(job.id),
+                sibling_import_job_id=str(sibling.id),
+            )
+            continue
+        logger.info(
+            "intake_linked_format_sibling",
+            import_job_id=str(sibling.id),
+            sibling_import_job_id=str(job.id),
+            book_id=book.id,
+        )
 
 
 def _provision_book_from_metadata(
@@ -1322,6 +1463,7 @@ def process_import_job(job_id: str) -> None:
                 ),
             )
             _try_extract_front_cover(duplicate_variant)
+            _propagate_book_to_siblings(job, duplicate_variant.book)
             return
 
         metadata = extract_metadata(
@@ -1342,6 +1484,29 @@ def process_import_job(job_id: str) -> None:
                 "updated_at",
             ],
         )
+
+        sibling = _resolved_sibling(job)
+        if sibling is not None and sibling.book is not None:
+            # Another format of this book (same folder, same name) is already linked:
+            # attach this file to the same book instead of identifying it again.
+            job.evidence = {
+                **metadata,
+                SIBLING_EVIDENCE_KEY: {
+                    "import_job": str(sibling.id),
+                    "filename": sibling.original_filename,
+                    "book_id": sibling.book_id,
+                },
+            }
+            job.state = ImportJob.State.MATCHED
+            job.save(update_fields=["evidence", "state", "updated_at"])
+            _archive_and_complete_with_book(job, sibling.book)
+            logger.info(
+                "intake_linked_format_sibling",
+                import_job_id=str(job.id),
+                sibling_import_job_id=str(sibling.id),
+                book_id=sibling.book_id,
+            )
+            return
 
         signals = identification.build_identification_input(
             source_path=job.source_path,
@@ -1387,57 +1552,16 @@ def process_import_job(job_id: str) -> None:
 
         job.state = ImportJob.State.MATCHED
         job.save(update_fields=["state", "updated_at"])
-        storage = _default_storage()
-        storage_location = _default_storage_location()
-        job.state = ImportJob.State.ARCHIVING
-        job.save(update_fields=["state", "updated_at"])
-        destination, verified = _archive_source(storage, job)
-        _finalize_source_cleanup(job, verified)
-        if not verified:
-            raise RuntimeError("archive verification failed")
-
-        book = _provision_book_from_metadata(
-            candidate=top_candidate,
-            fallback_title=top_candidate.title,
-            extra_metadata=metadata,
+        book = _archive_and_complete_with_book(
+            job,
+            None,
+            provision=lambda: _provision_book_from_metadata(
+                candidate=top_candidate,
+                fallback_title=top_candidate.title,
+                extra_metadata=metadata,
+            ),
         )
-        job.storage_identifier = destination
-        job.storage_location = storage_location
-        job.normalized_filename = normalize_filename(
-            f"{book.title}{Path(job.normalized_filename).suffix}",
-        )
-        variant = FileVariant.objects.create(
-            book=book,
-            format=detected_format,
-            mime_type=mime_type,
-            original_filename=job.original_filename,
-            storage_location=storage_location,
-            storage_identifier=destination,
-            size_bytes=job.size_bytes,
-            sha256=job.sha256,
-            source_type=FileVariant.SourceType.UPLOAD,
-            uploader=job.uploader,
-            imported_at=timezone.now(),
-            processing_state=FileVariant.ProcessingState.COMPLETE,
-        )
-        _try_extract_front_cover(variant)
-
-        job.book = book
-        job.file_variant = variant
-        job.storage_location = storage_location
-        job.storage_identifier = destination
-        job.state = ImportJob.State.COMPLETE
-        job.save(
-            update_fields=[
-                "state",
-                "book_id",
-                "file_variant_id",
-                "storage_location_id",
-                "storage_identifier",
-                "normalized_filename",
-                "updated_at",
-            ],
-        )
+        _propagate_book_to_siblings(job, book)
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
         job.last_error = str(exc)
         job.state = ImportJob.State.FAILED

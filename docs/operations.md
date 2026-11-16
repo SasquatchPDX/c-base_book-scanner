@@ -207,6 +207,18 @@ uv run python manage.py ingest_sources --source-id 1 --preview
 
 Each row shows `[layout: author=[...] title=... series=...]` or `[layout: no match]`.
 
+### Formats of one book (`group_sibling_formats`)
+
+Enabled by default per source: files in the same folder with the same name and
+different extensions (`Dune.epub`, `Dune.mobi`, `Dune.txt`; names compared
+case-insensitively) are treated as formats of one book. When one of them is linked
+to a book (automatic match, exact duplicate, or a review decision), the others are
+attached to that book as further variants: files not processed yet skip the
+external lookup (evidence key `format_sibling_of`), and files already waiting in
+review are resolved as "Merged with existing book" with the rule recorded in the
+decision payload. Disable it for collections where equal names do not mean the
+same book.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for

@@ -160,7 +160,12 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
                     "become author/title hints. Check the result with "
                     "<code>manage.py ingest_sources --source-id N --preview</code>."
                 ),
-                "fields": ("path_layouts", "author_name_order", "layout_ignore_values"),
+                "fields": (
+                    "path_layouts",
+                    "author_name_order",
+                    "layout_ignore_values",
+                    "group_sibling_formats",
+                ),
             },
         ),
     )

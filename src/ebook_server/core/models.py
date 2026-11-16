@@ -172,6 +172,14 @@ class SourceLocation(models.Model):
         choices=AuthorNameOrder.choices,
         default=AuthorNameOrder.AUTO,
     )
+    group_sibling_formats = models.BooleanField(
+        default=True,
+        help_text=(
+            "Treat files in the same folder with the same name and different extensions "
+            "(e.g. 'Dune.epub', 'Dune.mobi') as formats of one book: once one of them is "
+            "linked to a book, the others are attached to it as variants."
+        ),
+    )
     layout_ignore_values = models.JSONField(
         default=list,
         blank=True,
