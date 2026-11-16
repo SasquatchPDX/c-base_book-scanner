@@ -1071,6 +1071,10 @@ def resolve_import_with_review_data(
     return variant
 
 
+AUTO_ACCEPT_BLOCKED_KEY = "auto_accept_blocked"
+BOOK_AUTHORS_SOURCE_KEY = "book_authors_source"
+
+
 def _provision_book_from_metadata(
     *,
     candidate: identification.IdentificationCandidate | None,
@@ -1272,7 +1276,25 @@ def process_import_job(job_id: str) -> None:
         _save_metadata_candidates(job, candidates)
 
         top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+        file_authors = identification.evidence_author_names(metadata)
+        auto_accept = top_candidate is not None and top_candidate.score >= AUTO_ACCEPT_SCORE
+        if (
+            auto_accept
+            and top_candidate is not None
+            and identification.authors_conflict(top_candidate.authors, file_authors)
+        ):
+            # A high score (e.g. an ISBN match) that names other authors than the file
+            # itself must not be accepted silently.
+            auto_accept = False
+            metadata[AUTO_ACCEPT_BLOCKED_KEY] = {
+                "reason": "authors of the best match differ from the file's authors",
+                "score": top_candidate.score,
+                "candidate_authors": list(top_candidate.authors),
+                "file_authors": file_authors,
+            }
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
+        if not auto_accept or top_candidate is None:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
@@ -1319,6 +1341,17 @@ def process_import_job(job_id: str) -> None:
             fallback_title=top_candidate.title,
             extra_metadata=metadata,
         )
+        if not top_candidate.authors and file_authors and not book.authors.exists():
+            # The match carries no authors (e.g. an edition record without them):
+            # use the file's own author evidence and record that it came from there.
+            for author_name in file_authors:
+                author, _ = Author.objects.get_or_create(
+                    full_name=_fit(Author, "full_name", author_name),
+                )
+                book.authors.add(author)
+            metadata[BOOK_AUTHORS_SOURCE_KEY] = {"source": "file", "authors": file_authors}
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
         job.storage_identifier = destination
         job.storage_location = storage_location
         job.normalized_filename = normalize_filename(

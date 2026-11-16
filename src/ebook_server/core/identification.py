@@ -293,15 +293,16 @@ class OpenLibraryMetadataProvider:
         return payload
 
     def _resolve_author_names(self, payload: dict[str, Any]) -> list[str]:
-        """Resolve edition ``authors: [{key}]`` references to names (bounded, best effort)."""
-        raw_authors = payload.get("authors")
-        if not isinstance(raw_authors, list):
-            return []
+        """Resolve an edition's author references to names (bounded, best effort).
+
+        Many edition records carry no ``authors`` at all, only ``works: [{key}]``;
+        the authors are then taken from the (first) work record.
+        """
+        keys = _author_keys(payload.get("authors"))
+        if not keys:
+            keys = self._work_author_keys(payload.get("works"))
         names: list[str] = []
-        for entry in raw_authors[:MAX_AUTHOR_LOOKUPS]:
-            key = entry.get("key") if isinstance(entry, dict) else None
-            if not isinstance(key, str) or not re.fullmatch(r"/authors/OL\d+A", key):
-                continue
+        for key in keys[:MAX_AUTHOR_LOOKUPS]:
             try:
                 author_payload = self._get_json(f"https://openlibrary.org{key}.json")
             except (OSError, ValueError) as exc:
@@ -316,6 +317,27 @@ class OpenLibraryMetadataProvider:
             if isinstance(name, str) and name.strip():
                 names.append(name.strip())
         return names
+
+    def _work_author_keys(self, works: Any) -> list[str]:
+        if not isinstance(works, list):
+            return []
+        for entry in works[:1]:
+            key = entry.get("key") if isinstance(entry, dict) else None
+            if not isinstance(key, str) or not re.fullmatch(r"/works/OL\d+W", key):
+                continue
+            try:
+                work_payload = self._get_json(f"https://openlibrary.org{key}.json")
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "metadata_provider_request_failed",
+                    provider_id=self.provider_id,
+                    operation="work",
+                    error_type=type(exc).__name__,
+                )
+                return []
+            if isinstance(work_payload, dict):
+                return _author_keys(work_payload.get("authors"))
+        return []
 
     def _query_search(self, query: str) -> list[dict[str, Any]]:
         encoded = urlencode({"q": query, "limit": "5"})
@@ -349,6 +371,85 @@ class OpenLibraryMetadataProvider:
                     raise
                 time.sleep(_retry_after_seconds(exc))
         raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
+
+
+def _author_keys(raw_authors: Any) -> list[str]:
+    """Author keys from ``[{"key": ...}]`` (editions) or ``[{"author": {"key": ...}}]`` (works)."""
+    if not isinstance(raw_authors, list):
+        return []
+    keys: list[str] = []
+    for entry in raw_authors:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        nested = entry.get("author")
+        if not isinstance(key, str) and isinstance(nested, dict):
+            key = nested.get("key")
+        if isinstance(key, str) and re.fullmatch(r"/authors/OL\d+A", key) and key not in keys:
+            keys.append(key)
+    return keys
+
+
+# Placeholder creator values that say nothing about the author.
+_PLACEHOLDER_AUTHORS = {
+    "unknown",
+    "unbekannt",
+    "anonymous",
+    "administrator",
+    "admin",
+    "user",
+    "n/a",
+}
+
+
+def _display_name(raw: str) -> str:
+    """``"Foster, Alan Dean"`` → ``"Alan Dean Foster"``; other names unchanged."""
+    name = " ".join(raw.split()).strip(" ,;")
+    if name.count(",") == 1:
+        last, first = (part.strip() for part in name.split(","))
+        if last and first:
+            return f"{first} {last}"
+    return name
+
+
+def evidence_author_names(metadata: dict[str, Any]) -> list[str]:
+    """Author names the file itself provides: embedded metadata, then folder-layout hints."""
+    raw: list[Any] = []
+    if isinstance(metadata.get("authors"), list):
+        raw.extend(metadata["authors"])
+    layout = metadata.get("path_layout")  # present for sources with a folder layout
+    if isinstance(layout, dict) and isinstance(layout.get("authors"), list):
+        raw.extend(layout["authors"])
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        name = _display_name(value)
+        key = normalize_text(name)
+        if not key or key in _PLACEHOLDER_AUTHORS or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def _surname(name: str) -> str:
+    tokens = re.findall(r"\w+", normalize_text(_display_name(name)))
+    return tokens[-1] if tokens else ""
+
+
+def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) -> bool:
+    """True when both sides name authors and no surname is shared.
+
+    Used to stop automatic acceptance (e.g. of an ISBN match) that contradicts the
+    file's own author evidence. Missing authors on either side are not a conflict.
+    """
+    candidate_surnames = {_surname(name) for name in candidate_authors} - {""}
+    evidence_surnames = {_surname(name) for name in evidence_authors} - {""}
+    if not candidate_surnames or not evidence_surnames:
+        return False
+    return not candidate_surnames & evidence_surnames
 
 
 def _retry_after_seconds(error: HTTPError) -> float:
