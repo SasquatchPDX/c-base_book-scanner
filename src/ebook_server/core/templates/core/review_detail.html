@@ -13,11 +13,30 @@
 {% endif %}
 <div class="review-layout">
   <section>
+    {% if source %}
+    <h2>File</h2>
+    <dl class="file-facts">
+      <dt>File name</dt><dd class="mono">{{ source.filename }}</dd>
+      {% if source.source_name %}
+      <dt>Folder</dt><dd class="mono">{{ source.folder|default:"(top level of the source)" }}</dd>
+      <dt>Source</dt><dd>{{ source.source_name }} <span class="mono muted">{{ source.source_root }}</span></dd>
+      <dt>Full path</dt><dd class="mono">{{ source.full_path }}{% if not source.source_exists %} <span class="error">– no longer at this path</span>{% endif %}</dd>
+      {% else %}
+      <dt>Source</dt><dd>{{ source.source_type_label }}{% if source.uploader %} by {{ source.uploader }}{% endif %}</dd>
+      {% endif %}
+      <dt>Format</dt><dd>{{ source.format|upper|default:"–" }}{% if source.size_bytes %} · {{ source.size_bytes|filesizeformat }}{% endif %}</dd>
+      {% if source.sha256 %}<dt>SHA-256</dt><dd class="mono small">{{ source.sha256 }}</dd>{% endif %}
+      {% if source.archive %}<dt>Archived copy</dt><dd class="mono small">{{ source.archive }}</dd>{% endif %}
+      {% if source.path_layout %}<dt>From folder layout</dt><dd>{% if source.path_layout.authors %}author {{ source.path_layout.authors|join:", " }}{% endif %}{% if source.path_layout.title %}{% if source.path_layout.authors %} · {% endif %}title “{{ source.path_layout.title }}”{% endif %} <span class="mono muted small">{{ source.path_layout.template }}</span></dd>{% endif %}
+      {% if source.siblings %}<dt>Other formats here</dt><dd>{% for sibling in source.siblings %}<div><span class="mono">{{ sibling.filename }}</span> – {{ sibling.state_label }}{% if sibling.book_title %}, linked to “{{ sibling.book_title }}”{% endif %}</div>{% endfor %}</dd>{% endif %}
+    </dl>
+    {% endif %}
     <h2>Evidence</h2>
     <dl class="metadata">
-      <div><dt>Source</dt><dd>{{ task.source_filename }}</dd></div>
+      <div><dt>Inferred title</dt><dd>{{ task.inferred_title|default:"–" }}</dd></div>
       <div><dt>Inferred authors</dt><dd>{{ task.inferred_authors|join:", "|default:"Unknown" }}</dd></div>
       <div><dt>Operator</dt><dd>{% if task.import_job_id %}{{ task.import_job.uploader.username }}{% else %}{{ task.scan_job.operator.username|default:"Unknown" }}{% endif %}</dd></div>
+      {% if not source %}<div><dt>Source</dt><dd>{{ task.source_filename }}</dd></div>{% endif %}
     </dl>
     <details><summary>Embedded metadata</summary><pre>{{ task.embedded_metadata }}</pre></details>
 
@@ -56,11 +75,15 @@
       <h2>Refine search</h2>
       <form method="post" action="{% url 'review-search-again' task.id %}">
         {% csrf_token %}
-        <label>Title<input name="inferred_title" value="{{ task.inferred_title }}"></label>
-        <label>Authors<input name="inferred_authors" value="{{ task.inferred_authors|join:', ' }}" placeholder="Comma-separated"></label>
-        <p class="muted small">Searches {% for provider in configured_providers %}{% if provider.available %}{{ provider.label }}{% if not forloop.last %}, {% endif %}{% endif %}{% empty %}no provider{% endfor %} with these terms. The terms are saved either way.</p>
-        <button type="submit"{% if searching %} disabled{% endif %}>{% if searching %}Search running…{% else %}Save terms &amp; search providers{% endif %}</button>
-        <button class="secondary" type="submit" formaction="{% url 'review-edit-search-terms' task.id %}">Save terms only</button>
+        <label>Title<input name="inferred_title" value="{{ form_terms.title }}"></label>
+        <label>Authors<input name="inferred_authors" value="{{ form_terms.authors|join:', ' }}" placeholder="Comma-separated"></label>
+        {% if form_terms.source == "search" and form_terms.differs %}
+        <p class="muted small">Showing the terms of your last search. Saved terms: “{{ form_terms.saved.title|default:"–" }}”{% if form_terms.saved.authors %} / {{ form_terms.saved.authors|join:", " }}{% endif %}.</p>
+        {% endif %}
+        <button type="submit"{% if searching %} disabled{% endif %}>{% if searching %}Search running…{% else %}Search providers{% endif %}</button>
+        <p class="muted small">Searches {% for provider in configured_providers %}{% if provider.available %}{{ provider.label }}{% if not forloop.last %}, {% endif %}{% endif %}{% empty %}no provider{% endfor %} with the terms above. Does not change the saved terms.</p>
+        <button class="secondary" type="submit" formaction="{% url 'review-edit-search-terms' task.id %}">Save terms</button>
+        <p class="muted small">Stores the terms above as this review's search terms. Does not search.</p>
       </form>
     </section>
     <section class="action-panel">

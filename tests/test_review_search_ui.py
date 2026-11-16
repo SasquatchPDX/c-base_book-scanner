@@ -71,11 +71,12 @@ def review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_search_with_edited_terms_keeps_and_uses_them(
+def test_search_uses_submitted_terms_without_saving_them(
     review: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client: Client = review["client"]
     task: ReviewTask = review["task"]
+    saved_title = task.inferred_title
     provider = _Returns("stub", "Stub Library", [{"title": "Neuromancer", "author_name": ["W G"]}])
     _providers(monkeypatch, provider)
 
@@ -88,16 +89,40 @@ def test_search_with_edited_terms_keeps_and_uses_them(
     assert response.status_code == 302
     assert response["Location"] == f"/reviews/{task.id}/"
     task.refresh_from_db()
-    assert task.inferred_title == "Neuromancer"
-    assert task.inferred_authors == ["William Gibson", "Someone Else"]
+    assert task.inferred_title == saved_title  # searching does not save
     assert provider.seen[0] == ("Neuromancer", "William Gibson")
     page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    # ...but the form keeps showing what was searched for.
     assert 'name="inferred_title" value="Neuromancer"' in page
     assert 'value="William Gibson, Someone Else"' in page
+    assert "Showing the terms of your last search" in page
     search = MetadataSearch.objects.filter(trigger=MetadataSearch.Trigger.REVIEW).get()
     assert search.query["title_hints"] == ["Neuromancer"]
     assert search.query["author"] == "William Gibson"
     assert search.requested_by is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_saved_terms_win_over_older_search_and_drive_plain_searches(
+    review: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client: Client = review["client"]
+    task: ReviewTask = review["task"]
+    provider = _Returns("stub", "Stub Library", [])
+    _providers(monkeypatch, provider)
+    client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "Draft"}, headers=HTML)
+
+    client.post(
+        f"/reviews/{task.id}/edit-search-terms/",
+        {"inferred_title": "Count Zero", "inferred_authors": "William Gibson"},
+        headers=HTML,
+    )
+    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    assert 'name="inferred_title" value="Count Zero"' in page
+    assert "Showing the terms of your last search" not in page
+
+    client.post(f"/reviews/{task.id}/search-again/")  # API call without terms
+    assert provider.seen[-1] == ("Count Zero", "William Gibson")
 
 
 @pytest.mark.django_db(transaction=True)

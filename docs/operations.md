@@ -170,6 +170,27 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Metadata providers
+
+Every identification (import, review search, scan identification) asks all
+configured providers and merges their candidates. `BOOK_SCANNER_METADATA_PROVIDERS`
+is a JSON list of provider classes; the default is:
+
+| Provider | Class | Notes |
+|---|---|---|
+| Open Library | `ebook_server.core.identification.OpenLibraryMetadataProvider` | works and best-matching edition; no key |
+| Deutsche Nationalbibliothek | `ebook_server.core.metadata_providers.DnbMetadataProvider` | public SRU catalogue, strong for German editions; no key |
+| Google Books (optional) | `ebook_server.core.metadata_providers.GoogleBooksMetadataProvider` | needs `BOOK_SCANNER_GOOGLE_BOOKS_API_KEY`; listed as unavailable without it |
+
+Each provider receives the search terms (title, author, ISBN, language). Every
+run is stored as a `MetadataSearch` with each provider's outcome (results, no
+results, or an error with its reason) and is shown on the review page.
+
+On the review page, **Search providers** searches with the terms in the form
+without saving them; **Save terms** stores them as the review's search terms
+(used by later searches without explicit terms). The form shows the newer of the
+saved terms and the terms of the last search.
+
 ### Folder layouts (author/title from paths)
 
 Members organise collections differently, so each source can declare how its

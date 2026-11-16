@@ -43,18 +43,45 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
     }
 
 
-def _review_signals(task: ReviewTask, import_job: ImportJob) -> identification.IdentificationInput:
+def search_terms(raw: Any) -> dict[str, Any] | None:
+    """Validated one-off search terms ({"title": str, "authors": [str]}) or ``None``."""
+    if not isinstance(raw, dict):
+        return None
+    title = raw.get("title")
+    authors = raw.get("authors")
+    return {
+        "title": title.strip() if isinstance(title, str) else "",
+        "authors": [str(a).strip() for a in authors if isinstance(a, str) and a.strip()]
+        if isinstance(authors, list)
+        else [],
+    }
+
+
+def _review_signals(
+    task: ReviewTask,
+    import_job: ImportJob,
+    terms: dict[str, Any] | None = None,
+) -> identification.IdentificationInput:
+    """Signals from the file, with the reviewer's terms for title/author.
+
+    ``terms`` are one-off terms submitted with a search (not saved on the task);
+    without them the task's saved terms are used.
+    """
     base = identification.build_identification_input(
         source_path=import_job.source_path,
         original_filename=import_job.original_filename,
         extracted_metadata=(import_job.evidence if isinstance(import_job.evidence, dict) else {}),
     )
-    title = task.inferred_title.strip()
-    authors = [
-        str(author).strip()
-        for author in task.inferred_authors
-        if isinstance(author, str) and author.strip()
-    ]
+    if terms is not None:
+        title = str(terms.get("title") or "").strip()
+        authors = list(terms.get("authors") or [])
+    else:
+        title = task.inferred_title.strip()
+        authors = [
+            str(author).strip()
+            for author in task.inferred_authors
+            if isinstance(author, str) and author.strip()
+        ]
     return identification.IdentificationInput(
         title_hints=[title] if title else base.title_hints,
         author_hints=authors if authors else base.author_hints,
@@ -70,6 +97,7 @@ def request_review_identification(
     *,
     review_task: ReviewTask,
     requested_by_user_id: int | None,
+    terms: dict[str, Any] | None = None,
 ) -> ProcessingJob:
     if review_task.import_job_id is None:
         raise ReviewIdentificationError("review task is not for an import")
@@ -95,6 +123,7 @@ def request_review_identification(
                 "review_task_id": task.id,
                 "import_job_id": str(task.import_job_id),
                 "requested_by_user_id": requested_by_user_id,
+                "search_terms": search_terms(terms),
                 "candidate_count": 0,
                 "attempt_count": 0,
                 "error": "",
@@ -160,7 +189,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         import_job = task.import_job
         if import_job is None:
             raise ReviewIdentificationError("review task is not for an import")
-        signals = _review_signals(task, import_job)
+        signals = _review_signals(task, import_job, search_terms(details.get("search_terms")))
         search = metadata_search.start_search(
             trigger=MetadataSearch.Trigger.REVIEW,
             signals=signals,

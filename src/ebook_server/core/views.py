@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final, cast
 from uuid import UUID, uuid4
 
@@ -1095,6 +1095,108 @@ def _active_search_job(task: ReviewTask) -> ProcessingJob | None:
         .order_by("-scheduled_at")
         .first()
     )
+
+
+def _review_source_info(task: ReviewTask) -> dict[str, Any] | None:
+    """Where the reviewed file came from: name, folder, source, archive copy, siblings."""
+    job = task.import_job
+    if job is None:
+        return None
+    location = job.source_location
+    is_source_import = location is not None and bool(job.source_path)
+    relative: str | None = None
+    folder = ""
+    if is_source_import and location is not None:
+        try:
+            relative_path = PurePosixPath(job.source_path).relative_to(location.root_path)
+        except ValueError:
+            relative_path = None
+        if relative_path is not None:
+            relative = str(relative_path)
+            folder = "" if str(relative_path.parent) == "." else str(relative_path.parent)
+    try:
+        source_exists = bool(job.source_path) and Path(job.source_path).exists()
+    except OSError:
+        source_exists = False
+    evidence = job.evidence if isinstance(job.evidence, dict) else {}
+    siblings = [
+        {
+            "filename": sibling.original_filename,
+            "state": sibling.state,
+            "state_label": sibling.get_state_display(),
+            "book_id": sibling.book_id,
+            "book_title": sibling.book.title if sibling.book is not None else None,
+        }
+        for sibling in intake._sibling_jobs(job)
+    ]
+    return {
+        "filename": job.original_filename,
+        "relative_path": relative,
+        "folder": folder,
+        "full_path": job.source_path if is_source_import else None,
+        "source_exists": source_exists if is_source_import else None,
+        "source_type": job.source_type,
+        "source_type_label": job.get_source_type_display(),
+        "source_name": location.name if location is not None else None,
+        "source_root": location.root_path if location is not None else None,
+        "uploader": job.uploader.get_username() if job.uploader_id else None,
+        "format": job.detected_format,
+        "size_bytes": job.size_bytes,
+        "sha256": job.sha256,
+        "archive": (
+            f"{job.storage_location.identifier}: {job.storage_identifier}"
+            if job.storage_location is not None and job.storage_identifier
+            else None
+        ),
+        "path_layout": evidence.get("path_layout"),
+        "siblings": siblings,
+    }
+
+
+def _split_authors(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        return [author.strip() for author in raw.split(",") if author.strip()]
+    if isinstance(raw, list):
+        return [str(author).strip() for author in raw if str(author).strip()]
+    return []
+
+
+def _search_terms_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """One-off search terms submitted with a search request, if any."""
+    if "inferred_title" not in payload and "inferred_authors" not in payload:
+        return None
+    title = payload.get("inferred_title")
+    return {
+        "title": title.strip() if isinstance(title, str) else "",
+        "authors": _split_authors(payload.get("inferred_authors")),
+    }
+
+
+def _form_search_terms(task: ReviewTask, searches: list[Any]) -> dict[str, Any]:
+    """Terms to show in the refine form: the newer of the saved terms and the terms of
+    the latest search a reviewer ran, so the form never jumps back after a search."""
+    saved = {"title": task.inferred_title, "authors": list(task.inferred_authors or [])}
+    latest_manual = next(
+        (
+            search
+            for search in searches
+            if search.requested_by_id is not None
+            and search.trigger in {"review", "scan"}
+            and (
+                task.search_terms_saved_at is None or search.started_at > task.search_terms_saved_at
+            )
+        ),
+        None,
+    )
+    if latest_manual is None:
+        return {**saved, "source": "saved", "saved": saved}
+    query = latest_manual.query if isinstance(latest_manual.query, dict) else {}
+    hints = query.get("title_hints") or []
+    shown = {
+        "title": hints[0] if hints else "",
+        "authors": [a for a in query.get("author_hints") or [] if isinstance(a, str)],
+    }
+    return {**shown, "source": "search", "saved": saved, "differs": shown != saved}
 
 
 def _apply_search_terms(task: ReviewTask, payload: dict[str, Any]) -> list[str]:
@@ -3344,6 +3446,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
 
     tasks = ReviewTask.objects.select_related(
         "import_job",
+        "import_job__source_location",
         "import_job__uploader",
         "scan_job",
         "scan_job__operator",
@@ -3381,7 +3484,13 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     try:
-        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related(
+            "import_job",
+            "import_job__source_location",
+            "import_job__storage_location",
+            "import_job__uploader",
+            "scan_job",
+        ).get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
@@ -3394,6 +3503,10 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     searches = metadata_search.searches_for_task(task)
     active_job = _active_search_job(task)
     providers = identification.configured_providers()
+    source_info = _review_source_info(task)
+    form_terms = _form_search_terms(task, searches)
+    payload["source"] = source_info
+    payload["search_terms"] = form_terms
     payload["searches"] = [metadata_search.serialize_search(search) for search in searches]
     payload["configured_providers"] = providers
     payload["active_search"] = (
@@ -3418,6 +3531,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "active_search_job": active_job,
                 "searching": searching,
                 "configured_providers": providers,
+                "source": source_info,
+                "form_terms": form_terms,
                 "status_labels": metadata_search.STATUS_LABELS,
                 "books": Book.objects.order_by("title")[:250],
             },
@@ -3604,14 +3719,15 @@ def review_search_again(
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
 
-    # The refine form submits its fields with the search, so edited terms are kept.
-    term_fields = _apply_search_terms(task, payload)
+    # Terms submitted with the search are used for this search only; saving them is
+    # the separate "Save terms" action. Without submitted terms the saved ones are used.
+    terms = _search_terms_from_payload(payload)
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
     task.decision_notes = str(payload.get("notes", ""))
     task.decided_at = timezone.now()
-    task.decision_payload = {"search_again": True}
+    task.decision_payload = {"search_again": True, "terms": terms}
     task.save(
         update_fields=[
             "state",
@@ -3621,7 +3737,6 @@ def review_search_again(
             "reviewer_id",
             "decided_at",
             "updated_at",
-            *term_fields,
         ],
     )
     try:
@@ -3629,18 +3744,23 @@ def review_search_again(
             scan_job = task.scan_job
             if scan_job is None:
                 raise scan_identification.ScanIdentificationError("scan job is unavailable")
-            scan_job.provisional_title = task.inferred_title
-            scan_job.provisional_authors = task.inferred_authors
-            scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
+            if terms is None:
+                scan_job.provisional_title = task.inferred_title
+                scan_job.provisional_authors = task.inferred_authors
+                scan_job.save(
+                    update_fields=["provisional_title", "provisional_authors", "updated_at"]
+                )
             processing_job = scan_identification.request_scan_identification(
                 scan_job=scan_job,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = scan_identification.job_payload(processing_job)
         else:
             processing_job = review_identification.request_review_identification(
                 review_task=task,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = review_identification.job_payload(processing_job)
     except (
@@ -3711,6 +3831,7 @@ def review_edit_search_terms(
         return HttpResponseForbidden()
 
     _apply_search_terms(task, payload)
+    task.search_terms_saved_at = timezone.now()
 
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS
@@ -3724,6 +3845,7 @@ def review_edit_search_terms(
             "decision_notes",
             "inferred_title",
             "inferred_authors",
+            "search_terms_saved_at",
             "reviewer_id",
             "decided_at",
             "updated_at",

@@ -45,13 +45,33 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
     }
 
 
-def _signals(scan_job: ScanJob) -> identification.IdentificationInput:
-    authors = [
-        str(author).strip()
-        for author in scan_job.provisional_authors
-        if isinstance(author, str) and author.strip()
-    ]
-    title = scan_job.provisional_title.strip()
+def _one_off_terms(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    title = raw.get("title")
+    authors = raw.get("authors")
+    return {
+        "title": title.strip() if isinstance(title, str) else "",
+        "authors": [str(a).strip() for a in authors if isinstance(a, str) and a.strip()]
+        if isinstance(authors, list)
+        else [],
+    }
+
+
+def _signals(
+    scan_job: ScanJob, terms: dict[str, Any] | None = None
+) -> identification.IdentificationInput:
+    one_off = _one_off_terms(terms)
+    if one_off is not None:
+        authors = list(one_off["authors"])
+        title = str(one_off["title"])
+    else:
+        authors = [
+            str(author).strip()
+            for author in scan_job.provisional_authors
+            if isinstance(author, str) and author.strip()
+        ]
+        title = scan_job.provisional_title.strip()
     return identification.IdentificationInput(
         title_hints=[title] if title else [],
         author_hints=authors,
@@ -160,13 +180,24 @@ def request_scan_identification(
     *,
     scan_job: ScanJob,
     requested_by_user_id: int | None,
+    terms: dict[str, Any] | None = None,
 ) -> ProcessingJob:
-    """Persist and dispatch metadata lookup outside the request process."""
+    """Persist and dispatch metadata lookup outside the request process.
+
+    ``terms`` ({"title", "authors"}) search once with other terms than the scan's
+    saved provisional title/authors, without changing them.
+    """
     if scan_job.book_id is not None:
         raise ScanIdentificationError("scan job is already linked to a book")
     if scan_job.state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
         raise ScanIdentificationError("scan job is not open for identification")
-    if not scan_job.provisional_title.strip() and not scan_job.provisional_authors:
+    one_off = _one_off_terms(terms)
+    has_terms = (
+        bool(one_off["title"] or one_off["authors"])
+        if one_off is not None
+        else bool(scan_job.provisional_title.strip() or scan_job.provisional_authors)
+    )
+    if not has_terms:
         raise ScanIdentificationError("a provisional title or author is required")
 
     with transaction.atomic():
@@ -187,6 +218,7 @@ def request_scan_identification(
             details={
                 "scan_job_id": str(locked.id),
                 "requested_by_user_id": requested_by_user_id,
+                "search_terms": one_off,
                 "attempt_count": 0,
                 "candidate_count": 0,
                 "error": "",
@@ -249,7 +281,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         scan_job = ScanJob.objects.select_related("operator").get(pk=details["scan_job_id"])
         if scan_job.book_id is not None:
             raise ScanIdentificationError("scan job is already linked to a book")
-        signals = _signals(scan_job)
+        signals = _signals(scan_job, details.get("search_terms"))
         search = metadata_search.start_search(
             trigger=MetadataSearch.Trigger.SCAN,
             signals=signals,

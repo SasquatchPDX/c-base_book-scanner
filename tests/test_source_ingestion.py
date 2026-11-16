@@ -232,6 +232,8 @@ def test_failed_source_import_leaves_file_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Keep the test offline: no real metadata provider requests.
+    monkeypatch.setattr("ebook_server.core.identification._provider_instances", lambda: [])
     source_root = tmp_path / "incoming-fail"
     source_root.mkdir()
     source_file = source_root / "book.pdf"

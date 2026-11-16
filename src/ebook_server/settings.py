@@ -63,9 +63,14 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
     metrics_bearer_token: SecretStr = SecretStr("")
     max_upload_bytes: int = 150 * 1024 * 1024
+    # Every listed provider is asked for each identification; candidates are merged.
+    # Also available: "ebook_server.core.metadata_providers.GoogleBooksMetadataProvider"
+    # (needs google_books_api_key).
     metadata_providers: list[str] = [
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
+        "ebook_server.core.metadata_providers.DnbMetadataProvider",
     ]
+    google_books_api_key: SecretStr = SecretStr("")
     metadata_user_agent: str = DEFAULT_METADATA_USER_AGENT
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
@@ -254,6 +259,7 @@ BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
 BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
+BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_value()
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url

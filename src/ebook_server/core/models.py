@@ -1022,6 +1022,17 @@ class MetadataCandidate(models.Model):
         source_id = self.import_job_id or self.scan_job_id
         return f"{source_id}:{self.provider_id}:{self.provider_ref}:{self.score}"
 
+    @property
+    def record_url(self) -> str:
+        """Link to the candidate's record at its provider, when known."""
+        raw = self.raw_payload if isinstance(self.raw_payload, dict) else {}
+        url = raw.get("_record_url")
+        if isinstance(url, str) and url.startswith("https://"):
+            return url
+        if self.provider_id == "openlibrary" and self.provider_ref.startswith("/"):
+            return f"https://openlibrary.org{self.provider_ref}"
+        return ""
+
 
 class ReviewTask(models.Model):
     """Reusable workflow task for manual human resolution."""
@@ -1098,6 +1109,9 @@ class ReviewTask(models.Model):
     )
     inferred_title = models.CharField(max_length=255, blank=True)
     inferred_authors = models.JSONField(default=list, blank=True)
+    # When a reviewer last saved inferred_title/inferred_authors ("Save terms").
+    # A later search with other, unsaved terms is shown in the form instead.
+    search_terms_saved_at = models.DateTimeField(null=True, blank=True)
     embedded_metadata = models.JSONField(default=dict, blank=True)
     provider_snapshot = models.JSONField(default=dict, blank=True)
     decision = models.CharField(

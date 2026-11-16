@@ -390,11 +390,11 @@ def build_identification_input(
     )
 
 
-class OpenLibraryMetadataProvider:
-    """Public Open Library metadata provider (primary external source)."""
+class HttpMetadataProvider:
+    """Shared HTTP plumbing for providers: request log, error reporting, 429 retry."""
 
-    provider_id = "openlibrary"
-    label = "Open Library"
+    provider_id = "http"
+    label = "HTTP provider"
 
     def __init__(self) -> None:
         # Per-run log of the requests made, read by resolve_candidates_with_report.
@@ -405,6 +405,44 @@ class OpenLibraryMetadataProvider:
         if error:
             entry["error"] = error
         self.request_log.append(entry)
+
+    def _request_failed(self, request: str, operation: str, exc: BaseException) -> NoReturn:
+        reason = describe_request_error(exc)
+        logger.warning(
+            "metadata_provider_request_failed",
+            provider_id=self.provider_id,
+            operation=operation,
+            error_type=type(exc).__name__,
+        )
+        self._log(request, PROVIDER_STATUS_ERROR, error=reason)
+        raise ProviderRequestError(f"{self.label}: {reason}") from exc
+
+    def _get_bytes(self, url: str) -> bytes:
+        user_agent = str(
+            getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
+        )
+        for attempt in range(2):
+            request = Request(url, headers={"User-Agent": user_agent})
+            try:
+                with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                    if response.status >= 400:
+                        raise URLError(f"provider error {response.status}")
+                    return bytes(response.read())
+            except HTTPError as exc:
+                if exc.code != 429 or attempt == 1:
+                    raise
+                time.sleep(_retry_after_seconds(exc))
+        raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
+
+    def _get_json(self, url: str) -> Any:
+        return json.loads(self._get_bytes(url).decode("utf-8"))
+
+
+class OpenLibraryMetadataProvider(HttpMetadataProvider):
+    """Public Open Library metadata provider (primary external source)."""
+
+    provider_id = "openlibrary"
+    label = "Open Library"
 
     def search(
         self,
@@ -454,6 +492,8 @@ class OpenLibraryMetadataProvider:
         self._log(request, PROVIDER_STATUS_RESULTS, count=1)
         payload = dict(payload)
         payload["_queried_isbn"] = isbn
+        if isinstance(payload.get("key"), str):
+            payload["_record_url"] = f"https://openlibrary.org{payload['key']}"
         names = self._resolve_author_names(payload)
         if names:
             payload["author_name"] = names
@@ -496,41 +536,16 @@ class OpenLibraryMetadataProvider:
         except (OSError, ValueError) as exc:
             self._request_failed(request, "search", exc)
         docs = payload.get("docs", []) if isinstance(payload, dict) else []
-        docs = docs if isinstance(docs, list) else []
+        docs = [doc for doc in docs if isinstance(doc, dict)] if isinstance(docs, list) else []
+        for doc in docs:
+            if isinstance(doc.get("key"), str):
+                doc["_record_url"] = f"https://openlibrary.org{doc['key']}"
         self._log(
             request,
             PROVIDER_STATUS_RESULTS if docs else PROVIDER_STATUS_NO_RESULTS,
             count=len(docs),
         )
         return docs
-
-    def _request_failed(self, request: str, operation: str, exc: BaseException) -> NoReturn:
-        reason = describe_request_error(exc)
-        logger.warning(
-            "metadata_provider_request_failed",
-            provider_id=self.provider_id,
-            operation=operation,
-            error_type=type(exc).__name__,
-        )
-        self._log(request, PROVIDER_STATUS_ERROR, error=reason)
-        raise ProviderRequestError(f"{self.label}: {reason}") from exc
-
-    def _get_json(self, url: str) -> Any:
-        user_agent = str(
-            getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
-        )
-        for attempt in range(2):
-            request = Request(url, headers={"User-Agent": user_agent})
-            try:
-                with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                    if response.status >= 400:
-                        raise URLError(f"provider error {response.status}")
-                    return json.loads(response.read().decode("utf-8"))
-            except HTTPError as exc:
-                if exc.code != 429 or attempt == 1:
-                    raise
-                time.sleep(_retry_after_seconds(exc))
-        raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
 
 
 def _retry_after_seconds(error: HTTPError) -> float:
@@ -575,7 +590,9 @@ def _provider_load_errors() -> list[tuple[str, str]]:
     for provider_ref in _configured_provider_refs():
         try:
             _load_provider(provider_ref)
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        except ValueError as exc:  # provider-reported configuration problem
+            errors.append((provider_ref, str(exc)))
+        except (ImportError, AttributeError, TypeError) as exc:
             errors.append((provider_ref, f"{type(exc).__name__}: {exc}"))
     return errors
 

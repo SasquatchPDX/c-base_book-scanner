@@ -757,6 +757,8 @@ def test_storage_failure_keeps_source_recoverable(
     client.force_login(profile.user)
 
     monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: FailingStorage())
+    # Keep the test offline: no real metadata provider requests.
+    monkeypatch.setattr("ebook_server.core.identification._provider_instances", lambda: [])
 
     response = client.post(
         "/imports/upload/",
