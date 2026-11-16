@@ -32,6 +32,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Evidence key for title/author hints read from the first lines of plain-text books
+# (see core.text_header); written by intake, read when building signals.
+TEXT_HEADER_EVIDENCE_KEY = "text_header"
 
 
 class MetadataProvider(Protocol):
@@ -204,9 +207,20 @@ def build_identification_input(
     if isinstance(metadata_title, str) and normalize_text(metadata_title):
         title_hints = [metadata_title] + filename_title_hints
     else:
-        title_hints = filename_title_hints
+        title_hints = list(filename_title_hints)
 
-    author_hints = filename_author_hints
+    author_hints = list(filename_author_hints)
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    if isinstance(header, dict):
+        header_title = header.get("title")
+        if isinstance(header_title, str) and header_title.strip():
+            title_hints.insert(1 if title_hints else 0, header_title.strip())
+        header_authors = [
+            a.strip() for a in header.get("authors") or [] if isinstance(a, str) and a.strip()
+        ]
+        if header_authors:
+            # Authors named in the text itself beat the "A - B" filename split guesses.
+            author_hints = header_authors
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:
