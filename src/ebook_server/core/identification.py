@@ -167,28 +167,156 @@ def normalize_text(value: str | None) -> str:
     return " ".join(value.lower().strip().split())
 
 
+_NAME_TOKEN = re.compile(r"^(?:(?:[A-Z]\.){1,4}|[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*\.?)$")
+_NAME_PARTICLES = {"von", "van", "de", "der", "den", "da", "di", "du", "la", "le", "del", "zu", "y"}
+_NOT_NAME_WORDS = {
+    "the",
+    "a",
+    "an",
+    "of",
+    "and",
+    "or",
+    "in",
+    "on",
+    "to",
+    "for",
+    "with",
+    "by",
+    "der",
+    "die",
+    "das",
+    "und",
+    "ein",
+    "eine",
+    "unknown",
+    "anonymous",
+    "various",
+    "volume",
+    "vol",
+    "book",
+    "part",
+    "series",
+    "edition",
+}
+# "Title, The/A/An/Der/Die/Das" -> "The/A/An/Der/Die/Das Title" (library sorting convention).
+_INVERTED_ARTICLE = re.compile(r"^(.*),\s*(The|A|An|Der|Die|Das)$", re.IGNORECASE)
+_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
+_FILENAME_SEPARATOR = re.compile(r"\s+-\s+|--")
+
+
+def _name_like(value: str) -> bool:
+    """2-5 capitalised name tokens (particles/initials allowed), no digits or stray words.
+
+    Deliberately permissive (and therefore also matches some short title-case phrases) -
+    callers decide where in a split it's safe to treat a match as an author.
+    """
+    tokens = value.split()
+    if not 2 <= len(tokens) <= 5 or any(ch.isdigit() for ch in value):
+        return False
+    for token in tokens:
+        if re.fullmatch(r"(?:[A-Z]\.){1,4}", token):
+            continue  # initials such as "A." or "H.P."
+        bare = token.lower().strip(".")
+        if bare in _NAME_PARTICLES:
+            continue
+        if bare in _NOT_NAME_WORDS or not _NAME_TOKEN.match(token):
+            return False
+    return any(len(token.strip(".")) >= 3 for token in tokens)
+
+
+def _looks_like_last_first(value: str) -> str | None:
+    """ "Corey, James S. A." -> "James S. A. Corey" if that reads as a plausible name."""
+    if value.count(",") != 1:
+        return None
+    last, first = (part.strip() for part in value.split(","))
+    if not (last and first):
+        return None
+    candidate = f"{first} {last}"
+    return candidate if _name_like(candidate) else None
+
+
+_AUTHOR_LIST_SEPARATOR = re.compile(r"\s*(?:&|;|\band\b|\bund\b)\s*", re.IGNORECASE)
+
+
+def _author_group_like(value: str) -> bool:
+    """Like `_name_like`, but also accepts "David Weber & Linda Evans" (co-authors)."""
+    parts = [p.strip() for p in _AUTHOR_LIST_SEPARATOR.split(value) if p.strip()]
+    return bool(parts) and all(_name_like(p) or _looks_like_last_first(p) for p in parts)
+
+
+def _pick_author_segment(segments: list[str]) -> tuple[str | None, list[str]]:
+    """Find a plausible author at either end of a filename split; keep the rest as title.
+
+    "Title - Author" (author last) is the dominant convention in practice and is checked
+    first; "Author - Title" is also common enough to support as a fallback. A segment in
+    the *middle* of a 3+-part split is never treated as an author on its own - only the
+    outermost ends are, since that is where this convention actually puts one.
+    """
+    if len(segments) < 2:
+        return None, segments
+    last = segments[-1]
+    if _looks_like_last_first(last) or _author_group_like(last):
+        return _looks_like_last_first(last) or last, segments[:-1]
+    first = segments[0]
+    if _looks_like_last_first(first) or _author_group_like(first):
+        return _looks_like_last_first(first) or first, segments[1:]
+    return None, segments
+
+
+def _title_variants(title: str) -> list[str]:
+    """Cheap, safe normalisations of one title guess, as extra hints (never a replacement)."""
+    variants = [title]
+    inverted = _INVERTED_ARTICLE.match(title)
+    if inverted:
+        variants.append(f"{inverted.group(2)} {inverted.group(1)}".strip())
+    stripped = _TRAILING_PAREN.sub("", title).strip()
+    if stripped and stripped != title:
+        variants.append(stripped)
+        inverted_stripped = _INVERTED_ARTICLE.match(stripped)
+        if inverted_stripped:
+            variants.append(f"{inverted_stripped.group(2)} {inverted_stripped.group(1)}".strip())
+    return list(dict.fromkeys(v for v in variants if v))
+
+
 def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
-    """Return title and author candidates from filename patterns."""
+    """Return title and author candidates from filename patterns.
+
+    Handles the common "Title - Author" and "Author - Title" conventions (picking
+    whichever end of the split looks name-shaped, rather than guessing both ways at
+    once), "Series NN - Title - Author" (the series/volume prefix is dropped from the
+    *primary* title guess - live-testing against Open Library showed it isn't just a
+    lower score, it can make a provider's search return nothing at all), and library
+    sorting's inverted-article titles ("Title, The" -> "The Title").
+    """
     stem = Path(raw_filename).stem
     if not stem:
         return [], []
+    normalized = " ".join(stem.replace("_", " ").split())
+    if not normalized:
+        return [], []
 
-    normalized = stem.replace("_", " ")
-    title_hints = [normalized]
-    author_hints: list[str] = []
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(normalized) if s.strip()] or [
+        normalized,
+    ]
+    author, title_segments = (
+        _pick_author_segment(segments) if len(segments) >= 2 else (None, segments)
+    )
+    author_hints = [author] if author else []
 
-    for sep in [" - ", " -", "- ", "--"]:
-        if sep in normalized:
-            left, right = normalized.split(sep, 1)
-            left = left.strip()
-            right = right.strip()
-            if left and right:
-                title_hints.extend([left, right])
-                author_hints.extend([left, right])
-            break
+    if author and len(title_segments) >= 2:
+        primary_title, fallback_title = title_segments[-1], " - ".join(title_segments)
+    else:
+        primary_title, fallback_title = " - ".join(title_segments), None
 
-    return list(dict.fromkeys([x for x in title_hints if x])), list(
-        dict.fromkeys([x for x in author_hints if x]),
+    title_hints = _title_variants(primary_title)
+    if fallback_title:
+        title_hints += [v for v in _title_variants(fallback_title) if v not in title_hints]
+    if normalized not in title_hints:
+        title_hints.append(normalized)
+
+    return (
+        list(dict.fromkeys(h for h in title_hints if h)),
+        list(dict.fromkeys(author_hints)),
     )
 
 
@@ -201,7 +329,13 @@ def build_identification_input(
     filename_title_hints, filename_author_hints = parse_filename_signals(original_filename)
 
     metadata_title = extracted_metadata.get("title")
-    if isinstance(metadata_title, str) and normalize_text(metadata_title):
+    # A format extractor with nothing real to say falls back to the raw filename stem as
+    # "title" (see intake.extract_metadata). That's not an actual signal beyond what the
+    # filename parsing above already produced, better, so don't let it jump the queue.
+    is_stem_fallback = isinstance(metadata_title, str) and normalize_text(
+        metadata_title,
+    ) == normalize_text(Path(original_filename).stem)
+    if isinstance(metadata_title, str) and normalize_text(metadata_title) and not is_stem_fallback:
         title_hints = [metadata_title] + filename_title_hints
     else:
         title_hints = filename_title_hints
