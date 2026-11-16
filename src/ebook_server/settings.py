@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _package_version
 from pathlib import Path
@@ -17,6 +18,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 django_stubs_ext.monkeypatch()
+
+if os.environ.get("PYTEST_VERSION"):
+    # A deployment `.env` in the working directory (env_file below) must never point the
+    # test suite at the deployment's own PostgreSQL role or LDAP mode. PYTEST_VERSION is
+    # set by pytest itself before this module is ever imported, and os.environ outranks
+    # `.env` in pydantic-settings' source precedence, so this always wins.
+    os.environ.setdefault("BOOK_SCANNER_DATABASE_URL", "")
+    os.environ.setdefault("BOOK_SCANNER_REDIS_URL", "")
+    os.environ.setdefault("BOOK_SCANNER_LDAP_MODE", "stub")
 try:
     _APP_VERSION = _package_version("ebook-server")
 except PackageNotFoundError:  # pragma: no cover - running from a bare checkout
