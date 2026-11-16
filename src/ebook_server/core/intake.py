@@ -514,22 +514,31 @@ def extract_metadata(
 ) -> dict[str, Any]:
     try:
         if detected_format == "pdf":
-            return _extract_pdf_metadata(file_path, original_filename=original_filename)
-        if detected_format == "epub":
-            return _extract_epub_metadata(file_path, original_filename=original_filename)
-        if detected_format == "txt":
-            return _extract_text_metadata(file_path, original_filename=original_filename)
-        if detected_format == "html":
-            return _extract_html_metadata(file_path, original_filename=original_filename)
-        if detected_format == "fb2":
-            return _extract_fb2_metadata(file_path, original_filename=original_filename)
-        if detected_format == "cbz":
-            return _extract_cbz_metadata(file_path, original_filename=original_filename)
+            metadata = _extract_pdf_metadata(file_path, original_filename=original_filename)
+        elif detected_format == "epub":
+            metadata = _extract_epub_metadata(file_path, original_filename=original_filename)
+        elif detected_format == "txt":
+            metadata = _extract_text_metadata(file_path, original_filename=original_filename)
+        elif detected_format == "html":
+            metadata = _extract_html_metadata(file_path, original_filename=original_filename)
+        elif detected_format == "fb2":
+            metadata = _extract_fb2_metadata(file_path, original_filename=original_filename)
+        elif detected_format == "cbz":
+            metadata = _extract_cbz_metadata(file_path, original_filename=original_filename)
+        else:
+            metadata = {"title": Path(original_filename).stem}
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
-        return {"title": Path(original_filename).stem}
-    return {"title": Path(original_filename).stem}
+        metadata = {"title": Path(original_filename).stem}
+
+    # A Calibre-style metadata.opf next to the file is curated by whatever tool built
+    # the library, so it outranks this one file's own (possibly sparse or placeholder)
+    # embedded metadata wherever it has an opinion.
+    sidecar = _extract_opf_sidecar_metadata(file_path)
+    if sidecar:
+        metadata.update({key: value for key, value in sidecar.items() if value})
+    return metadata
 
 
 def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
@@ -760,6 +769,67 @@ def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
         if identification.normalize_isbns(text):
             return text
     return texts[0][1]
+
+
+def _find_sidecar_opf(source_path: str) -> Path | None:
+    """Return a Calibre-style metadata.opf next to source_path, if one is there."""
+    try:
+        entries = list(Path(source_path).parent.iterdir())
+    except OSError:
+        return None
+    return next(
+        (entry for entry in entries if entry.is_file() and entry.name.lower() == "metadata.opf"),
+        None,
+    )
+
+
+def _extract_opf_sidecar_metadata(source_path: str) -> dict[str, Any] | None:
+    """Parse a sidecar metadata.opf next to source_path, if present.
+
+    Calibre (and similar tools) write one metadata.opf per book folder, shared by every
+    format in that folder. Same OPF/Dublin-Core shape as an EPUB's internal metadata, so
+    this reuses _find_text_any/_pick_epub_identifier, but dc:creator needs to be read as
+    a list here: an OPF commonly lists several contributors, tagged with an opf:role
+    attribute, and only the "aut" (author) role should count as an author.
+    """
+    opf_path = _find_sidecar_opf(source_path)
+    if opf_path is None:
+        return None
+    try:
+        payload = _read_metadata_sample(opf_path)
+        opf_root = ET.fromstring(payload)
+    except (ValidationError, ET.ParseError, OSError):
+        return None
+
+    authors: list[str] = []
+    for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}creator"):
+        role = next(
+            (value for key, value in element.attrib.items() if _xml_local_name(key) == "role"),
+            "",
+        )
+        if role and role.lower() != "aut":
+            continue
+        name = "".join(element.itertext()).strip()
+        if name and name not in authors:
+            authors.append(name)
+
+    identifier = _pick_epub_identifier(
+        [
+            (element.attrib, "".join(element.itertext()).strip())
+            for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}identifier")
+        ],
+    )
+    return {
+        "title": _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title"),
+        "authors": authors,
+        "language": _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language"),
+        "description": _find_text_any(
+            opf_root,
+            ".//{http://purl.org/dc/elements/1.1/}description",
+        ),
+        "publisher": _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher"),
+        "identifier": identifier,
+    }
 
 
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
