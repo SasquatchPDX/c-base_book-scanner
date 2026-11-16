@@ -100,7 +100,7 @@ def test_isbn_lookup_resolves_authors_publisher_and_keeps_queried_isbn() -> None
     top = candidates[0]
     assert top.isbn10 == "0340960191"
     assert top.authors == ["Frank Herbert"]
-    assert top.publisher == "ace books"
+    assert top.publisher == "Ace Books"
     assert top.publication_year == 1990
     assert top.score >= 0.95
     assert sum("/isbn/" in url for url in seen) == 1

@@ -9,6 +9,7 @@ from typing import ClassVar, Final
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.timezone import now
 
@@ -111,6 +112,18 @@ class StorageLocation(models.Model):
         return self.identifier
 
 
+MAX_PUBLICATION_YEAR = 9999
+
+
+def clean_publication_year(value: object) -> int | None:
+    """Return a plausible publication year or ``None``."""
+    try:
+        year = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    return year if 1 <= year <= MAX_PUBLICATION_YEAR else None
+
+
 class SourceLocation(models.Model):
     """Configured input source for ingestion workflows."""
 
@@ -193,7 +206,12 @@ class Book(models.Model):
     title = models.CharField(max_length=255)
     subtitle = models.CharField(max_length=512, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
-    publication_date = models.DateField(null=True, blank=True)
+    # Year only: providers give a (first-)publication year, never a reliable full date.
+    publication_year = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(MAX_PUBLICATION_YEAR)],
+    )
     edition = models.CharField(max_length=128, blank=True)
     language = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)

@@ -35,7 +35,7 @@ class AppUserProfileAdmin(admin.ModelAdmin[AppUserProfile]):
 
 @admin.register(Book)
 class BookAdmin(admin.ModelAdmin[Book]):
-    list_display = ("title", "publisher", "publication_date")
+    list_display = ("title", "publisher", "publication_year")
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories", "genres")
 

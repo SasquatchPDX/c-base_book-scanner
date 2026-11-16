@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import posixpath
 import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -37,6 +38,7 @@ from ebook_server.storage import (
 )
 
 from . import identification, source_layout
+from .languages import detect_language, normalize_language
 from .models import (
     Author,
     Book,
@@ -47,6 +49,7 @@ from .models import (
     ReviewTask,
     SourceLocation,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import backend_for_location
 
@@ -537,14 +540,31 @@ def extract_metadata(
     return {"title": Path(original_filename).stem}
 
 
+def _detected_language_evidence(text: str) -> dict[str, Any] | None:
+    """Language detected from running text, recorded separately from declared metadata."""
+    try:
+        detected = detect_language(text)
+    except Exception:  # detection is an optional signal and must never fail intake
+        logger.warning("language_detection_failed")
+        return None
+    if detected is None:
+        return None
+    code, probability = detected
+    return {"code": code, "probability": round(probability, 4), "tool": "py3langid"}
+
+
 def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     payload = _read_metadata_sample(Path(file_path))
-    _text, encoding = _decode_text_sample(payload)
-    return {
+    text, encoding = _decode_text_sample(payload)
+    metadata: dict[str, Any] = {
         "title": Path(original_filename).stem,
         "raw_metadata": {"encoding": encoding},
         "container_type": "txt",
     }
+    detected = _detected_language_evidence(text)
+    if detected is not None:
+        metadata["detected_language"] = detected
+    return metadata
 
 
 def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
@@ -565,10 +585,20 @@ def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[st
     if title is None and soup.title is not None:
         title = soup.title.get_text(" ", strip=True) or None
     author = meta_content("author", "dc.creator", "dcterms.creator")
+    declared_language = meta_content("language", "dc.language")
+    if declared_language is None and soup.html is not None:
+        lang_attr = soup.html.get("lang")
+        declared_language = lang_attr.strip() if isinstance(lang_attr, str) else None
+    detected = (
+        None
+        if normalize_language(declared_language)
+        else _detected_language_evidence(soup.get_text(" ", strip=True))
+    )
     return {
+        **({"detected_language": detected} if detected else {}),
         "title": title or Path(original_filename).stem,
         "authors": [author] if author else [],
-        "language": meta_content("language", "dc.language"),
+        "language": declared_language,
         "description": meta_content("description", "og:description", "dc.description"),
         "identifier": meta_content("isbn", "dc.identifier", "dcterms.identifier"),
         "publisher": meta_content("publisher", "dc.publisher"),
@@ -728,6 +758,14 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
+        year_match = re.search(r"\b(1[5-9][0-9]{2}|20[0-9]{2})\b", raw_date or "")
+        detected = None
+        if normalize_language(language) is None:
+            detected = _detected_language_evidence(
+                _epub_text_sample(archive, opf_root, opf_path),
+            )
         identifier = _pick_epub_identifier(
             [
                 (element.attrib, "".join(element.itertext()).strip())
@@ -740,11 +778,50 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "language": language,
             "description": description,
             "identifier": identifier,
+            "publisher": publisher,
+            "publication_year": int(year_match.group(1)) if year_match else None,
+            **({"detected_language": detected} if detected else {}),
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },
             "container_type": "epub",
         }
+
+
+EPUB_LANGUAGE_SAMPLE_DOCUMENTS = 12
+EPUB_LANGUAGE_SAMPLE_CHARS = 20_000
+
+
+def _epub_text_sample(archive: ZipFile, opf_root: Any, opf_path: str) -> str:
+    """Bounded text sample from the first spine documents (for language detection)."""
+    opf_ns = "{http://www.idpf.org/2007/opf}"
+    manifest = {
+        item.attrib.get("id"): item.attrib.get("href")
+        for item in opf_root.iterfind(f".//{opf_ns}manifest/{opf_ns}item")
+        if "html" in str(item.attrib.get("media-type", ""))
+    }
+    base = PurePosixPath(opf_path).parent
+    chunks: list[str] = []
+    total = 0
+    spine = list(opf_root.iterfind(f".//{opf_ns}spine/{opf_ns}itemref"))
+    for itemref in spine[:EPUB_LANGUAGE_SAMPLE_DOCUMENTS]:
+        href = manifest.get(itemref.attrib.get("idref"))
+        if not isinstance(href, str) or not href:
+            continue
+        relative = unquote(href.split("#", 1)[0])
+        member = posixpath.normpath(posixpath.join("" if str(base) == "." else str(base), relative))
+        if member.startswith(("../", "/")) or member == "..":
+            continue
+        try:
+            payload = _read_epub_metadata_member(archive, member)
+        except (KeyError, ValidationError):
+            continue
+        text = BeautifulSoup(payload, "html.parser").get_text(" ", strip=True)
+        chunks.append(text)
+        total += len(text)
+        if total >= EPUB_LANGUAGE_SAMPLE_CHARS:
+            break
+    return " ".join(chunks)[:EPUB_LANGUAGE_SAMPLE_CHARS]
 
 
 def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
@@ -992,11 +1069,9 @@ def _provision_book_from_manual_metadata(
         description=description or "",
         edition=_fit(Book, "edition", edition),
     )
-    if publication_year:
-        try:
-            book.publication_date = date(publication_year, 1, 1)
-        except ValueError:
-            pass
+    year = clean_publication_year(publication_year)
+    if year is not None:
+        book.publication_year = year
     for raw_author in authors or []:
         author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
@@ -1136,11 +1211,9 @@ def _provision_book_from_metadata(
             book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
-        if candidate.publication_year:
-            try:
-                book.publication_date = date(candidate.publication_year, 1, 1)
-            except ValueError:
-                pass
+        year = clean_publication_year(candidate.publication_year)
+        if year is not None:
+            book.publication_year = year
         book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book

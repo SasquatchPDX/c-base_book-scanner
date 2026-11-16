@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
+import inspect
 import json
 import re
 import time
@@ -18,6 +20,8 @@ import structlog
 from django.conf import settings as django_settings
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import token_set_ratio
+
+from .languages import normalize_language, normalize_languages
 
 logger = structlog.get_logger(__name__)
 
@@ -36,6 +40,56 @@ REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.
 # (see core.source_layout); written by intake, read when building signals.
 PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
 
+# Open Library search returns a reduced field set unless fields are requested.
+# Work-level ISBN/publisher lists span all editions; "editions" adds the single
+# edition that best matches the query (biased by the ``lang`` parameter).
+OPENLIBRARY_SEARCH_FIELDS = ",".join(
+    [
+        "key",
+        "title",
+        "subtitle",
+        "author_name",
+        "first_publish_year",
+        "language",
+        "isbn",
+        "publisher",
+        "edition_count",
+        "cover_i",
+        "editions",
+        "editions.key",
+        "editions.title",
+        "editions.language",
+        "editions.publisher",
+        "editions.publish_date",
+        "editions.isbn",
+    ]
+)
+PUBLISHER_MATCH_RATIO = 90
+_PUBLISHER_NOISE = {
+    "books",
+    "book",
+    "publishing",
+    "publishers",
+    "publisher",
+    "press",
+    "group",
+    "inc",
+    "llc",
+    "ltd",
+    "limited",
+    "co",
+    "company",
+    "corp",
+    "verlag",
+    "gmbh",
+    "ag",
+    "the",
+    "and",
+    "&",
+    "media",
+    "brand",
+}
+
 
 class MetadataProvider(Protocol):
     """Minimal metadata-provider contract."""
@@ -50,7 +104,11 @@ class MetadataProvider(Protocol):
         isbn: str | None = None,
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return raw candidate dicts from external metadata source."""
+        """Return raw candidate dicts from external metadata source.
+
+        Providers may additionally accept a ``language`` keyword (normalised ISO
+        639-1/-3 code) to bias results; it is only passed when accepted.
+        """
 
 
 @dataclass(frozen=True)
@@ -85,6 +143,10 @@ class IdentificationCandidate:
     publication_year: int | None
     score: float
     raw: dict[str, Any]
+    # Comparison-only data: every language/publisher/ISBN-13 known for the work.
+    languages: tuple[str, ...] = ()
+    publishers: tuple[str, ...] = ()
+    work_isbns: tuple[str, ...] = ()
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -262,7 +324,7 @@ def build_identification_input(
         author_hints=author_hints,
         isbns=isbns,
         folder_hints=[h for h in folder_hints if h],
-        language=normalize_text(extracted_metadata.get("language")),
+        language=_signal_language(extracted_metadata),
         publisher=normalize_text(extracted_metadata.get("publisher")),
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
@@ -282,6 +344,7 @@ class OpenLibraryMetadataProvider:
         author: str | None = None,
         isbn: str | None = None,
         folder_hint: str | None = None,
+        language: str | None = None,
     ) -> list[dict[str, Any]]:
         if isbn:
             isbn_candidate = self._query_isbn(isbn)
@@ -295,7 +358,7 @@ class OpenLibraryMetadataProvider:
             query_parts = [folder_hint]
         if not query_parts:
             return []
-        return self._query_search(" ".join(query_parts))
+        return self._query_search(" ".join(query_parts), language=language)
 
     def _query_isbn(self, isbn: str) -> dict[str, Any] | None:
         url = f"https://openlibrary.org/isbn/{isbn}.json"
@@ -343,8 +406,11 @@ class OpenLibraryMetadataProvider:
                 names.append(name.strip())
         return names
 
-    def _query_search(self, query: str) -> list[dict[str, Any]]:
-        encoded = urlencode({"q": query, "limit": "5"})
+    def _query_search(self, query: str, *, language: str | None = None) -> list[dict[str, Any]]:
+        params = {"q": query, "limit": "5", "fields": OPENLIBRARY_SEARCH_FIELDS}
+        if language and len(language) == 2:
+            params["lang"] = language  # prefers editions in the file's language
+        encoded = urlencode(params)
         url = f"https://openlibrary.org/search.json?{encoded}"
         try:
             payload = self._get_json(url)
@@ -446,6 +512,9 @@ def _query_provider(
     isbn = signals.isbns[0] if signals.isbns else None
     author = signals.best_author()
     folder_hint = signals.folder_hints[0] if signals.folder_hints else None
+    extra: dict[str, Any] = {}
+    if signals.language and _accepts_keyword(provider.search, "language"):
+        extra["language"] = signals.language
 
     for title in signals.title_hints[:3]:
         hits = provider.search(
@@ -453,6 +522,7 @@ def _query_provider(
             author=author,
             isbn=isbn,
             folder_hint=folder_hint,
+            **extra,
         )
         if hits:
             return hits
@@ -467,7 +537,76 @@ def _query_provider(
         author=author,
         isbn=isbn,
         folder_hint=folder_hint,
+        **extra,
     )
+
+
+def _signal_language(extracted_metadata: dict[str, Any]) -> str | None:
+    """Declared language when usable, otherwise a language detected from the text."""
+    declared = normalize_language(_first_str(extracted_metadata.get("language")))
+    if declared:
+        return declared
+    detected = extracted_metadata.get("detected_language")
+    if isinstance(detected, dict):
+        return normalize_language(_first_str(detected.get("code")))
+    return None
+
+
+def _accepts_keyword(func: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _first_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return next((item for item in value if isinstance(item, str) and item.strip()), None)
+    return None
+
+
+def _best_edition(payload: dict[str, Any]) -> dict[str, Any]:
+    editions = payload.get("editions")
+    docs = editions.get("docs") if isinstance(editions, dict) else None
+    if isinstance(docs, list) and docs and isinstance(docs[0], dict):
+        return docs[0]
+    return {}
+
+
+def _isbn13_set(values: Any) -> set[str]:
+    result: set[str] = set()
+    for value in _as_str_list(values):
+        normalized = _normalize_identifier(value)
+        if normalized is None:
+            continue
+        result.add(_isbn10_to_isbn13(normalized) if len(normalized) == 10 else normalized)
+    return result
+
+
+def _publisher_tokens(value: str) -> set[str]:
+    tokens = set(re.findall(r"\w+", normalize_text(value)))
+    return tokens - _PUBLISHER_NOISE
+
+
+def _publisher_match(signal: str | None, candidates: tuple[str, ...]) -> bool:
+    if not signal:
+        return False
+    left = _publisher_tokens(signal)
+    if not left:
+        return False
+    for candidate in candidates:
+        right = _publisher_tokens(candidate)
+        if right and token_set_ratio(" ".join(sorted(left)), " ".join(sorted(right))) >= (
+            PUBLISHER_MATCH_RATIO
+        ):
+            return True
+    return False
 
 
 def _normalize_candidate(
@@ -524,12 +663,34 @@ def _normalize_candidate(
             if isbn10 is not None:
                 isbn10 = _normalize_identifier(isbn10)
 
-    publisher = None
-    raw_publisher = payload.get("publisher") or payload.get("publishers")
-    if isinstance(raw_publisher, list) and raw_publisher:
-        publisher = normalize_text(str(raw_publisher[0]))
-    elif isinstance(raw_publisher, str):
-        publisher = normalize_text(raw_publisher)
+    edition = _best_edition(payload)
+    if isbn10 is None and isbn13 is None and edition:
+        # Search hit: take the ISBNs of the best-matching edition, not of the work.
+        for value in _as_str_list(edition.get("isbn")):
+            normalized = _normalize_identifier(value)
+            if normalized is None:
+                continue
+            if len(normalized) == 13 and isbn13 is None:
+                isbn13 = normalized
+            elif len(normalized) == 10 and isbn10 is None:
+                isbn10 = normalized
+    work_isbns = (
+        _isbn13_set(payload.get("isbn"))
+        | _isbn13_set(payload.get("isbn_10"))
+        | _isbn13_set(payload.get("isbn_13"))
+        | _isbn13_set(edition.get("isbn"))
+    )
+
+    # Edition record ("publishers") or best edition of a search hit; the work-level
+    # "publisher" list spans all editions, so it is only used for comparison.
+    edition_publishers = _as_str_list(edition.get("publisher")) or _as_str_list(
+        payload.get("publishers")
+    )
+    work_publishers = _as_str_list(payload.get("publisher"))
+    publisher = next((p.strip() for p in edition_publishers if p.strip()), None)
+    publishers = tuple(
+        dict.fromkeys(p.strip() for p in edition_publishers + work_publishers if p.strip())
+    )
 
     publication_year = None
     raw_publish = payload.get("first_publish_year")
@@ -542,14 +703,19 @@ def _normalize_candidate(
     elif isinstance(raw_publish, str) and raw_publish.isdigit():
         publication_year = int(raw_publish)
 
-    language: str | None = None
-    raw_language = payload.get("language")
-    if isinstance(raw_language, str):
-        language = normalize_text(raw_language)
-    elif isinstance(raw_language, list) and raw_language:
-        first_language = raw_language[0]
-        if isinstance(first_language, str):
-            language = normalize_text(first_language)
+    # Edition languages first (edition record: [{"key": "/languages/eng"}]; search
+    # edition: ["eng"]), then every language the work is known in.
+    edition_languages = normalize_languages(edition.get("language")) or normalize_languages(
+        payload.get("languages")
+    )
+    work_languages = normalize_languages(payload.get("language"))
+    languages = tuple(dict.fromkeys(edition_languages + work_languages))
+    if edition_languages:
+        language: str | None = edition_languages[0]
+    elif signals.language and signals.language in work_languages:
+        language = signals.language
+    else:
+        language = work_languages[0] if work_languages else None
 
     candidate = IdentificationCandidate(
         provider_id=provider_id,
@@ -567,6 +733,9 @@ def _normalize_candidate(
         publication_year=publication_year,
         score=0.0,
         raw=payload,
+        languages=languages,
+        publishers=publishers,
+        work_isbns=tuple(sorted(work_isbns)),
     )
     return _apply_scoring(signals, candidate)
 
@@ -600,10 +769,11 @@ def _apply_scoring(
     score = 0.0
 
     if signals.isbns:
-        isbn_matches = {
-            value for value in signals.isbns if value in {candidate.isbn10, candidate.isbn13}
-        }
-        if isbn_matches:
+        signal_isbns = _isbn13_set(signals.isbns)
+        candidate_isbns = _isbn13_set([v for v in (candidate.isbn10, candidate.isbn13) if v]) | set(
+            candidate.work_isbns
+        )
+        if signal_isbns & candidate_isbns:
             score += 0.95
 
     title_scores = [
@@ -615,10 +785,17 @@ def _apply_scoring(
     author_score = _author_match_score(signals.author_hints, candidate.authors)
     score += 0.3 * author_score
 
-    if signals.language and candidate.language and signals.language == candidate.language:
-        score += 0.05
+    if signals.language:
+        candidate_languages = set(candidate.languages)
+        if candidate.language:
+            candidate_languages.add(normalize_language(candidate.language) or candidate.language)
+        if signals.language in candidate_languages:
+            score += 0.05
 
-    if signals.publisher and candidate.publisher and signals.publisher == candidate.publisher:
+    if _publisher_match(
+        signals.publisher,
+        candidate.publishers or ((candidate.publisher,) if candidate.publisher else ()),
+    ):
         score += 0.05
 
     if signals.description and candidate.description:
@@ -626,22 +803,7 @@ def _apply_scoring(
         if normalized_signal and normalized_signal in normalize_text(candidate.description):
             score += 0.05
 
-    normalized_candidate = IdentificationCandidate(
-        provider_id=candidate.provider_id,
-        provider_ref=candidate.provider_ref,
-        title=candidate.title,
-        authors=candidate.authors,
-        isbn10=candidate.isbn10,
-        isbn13=candidate.isbn13,
-        language=candidate.language,
-        description=candidate.description,
-        publisher=candidate.publisher,
-        edition=candidate.edition,
-        publication_year=candidate.publication_year,
-        score=min(score, 1.0),
-        raw=candidate.raw,
-    )
-    return normalized_candidate
+    return dataclasses.replace(candidate, score=min(score, 1.0))
 
 
 def best_candidate(
