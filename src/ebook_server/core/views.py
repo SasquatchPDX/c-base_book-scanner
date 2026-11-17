@@ -58,6 +58,7 @@ from ebook_server.storage import (
 
 from . import (
     book_deletion,
+    combine,
     conversion,
     genres,
     intake,
@@ -1291,6 +1292,11 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
     ),
+    "edition_conflict": (
+        "The best match scored high enough to be accepted automatically, but it "
+        "describes another edition than the file: its ISBN, language or publisher "
+        "does not match the file's own metadata."
+    ),
 }
 
 
@@ -1830,6 +1836,7 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
         {"kind": identifier.kind, "value": identifier.value}
         for identifier in book.identifiers.all()
     ]
+    payload["combine_options"] = combine.combine_options_for_book(book)
     if _wants_html(request):
         return render(
             request,
@@ -1840,6 +1847,7 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
                 "variants": payload.get("variants", []),
                 "identifiers": payload["identifiers"],
                 "conversion_options": payload.get("conversion_options", []),
+                "combine_options": payload["combine_options"],
             },
         )
     return JsonResponse(payload)
@@ -2130,6 +2138,56 @@ def conversion_job_status(
             request,
             "core/processing_job.html",
             {"job": job, "payload": payload, "kind": "Conversion"},
+        )
+    return JsonResponse(payload)
+
+
+@require_POST
+@login_required
+def library_book_combine_parts(request: HttpRequest, book_id: int) -> HttpResponseBase:
+    """Queue a combined whole-book file built from a multi-part work's parts (#60)."""
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        book = Book.objects.get(pk=book_id)
+    except Book.DoesNotExist:
+        return HttpResponseNotFound()
+    payload = _request_payload(request)
+    raw_format = payload.get("target_format")
+    if not isinstance(raw_format, str) or not raw_format.strip():
+        return HttpResponseBadRequest("target_format required")
+    try:
+        job = combine.request_combined_variant(
+            book=book,
+            target_format=raw_format,
+            requested_by_user_id=profile.user_id,
+        )
+    except combine.CombineError as exc:
+        return HttpResponseBadRequest(str(exc))
+    if _wants_html(request):
+        return redirect("combine-job-status", job_id=job.job_id)
+    return JsonResponse(combine.combine_job_payload(job), status=202)
+
+
+@require_GET
+@login_required
+def combine_job_status(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.COMBINE_PARTS:
+        return HttpResponseNotFound()
+    payload = combine.combine_job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Combine parts"},
         )
     return JsonResponse(payload)
 
