@@ -767,7 +767,7 @@ def _group_signals(group: ImportGroup, jobs: list[ImportJob]) -> Any:
                     if isbn not in isbns:
                         isbns.append(isbn)
         language = language or identification.normalize_text(evidence.get("language")) or None
-        publisher = publisher or identification.normalize_text(evidence.get("publisher")) or None
+        publisher = publisher or identification.publisher_signal(evidence.get("publisher")) or None
     parent_name = Path(group.folder).parent.name
     return identification.IdentificationInput(
         title_hints=title_hints,

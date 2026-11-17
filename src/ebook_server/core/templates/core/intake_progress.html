@@ -1,0 +1,45 @@
+{% extends "core/base.html" %}
+{% block title %}Intake progress · Hackerspace Library{% endblock %}
+{% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
+{% block content %}
+<p class="eyebrow">Admin</p>
+<h1>Intake progress</h1>
+<p class="muted">What is still left to import, per intake channel. Pending counts files already discovered and queued; run <code>ingest_sources</code> to discover new ones. Refreshes every 30 seconds. Same data as <code>manage.py ingest_sources --status --json</code>.</p>
+
+<h2>Sources</h2>
+{% if progress.sources %}
+<div class="list-stack">
+  {% for row in progress.sources %}
+  <div class="book-row">
+    <div class="grow">
+      <h2>{{ row.name }}</h2>
+      <p class="muted">{{ row.transfer_mode }}{% if not row.is_active %} · inactive{% endif %}</p>
+      <progress max="100" value="{{ row.percent_done }}" aria-label="{{ row.name }} complete">{{ row.percent_done }}%</progress>
+    </div>
+    <dl class="metadata">
+      <div><dt>Done</dt><dd>{{ row.percent_done }}%</dd></div>
+      <div><dt>Pending</dt><dd>{{ row.pending_files }} file{{ row.pending_files|pluralize }} · {{ row.pending_bytes|filesizeformat }} {% if row.transfer_mode == "index" %}to hash{% else %}to copy{% endif %}</dd></div>
+      <div><dt>Needs review</dt><dd>{{ row.needs_review }}</dd></div>
+      <div><dt>Complete</dt><dd>{{ row.complete }}</dd></div>
+      <div><dt>Failed</dt><dd>{% if row.failed %}<span class="status status-failed">{{ row.failed }}</span>{% else %}0{% endif %}</dd></div>
+    </dl>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">No source locations are registered.</div>
+{% endif %}
+
+<h2>Web uploads</h2>
+<dl class="metadata">
+  <div><dt>Pending</dt><dd>{{ progress.uploads.pending_files }} · {{ progress.uploads.pending_bytes|filesizeformat }}</dd></div>
+  <div><dt>Needs review</dt><dd>{{ progress.uploads.needs_review }}</dd></div>
+  <div><dt>Complete</dt><dd>{{ progress.uploads.complete }}</dd></div>
+  <div><dt>Failed</dt><dd>{{ progress.uploads.failed }}</dd></div>
+</dl>
+
+<h2>Scanner</h2>
+<dl class="metadata">
+  {% for state, count in progress.scan_jobs.items %}<div><dt>{{ state }}</dt><dd>{{ count }}</dd></div>{% endfor %}
+</dl>
+{% endblock %}

@@ -1,0 +1,42 @@
+{% extends "core/base.html" %}
+{% block title %}Raw scans · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Physical books</p>
+      <h1>Raw scans</h1>
+      <p class="muted">Captured and verified, being processed. They join the library after ScanTailor processing and finish.</p>
+    </div>
+  </div>
+  <div class="list-stack">
+    {% for summary in summaries %}
+      <article class="review-row" data-raw-scan-job="{{ summary.job.id }}">
+        <div class="grow">
+          <h2><a href="{% url 'scan-job-workspace' summary.job.id %}?view=html">{{ summary.title|default:"Untitled scan" }}</a></h2>
+          <p>
+            {{ summary.page_count }} page{{ summary.page_count|pluralize }}
+            · {{ summary.open_rescans }} open rescan{{ summary.open_rescans|pluralize }}
+            {% if summary.job.scanner_id %}· {{ summary.job.scanner_id }}{% endif %}
+          </p>
+          {% if summary.metadata.opf_version %}
+            <p data-raw-scan-opf>
+              {{ summary.metadata.authors|join:", "|default:"Unknown author" }}
+              {% if summary.metadata.isbn %}· ISBN <span class="mono">{{ summary.metadata.isbn }}</span>{% endif %}
+              {% if summary.metadata.language %}· {{ summary.metadata.language }}{% endif %}
+            </p>
+          {% endif %}
+          {% if summary.completeness %}
+            <p class="muted">Completeness:
+              {% for flag, value in summary.completeness.items %}{{ flag }}: {{ value }}{% if not forloop.last %}, {% endif %}{% endfor %}
+            </p>
+          {% endif %}
+          {% if summary.refinish_needed %}<p class="muted">Re-finish needed</p>{% endif %}
+          <p class="muted mono">{{ summary.job.id }}{% if summary.job.captured_at %} · captured {{ summary.job.captured_at }}{% endif %}</p>
+        </div>
+        <span class="status status-{{ summary.job.state }}">{{ summary.job.get_state_display }}</span>
+      </article>
+    {% empty %}
+      <p class="empty-state">No raw scans waiting for processing.</p>
+    {% endfor %}
+  </div>
+{% endblock %}

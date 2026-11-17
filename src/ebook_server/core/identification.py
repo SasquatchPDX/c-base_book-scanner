@@ -8,7 +8,7 @@ import json
 import re
 import socket
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -101,6 +101,68 @@ WORK_ISBN_MATCH_SCORE = getattr(
 )
 # Minimum rapidfuzz token_set_ratio for two publisher names (noise words removed).
 PUBLISHER_MATCH_MIN_RATIO = 90.0
+# Values ebook tools write into the publisher field that name no publisher: converters,
+# authoring tools, distribution sites and placeholders. Compared after ``normalize_text``;
+# an entry also matches when followed only by version tokens ("calibre 5.42.0", "Adobe
+# InDesign CS6", "calibre (3.48.0) [https://calibre-ebook.com]"). Deliberately an exact
+# list: a domain-shaped name such as "Tor.com" or "Smashwords.com" is a real imprint and
+# stays a publisher signal (#144 review). Deployments add entries through
+# BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS.
+DEFAULT_IGNORED_PUBLISHERS: tuple[str, ...] = (
+    "calibre",
+    "calibre-ebook.com",
+    "adobe acrobat",
+    "adobe acrobat pro",
+    "adobe acrobat pro dc",
+    "adobe acrobat distiller",
+    "acrobat distiller",
+    "adobe distiller",
+    "adobe indesign",
+    "adobe pdf library",
+    "microsoft word",
+    "microsoft office word",
+    "libreoffice",
+    "libreoffice writer",
+    "openoffice",
+    "openoffice.org",
+    "openoffice.org writer",
+    "apache openoffice",
+    "pages",
+    "sigil",
+    "pandoc",
+    "abbyy finereader",
+    "finereader",
+    "kindle previewer",
+    "kindlegen",
+    "epub bud",
+    "epubbud.com",
+    "pubone.info",
+    "unknown",
+    "unknown publisher",
+    "n/a",
+    "none",
+    "s.n.",
+    "[s.n.]",
+    "-",
+)
+IGNORED_PUBLISHERS = frozenset(
+    " ".join(str(value).lower().split())
+    for value in (
+        *DEFAULT_IGNORED_PUBLISHERS,
+        *getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS", []),
+    )
+    if str(value).strip()
+)
+# A web address inside the publisher value ("ePub Bud (www.epubbud.com)", "calibre
+# [https://calibre-ebook.com]"): removed with its brackets before the rest is judged.
+_PUBLISHER_URL = re.compile(
+    r"[(\[<]\s*(?:[a-z][a-z0-9+.-]*://|www\.)[^)\]>]*[)\]>]|(?:[a-z][a-z0-9+.-]*://|\bwww\.)\S*"
+)
+# What may follow an ignored tool name: version numbers ("5.42.0", "v2", "(3.48.0)"),
+# Adobe release names ("CS6", "CC 2019") and build words.
+_PUBLISHER_VERSION_TOKEN = re.compile(
+    r"[(\[]?(?:v?\d[\w.\-]*|cs\d*|cc|dc|pro|x64|x86|build|version|for|mac|macos|macintosh|windows|win)[)\]]?,?"
+)
 _PUBLISHER_NOISE_TOKENS = frozenset(
     {
         "ag",
@@ -126,6 +188,12 @@ _PUBLISHER_NOISE_TOKENS = frozenset(
         "verlag",
     }
 )
+
+# Strong-evidence rule for candidates without ISBN confirmation (see
+# docs/metadata-providers.md and _apply_strong_match_rule). Its settings are read at
+# call time so they can be tuned per deployment and overridden in tests.
+STRONG_MATCH_RULE = "exact_title_strong_author"
+STRONG_MATCH_EVIDENCE_KEY = "_auto_accept_rule"
 
 
 class MetadataProvider(Protocol):
@@ -253,6 +321,7 @@ class IdentificationInput:
     language: str | None
     publisher: str | None
     description: str | None
+    publication_year: int | None = None
     # Typed evidence behind the flat hint lists. Inputs built by hand (scan jobs, review
     # re-searches, tests) may leave them empty: the hints then count as alternatives of
     # unknown provenance, which is how they were always scored.
@@ -904,10 +973,11 @@ def build_identification_input(
         # Normalised (ISO 639-1, else 639-3) so "en" and "eng" compare equal; "UND" and
         # unknown codes become None ("no signal"), never a mismatch.
         language=normalize_language(_first_str(extracted_metadata.get("language"))),
-        publisher=normalize_text(extracted_metadata.get("publisher")),
+        publisher=publisher_signal(extracted_metadata.get("publisher")),
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
         else None,
+        publication_year=_metadata_year(extracted_metadata),
         author_evidence=_author_evidence(extracted_metadata, filename_author_hints),
         title_evidence=_title_evidence(
             title_hints,
@@ -1009,6 +1079,19 @@ def strongest_title_evidence(signals: IdentificationInput) -> list[TitleEvidence
         return []
     best = max(EVIDENCE_RANK.get(t.source, 0) for t in titles)
     return [t for t in titles if EVIDENCE_RANK.get(t.source, 0) == best]
+
+
+def _metadata_year(extracted_metadata: dict[str, Any]) -> int | None:
+    """Publication year from embedded metadata, when an extractor provides one."""
+    for field_name in ("publication_year", "date", "pubdate"):
+        value = extracted_metadata.get(field_name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            match = re.search(r"\b(1[0-9]{3}|20[0-9]{2})\b", value)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 def _apply_path_layout_hints(
@@ -1328,7 +1411,7 @@ def resolve_candidates_with_report(
     normalized.sort(
         key=lambda item: (item.score, not edition_conflicts(item, signals)), reverse=True
     )
-    return normalized, outcomes
+    return _apply_strong_match_rule(signals, normalized), outcomes
 
 
 def _query_provider(
@@ -1645,6 +1728,39 @@ def _pick_language(
     return normalize_text(usable_work[0]) if usable_work else None
 
 
+def publisher_signal(value: Any) -> str:
+    """The file's publisher as identification evidence, or ``""`` for no signal.
+
+    Raw metadata is evidence, not truth: converters and authoring tools write their own
+    name into the publisher field. A value that is only a web address, or that names an
+    ignored tool (``IGNORED_PUBLISHERS``, optionally followed by a version), counts as a
+    missing publisher: no edition conflict and no publisher bonus. A web address next
+    to a real name is dropped and the name kept ("Tor.com (www.tor.com)" -> "tor.com").
+    Domain-shaped imprints ("Tor.com", "Amazon.com Services LLC") are kept, so they still
+    reveal another edition (``edition_publisher_mismatch``).
+    """
+    text = normalize_text(value if isinstance(value, str) else None)
+    if not text or _is_ignored_publisher(text):
+        return ""
+    stripped = " ".join(_PUBLISHER_URL.sub(" ", text).split()).strip(" -,;:|/")
+    if stripped != text and (not stripped or _is_ignored_publisher(stripped)):
+        return ""
+    return stripped or text
+
+
+def _is_ignored_publisher(text: str) -> bool:
+    """True when ``text`` is an ignored tool/placeholder, alone or followed by versions."""
+    text = text.replace("®", "").replace("™", "")
+    text = " ".join(text.split())
+    if text in IGNORED_PUBLISHERS:
+        return True
+    words = text.split()
+    for cut in range(len(words) - 1, 0, -1):
+        if " ".join(words[:cut]) in IGNORED_PUBLISHERS:
+            return all(_PUBLISHER_VERSION_TOKEN.fullmatch(word) for word in words[cut:])
+    return False
+
+
 def _publisher_tokens(value: str) -> str:
     return " ".join(sorted(set(default_process(value).split()) - _PUBLISHER_NOISE_TOKENS))
 
@@ -1822,6 +1938,36 @@ def title_similarity(left: str, right: str) -> float:
 def author_similarity(left: list[str], right: list[str]) -> float:
     """Public form of the candidate author score (0.0 when no name corresponds)."""
     return _author_match_score(left, right)
+
+
+def titles_agree(left: str, right: str) -> bool:
+    """Whether two titles name the same book, tolerating subtitles and annotations.
+
+    "Foundation" agrees with "Foundation: A Novel"; "Foundation" and "Foundation and
+    Earth" do not (see :func:`_title_match_score`).
+    """
+    if not normalize_text(left) or not normalize_text(right):
+        return False
+    return any(
+        _title_match_score(a, b) >= SAME_BOOK_TITLE_MIN_SCORE
+        for a in _title_variants(left)
+        for b in _title_variants(right)
+    )
+
+
+def author_lists_agree(left: list[str], right: list[str]) -> bool:
+    """Whether two author lists name the same people (every name has a match).
+
+    Names are matched like :func:`authors_conflict` does ("Banks, Iain" and "Iain M.
+    Banks" agree). Two empty lists agree; an empty and a non-empty list do not.
+    """
+    left_names = [name for name in left if normalize_text(name)]
+    right_names = [name for name in right if normalize_text(name)]
+    if not left_names or not right_names:
+        return not left_names and not right_names
+    return all(
+        any(_author_names_agree(name, other) for other in right_names) for name in left_names
+    ) and all(any(_author_names_agree(name, other) for other in left_names) for name in right_names)
 
 
 # Creator values that say nothing about who wrote the book: office-suite and PDF
@@ -2117,3 +2263,265 @@ def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> 
     if left.authors and right.authors:
         return _author_coverage(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
     return True
+
+
+@dataclass(frozen=True)
+class StrongMatchSettings:
+    enabled: bool
+    min_title_score: float
+    min_author_score: float
+    tie_margin: float
+    year_tolerance: int
+
+
+def _strong_match_settings() -> StrongMatchSettings:
+    def setting(name: str, default: Any) -> Any:
+        return getattr(django_settings, f"BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_{name}", default)
+
+    return StrongMatchSettings(
+        enabled=bool(setting("ENABLED", True)),
+        min_title_score=float(setting("MIN_TITLE", 1.0)),
+        min_author_score=float(setting("MIN_AUTHOR", 0.9)),
+        tie_margin=float(setting("TIE_MARGIN", 0.05)),
+        year_tolerance=int(setting("YEAR_TOLERANCE", 2)),
+    )
+
+
+def _strong_match_assessment(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+    config: StrongMatchSettings,
+) -> dict[str, Any]:
+    """Check one candidate against the exact-title + strong-author rule.
+
+    The author side uses the typed author evidence (``author_evidence_score``):
+    filename guesses are alternatives, so the dilution a filename split causes
+    ("Author - Title" yields both halves as author hints) costs nothing, while
+    embedded/layout coauthors must all be covered. A candidate that omits a genuine
+    coauthor, or matches none of an explicit author list, is never promoted. The
+    matched title and author must come from different hints, and the matched title
+    must not be contradicted by stronger title evidence (an embedded title beats a
+    filename guess).
+    """
+    title_score, title_hint = _matched_title_hint(signals, candidate)
+    author_names = [name for group in signals.author_groups() for name in group.names]
+    author_hint = max(
+        author_names,
+        key=lambda name: _author_match_score([name], candidate.authors),
+        default="",
+    )
+    author_score = author_evidence_score(signals, candidate.authors)
+    missing = missing_coauthors(signals, candidate.authors)
+    title_source, strongest_source, title_agrees = _title_provenance(signals, title_hint, candidate)
+    blocked_by: list[str] = []
+    if title_score < config.min_title_score:
+        blocked_by.append("title_not_exact")
+    if not title_agrees:
+        blocked_by.append(TITLE_EVIDENCE_CONFLICT)
+    if author_score < config.min_author_score:
+        blocked_by.append("author_not_strong")
+    if missing:
+        blocked_by.append("missing_coauthor")
+    if _explicit_authors_unmatched(signals, candidate.authors):
+        blocked_by.append("author_evidence_conflict")
+    if title_hint and default_process(title_hint) == default_process(author_hint):
+        blocked_by.append("title_and_author_from_same_hint")
+
+    # ISBN, language and publisher are compared with the candidate's own edition, as
+    # in edition_conflicts (#37): a work-level value proves the work, not the edition.
+    file_isbns = _isbn13_set(signals.isbns)
+    if file_isbns and not _edition_isbn13s(candidate) & file_isbns:
+        known_isbns = _edition_isbn13s(candidate) | set(candidate.work_isbns)
+        if not known_isbns or known_isbns & file_isbns:
+            blocked_by.append("file_isbn_unconfirmed")
+        else:
+            blocked_by.append("conflicting_isbn")
+
+    # A concrete edition that lacks the file's language/publisher while its work lists
+    # them is uncertainty (another edition may be the file's), never a promotion.
+    file_language = normalize_language(signals.language)
+    if file_language:
+        candidate_languages = _candidate_languages(candidate)
+        if candidate_languages and file_language not in candidate_languages:
+            blocked_by.append("conflicting_language")
+        elif not candidate_languages and candidate.concrete_edition and candidate.work_languages:
+            blocked_by.append("edition_language_unknown")
+    if (
+        signals.publisher
+        and candidate.concrete_edition
+        and not _edition_publishers(candidate)
+        and candidate.work_publishers
+    ):
+        blocked_by.append("edition_publisher_unknown")
+
+    if (
+        signals.publication_year is not None
+        and candidate.publication_year is not None
+        and signals.publication_year < candidate.publication_year - config.year_tolerance
+    ):
+        # A file dated before the work's first publication is a different book; a later
+        # year is normal for reprints and is not treated as a conflict.
+        blocked_by.append("publication_year_mismatch")
+
+    return {
+        "title_score": round(title_score, 4),
+        "title_hint": title_hint,
+        "title_source": title_source,
+        "strongest_title_source": strongest_source,
+        "author_score": round(author_score, 4),
+        "author_hint": author_hint,
+        "missing_coauthors": missing,
+        "blocked_by": blocked_by,
+    }
+
+
+def _title_forms(title: str) -> list[str]:
+    """A title plus its cheap variants and its " - " segments, for agreement checks."""
+    forms = _title_variants(title)
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(title) if s.strip()]
+    return list(dict.fromkeys([*forms, *(s for s in segments if len(segments) > 1)]))
+
+
+def _title_provenance(
+    signals: IdentificationInput,
+    title_hint: str,
+    candidate: IdentificationCandidate,
+) -> tuple[str, str, bool]:
+    """Source of the matched title hint, the strongest title source, and whether they agree.
+
+    The matched hint may promote only when it is the strongest title evidence, or when
+    the strongest evidence names the candidate's title too (same title, a subtitle
+    variant, or a " - " segment of it). "Dune - Frank Herbert.epub" whose embedded
+    title is "The Dragon in the Sea" does not agree with a Dune candidate.
+    """
+    titles = signals.title_sources()
+    source = next((t.source for t in titles if t.title == title_hint), EVIDENCE_UNKNOWN)
+    strongest = strongest_title_evidence(signals)
+    if not strongest:
+        return source, source, True
+    strongest_source = strongest[0].source
+    if EVIDENCE_RANK.get(source, 0) >= EVIDENCE_RANK.get(strongest_source, 0):
+        return source, strongest_source, True
+    agrees = any(
+        _title_match_score(form, candidate.title) >= SAME_BOOK_TITLE_MIN_SCORE
+        for evidence in strongest
+        for form in _title_forms(evidence.title)
+    )
+    return source, strongest_source, agrees
+
+
+def _matched_title_hint(
+    signals: IdentificationInput, candidate: IdentificationCandidate
+) -> tuple[float, str]:
+    """The title hint that best matches the candidate's title, with its match score."""
+    return max(
+        ((_title_match_score(hint, candidate.title), hint) for hint in signals.title_hints),
+        default=(0.0, ""),
+    )
+
+
+# The candidate's title matches only weaker title evidence (e.g. a filename guess)
+# while stronger evidence (e.g. the embedded title) names another book.
+TITLE_EVIDENCE_CONFLICT = "stronger_title_evidence_disagrees"
+
+
+def title_evidence_conflict(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> dict[str, Any] | None:
+    """Why stronger title evidence contradicts ``candidate``, or ``None`` when it does not.
+
+    Shared by the strong-match rule (before promotion) and by the intake auto-accept
+    decision, which runs it on every candidate at or above the threshold however the
+    score got there (title + author + language/publisher bonuses, an ISBN, or the
+    rule). "Dune - Frank Herbert.epub" embedding "The Dragon in the Sea" is never
+    accepted as Dune: the Dune match comes from the filename only.
+    """
+    _, title_hint = _matched_title_hint(signals, candidate)
+    title_source, strongest_source, agrees = _title_provenance(signals, title_hint, candidate)
+    if agrees:
+        return None
+    return {
+        "candidate_title": candidate.title,
+        "title_hint": title_hint,
+        "title_source": title_source,
+        "strongest_title_source": strongest_source,
+        "strongest_titles": [evidence.title for evidence in strongest_title_evidence(signals)],
+    }
+
+
+def _explicit_authors_unmatched(signals: IdentificationInput, candidate_authors: list[str]) -> bool:
+    """True when an explicit (coauthor) author list names nobody the candidate names.
+
+    Same test as the intake author-conflict guard (#92, ``authors_conflict``), applied
+    to embedded and folder-layout author lists before a score is promoted.
+    """
+    named = [a for a in candidate_authors if not is_placeholder_author(a)]
+    return any(
+        group.kind == AUTHORS_COAUTHORS and authors_conflict(named, list(group.names))
+        for group in signals.author_groups()
+    )
+
+
+def _apply_strong_match_rule(
+    signals: IdentificationInput,
+    candidates: list[IdentificationCandidate],
+) -> list[IdentificationCandidate]:
+    """Let an unambiguous exact-title + strong-author match reach auto-accept.
+
+    Title and author alone score at most 0.85, below the auto-accept threshold, so
+    books without ISBN, language or publisher metadata (pre-ISBN books, plain-text
+    files) could never be accepted automatically. When the top candidate passes
+    ``_strong_match_assessment`` with no conflicting signal, and no other candidate is
+    near-tied with it or also passes, its score is raised to the auto-accept
+    threshold. The decision and its inputs are recorded in the candidate's raw payload
+    under ``STRONG_MATCH_EVIDENCE_KEY`` whether or not the rule applied.
+    """
+    if not candidates:
+        return candidates
+    config = _strong_match_settings()
+    top = candidates[0]
+    if not config.enabled or top.score >= AUTO_ACCEPT_SCORE:
+        return candidates
+
+    assessment = _strong_match_assessment(signals, top, config)
+    blocked_by = list(assessment["blocked_by"])
+    runner_up_score = candidates[1].score if len(candidates) > 1 else None
+    if runner_up_score is not None and top.score - runner_up_score <= config.tie_margin:
+        blocked_by.append("near_tied_candidate")
+    elif any(
+        not _strong_match_assessment(signals, other, config)["blocked_by"]
+        for other in candidates[1:]
+    ):
+        blocked_by.append("multiple_qualifying_candidates")
+
+    applied = not blocked_by
+    evidence = {
+        "rule": STRONG_MATCH_RULE,
+        "applied": applied,
+        "blocked_by": blocked_by,
+        "base_score": round(top.score, 4),
+        "auto_accept_threshold": AUTO_ACCEPT_SCORE,
+        "runner_up_score": round(runner_up_score, 4) if runner_up_score is not None else None,
+        "tie_margin": config.tie_margin,
+        "title_score": assessment["title_score"],
+        "title_hint": assessment["title_hint"],
+        "author_score": assessment["author_score"],
+        "author_hint": assessment["author_hint"],
+        "title_source": assessment["title_source"],
+        "strongest_title_source": assessment["strongest_title_source"],
+        "missing_coauthors": assessment["missing_coauthors"],
+    }
+    if applied:
+        logger.info(
+            "identification_strong_match_applied",
+            rule=STRONG_MATCH_RULE,
+            provider_id=top.provider_id,
+            base_score=top.score,
+        )
+    promoted = replace(
+        top,
+        score=max(top.score, AUTO_ACCEPT_SCORE) if applied else top.score,
+        raw={**top.raw, STRONG_MATCH_EVIDENCE_KEY: evidence},
+    )
+    return [promoted, *candidates[1:]]
