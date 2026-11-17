@@ -202,13 +202,17 @@ OCR variant. The OCR service is a contract fixture; it validates orchestration
 and provenance, not recognition quality. Containers are removed when the suite
 exits.
 
-The suite reserves host ports 55432, 56379, 55389, 58080, 58081, and 58082 by default.
+The suite reserves host ports 15432, 16379, 13389, 18080, 18081, and 18082 by default.
+These sit below Linux's ephemeral port range (32768-60999) on purpose: ports
+inside it can be taken at random as source ports by the job's own outbound
+connections (image pulls, package downloads), which made binds fail
+intermittently with "address already in use". Keep any overrides below 32768.
 Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with
 `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
 `BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
 `BOOK_SCANNER_INTEGRATION_LDAP_PORT`, and
 `BOOK_SCANNER_INTEGRATION_PROXY_PORT`; override the OCR fixture port with
-`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 58081 is the suite-internal host
+`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 18081 is the suite-internal host
 Uvicorn listener. Credentials in
 `compose.integration.yml` belong only to the public seeded test fixtures and must
 never be copied into a deployment.
