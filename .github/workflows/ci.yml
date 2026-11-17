@@ -61,6 +61,8 @@ jobs:
           BOOK_SCANNER_DATABASE_URL: postgresql://ci:ci@database.example.test/library
           BOOK_SCANNER_REDIS_URL: redis://redis.example.test:6379/0
           BOOK_SCANNER_LDAP_MODE: ldap
+          BOOK_SCANNER_LDAP_SERVER_URI: ldaps://ldap.example.test
+          BOOK_SCANNER_LDAP_USER_DN_TEMPLATE: uid={username},ou=people,dc=example,dc=test
           BOOK_SCANNER_SECURE_SSL_REDIRECT: "true"
           BOOK_SCANNER_SESSION_COOKIE_SECURE: "true"
           BOOK_SCANNER_CSRF_COOKIE_SECURE: "true"
