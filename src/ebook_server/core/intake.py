@@ -965,11 +965,11 @@ def _create_or_reuse_file_variant(
     )
 
 
-def _try_extract_front_cover(variant: FileVariant) -> None:
+def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None) -> None:
     from . import covers
 
     try:
-        cover = covers.extract_front_cover(variant)
+        cover = covers.extract_front_cover(variant, import_job=job)
     except Exception as exc:  # cover generation is optional; preserve successful intake
         logger.warning(
             "cover_extraction_failed",
@@ -1051,7 +1051,7 @@ def resolve_import_with_review_data(
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant)
+    _try_extract_front_cover(variant, job)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -1264,7 +1264,7 @@ def process_import_job(job_id: str) -> None:
                     job.sha256,
                 ),
             )
-            _try_extract_front_cover(duplicate_variant)
+            _try_extract_front_cover(duplicate_variant, job)
             return
 
         metadata = extract_metadata(
@@ -1359,7 +1359,7 @@ def process_import_job(job_id: str) -> None:
             imported_at=timezone.now(),
             processing_state=FileVariant.ProcessingState.COMPLETE,
         )
-        _try_extract_front_cover(variant)
+        _try_extract_front_cover(variant, job)
 
         job.book = book
         job.file_variant = variant
