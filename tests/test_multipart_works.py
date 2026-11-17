@@ -836,8 +836,8 @@ def test_part_identical_to_another_books_file_blocks_until_acknowledged_then_joi
     other_variant.refresh_from_db()
     assert other_variant.book_id == other_book.id
     assert list(other_book.file_variants.all()) == [other_variant]
-    job.refresh_from_db()
-    assert (job.state, job.book_id, job.file_variant_id) == (
+    resolved = ImportJob.objects.get(pk=job.pk)
+    assert (resolved.state, resolved.book_id, resolved.file_variant_id) == (
         ImportJob.State.COMPLETE,
         book.id,
         part_one.id,
