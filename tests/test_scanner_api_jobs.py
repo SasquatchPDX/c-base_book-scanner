@@ -142,6 +142,7 @@ def test_put_job_creates_open_job(key: str, settings: Any) -> None:
         "capture_layout": "single_page",
         "events": {"sans_last_line_no": 0},
         "pages": [],
+        "covers": [],
         # Registered by the OPF store (#130); null until the scanner sends one.
         "metadata_opf": None,
         "open_rescans": 0,

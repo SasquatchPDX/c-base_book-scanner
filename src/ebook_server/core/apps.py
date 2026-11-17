@@ -14,6 +14,7 @@ class CoreConfig(AppConfig):
         from . import (
             book_opf,
             checks,  # noqa: F401  (registers system checks)
+            scan_covers,
             scan_events,
             scan_manifest,
             scanner_opf,
@@ -24,6 +25,7 @@ class CoreConfig(AppConfig):
         search.connect_signals()
         book_opf.connect_signals()
         thumbnails.connect_signals()
+        scan_covers.register()
         # capture-complete and GET jobs/{id} compare against the stored event lines (S5).
         scan_manifest.register_event_high_water_mark(scan_events.sans_high_water_mark)
         # Scanner metadata.opf (#130): manifest source, raw-scan annotator, book linker.

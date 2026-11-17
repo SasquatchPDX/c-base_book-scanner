@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0043_scanjob_raw_scan_lifecycle"),
+        ("core", "0044_scanner_page_and_cover_upload"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

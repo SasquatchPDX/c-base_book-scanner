@@ -140,6 +140,27 @@ Normalization is for comparison only; the Book keeps the provider's code form.
 Publisher comparison ignores case, punctuation and noise words such as "Books",
 "Press", "Ltd", "Verlag", and then needs a rapidfuzz `token_set_ratio` of at least 90.
 
+The file's publisher passes through `identification.publisher_signal()` first (for
+single files in `build_identification_input` and for multi-part groups in
+`multipart._group_signals`). Values that name no publisher become "no publisher
+signal" (no bonus, no edition conflict):
+
+- converters, authoring tools and placeholders from the built-in
+  `DEFAULT_IGNORED_PUBLISHERS` list (calibre, Adobe Acrobat/InDesign/Distiller/PDF
+  Library, Microsoft Word, LibreOffice/OpenOffice, Pages, Sigil, Pandoc, ABBYY
+  FineReader, Kindle Previewer/KindleGen, ePub Bud, "Unknown", "Unknown Publisher",
+  "n/a", "[s.n.]", ...), also when followed only by version tokens
+  (`Calibre 5.42.0`, `Adobe InDesign CS6`, `calibre (3.48.0) [https://calibre-ebook.com]`);
+- a bare web address (`https://...`, `www....`).
+
+A web address next to a real name is removed and the name kept (`Tor.com
+(www.tor.com)` becomes `tor.com`). Names that merely contain a domain (`Tor.com`,
+`Tor.com Publishing`, `Amazon.com Services LLC`, `Smashwords.com`, `Books.de`) are
+real imprints and stay a publisher signal, so a Tor.com file still reveals a Gollancz
+edition as `edition_publisher_mismatch`. `BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS`
+(a JSON list in the environment, default `[]`) adds deployment-specific entries to the
+built-in list; entries are compared case-insensitively after whitespace normalization.
+
 ### Work versus edition
 
 An Open Library search hit is a *work*; its `isbn`, `publisher` and `language`
