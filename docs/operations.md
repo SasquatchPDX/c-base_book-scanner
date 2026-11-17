@@ -247,6 +247,39 @@ The archive directory name is fixed (`BOOK_SCANNER_ARCHIVE_DIRNAME`) so the arch
 always sits behind the storage-root mount and sentinel checks below; it is not a
 separate setting that could point back at the VM disk.
 
+### Archive layout (`BOOK_SCANNER_ARCHIVE_LAYOUT`)
+
+Inside `library-artifacts/`, files are written in a Calibre-style tree: one folder
+per book holding every format, conversions, the cover (`cover.jpg`) and OCR output.
+
+| Value | Folder for a book |
+| --- | --- |
+| `author_title` (default) | `<Author>/<Title>/` (first author). A second, different book with the same author and title gets `<Author>/<Title> (<book id>)/`. |
+| `calibre` | `<Author>/<Title> (<book id>)/`, exactly as Calibre names folders. |
+| `job` | `books/<import job id>/` for originals and `books/<book id>/{converted,covers,ocr}/` for derived files: the layout used before #7. |
+| custom template | `/`-separated, with `{author}`, `{title}`, `{book_id}`, `{year}`, `{language}` (or `{job_id}` alone for a per-import layout), e.g. `{language}/{author}/{title}`. |
+
+Files are named `<Title> - <Author>.<ext>`. Names are NFC-normalized, stripped of
+control characters, path separators and characters Windows/SMB reject, capped at
+120 bytes per component, and Windows device names (`CON`, `NUL`, ...) are prefixed
+with `_`; a new file never overwrites an existing one (a short random suffix is
+added instead). Folder names are compared case-insensitively, because SMB clients
+treat `Asimov/Foundation` and `asimov/foundation` as the same folder.
+
+The database stays authoritative: each file records its storage location and
+identifier, and nothing reads metadata back from a path. Consequences:
+
+- **Changing the layout applies to new files only.** Existing files stay where they
+  are and keep working.
+- **Correcting a book's title or author does not rename its folder.** The folder is
+  assigned once (`Book.archive_folder`) and later files of that book keep joining
+  it. Moving books into the folder their current metadata implies is an explicit,
+  admin-run reorganize.
+- **Files waiting for review** are archived under `_unsorted/<import job id>/` and
+  moved into the book folder when identification or review settles the Book (a hard
+  link on the same share, with the `_unsorted` name removed after the database
+  commit; where hard links are unsupported the file stays under `_unsorted`).
+
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
 library references each file where it already is, read-only.
@@ -986,7 +1019,7 @@ errors, storage capacity, and health endpoint status. Do not log document conten
 ## Library search index
 
 `/library/books/` searches a denormalised row per book (`BookSearchDocument`
-plus `BookSearchFacet`, migration 0033, #28). On PostgreSQL it uses full-text
+plus `BookSearchFacet`, migration 0034, #28). On PostgreSQL it uses full-text
 search (`simple` configuration over accent- and case-folded text), `pg_trgm`
 substring and typo matching, and GIN/B-tree indexes. On SQLite, and on
 PostgreSQL until every book has a row, it falls back to plain `icontains`
@@ -994,7 +1027,7 @@ filters (slow on large libraries, but correct).
 
 Rows are rewritten automatically after every committed change to a book, its
 authors, genres, categories, identifiers, covers or file variants. Build them
-once after upgrading to migration 0033, and rebuild nightly as a safety net:
+once after upgrading to migration 0034, and rebuild nightly as a safety net:
 
 ```bash
 uv run python manage.py rebuild_search_index     # all books; safe to repeat
@@ -1036,14 +1069,14 @@ and the language shelves are cached for five minutes; "Recently added" and
 
 Lists and shelves show 120 px and 240 px wide WebP thumbnails instead of the
 full covers. They are derived, regenerable files (`CoverThumbnail`, migration
-0034) in the `cover-thumbnails` storage location, a cache on the application
+0035) in the `cover-thumbnails` storage location, a cache on the application
 VM. Its directory is `BOOK_SCANNER_COVER_THUMBNAIL_ROOT` (default
 `<storage root>/cover-thumbnails`), copied into the location's `base_path`
 when the location is first created; change it later in the admin. Expect about
 15 KB per book.
 
 A background job renders them whenever a front cover is stored. After the
-upgrade to migration 0034, and whenever the
+upgrade to migration 0035, and whenever the
 `ebook_server_library_derived_rows_missing{kind="cover_thumbnails"}` metric is
 above zero, backfill them:
 

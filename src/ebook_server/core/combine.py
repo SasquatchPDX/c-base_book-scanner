@@ -28,9 +28,9 @@ from pypdf import PdfReader, PdfWriter
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import intake
+from . import archive_layout, intake
 from .models import Book, FileVariant, ProcessingJob
-from .storage_registry import StorageConfigurationError, backend_for_location
+from .storage_registry import StorageConfigurationError, backend_for_location, writable_location_for
 
 logger = structlog.get_logger(__name__)
 
@@ -347,15 +347,19 @@ def _combine(job: ProcessingJob, details: dict[str, Any]) -> FileVariant:
                 book_id=book.id,
                 matching_variant_ids=identical_ids,
             )
-        storage = backend_for_location(parts[0].storage_location)
+        output_location = writable_location_for(parts[0].storage_location)
+        storage = backend_for_location(output_location)
         filename = intake.normalize_filename(
             f"{intake._sanitize_title_for_filename(book.title)} (combined).{fmt}"
         )
-        storage_identifier = storage.generate_destination(
-            f"books/{book.id}/combined/{uuid.uuid4()}", filename
-        )
         storage.ensure_free_space(size)
-        storage.store(str(output), storage_identifier)
+        storage_identifier = archive_layout.publish_derived(
+            storage,
+            book,
+            str(output),
+            filename,
+            legacy_namespace=f"books/{book.id}/combined/{uuid.uuid4()}",
+        )
         if storage.hash(storage_identifier) != sha:
             raise CombineError("stored combined file failed verification")
     return FileVariant.objects.create(
@@ -363,7 +367,7 @@ def _combine(job: ProcessingJob, details: dict[str, Any]) -> FileVariant:
         format=fmt,
         mime_type=COMBINABLE_FORMATS[fmt],
         original_filename=filename,
-        storage_location=parts[0].storage_location,
+        storage_location=output_location,
         storage_identifier=storage_identifier,
         size_bytes=size,
         sha256=sha,
