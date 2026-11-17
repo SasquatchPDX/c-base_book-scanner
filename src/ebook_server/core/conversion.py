@@ -484,14 +484,14 @@ def _execute_plan(
         if existing is not None:
             return existing
 
-        storage_identifier = archive_layout.derived_destination(
+        storage_identifier = archive_layout.publish_derived(
             output_storage,
             source_variant.book,
+            str(current_path),
             f"{archive_layout.book_file_stem(source_variant.book)}.{target_format}",
             legacy_namespace=f"books/{source_variant.book_id}/converted",
             legacy_filename=f"{uuid.uuid4()}.{target_format}",
         )
-        output_storage.store(str(current_path), storage_identifier)
 
         return FileVariant.objects.create(
             book=source_variant.book,

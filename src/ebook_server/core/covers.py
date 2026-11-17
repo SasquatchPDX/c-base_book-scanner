@@ -364,17 +364,17 @@ def extract_front_cover(
         payload, extractor_tool, extractor_version = extracted
 
     sha256 = hashlib.sha256(payload).hexdigest()
-    destination = archive_layout.derived_destination(
-        storage,
-        variant.book,
-        "cover.jpg",
-        legacy_namespace=f"books/{variant.book_id}/covers",
-        legacy_filename=f"{uuid4()}-front.jpg",
-    )
     with NamedTemporaryFile(suffix=".jpg", delete_on_close=False) as output_file:
         output_file.write(payload)
         output_file.close()
-        storage.store(output_file.name, destination)
+        destination = archive_layout.publish_derived(
+            storage,
+            variant.book,
+            output_file.name,
+            "cover.jpg",
+            legacy_namespace=f"books/{variant.book_id}/covers",
+            legacy_filename=f"{uuid4()}-front.jpg",
+        )
 
     try:
         with transaction.atomic():

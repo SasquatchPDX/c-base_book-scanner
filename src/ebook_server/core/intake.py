@@ -1908,9 +1908,8 @@ def _create_or_reuse_file_variant(
     if not storage_id:
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
-            storage_id = archive_layout.original_destination(storage, job, book)
             storage.ensure_free_space(Path(job.source_path).stat().st_size)
-            storage.store(job.source_path, storage_id)
+            storage_id = archive_layout.publish_original(storage, job, book, job.source_path)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
         else:
@@ -2712,7 +2711,7 @@ def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[st
     storage_location = _default_storage_location()
     # The Book is not known yet: under a book-scoped layout the file goes to _unsorted/
     # and is moved into the book folder once identification or review settles the Book.
-    destination = archive_layout.original_destination(storage, job, None)
+    destination = archive_layout.pending_destination(storage, job)
     # Checked per file, so a bulk import already queued still stops before the disk fills.
     storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):

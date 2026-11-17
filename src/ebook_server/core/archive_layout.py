@@ -46,6 +46,7 @@ from django.db import IntegrityError, transaction
 from ebook_server.storage import (
     MAX_COMPONENT_BYTES,
     LocalFilesystemStorage,
+    PublishMode,
     StorageBackend,
     safe_path_component,
 )
@@ -239,52 +240,83 @@ def book_folder(book: Book, storage: StorageBackend) -> str:
     raise RuntimeError(f"could not assign a unique archive folder to book {book.pk}")
 
 
-def original_destination(
-    storage: StorageBackend,
-    job: ImportJob,
-    book: Book | None,
-) -> str:
-    """Storage id for an imported original (copied, moved or uploaded).
+def pending_destination(storage: StorageBackend, job: ImportJob) -> str:
+    """Storage id for an original archived before its Book is known.
 
-    Without a Book (identification pending review) the file waits under
-    ``_unsorted/<job id>/``; ``place_pending_original`` moves it on resolution.
+    The namespace belongs to this import alone (``books/<job id>/`` under the ``job``
+    layout, ``_unsorted/<job id>/`` otherwise), so the id needs no reservation: only
+    this job ever writes there, and a retry of the job replaces its own file.
+    ``place_pending_original`` moves it into the book folder once the Book is settled.
     """
     layout = configured_layout()
-    if layout.job_scoped:
-        namespace = layout.template.format(job_id=job.id)
-        return storage.generate_destination(namespace, job.normalized_filename)
-    if book is None:
-        return storage.generate_destination(
-            f"{PENDING_NAMESPACE}/{job.id}", job.normalized_filename
-        )
+    namespace = (
+        layout.template.format(job_id=job.id)
+        if layout.job_scoped
+        else f"{PENDING_NAMESPACE}/{job.id}"
+    )
+    return storage.generate_destination(namespace, job.normalized_filename)
+
+
+def _original_filename(job: ImportJob, book: Book) -> str:
     suffix = Path(job.normalized_filename).suffix or (
         f".{job.detected_format}" if job.detected_format else ""
     )
-    return storage.generate_destination(
-        book_folder(book, storage),
-        f"{book_file_stem(book)}{suffix}",
-        unique=True,
+    return f"{book_file_stem(book)}{suffix}"
+
+
+def publish_original(
+    storage: StorageBackend,
+    job: ImportJob,
+    book: Book,
+    source: str,
+    *,
+    mode: PublishMode = "copy",
+) -> str:
+    """Archive an imported original of ``book`` and return its storage id.
+
+    Under a book-scoped layout the file joins the shared book folder; the name is
+    allocated and written in one exclusive step (``publish_unique``), so two imports
+    or conversions racing for ``<Title> - <Author>.epub`` get distinct files and
+    neither overwrites the other. Under the ``job`` layout it goes to the import's own
+    ``books/<job id>/`` folder.
+    """
+    if configured_layout().job_scoped:
+        destination = pending_destination(storage, job)
+        if mode == "link":
+            raise ValueError("a per-import layout has no book folder to link into")
+        if mode == "move":
+            storage.move(source, destination)
+        else:
+            storage.store(source, destination)
+        return destination
+    return storage.publish_unique(
+        source, book_folder(book, storage), _original_filename(job, book), mode=mode
     )
 
 
-def derived_destination(
+def publish_derived(
     storage: StorageBackend,
     book: Book,
+    source: str,
     filename: str,
     *,
     legacy_namespace: str,
     legacy_filename: str | None = None,
 ) -> str:
-    """Storage id for a file derived from a book (conversion, cover, OCR, cleaned scan).
+    """Store a file derived from a book (conversion, cover, OCR, cleaned scan).
 
-    Under a book-scoped layout it lands in the book's folder, never overwriting an
-    existing file; under the ``job`` layout it keeps the original
-    ``books/<book id>/<kind>/`` namespace and file naming (``legacy_namespace``,
-    ``legacy_filename``).
+    Under a book-scoped layout it lands in the book's folder; allocation and the write
+    are one exclusive step, so concurrent jobs producing the same ``output.pdf`` each
+    get their own file and an existing file is never overwritten. Under the ``job``
+    layout it keeps the original ``books/<book id>/<kind>/`` namespace and naming
+    (``legacy_namespace``, ``legacy_filename``), which callers make unique per job.
+    Returns the storage id written.
     """
     if configured_layout().job_scoped:
-        return storage.generate_destination(legacy_namespace, legacy_filename or filename)
-    return storage.generate_destination(book_folder(book, storage), filename, unique=True)
+        destination = storage.generate_destination(legacy_namespace, legacy_filename or filename)
+        storage.store(source, destination)
+        return destination
+    return storage.publish_unique(source, book_folder(book, storage), filename)
 
 
 def is_pending_identifier(storage_identifier: str) -> bool:
@@ -319,8 +351,7 @@ def place_pending_original(
     ):
         return
     try:
-        destination = original_destination(storage, job, book)
-        storage.link(source, destination)
+        destination = publish_original(storage, job, book, source, mode="link")
     except (OSError, ValueError, RuntimeError) as exc:
         logger.warning(
             "archive_pending_move_failed",
