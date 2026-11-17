@@ -22,6 +22,8 @@ import hashlib
 import json
 import os
 import re
+import struct
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -405,6 +407,100 @@ def verify_checksum(upload: ReceivedUpload, expected: str) -> None:
         )
 
 
+_PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
+# Samples per pixel by IHDR colour type (greyscale, RGB, palette, grey+alpha, RGBA).
+_PNG_CHANNELS: Final[dict[int, int]] = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+# Adam7 passes: (x offset, y offset, x step, y step).
+_ADAM7_PASSES: Final = (
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+)
+_PNG_READ_BYTES: Final = 64 * 1024
+
+
+def png_image_data_length(
+    width: int, height: int, bit_depth: int, colour_type: int, interlace: int
+) -> int:
+    """Bytes of decompressed IDAT data that an IHDR implies (PNG spec §7.2, §8.2).
+
+    Each scanline is one filter-type byte plus its packed samples; an Adam7 image is
+    seven reduced images, and a pass with no columns or no rows contributes nothing.
+    """
+    bits_per_pixel = bit_depth * _PNG_CHANNELS[colour_type]
+
+    def size(columns: int, rows: int) -> int:
+        if columns == 0 or rows == 0:
+            return 0
+        return rows * (1 + (columns * bits_per_pixel + 7) // 8)
+
+    if interlace == 0:
+        return size(width, height)
+    return sum(
+        size(
+            (width - x0 + dx - 1) // dx if width > x0 else 0,
+            (height - y0 + dy - 1) // dy if height > y0 else 0,
+        )
+        for x0, y0, dx, dy in _ADAM7_PASSES
+    )
+
+
+def check_png_image_data(path: Path) -> None:
+    """Raise ``ValueError`` unless the IDAT stream inflates to exactly what IHDR implies.
+
+    Pillow pads a complete zlib stream that holds too few scanlines with black rows
+    and reports no error (#147), so the length is checked here. The stream is inflated
+    in bounded pieces and never held in memory; the chunk CRCs were already checked
+    by ``verify()``.
+    """
+    expected: int | None = None
+    inflated = 0
+    inflater = zlib.decompressobj()
+    with path.open("rb") as handle:
+        if handle.read(8) != _PNG_SIGNATURE:
+            raise ValueError("not a PNG")
+        while True:
+            head = handle.read(8)
+            if len(head) != 8:
+                raise ValueError("PNG ends before IEND")
+            length, kind = struct.unpack(">I4s", head)
+            if kind == b"IHDR":
+                data = handle.read(length)
+                if length != 13 or len(data) != 13:
+                    raise ValueError("bad IHDR")
+                width, height, depth, colour, _comp, _filter, interlace = struct.unpack(
+                    ">IIBBBBB", data
+                )
+                if colour not in _PNG_CHANNELS or interlace not in (0, 1):
+                    raise ValueError("bad IHDR")
+                expected = png_image_data_length(width, height, depth, colour, interlace)
+            elif kind == b"IDAT":
+                if expected is None:
+                    raise ValueError("IDAT before IHDR")
+                remaining = length
+                while remaining:
+                    piece = handle.read(min(remaining, _PNG_READ_BYTES))
+                    if not piece:
+                        raise ValueError("PNG ends inside IDAT")
+                    remaining -= len(piece)
+                    # Inflate at most one byte past the expected length: enough to
+                    # detect excess data without inflating a bomb.
+                    inflated += len(inflater.decompress(piece, expected + 1 - inflated))
+                    if inflated > expected:
+                        raise ValueError("more image data than IHDR declares")
+            elif kind == b"IEND":
+                break
+            else:
+                handle.seek(length, 1)
+            handle.seek(4, 1)  # CRC
+    if expected is None or not inflater.eof or inflated != expected:
+        raise ValueError("image data length does not match IHDR")
+
+
 def sniff_image(path: Path) -> tuple[str, str]:
     """``(mime_type, extension)`` of a decodable image, else ``422 invalid_image``.
 
@@ -414,7 +510,10 @@ def sniff_image(path: Path) -> tuple[str, str]:
     scale, which still reads every scan line (so a truncated file fails) at a fraction
     of the memory; other formats are decoded in full. Pillow's decompression-bomb limit
     (``Image.MAX_IMAGE_PIXELS``) is enforced as an error before any decoding, and
-    truncated data is never accepted (``LOAD_TRUNCATED_IMAGES`` stays off).
+    ``LOAD_TRUNCATED_IMAGES`` stays off, so a stream cut off mid-write fails. Pillow
+    does not notice a complete PNG stream that holds fewer scanlines than IHDR declares
+    (it pads them with black), so for a PNG the inflated IDAT length is also checked
+    against IHDR (:func:`check_png_image_data`, #147).
     """
     import warnings
 
@@ -433,6 +532,8 @@ def sniff_image(path: Path) -> tuple[str, str]:
                     width, height = image.size
                     image.draft(image.mode, (max(width // 8, 1), max(height // 8, 1)))
                 image.load()
+            if image_format == "PNG":
+                check_png_image_data(path)
     except Exception as exc:  # Pillow raises many types for corrupt input.
         raise UploadError(422, "invalid_image", "The image cannot be decoded.") from exc
     known = _IMAGE_FORMATS.get(image_format)

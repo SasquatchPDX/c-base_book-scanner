@@ -309,6 +309,11 @@ def test_undecodable_image_is_invalid_image(key: str, tmp_path: Path) -> None:
     [
         pytest.param(b"not a zlib stream" * 4, id="broken-zlib"),
         pytest.param(zlib.compress(b"\x00" * 50), id="too-few-pixels"),
+        # #147: a complete zlib stream with 1 of the 48 scanlines (1 filter byte +
+        # 64 * 3 samples each); Pillow pads the rest with black and raises nothing.
+        pytest.param(zlib.compress(b"\x00" * 193), id="one-of-48-rows"),
+        pytest.param(zlib.compress(b"\x00" * 193 * 47), id="one-row-short"),
+        pytest.param(zlib.compress(b"\x00" * 193 * 49), id="one-row-too-many"),
     ],
 )
 @pytest.mark.parametrize("target", ["page", "cover"])
@@ -327,6 +332,89 @@ def test_png_with_valid_checksums_but_undecodable_pixels_is_invalid_image(
     assert not ScanCover.objects.exists()
     assert _scan_files(tmp_path) == []
     assert ScanJob.objects.get(pk=JOB_ID).state == ScanJob.State.OPEN
+
+
+def _png_bytes(image: Image.Image) -> bytes:
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+ADAM7_PASSES = (
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+)
+
+
+def _adam7_png(width: int, height: int, *, drop_last_pass: bool = False) -> bytes:
+    """An 8-bit greyscale Adam7-interlaced PNG (Pillow cannot write one), all black."""
+    passes = []
+    for x0, y0, dx, dy in ADAM7_PASSES:
+        columns = (width - x0 + dx - 1) // dx if width > x0 else 0
+        rows = (height - y0 + dy - 1) // dy if height > y0 else 0
+        if columns and rows:
+            passes.append((b"\x00" + b"\x00" * columns) * rows)
+    if drop_last_pass:
+        passes.pop()
+    header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 1)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(b"".join(passes)))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        ((64, 48, 8, 2, 0), 48 * (1 + 64 * 3)),
+        ((10, 3, 1, 0, 0), 3 * (1 + 2)),  # 10 one-bit pixels pack into 2 bytes
+        ((5, 2, 16, 6, 0), 2 * (1 + 5 * 8)),
+        ((7, 1, 4, 3, 0), 1 * (1 + 4)),
+        # Adam7 1x1: only the first pass has a pixel.
+        ((1, 1, 8, 0, 1), 2),
+        # Adam7 8x8 greyscale: passes are 1x1, 1x1, 2x1, 2x2, 4x2, 4x4, 8x4.
+        ((8, 8, 8, 0, 1), 2 + 2 + 3 + 2 * 3 + 2 * 5 + 4 * 5 + 4 * 9),
+    ],
+)
+def test_png_image_data_length(args: tuple[int, int, int, int, int], expected: int) -> None:
+    assert scanner_uploads.png_image_data_length(*args) == expected
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        pytest.param(Image.new("RGB", (64, 48), (1, 2, 3)), id="rgb"),
+        pytest.param(Image.new("RGBA", (33, 7), (1, 2, 3, 4)), id="rgba"),
+        pytest.param(Image.new("L", (17, 5), 9), id="grey"),
+        pytest.param(Image.new("LA", (3, 9), (9, 1)), id="grey-alpha"),
+        pytest.param(Image.new("1", (13, 11), 1), id="one-bit"),
+        pytest.param(Image.new("P", (21, 4), 3), id="palette"),
+        pytest.param(Image.new("I;16", (6, 6), 300), id="sixteen-bit"),
+    ],
+)
+def test_sniff_image_accepts_complete_pngs(tmp_path: Path, image: Image.Image) -> None:
+    path = tmp_path / "page.png"
+    path.write_bytes(_png_bytes(image))
+    assert scanner_uploads.sniff_image(path) == ("image/png", ".png")
+
+
+@pytest.mark.parametrize("size", [(5, 3), (8, 8), (37, 19)])
+def test_sniff_image_checks_interlaced_png_length(tmp_path: Path, size: tuple[int, int]) -> None:
+    path = tmp_path / "page.png"
+    path.write_bytes(_adam7_png(*size))
+    assert scanner_uploads.sniff_image(path) == ("image/png", ".png")
+
+    path.write_bytes(_adam7_png(*size, drop_last_pass=True))
+    with pytest.raises(scanner_uploads.UploadError) as error:
+        scanner_uploads.sniff_image(path)
+    assert (error.value.status, error.value.code) == (422, "invalid_image")
 
 
 @pytest.mark.django_db

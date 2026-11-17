@@ -235,7 +235,10 @@ see `docs/operations.md`).
     `422 checksum_mismatch`, `422 invalid_image`: not a JPEG/PNG/TIFF/WebP whose pixels
     fully decode within Pillow's decompression-bomb limit (`Image.MAX_IMAGE_PIXELS`).
     Valid headers and PNG chunk checksums are not enough; the staged file is decoded
-    before anything is published, so no version is created.
+    before anything is published, so no version is created. For a PNG the inflated
+    IDAT data must also be exactly as long as IHDR implies (width, height, bit depth,
+    colour type, Adam7 interlacing), so a complete stream with missing or extra
+    scanlines is refused too.
   - `413 payload_too_large`: the image is above `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES`
     (the `max_image_bytes` that `ping` reports), or `Content-Length` is above that plus
     1 MiB of multipart overhead. `415` for a body that is not `multipart/form-data`;
