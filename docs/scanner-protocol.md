@@ -5,7 +5,7 @@ There are two scanner-facing APIs:
 1. **Device API v1 (`/api/scanner/v1/`), planned and the target for the
    libreflip scanner (`sans`).** It is specified in full in the canonical
    contract [`libreflip/serif` `docs/sans-serif-interface.md`](https://github.com/libreflip/serif/blob/master/docs/sans-serif-interface.md). It
-   uses per-device API keys (`Authorization: Bearer`), TLS 1.3, the
+   uses one API key for the one scanner (`Authorization: Bearer`), TLS 1.3, the
    scanner-assigned job ID as primary key, background per-page upload,
    `scan.jsonl` events, `metadata.opf` as authoritative metadata,
    `capture-complete` into the new raw-scan state `captured`, and the rescan
@@ -17,9 +17,11 @@ There are two scanner-facing APIs:
 
 ## Device API v1: server-side work (summary)
 
-- `ScannerDevice` model with a SHA-256-hashed key, plus
-  `manage.py scanner_device create|rotate|revoke|list` (Sprint020 H). A
-  device key reaches only `/api/scanner/v1/`, and a session cannot reach it.
+- One scanner, one key: `BOOK_SCANNER_SCANNER_API_KEY_SHA256` holds the
+  SHA-256 of the key (empty disables the API), and `manage.py
+  generate_scanner_key` prints a new key and that line. There is no device
+  registry; this replaces Sprint020 H's device registration. The key reaches
+  only `/api/scanner/v1/`, and a session cannot reach it.
   The views are CSRF-exempt because no cookies are involved.
 - `ScanJob.id` becomes a string primary key. Scanner jobs use the scanner's
   ID (`YYYYMMDDTHHMMSSZ[-N]`); web-created jobs keep `str(uuid4())`. The
