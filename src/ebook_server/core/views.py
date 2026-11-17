@@ -174,17 +174,34 @@ def _serialize_scan_todo(todo: ScanTodo) -> dict[str, Any]:
     }
 
 
-def _serialize_scan_page(page: ScanPage) -> dict[str, Any]:
-    active_version = page.active_version()
+def _prefetched_active_version(versions: list[ScanPageVersion]) -> ScanPageVersion | None:
+    """``ScanPage.active_version()`` computed from an already-loaded version list."""
+    active = [version for version in versions if version.is_active]
+    return max(active, key=lambda version: version.version) if active else None
+
+
+def _serialize_scan_page(
+    page: ScanPage,
+    *,
+    versions: list[ScanPageVersion] | None = None,
+    open_todo_count: int | None = None,
+) -> dict[str, Any]:
+    """Serialize a page; pass ``versions``/``open_todo_count`` to avoid per-page queries."""
+    if versions is None:
+        active_version = page.active_version()
+        ordered_versions = list(page.versions.order_by("-version"))
+    else:
+        active_version = _prefetched_active_version(versions)
+        ordered_versions = sorted(versions, key=lambda version: version.version, reverse=True)
+    if open_todo_count is None:
+        open_todo_count = page.todos.filter(state=ScanTodo.State.OPEN).count()
     return {
         "id": str(page.id),
         "logical_sequence_number": page.logical_sequence_number,
         "side": page.side,
-        "open_rescan_todos": page.todos.filter(state=ScanTodo.State.OPEN).count(),
+        "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
-        "available_versions": [
-            _serialize_scan_page_version(v) for v in page.versions.order_by("-version")
-        ],
+        "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],
         "created_at": page.created_at.isoformat(),
         "updated_at": page.updated_at.isoformat(),
     }
@@ -1869,6 +1886,48 @@ def _serialize_workspace_page(page: ScanPage) -> dict[str, Any]:
     return payload
 
 
+def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
+    """Serialize every page of ``job`` for the workspace with a bounded query count.
+
+    The per-page helpers above issue several queries per page and per stage, which
+    made the workspace for a realistic (hundreds of pages) book time out (#51).
+    """
+    page_list = list(
+        job.pages.annotate(
+            open_todo_count=Count("todos", filter=Q(todos__state=ScanTodo.State.OPEN)),
+        )
+        .prefetch_related("versions")
+        .order_by("logical_sequence_number", "side"),
+    )
+    versions_by_page = {page.id: list(page.versions.all()) for page in page_list}
+    states_by_page = scantailor.ensure_stage_states_for_pages(
+        job,
+        page_list,
+        {
+            page_id: _prefetched_active_version(versions)
+            for page_id, versions in versions_by_page.items()
+        },
+    )
+    serialized: list[dict[str, Any]] = []
+    for page in page_list:
+        versions = versions_by_page[page.id]
+        payload = _serialize_scan_page(
+            page,
+            versions=versions,
+            open_todo_count=getattr(page, "open_todo_count", 0),
+        )
+        if _prefetched_active_version(versions) is not None:
+            payload["thumbnail"] = _scan_page_thumbnail_url(page)
+        page_states = states_by_page.get(page.id, {})
+        payload["stages"] = [
+            _serialize_stage_state(page_states[stage])
+            for stage in scantailor.stage_order()
+            if stage in page_states
+        ]
+        serialized.append(payload)
+    return serialized
+
+
 def _scan_workspace_page_payload(job: ScanJob, page: ScanPage) -> dict[str, Any]:
     _ensure_workspace_stage_states(job, page)
     return _serialize_workspace_page(page)
@@ -2034,21 +2093,11 @@ def scan_job_workspace(
         return HttpResponseBadRequest("invalid job id")
 
     try:
-        job = (
-            ScanJob.objects.select_related("book", "operator")
-            .prefetch_related(
-                "pages",
-                "pages__versions",
-            )
-            .get(pk=job_id)
-        )
+        job = ScanJob.objects.select_related("book", "operator").get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
-    pages = []
-    for page in job.pages.all().order_by("logical_sequence_number", "side"):
-        _ensure_workspace_stage_states(job, page)
-        pages.append(_serialize_workspace_page(page))
+    pages = _serialize_workspace_pages(job)
     payload = {
         "job_id": str(job.id),
         "state": job.state,
