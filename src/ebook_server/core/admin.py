@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
@@ -43,6 +45,11 @@ class BookAdmin(admin.ModelAdmin[Book]):
     filter_horizontal = ("authors", "categories", "genres")
     # Assigned by core.archive_layout; editing it by hand would orphan the book's folder.
     readonly_fields = ("archive_folder",)
+    actions = ("plan_archive_reorganize",)
+
+    @admin.action(description="Plan moving selected books into their archive folders (dry run)")
+    def plan_archive_reorganize(self, request: HttpRequest, queryset: QuerySet[Book]) -> None:
+        _queue_reorganize(self, request, book_ids=list(queryset.values_list("pk", flat=True)))
 
 
 @admin.register(Author)
@@ -286,12 +293,136 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
             {"fields": ("group_sibling_formats",)},
         ),
     )
+    actions = ("plan_sort_into_archive_tree",)
+
+    @admin.action(
+        description="Plan sorting books imported from these sources into the archive tree (dry run)"
+    )
+    def plan_sort_into_archive_tree(
+        self,
+        request: HttpRequest,
+        queryset: QuerySet[SourceLocation],
+    ) -> None:
+        _queue_reorganize(
+            self,
+            request,
+            source_location_ids=list(queryset.values_list("pk", flat=True)),
+        )
+
+
+REORGANIZE_REPORT_ROWS = 500
+
+
+def _queue_reorganize(
+    model_admin: Any,
+    request: HttpRequest,
+    *,
+    book_ids: list[int] | None = None,
+    source_location_ids: list[int] | None = None,
+    apply_plan_job: ProcessingJob | None = None,
+) -> None:
+    """Record an archive-reorganize ProcessingJob; planning and moving run in a worker."""
+    from django.urls import reverse
+    from django.utils.html import format_html
+
+    from .archive_reorganize import ReorganizeDispatchError, ReorganizeError, request_reorganize
+
+    user_id = request.user.pk if request.user.is_authenticated else None
+    try:
+        job, dispatched = request_reorganize(
+            book_ids=book_ids,
+            source_location_ids=source_location_ids,
+            apply_plan_job=apply_plan_job,
+            requested_by_user_id=user_id,
+        )
+    except ReorganizeError as exc:
+        model_admin.message_user(request, f"Not queued: {exc}", messages.ERROR)
+        return
+    except ReorganizeDispatchError as exc:
+        model_admin.message_user(
+            request, f"Recorded but could not be queued: {exc}", messages.ERROR
+        )
+        return
+    url = reverse("admin:core_processingjob_change", args=[job.pk])
+    what = "Applying the plan" if apply_plan_job is not None else "Dry-run plan"
+    if dispatched:
+        model_admin.message_user(
+            request,
+            format_html(
+                '{} queued as job <a href="{}">{}</a>. Review it there, then apply a plan '
+                'with the "Apply selected archive reorganize plans" action.',
+                what,
+                url,
+                job.job_id,
+            ),
+            messages.SUCCESS,
+        )
+    else:
+        model_admin.message_user(
+            request,
+            format_html(
+                '{} recorded as job <a href="{}">{}</a>, but no worker queue is configured. '
+                "Run <code>manage.py reorganize_archive --run-queued</code>.",
+                what,
+                url,
+                job.job_id,
+            ),
+            messages.WARNING,
+        )
 
 
 @admin.register(ProcessingJob)
 class ProcessingJobAdmin(admin.ModelAdmin[ProcessingJob]):
     list_display = ("job_id", "job_type", "state", "file_variant", "scheduled_at", "finished_at")
     list_filter = ("job_type", "state")
+    readonly_fields = ("reorganize_report",)
+    actions = ("apply_reorganize_plan",)
+
+    @admin.display(description="Archive reorganize")
+    def reorganize_report(self, obj: ProcessingJob) -> str:
+        from django.utils.html import format_html, format_html_join
+        from django.utils.safestring import mark_safe
+
+        if obj.job_type != ProcessingJob.JobType.ARCHIVE_REORGANIZE:
+            return "-"
+        details = obj.details if isinstance(obj.details, dict) else {}
+        is_plan = details.get("mode") == "plan"
+        rows = list((details.get("plan") if is_plan else details.get("results")) or [])
+        shown = rows[:REORGANIZE_REPORT_ROWS]
+        if is_plan:
+            head = mark_safe("<tr><th>File</th><th>From</th><th>To</th></tr>")
+            body = format_html_join(
+                "",
+                "<tr><td>{} {}</td><td>{}</td><td>{}/{}</td></tr>",
+                (
+                    (r.get("kind"), r.get("id"), r.get("from"), r.get("to_folder"), r.get("name"))
+                    for r in shown
+                ),
+            )
+        else:
+            head = mark_safe("<tr><th>File</th><th>Status</th><th>Detail</th></tr>")
+            body = format_html_join(
+                "",
+                "<tr><td>{} {}</td><td>{}</td><td>{}</td></tr>",
+                ((r.get("kind"), r.get("id"), r.get("status"), r.get("detail")) for r in shown),
+            )
+        more = len(rows) - len(shown)
+        return format_html(
+            "<p>{}</p><table>{}{}</table><p>{}</p>",
+            details.get("summary", ""),
+            head,
+            body,
+            f"... and {more} more" if more > 0 else "",
+        )
+
+    @admin.action(description="Apply selected archive reorganize plans (moves files)")
+    def apply_reorganize_plan(
+        self,
+        request: HttpRequest,
+        queryset: QuerySet[ProcessingJob],
+    ) -> None:
+        for plan_job in queryset:
+            _queue_reorganize(self, request, apply_plan_job=plan_job)
 
 
 @admin.register(ImportJob)

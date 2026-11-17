@@ -239,6 +239,47 @@ def book_folder(book: Book, storage: StorageBackend) -> str:
     raise RuntimeError(f"could not assign a unique archive folder to book {book.pk}")
 
 
+def proposed_book_folder(book: Book, storage: StorageBackend) -> str:
+    """The folder a reorganize would give ``book`` now, without claiming it.
+
+    Its current folder is kept when that is already the folder (or the disambiguated
+    form of the folder) its metadata implies.
+    """
+    current = (book.archive_folder or "").lower()
+    for candidate in _folder_candidates(render_book_folder(book), book.pk):
+        if candidate.lower() == current:
+            return book.archive_folder
+        if not _folder_in_use(candidate, book, storage):
+            return candidate
+    raise RuntimeError(f"no free archive folder for book {book.pk}")
+
+
+def reassign_book_folder(book: Book, storage: StorageBackend) -> str:
+    """Claim the folder ``book``'s current metadata implies (explicit reorganize only).
+
+    Same collision rules as ``book_folder``; returns the current folder unchanged when
+    it already matches. Files are not moved here; the caller moves them.
+    """
+    with transaction.atomic():
+        locked = Book.objects.select_for_update().get(pk=book.pk)
+        current = locked.archive_folder or ""
+        for candidate in _folder_candidates(render_book_folder(locked), locked.pk):
+            if candidate.lower() == current.lower():
+                book.archive_folder = current
+                return current
+            if _folder_in_use(candidate, locked, storage):
+                continue
+            try:
+                with transaction.atomic():
+                    Book.objects.filter(pk=locked.pk).update(archive_folder=candidate)
+            except IntegrityError:
+                continue
+            book.archive_folder = candidate
+            logger.info("archive_folder_reassigned", book_id=locked.pk)
+            return candidate
+    raise RuntimeError(f"could not assign a unique archive folder to book {book.pk}")
+
+
 def original_destination(
     storage: StorageBackend,
     job: ImportJob,

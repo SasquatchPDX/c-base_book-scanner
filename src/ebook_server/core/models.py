@@ -875,6 +875,7 @@ class ProcessingJob(models.Model):
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
+        ARCHIVE_REORGANIZE = "archive_reorganize", "Archive reorganize"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"
