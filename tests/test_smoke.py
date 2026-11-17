@@ -80,7 +80,6 @@ def test_production_settings_accept_hardened_configuration() -> None:
         csrf_cookie_secure=True,
         secure_hsts_seconds=31536000,
         metrics_bearer_token=SecretStr("metrics-monitoring-token"),
-        public_base_url="https://library.example.test/",
     )
 
     assert production.environment == "production"

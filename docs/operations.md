@@ -41,6 +41,8 @@ list). To change the default for every scanner, set
 `deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.
+For the libreflip scanner, put `deploy/nginx/serif-lan-tls.conf` (TLS 1.3, LAN
+only) in front of it; see "libreflip scanner deployment" below.
 
 ### Static files
 
@@ -141,37 +143,282 @@ Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
 - PostgreSQL and Redis URLs are supplied;
 - the authentication mode is `ldap` or `local` (`stub` is rejected);
 - HTTPS redirect, secure cookies, and HSTS are enabled;
-- `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
+- if the scanner API is enabled (`BOOK_SCANNER_SCANNER_API_KEY_SHA256` is set),
+  `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
+  Without a scanner key neither setting is needed.
 
 When TLS terminates at a trusted reverse proxy, set
 `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` and ensure that untrusted clients
 cannot inject `X-Forwarded-Proto`. HSTS preload is optional and should only be
 enabled after its long-lived operational consequences are understood.
 
-## Scanner devices
+## libreflip scanner deployment
 
-The libreflip scanner authenticates to the device API `/api/scanner/v1/` with its own
-API key (`Authorization: Bearer`), never with a member session. Manage devices with:
+The libreflip scanner (`sans`, a Raspberry Pi) uploads to the device API
+`/api/scanner/v1/`. The contract is libreflip/serif
+`docs/sans-serif-interface.md` (currently
+[libreflip/serif#37](https://github.com/libreflip/serif/pull/37)); §3 sets the
+rules this section implements:
+
+- serif is reachable only inside the LAN; the VM has no public address or port
+  forwarding;
+- nginx terminates TLS with `ssl_protocols TLSv1.3`, and there is no plain-HTTP
+  API;
+- the certificate is for the VM's LAN host name and is issued by a small
+  internal CA; sans verifies the chain and the host name and cannot skip that;
+- serif (or the site's NTP server) gives the LAN NTP, because sans refuses to
+  start a job without a synchronised clock;
+- there is exactly one scanner, and it has one API key, created with
+  `manage.py generate_scanner_key`. serif keeps only the key's SHA-256 in
+  `BOOK_SCANNER_SCANNER_API_KEY_SHA256`.
+
+All names and addresses below are placeholders: `serif.lan.example` is the
+VM's LAN host name and `192.0.2.0/24` stands for the LAN range(s). Replace
+them with the site's values.
+
+### The scanner API key
+
+The scanner authenticates to `/api/scanner/v1/` with `Authorization: Bearer
+<key>`, never with a member session. A browser session cannot use that
+namespace (it answers `401`), and the key authorises nothing outside it (it
+gets `403` on every other route). The API is off until a key hash is
+configured: with `BOOK_SCANNER_SCANNER_API_KEY_SHA256` empty (the default),
+every `/api/scanner/v1/` request answers `503`, and production does not
+require `BOOK_SCANNER_PUBLIC_BASE_URL`. With a key hash configured, production
+startup requires `BOOK_SCANNER_PUBLIC_BASE_URL` to be the server's `https://`
+base URL (it builds the portal links handed to the scanner).
+
+`BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and `BOOK_SCANNER_SCANNER_MAX_OPF_BYTES`
+are the upload limits reported by `GET /api/scanner/v1/ping`. Every API request
+writes one log line (`scanner_api_request`: route, status, job ID); the key is
+never logged.
+
+Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP listener in
+`deploy/nginx/book-scanner.conf` already refuses `/api/scanner/` with `403`,
+because the key travels in every request header.
+
+### nginx
+
+Install `deploy/nginx/book-scanner.conf` and `deploy/nginx/serif-lan-tls.conf`
+together (see `deploy/nginx/README.md`):
+
+1. In `book-scanner.conf`, set the upstream to `127.0.0.1:8000` and bind the
+   plain-HTTP server to loopback (`listen 127.0.0.1:8080;`) or delete it. It
+   already answers `403` on `/api/scanner/`.
+2. In `serif-lan-tls.conf`, replace `serif.lan.example` and the certificate
+   paths, and add one `allow <LAN CIDR>;` line per LAN range above each
+   `deny all;` (there are two servers). As shipped, the file denies everyone,
+   so forgetting this step locks clients out instead of opening the API.
+3. Set `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true`, add the host name to
+   `BOOK_SCANNER_ALLOWED_HOSTS`, and keep Uvicorn on `127.0.0.1`
+   (`deploy/systemd/book-scanner-web.service` does).
+4. `sudo nginx -t && sudo systemctl reload nginx`.
+
+### Certificates: internal CA for the LAN host name
+
+Use a two-level setup: a long-lived internal CA, which the scanner trusts, and
+a server certificate signed by it, which nginx serves. Renewing the server
+certificate then needs no change on the scanner. Run this on an admin machine,
+not on the VM, and keep `serif-ca.key` offline (an encrypted USB stick or a
+password manager attachment). Whoever holds that key can impersonate serif to
+the scanner.
 
 ```bash
-uv run python manage.py scanner_device create libreflip-01 --name "libreflip at c-base"
-uv run python manage.py scanner_device rotate libreflip-01   # old key stops working at once
-uv run python manage.py scanner_device revoke libreflip-01
-uv run python manage.py scanner_device list
+mkdir serif-ca && cd serif-ca
+umask 077
+
+# 1. The CA (10 years). It may only sign server certificates directly below it.
+openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout serif-ca.key -out serif-ca.pem -days 3650 \
+  -subj "/CN=serif internal CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# 2. The server key and request for the VM's LAN host name.
+openssl req -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+  -keyout serif.key -out serif.csr -subj "/CN=serif.lan.example"
+
+# 3. Sign it (825 days). Clients check the subjectAltName, not the CN.
+cat > serif.ext <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:serif.lan.example
+EOF
+openssl x509 -req -in serif.csr -CA serif-ca.pem -CAkey serif-ca.key \
+  -CAcreateserial -out serif.crt -days 825 -sha256 -extfile serif.ext
+
+# 4. Check before installing.
+openssl verify -CAfile serif-ca.pem serif.crt
+openssl x509 -in serif.crt -noout -subject -ext subjectAltName -enddate
 ```
 
-`create` and `rotate` print the key exactly once; the database keeps only its SHA-256.
-`rotate` also re-activates a revoked device. Admins can list devices and revoke them in
-`/admin/`. A device key authorises nothing outside `/api/scanner/v1/`, and a browser
-session cannot use that namespace (it answers `401`).
+`scripts/test_scanner_tls_proxy.sh` runs exactly these steps (with a short
+validity) in CI, so the procedure stays working.
 
-Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP example listener in
-`deploy/nginx/book-scanner.conf` (and any lab install without TLS) must not expose it,
-because the key travels in every request header; block the prefix there (for example
-`location ^~ /api/scanner/ { return 403; }`). `BOOK_SCANNER_SCANNER_API_ENABLED=false`
-switches the whole namespace off (`503`). `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and
-`BOOK_SCANNER_SCANNER_MAX_OPF_BYTES` are the upload limits reported to the scanner by
-`GET /api/scanner/v1/ping`.
+Install the certificate and key on the VM (nginx reads them as root):
+
+```bash
+sudo install -d -m 0755 /etc/ssl/serif
+sudo install -m 0644 serif.crt /etc/ssl/serif/serif.crt
+sudo install -m 0600 serif.key /etc/ssl/serif/serif.key
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Before the server certificate expires (`openssl x509 -enddate -noout -in
+/etc/ssl/serif/serif.crt`), repeat steps 2–4 with the same CA, install, and
+reload. The scanner keeps working without changes. If the host name changes,
+issue a new server certificate for it and update the scanner's `url`.
+
+A single self-signed certificate is possible, but every renewal then means a
+new `ca_file` on the scanner. If you choose it anyway, give it the same
+`serif.ext` extensions (`CA:FALSE`, `serverAuth`, the `subjectAltName`):
+`openssl req -x509` marks certificates `CA:TRUE` by default, and some TLS
+libraries refuse a CA certificate as a server certificate.
+
+**Giving the CA to the scanner.** The scanner needs only `serif-ca.pem`, never a
+key. Copy it over SSH, for example `scp serif-ca.pem pi@<scanner>:/tmp/`, then
+compare fingerprints on both ends before trusting it:
+
+```bash
+openssl x509 -in serif-ca.pem -noout -fingerprint -sha256
+```
+
+Installing it as `ca_file` is part of the onboarding steps below.
+
+### Time synchronisation (NTP)
+
+sans takes job IDs from its UTC clock and refuses to start a job while the
+kernel reports the clock as unsynchronised. `ping` also returns `server_time`,
+and sans stops uploading when the clocks differ by more than 120 seconds. Both
+the VM and the scanner therefore need NTP. The LAN is not routed to the
+internet, so choose one of these:
+
+- **The site already runs an NTP server.** Point both the VM and the scanner
+  at it and skip the chrony server below.
+- **chrony on the VM serves the LAN.** The VM itself needs a time source
+  (an upstream NTP server it can reach, or the hypervisor clock).
+
+  ```bash
+  sudo apt install chrony
+  sudo tee /etc/chrony/conf.d/serif-lan.conf <<'EOF'
+  # Upstream for the VM itself; replace with a reachable server.
+  server ntp.lan.example iburst
+  # Serve time to the LAN (repeat per range).
+  allow 192.0.2.0/24
+  # Keep serving a consistent time if the upstream is unreachable.
+  local stratum 10 orphan
+  EOF
+  sudo systemctl restart chrony
+  chronyc tracking      # "Leap status: Normal"
+  chronyc sources -v
+  ```
+
+  Open UDP port 123 from the LAN in the VM firewall. `chronyc clients` lists
+  the scanner once it has synced. `local stratum` keeps the LAN consistent
+  with the VM even when it drifts from real time; leave it out if the VM must
+  never serve unsynchronised time.
+
+On the scanner (Raspberry Pi OS uses `systemd-timesyncd`):
+
+```bash
+sudo mkdir -p /etc/systemd/timesyncd.conf.d
+printf '[Time]\nNTP=serif.lan.example\n' | sudo tee /etc/systemd/timesyncd.conf.d/serif.conf
+sudo systemctl restart systemd-timesyncd
+timedatectl show -p NTPSynchronized --value   # must print "yes"
+```
+
+### Onboarding a scanner
+
+1. **Generate the key on the VM.** As the service user, from the checkout:
+
+   ```bash
+   uv run python manage.py generate_scanner_key
+   ```
+
+   The command prints the key and the line
+   `BOOK_SCANNER_SCANNER_API_KEY_SHA256=<hex>`; it writes nothing anywhere.
+   Add that line to the server environment (`.env` or the systemd
+   `EnvironmentFile`), set `BOOK_SCANNER_PUBLIC_BASE_URL`, and restart the web
+   service. serif never stores the key itself. If it is lost or leaked, generate
+   a new one, replace the line, restart (the old key answers `401` from then
+   on), and repeat step 2.
+
+2. **Put the key and the CA on the Pi**, as the user that runs sans. Paste the
+   key into a file that is created with mode 0600, so it never lands in shell
+   history or in a world-readable file; sans refuses to upload if the key file
+   is readable by anyone else.
+
+   ```bash
+   mkdir -p ~/.config/sans
+   (umask 077 && cat > ~/.config/sans/serif-api-key)   # paste the key, Enter, Ctrl-D
+   chmod 0600 ~/.config/sans/serif-api-key
+   install -m 0644 /tmp/serif-ca.pem ~/.config/sans/serif-ca.pem
+   ls -l ~/.config/sans/                               # key: -rw-------
+   ```
+
+3. **Configure `[serif]` in `sans.toml`** (the machine profile). Both URLs must
+   be `https://` and use the certificate's host name:
+
+   ```toml
+   [serif]
+   url = "https://serif.lan.example/"
+   portal_job_url_prefix = "https://serif.lan.example/j/"
+   api_key_file = "/home/pi/.config/sans/serif-api-key"
+   ca_file = "/home/pi/.config/sans/serif-ca.pem"
+   min_free_bytes = 8_000_000_000
+   ```
+
+   Restart sans so it reads the profile.
+
+4. **Check `ping`** from the Pi with the same key, CA and host name sans
+   uses. The key goes through a bash process substitution, so it does not
+   appear in the process list:
+
+   ```bash
+   curl --fail-with-body --tlsv1.3 --cacert ~/.config/sans/serif-ca.pem \
+     -H @<(printf 'Authorization: Bearer %s\n' "$(cat ~/.config/sans/serif-api-key)") \
+     https://serif.lan.example/api/scanner/v1/ping
+   ```
+
+   Expect `200` with `"api_version": 1`, a `server_time` within a few seconds of `date -u`, and the `limits`. The idle
+   screen of sans should then show "All books uploaded" rather than "Upload
+   not configured" or "serif rejects this scanner's key".
+
+| Symptom | Likely cause |
+|---|---|
+| curl exit 6 / 7 | DNS for the host name, or nginx not listening on 443 |
+| curl exit 35 (handshake) | client cannot do TLS 1.3, or wrong port |
+| curl exit 60 (certificate) | wrong `ca_file`, or host name not in the certificate's subjectAltName |
+| `403` HTML page from nginx | the scanner's address is not in the `allow` lines |
+| `401` JSON error | key wrong or replaced; re-run step 1/2 |
+| `503` | `BOOK_SCANNER_SCANNER_API_KEY_SHA256` is empty (API disabled), or the web service was not restarted after setting it |
+| sans: "Clock not synchronised" | NTP on the Pi; check `timedatectl` |
+
+To take the scanner out of service, empty `BOOK_SCANNER_SCANNER_API_KEY_SHA256`
+and restart the web service; the API then answers `503`.
+
+### Acceptance on the VM
+
+CI proves the nginx rules against a live nginx
+(`scripts/test_scanner_tls_proxy.sh`). After installing on the real VM, repeat
+the two checks there:
+
+```bash
+# From a LAN host: a TLS 1.2-only client must fail the handshake.
+openssl s_client -connect serif.lan.example:443 -servername serif.lan.example -tls1_2 </dev/null
+curl --tls-max 1.2 --cacert serif-ca.pem https://serif.lan.example/   # exit 35
+
+# From a host outside the allowed ranges (another VLAN, or temporarily remove
+# its range): HTTPS and HTTP both answer 403.
+curl -s -o /dev/null -w '%{http_code}\n' --cacert serif-ca.pem https://serif.lan.example/api/scanner/v1/ping
+curl -s -o /dev/null -w '%{http_code}\n' http://serif.lan.example/
+
+# Plain HTTP never serves the device API.
+curl -s -o /dev/null -w '%{http_code}\n' http://serif.lan.example/api/scanner/v1/ping   # 403
+```
+
+Then run the onboarding steps with the real scanner.
 
 ## Authentication modes
 
@@ -234,6 +481,20 @@ HTTP multipart OCR boundaries before searching for and downloading the resulting
 OCR variant. The OCR service is a contract fixture; it validates orchestration
 and provenance, not recognition quality. Containers are removed when the suite
 exits.
+
+The suite first runs `scripts/test_scanner_tls_proxy.sh`, which starts the
+pinned Nginx with host networking (Linux only) three times on the scanner
+front end `deploy/nginx/serif-lan-tls.conf`: with `127.0.0.1` allowed, with only
+the documentation example ranges allowed, and unedited. It issues a
+certificate through the internal-CA procedure in "libreflip scanner deployment" and checks that TLS 1.3
+works with chain and host-name verification, that TLS 1.2-only clients
+(`openssl s_client -tls1_2`, `curl --tls-max 1.2`) cannot connect, that a source
+outside the allowed ranges and the unedited file get `403`, that `/api/scanner/`
+answers `413` above 64 MiB, and that neither the port-80 redirect server nor
+`book-scanner.conf`'s plain-HTTP listener serves `/api/scanner/`. It uses host
+ports 18440–18442, 18450–18452, 18460 and 18083 (base overridable with
+`BOOK_SCANNER_SCANNER_PROXY_PORT_BASE`, stub upstream with
+`BOOK_SCANNER_SCANNER_PROXY_UPSTREAM_PORT`).
 
 The suite reserves host ports 15432, 16379, 13389, 18080, 18081, and 18082 by default.
 These sit below Linux's ephemeral port range (32768-60999) on purpose: ports

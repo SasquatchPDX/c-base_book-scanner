@@ -1,13 +1,15 @@
 """Scanner device API v1 (``/api/scanner/v1/``) for the libreflip scanner (``sans``).
 
 The canonical contract is libreflip/serif ``docs/sans-serif-interface.md``; "§" below
-refers to it. Every request authenticates as a :class:`ScannerDevice` with
-``Authorization: Bearer <key>`` (§3, D9). Sessions and cookies play no part: a browser
-session without a valid key gets ``401``, and the views are CSRF-exempt because nothing
-here is cookie-authenticated. Device keys are only ever checked in this module, so they
-authorise nothing outside this namespace.
+refers to it. There is exactly one scanner (#125): every request authenticates with its
+key as ``Authorization: Bearer <key>`` (§3), checked against the SHA-256 in
+``BOOK_SCANNER_SCANNER_API_KEY_SHA256`` (:mod:`core.scanner_auth`). With that setting
+empty the API is disabled and answers ``503``. Sessions and cookies play no part: a
+browser session without a valid key gets ``401``, member-session middleware skips this
+namespace, and the views are CSRF-exempt because nothing here is cookie-authenticated.
 
 Errors always use the envelope ``{"error": {"code", "message", "details"}}`` (§6.1).
+Every request writes one log line (route, status, job ID); the key is never logged.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from datetime import UTC, datetime
 from functools import wraps
 from typing import Any, Final
 
+import structlog
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.http import HttpRequest, JsonResponse
@@ -25,16 +28,18 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from .models import ScanJob, ScannerDevice
+from .models import ScanJob
 from .scan_job_ids import is_device_job_id
-from .scanner_devices import authenticate_key, bearer_token
+from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
 
 API_VERSION: Final = 1
 # §6.12: event batches are fixed by the contract rather than configured per deployment.
 MAX_EVENT_BATCH_BYTES: Final = 1024 * 1024
 MAX_EVENT_BATCH_LINES: Final = 1000
 
-DeviceView = Callable[..., JsonResponse]
+logger = structlog.get_logger(__name__)
+
+ScannerView = Callable[..., JsonResponse]
 
 
 def iso_utc(value: datetime) -> str:
@@ -70,43 +75,73 @@ def _bearer_token(request: HttpRequest) -> str | None:
     return bearer_token(request.headers.get("Authorization", ""))
 
 
-def scanner_api_view(methods: Iterable[str]) -> Callable[[DeviceView], Callable[..., JsonResponse]]:
-    """Wrap a device view: API switch, Bearer authentication, method check.
+def _route_name(request: HttpRequest) -> str:
+    match = request.resolver_match
+    if match is None:
+        return request.path
+    return match.url_name or match.route
 
-    The wrapped view is called as ``view(request, device, *args, **kwargs)``.
+
+def _log_request(request: HttpRequest, status: int, job_id: object) -> None:
+    """One line per request: route, method, status and job ID, never the key."""
+    logger.info(
+        "scanner_api_request",
+        route=_route_name(request),
+        method=request.method,
+        status=status,
+        job_id=str(job_id) if job_id is not None else None,
+    )
+
+
+def _refusal(request: HttpRequest, allowed: tuple[str, ...]) -> JsonResponse | None:
+    """The response for a request that may not reach the view, else ``None``."""
+    if not scanner_api_enabled():
+        return error_response(
+            503, "scanner_api_disabled", "The scanner API is disabled on this server."
+        )
+    token = _bearer_token(request)
+    if token is None:
+        return _unauthorized(
+            "authentication_required", "Send the scanner key as Authorization: Bearer."
+        )
+    if not is_scanner_key(token):
+        return _unauthorized("invalid_api_key", "The scanner key is invalid.")
+    if request.method not in allowed:
+        response = error_response(
+            405,
+            "method_not_allowed",
+            f"{request.method} is not allowed here.",
+            {"allowed": list(allowed)},
+        )
+        response["Allow"] = ", ".join(allowed)
+        return response
+    return None
+
+
+def scanner_api_view(
+    methods: Iterable[str],
+) -> Callable[[ScannerView], Callable[..., JsonResponse]]:
+    """Wrap a scanner view: API switch, Bearer authentication, method check, logging.
+
+    The wrapped view is called as ``view(request, *args, **kwargs)`` once the scanner
+    key has been verified.
     """
     allowed = tuple(method.upper() for method in methods)
 
-    def decorator(view: DeviceView) -> Callable[..., JsonResponse]:
+    def decorator(view: ScannerView) -> Callable[..., JsonResponse]:
         @csrf_exempt
         @wraps(view)
         def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> JsonResponse:
-            if not getattr(settings, "BOOK_SCANNER_SCANNER_API_ENABLED", True):
-                return error_response(
-                    503, "scanner_api_disabled", "The scanner API is disabled on this server."
-                )
-            token = _bearer_token(request)
-            if token is None:
-                return _unauthorized(
-                    "authentication_required", "Send the device key as Authorization: Bearer."
-                )
-            device = authenticate_key(token)
-            if device is None:
-                return _unauthorized("invalid_api_key", "The device key is invalid or revoked.")
-            seen_at = timezone.now()
-            ScannerDevice.objects.filter(pk=device.pk).update(last_seen_at=seen_at)
-            device.last_seen_at = seen_at
-            if request.method not in allowed:
-                response = error_response(
-                    405,
-                    "method_not_allowed",
-                    f"{request.method} is not allowed here.",
-                    {"allowed": list(allowed)},
-                )
-                response["Allow"] = ", ".join(allowed)
-                return response
-            response = view(request, device, *args, **kwargs)
-            response.setdefault("Cache-Control", "no-store")
+            job_id = kwargs.get("job_id")
+            try:
+                response = _refusal(request, allowed)
+                if response is None:
+                    response = view(request, *args, **kwargs)
+                    response.setdefault("Cache-Control", "no-store")
+            except Exception:
+                _log_request(request, 500, job_id)
+                raise
+            _log_request(request, response.status_code, job_id)
             return response
 
         return wrapper
@@ -124,12 +159,11 @@ def limits() -> dict[str, int]:
 
 
 @scanner_api_view(["GET"])
-def ping(request: HttpRequest, device: ScannerDevice) -> JsonResponse:
+def ping(request: HttpRequest) -> JsonResponse:
     """§6.2: reachability, authentication and clock check."""
     return JsonResponse(
         {
             "api_version": API_VERSION,
-            "scanner_id": device.scanner_id,
             "server_time": iso_utc(timezone.now()),
             "limits": limits(),
         }
@@ -195,9 +229,8 @@ def _parse_registration(request: HttpRequest) -> tuple[dict[str, Any] | None, Js
         return None, error_response(400, "invalid_json", "The body must be a JSON object.")
     if not isinstance(payload, dict):
         return None, error_response(400, "invalid_json", "The body must be a JSON object.")
-    raw_started = payload.get("scan_started_at")
-    started = parse_datetime(raw_started) if isinstance(raw_started, str) else None
-    if started is None or started.tzinfo is None:
+    started = _parse_timestamp(payload.get("scan_started_at"))
+    if started is None:
         return None, error_response(
             400,
             "invalid_request",
@@ -212,7 +245,25 @@ def _parse_registration(request: HttpRequest) -> tuple[dict[str, Any] | None, Js
             "capture_layout must be one of: " + ", ".join(ScanJob.CaptureLayout.values),
             {"field": "capture_layout"},
         )
-    return {"scan_started_at": started.astimezone(UTC), "capture_layout": layout}, None
+    return {"scan_started_at": started, "capture_layout": layout}, None
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """An ISO 8601 timestamp with a time zone as aware UTC, or ``None`` if it is not one.
+
+    ``parse_datetime`` raises ``ValueError`` for well-formed strings that are not a
+    calendar date or time (``2026-02-30T00:00:00Z``, ``T25:00``), and converting an
+    extreme value to UTC can overflow. Both are a client error (``400``), not a ``500``.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        started = parse_datetime(value)
+        if started is None or started.tzinfo is None:
+            return None
+        return started.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
 
 
 def _conflict(job_id: str) -> JsonResponse:
@@ -224,13 +275,25 @@ def _conflict(job_id: str) -> JsonResponse:
     )
 
 
+def scanner_job(job_id: str, *, lock: bool = False) -> ScanJob | None:
+    """The job if the scanner registered it (``source=scanner``), else ``None``.
+
+    Scanner job routes answer ``404`` for ``None``: a web-created job and an unknown ID
+    look the same, so job IDs cannot be probed (§6.1). Registration (``PUT``) is the
+    exception and answers ``409 job_id_conflict`` for an existing web job (§6.3).
+    """
+    jobs = ScanJob.objects.select_for_update() if lock else ScanJob.objects.all()
+    return jobs.filter(pk=job_id, source=ScanJob.Source.SCANNER).first()
+
+
 @scanner_api_view(["PUT"])
-def job(request: HttpRequest, device: ScannerDevice, job_id: str) -> JsonResponse:
+def job(request: HttpRequest, job_id: str) -> JsonResponse:
     """Register a job (§6.3): 201 created, 200 identical repeat, 409 conflict.
 
-    The same device repeating the same ``scan_started_at`` (and ``capture_layout``) gets
-    ``200`` and changes nothing. Any other data for an existing ID, another device, or a
-    web-created job with that ID is ``409 job_id_conflict``; nothing is overwritten.
+    Repeating the registration with the same ``scan_started_at`` (and
+    ``capture_layout``) gets ``200`` and changes nothing. Any other data for an existing
+    scanner job, or an existing web-created job with that ID, is
+    ``409 job_id_conflict``; nothing is overwritten.
     """
     if not is_device_job_id(job_id):
         return _invalid_job_id(job_id)
@@ -246,14 +309,13 @@ def job(request: HttpRequest, device: ScannerDevice, job_id: str) -> JsonRespons
                     created = ScanJob.objects.create(
                         id=job_id,
                         state=ScanJob.State.OPEN,
-                        device=device,
-                        scanner_id=device.scanner_id,
+                        source=ScanJob.Source.SCANNER,
                         operator=None,
                         **registration,
                     )
                     return JsonResponse(job_status_payload(request, created), status=201)
                 same = (
-                    current.device_id == device.pk
+                    current.source == ScanJob.Source.SCANNER
                     and current.scan_started_at == registration["scan_started_at"]
                     and current.capture_layout == registration["capture_layout"]
                 )
@@ -267,6 +329,6 @@ def job(request: HttpRequest, device: ScannerDevice, job_id: str) -> JsonRespons
 
 
 @scanner_api_view(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
-def not_found(request: HttpRequest, device: ScannerDevice, path: str = "") -> JsonResponse:
+def not_found(request: HttpRequest, path: str = "") -> JsonResponse:
     """Unknown routes under the namespace answer in the envelope, after authentication."""
     return error_response(404, "not_found", "No such scanner API resource.")

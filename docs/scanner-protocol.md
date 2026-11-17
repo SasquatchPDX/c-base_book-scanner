@@ -3,8 +3,8 @@
 ## Core resources
 
 - `ScanJob`: string ID (a server-generated UUID for web-created jobs, the scanner-assigned
-  `YYYYMMDDTHHMMSSZ[-N]` for jobs registered over the device API), metadata hints, status,
-  operator, scanner id.
+  `YYYYMMDDTHHMMSSZ[-N]` for jobs registered over the scanner API), `source` (`scanner` or
+  `web`), metadata hints, status, operator, scanner id.
 - `ScanPage`: logical page identity and one or more immutable artifacts.
 - `ScanTodo`: optional tasks like `RESCAN`.
 
@@ -126,11 +126,12 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 - Filenames are sanitized before storage.
 - Parser/extractor boundaries remain server-side behind size and timeout controls.
 
-## Scan job IDs and the device API (`/api/scanner/v1/`)
+## Scan job IDs and the scanner API (`/api/scanner/v1/`)
 
-The libreflip device API is specified by the contract in
+The libreflip scanner API is specified by the contract in
 [libreflip/serif#37](https://github.com/libreflip/serif/pull/37) (`docs/sans-serif-interface.md`).
-Devices authenticate with their own key (`Authorization: Bearer`, see `docs/operations.md`).
+There is one scanner. It authenticates with the scanner API key (`Authorization: Bearer`,
+see `docs/operations.md`).
 
 - A `ScanJob` ID is an opaque, immutable string of at most 64 characters. Web-created jobs
   keep a server-generated UUID in canonical form (`str(uuid4())`). Jobs registered by a
@@ -138,19 +139,23 @@ Devices authenticate with their own key (`Authorization: Bearer`, see `docs/oper
 - Every `/scan/jobs/{job_id}/...` route accepts both forms (path converter `scan_job_id`).
 - `PUT /api/scanner/v1/jobs/{job_id}` with `{"scan_started_at": "<ISO 8601>",
   "capture_layout": "single_page"}` (layout optional) registers a job:
-  - `201`: created in state `open`, owned by the calling device (`operator` is empty).
-  - `200`: the same device repeats the same `scan_started_at` and layout; nothing changes.
-  - `409 job_id_conflict`: the ID exists for another device, with another
-    `scan_started_at` or layout, or as a web-created job. Nothing is overwritten.
+  - `201`: created in state `open` with `source=scanner` (`operator` is empty).
+  - `200`: the same `scan_started_at` and layout are registered again; nothing changes.
+  - `409 job_id_conflict`: the ID exists with another `scan_started_at` or layout, or
+    as a web-created job. Nothing is overwritten.
   - `400 invalid_job_id`: the ID does not match the format above (UUIDs included).
   - `400 invalid_json` / `invalid_request`: the body is not a JSON object, or
-    `scan_started_at` lacks a time zone, or the layout is unknown.
+    `scan_started_at` is not a valid ISO 8601 timestamp with a time zone (including
+    well-formed but impossible dates such as `2026-02-30T00:00:00Z`), or the layout
+    is unknown.
+- Every other scanner job route serves only jobs with `source=scanner`. A web-created
+  job and an unknown ID both answer `404`, so job IDs cannot be probed.
 
   The response body is the job status (`job_id`, `state`, `portal_url`,
   `scan_started_at`, `capture_layout`, `pages`, `open_rescans`). `portal_url` is built
   from `BOOK_SCANNER_PUBLIC_BASE_URL`.
 
-### Upgrade note: migration `0038_scanjob_string_pk`
+### Upgrade note: migration `0037_scanjob_string_pk`
 
 The migration changes `core_scanjob.id` from `uuid` to `varchar(64)`, together with every
 column that references it: `ScanPage`, `ScanTodo`, `ScanTailorStageState`,
