@@ -293,8 +293,9 @@ def invalidate_downstream_states(
         query |= Q(scan_job=page.scan_job, scan_page=page, stage=stage)
     for state in ScanTailorStageState.objects.filter(query):
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def mark_state_stale(
@@ -306,8 +307,9 @@ def mark_state_stale(
     states = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     for state in states:
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -1730,6 +1732,7 @@ def request_stage_job(
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
+    state.invalidated_reason = ""
     if not state.algorithm:
         state.algorithm = _default_algorithm(state.stage)
     if not state.algorithm_version:
@@ -1741,6 +1744,7 @@ def request_stage_job(
             "algorithm",
             "algorithm_version",
             "last_error",
+            "invalidated_reason",
             "updated_at",
         ],
     )

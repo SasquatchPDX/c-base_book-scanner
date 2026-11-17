@@ -27,6 +27,7 @@ interface StageState {
   output_storage_identifier: string;
   preview_storage_identifier: string;
   last_error: string;
+  invalidated_reason?: string;
 }
 
 interface WorkspacePage {
@@ -140,6 +141,24 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
     }
   }
   return editable;
+}
+
+/** Error text for a stage, shown only for genuine failures (not routine invalidation). */
+export function stageErrorText(state: Pick<StageState, "status" | "last_error">): string {
+  return state.status === "failed" ? state.last_error || "Stage failed" : "";
+}
+
+/** Editor status line for a stage: errors only for failures, invalidation is informational. */
+export function stageStatusMessage(
+  state: Pick<StageState, "status" | "last_error" | "revision" | "invalidated_reason">,
+): { text: string; tone: "info" | "error" } {
+  const error = stageErrorText(state);
+  if (error) return { text: error, tone: "error" };
+  const base = `Revision ${state.revision} · ${state.status}`;
+  if (state.status === "invalidated" && state.invalidated_reason) {
+    return { text: `${base} (${state.invalidated_reason})`, tone: "info" };
+  }
+  return { text: base, tone: "info" };
 }
 
 export function normalizeBox(value: unknown, fallback: Box): Box {
@@ -339,10 +358,8 @@ class WorkspaceController {
       this.clearGeometry();
     }
     this.saveButton.disabled = !this.editable;
-    this.setMessage(
-      state.last_error ? state.last_error : `Revision ${state.revision} · ${state.status}`,
-      state.last_error ? "error" : "info",
-    );
+    const message = stageStatusMessage(state);
+    this.setMessage(message.text, message.tone);
   }
 
   private markActiveControls(): void {
@@ -895,11 +912,13 @@ class WorkspaceController {
     if (status) {
       status.textContent = state.status;
       status.className = `status status-${state.status}`;
+      status.title = state.status === "invalidated" ? (state.invalidated_reason ?? "") : "";
     }
     const error = row.querySelector<HTMLElement>("[data-stage-error]");
     if (error) {
-      error.textContent = state.last_error;
-      error.hidden = !state.last_error;
+      const errorText = stageErrorText(state);
+      error.textContent = errorText;
+      error.hidden = !errorText;
     }
     const revision = row.querySelector<HTMLInputElement>("input[name='expected_revision']");
     if (revision) revision.value = String(state.revision);

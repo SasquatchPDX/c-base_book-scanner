@@ -5,6 +5,8 @@ import {
   editableParameters,
   normalizeBox,
   sourceBoxToDisplay,
+  stageErrorText,
+  stageStatusMessage,
 } from "./scantailor-workspace";
 
 describe("ScanTailor geometry coordinates", () => {
@@ -70,5 +72,33 @@ describe("editable stage parameters", () => {
       picture_algorithm: "window",
     });
     expect(parameters).not.toHaveProperty("worker_job_id");
+  });
+});
+
+describe("stage status presentation", () => {
+  it("treats routine invalidation as information, not an error", () => {
+    const invalidated = {
+      status: "invalidated",
+      revision: 3,
+      last_error: "page_split updated via batch",
+      invalidated_reason: "page_split updated via batch",
+    };
+
+    expect(stageErrorText(invalidated)).toBe("");
+    expect(stageStatusMessage(invalidated)).toEqual({
+      text: "Revision 3 · invalidated (page_split updated via batch)",
+      tone: "info",
+    });
+  });
+
+  it("shows the error only for failed stages", () => {
+    const failed = { status: "failed", revision: 2, last_error: "cannot read image" };
+
+    expect(stageErrorText(failed)).toBe("cannot read image");
+    expect(stageStatusMessage(failed)).toEqual({ text: "cannot read image", tone: "error" });
+    expect(stageStatusMessage({ status: "success", revision: 1, last_error: "" })).toEqual({
+      text: "Revision 1 · success",
+      tone: "info",
+    });
   });
 });

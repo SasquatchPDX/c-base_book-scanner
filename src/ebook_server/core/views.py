@@ -211,6 +211,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_size_bytes": state.output_size_bytes,
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
+        "invalidated_reason": state.invalidated_reason,
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),

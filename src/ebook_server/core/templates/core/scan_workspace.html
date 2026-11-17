@@ -116,8 +116,8 @@
             <div class="stage-row" data-stage-row data-page-id="{{ page.id }}" data-stage="{{ stage.stage }}">
               <div>
                 <strong>{{ stage.stage_label }}</strong>
-                <span class="status status-{{ stage.status }}" data-stage-status>{{ stage.status }}</span>
-                <small class="error" data-stage-error {% if not stage.last_error %}hidden{% endif %}>{{ stage.last_error }}</small>
+                <span class="status status-{{ stage.status }}" data-stage-status{% if stage.status == 'invalidated' and stage.invalidated_reason %} title="{{ stage.invalidated_reason }}"{% endif %}>{{ stage.status }}</span>
+                <small class="error" data-stage-error {% if stage.status != 'failed' or not stage.last_error %}hidden{% endif %}>{% if stage.status == 'failed' %}{{ stage.last_error }}{% endif %}</small>
               </div>
               <button
                 type="button"
