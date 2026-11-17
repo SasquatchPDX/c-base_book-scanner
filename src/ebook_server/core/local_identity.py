@@ -190,9 +190,7 @@ def _key(title: str) -> str:
     return " ".join(words)
 
 
-def _titles_by_origin(
-    metadata: dict[str, Any], signals: IdentificationInput
-) -> dict[str, dict[str, str]]:
+def _titles_by_origin(metadata: dict[str, Any], filename: str) -> dict[str, dict[str, str]]:
     """``{origin: {normalised title: display title}}``."""
     origins: dict[str, dict[str, str]] = {ORIGIN_PATH: {}, ORIGIN_CONTENT: {}, ORIGIN_EMBEDDED: {}}
 
@@ -200,8 +198,9 @@ def _titles_by_origin(
         for key in _variants(value):
             origins[origin].setdefault(key, value.strip() if isinstance(value, str) else key)
 
-    for hint in signals.title_hints:
-        add(ORIGIN_PATH, hint)
+    filename_titles, _authors = identification.parse_filename_signals(filename)
+    for title in filename_titles:
+        add(ORIGIN_PATH, title)
     layout = metadata.get("path_layout")
     if isinstance(layout, dict):
         add(ORIGIN_PATH, layout.get("title"))
@@ -246,11 +245,16 @@ def local_consensus(
     metadata: dict[str, Any],
     signals: IdentificationInput,
     candidates: list[IdentificationCandidate],
+    *,
+    filename: str,
 ) -> LocalIdentity | None:
-    """The book's identity from independent local evidence, or ``None``."""
+    """The book's identity from independent local evidence, or ``None``.
+
+    ``filename`` is the file's original name; its title parts are the path's witness.
+    """
     if not enabled():
         return None
-    origins = _titles_by_origin(metadata, signals)
+    origins = _titles_by_origin(metadata, filename)
     agreed: dict[str, set[str]] = {}
     names = list(origins)
     for i, left in enumerate(names):

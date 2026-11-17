@@ -3447,7 +3447,9 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             # (path, text header, embedded metadata) may still agree on what it is.
             from . import local_identity
 
-            local = local_identity.local_consensus(metadata, signals, candidates)
+            local = local_identity.local_consensus(
+                metadata, signals, candidates, filename=job.original_filename
+            )
             if local is not None:
                 top_candidate = local.as_candidate()
                 metadata[local_identity.LOCAL_IDENTITY_KEY] = local.evidence

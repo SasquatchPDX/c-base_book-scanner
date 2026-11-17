@@ -409,6 +409,10 @@ class _RecordingProvider:
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize(("filename", "header", "first_author", "absent"), REVIEW_PROBES)
+# These probes check which authors reach the provider search. Without a provider match
+# some of them would now be identified from their own agreeing file name and header
+# (local consensus, tests/test_local_identity.py), so that rule is off here.
+@override_settings(BOOK_SCANNER_IDENTIFICATION_LOCAL_CONSENSUS=False)
 def test_review_probes_end_to_end_through_source_intake(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

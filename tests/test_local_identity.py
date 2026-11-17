@@ -51,7 +51,7 @@ def _consensus(
     signals = build_identification_input(
         source_path=f"/library/{filename}", original_filename=filename, extracted_metadata=metadata
     )
-    return local_identity.local_consensus(metadata, signals, candidates or [])
+    return local_identity.local_consensus(metadata, signals, candidates or [], filename=filename)
 
 
 def _candidate(title: str, authors: list[str]) -> IdentificationCandidate:
