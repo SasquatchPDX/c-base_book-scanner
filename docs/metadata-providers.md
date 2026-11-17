@@ -67,3 +67,22 @@ For each hit store:
 - provenance timestamp
 
 Weak matches must route to review workflow instead of auto-linking.
+
+## Subject / genre evidence
+
+Subject tags are captured as evidence only; they do not affect candidate scoring and
+are not yet written to `Book.categories` / `Book.genres`.
+
+- Embedded: EPUB `dc:subject` and CBZ `ComicInfo.xml` `Genre` (comma-separated) land
+  in `ImportJob.evidence["subjects"]` (and therefore the review task's embedded
+  metadata).
+- Providers: `MetadataCandidate.subjects` holds tags from the provider record
+  (Open Library search `subject`, edition `subjects`, Google Books-style
+  `categories`). Open Library search requests `subject` explicitly via `fields`,
+  because the default search field set omits it.
+- Tags are trimmed, de-duplicated case-insensitively, limited to 25 per source and
+  128 characters each (`Category.name` / `Genre.name` length), and otherwise kept as
+  free text. Reviewers see candidate subjects on the review page.
+
+Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
+whether review gates it) is an open owner decision tracked in issue #50.

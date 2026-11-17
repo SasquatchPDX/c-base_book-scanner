@@ -6,7 +6,7 @@ import importlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -25,6 +25,24 @@ logger = structlog.get_logger(__name__)
 MAX_AUTHOR_LOOKUPS = 5
 MAX_RETRY_AFTER_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5
+# Subject/genre tags are evidence only (#50); keep them bounded so an untrusted file or
+# a provider record with thousands of subjects cannot bloat job evidence or candidates.
+MAX_SUBJECTS = 25
+MAX_SUBJECT_LENGTH = 128
+OPEN_LIBRARY_SEARCH_FIELDS = ",".join(
+    (
+        "key",
+        "title",
+        "author_name",
+        "author_key",
+        "first_publish_year",
+        "language",
+        "edition_count",
+        "cover_i",
+        "cover_edition_key",
+        "subject",
+    )
+)
 DEFAULT_USER_AGENT = "ebook-server (self-hosted hackerspace library)"
 
 AUTO_ACCEPT_SCORE = getattr(
@@ -83,6 +101,7 @@ class IdentificationCandidate:
     publication_year: int | None
     score: float
     raw: dict[str, Any]
+    subjects: list[str] = field(default_factory=list)
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -160,6 +179,27 @@ def normalize_isbns(raw: str | None) -> list[str]:
             if converted not in values:
                 values.append(converted)
     return values
+
+
+def normalize_subjects(values: Any) -> list[str]:
+    """Return trimmed, de-duplicated (case-insensitive), bounded subject/genre tags.
+
+    Tags are kept as free text in first-seen order; no taxonomy mapping is applied here.
+    """
+    subjects: list[str] = []
+    seen: set[str] = set()
+    for value in _as_str_list(values):
+        tag = re.sub(r"\s+", " ", value).strip()
+        if not tag or len(tag) > MAX_SUBJECT_LENGTH:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        subjects.append(tag)
+        if len(subjects) >= MAX_SUBJECTS:
+            break
+    return subjects
 
 
 def normalize_text(value: str | None) -> str:
@@ -319,7 +359,9 @@ class OpenLibraryMetadataProvider:
         return names
 
     def _query_search(self, query: str) -> list[dict[str, Any]]:
-        encoded = urlencode({"q": query, "limit": "5"})
+        # Open Library's default search field set omits ``subject``; request it explicitly
+        # alongside the default fields the candidate normalizer and scorer rely on.
+        encoded = urlencode({"q": query, "limit": "5", "fields": OPEN_LIBRARY_SEARCH_FIELDS})
         url = f"https://openlibrary.org/search.json?{encoded}"
         try:
             payload = self._get_json(url)
@@ -542,6 +584,13 @@ def _normalize_candidate(
         publication_year=publication_year,
         score=0.0,
         raw=payload,
+        # Open Library search docs use ``subject``, edition records ``subjects``;
+        # ``categories`` is the Google Books volumeInfo shape.
+        subjects=normalize_subjects(
+            _as_str_list(payload.get("subject"))
+            + _as_str_list(payload.get("subjects"))
+            + _as_str_list(payload.get("categories"))
+        ),
     )
     return _apply_scoring(signals, candidate)
 
@@ -628,6 +677,7 @@ def _apply_scoring(
         publication_year=candidate.publication_year,
         score=min(score, 1.0),
         raw=candidate.raw,
+        subjects=candidate.subjects,
     )
     return normalized_candidate
 

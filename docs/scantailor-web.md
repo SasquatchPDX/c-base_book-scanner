@@ -28,7 +28,13 @@ correct book-spine curvature. The four control points only define the correction
 (which quadrilateral becomes an upright rectangle); the output canvas holds the
 whole transformed input, so content outside the points and the Margins padding
 are kept (`opencv-v2`; bounded for near-degenerate quads, recorded as
-`dewarp_canvas_clipped`). Text/picture separation is manual only:
+`dewarp_canvas_clipped`). In `auto` mode (`opencv-v3`) the quad comes from the
+text: the fitted topmost and bottommost text lines give the top/bottom edges and
+robust fits through the outer line ends give the sides (a ragged side mirrors the
+aligned one). A page outline contour is the fallback. An already-upright page is
+passed through without resampling (`dewarp_correction="none_needed"`). When
+nothing is found, the result records `dewarp_mode="auto_fallback"` with a
+`dewarp_warning`. Text/picture separation is manual only:
 `zone_mode="auto"` currently applies one algorithm to the whole page. The output
 option named `fox` uses scikit-image's Niblack implementation, and `wolf` uses a
 local-contrast approximation. Correcting those advertised names and establishing
