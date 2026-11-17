@@ -17,7 +17,8 @@ from urllib.request import Request, urlopen
 import structlog
 from django.conf import settings as django_settings
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
-from rapidfuzz.fuzz import token_set_ratio
+from rapidfuzz.fuzz import token_set_ratio, token_sort_ratio
+from rapidfuzz.utils import default_process
 
 logger = structlog.get_logger(__name__)
 
@@ -603,7 +604,20 @@ def _as_str_list(value: Any) -> list[str]:
 
 
 def _title_match_score(left: str, right: str) -> float:
-    return token_set_ratio(normalize_text(left), normalize_text(right)) / 100.0
+    """Similarity of two titles in [0, 1], penalising tokens only one side has.
+
+    ``token_set_ratio`` alone scores 1.0 whenever one title's tokens are a subset of
+    the other's ("Foundation" vs "Foundation and Earth"), which are different books.
+    Averaging it with ``token_sort_ratio`` keeps word-order tolerance while making
+    unmatched tokens cost score; only genuinely equal titles reach 1.0.
+    """
+    left_processed = default_process(left)
+    right_processed = default_process(right)
+    if not left_processed or not right_processed:
+        return 0.0
+    set_score = token_set_ratio(left_processed, right_processed)
+    sort_score = token_sort_ratio(left_processed, right_processed)
+    return (set_score + sort_score) / 200.0
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:

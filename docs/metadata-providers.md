@@ -29,6 +29,12 @@ comparisons need normalization. `BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
 does not affect intake acceptance. Task D must give that setting a tested role or
 remove it; do not lower auto-accept merely to reduce the review queue.
 
+Title similarity is the mean of rapidfuzz `token_set_ratio` and `token_sort_ratio`
+over punctuation-normalized titles. `token_set_ratio` alone gives full marks when one
+title's words are a subset of the other's ("Foundation" vs "Foundation and Earth"),
+so the sort ratio is blended in to make unmatched words cost score. Only titles with
+the same words reach a full title score.
+
 ## Provider options identified
 
 ### Open Library (primary)
