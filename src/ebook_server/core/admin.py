@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
 
+from . import genres
 from .models import (
     AppUserProfile,
     Author,
     Book,
+    BookGenre,
     Category,
     CoverImage,
     FileVariant,
     Genre,
+    GenreAlias,
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ProcessingJob,
     ReviewTask,
     ScanJob,
@@ -35,13 +41,32 @@ class AppUserProfileAdmin(admin.ModelAdmin[AppUserProfile]):
     list_filter = ("role", "is_disabled")
 
 
+class BookGenreInline(admin.TabularInline):  # type: ignore[type-arg]
+    """Genres with provenance; rows added here are recorded as admin-set."""
+
+    model = BookGenre
+    extra = 0
+    fields = ("genre", "source", "source_tag", "created_at")
+    readonly_fields = ("source_tag", "created_at")
+    autocomplete_fields = ("genre",)
+
+
 @admin.register(Book)
 class BookAdmin(admin.ModelAdmin[Book]):
     list_display = ("title", "publisher", "publication_year", "publication_date")
     search_fields = ("title", "subtitle", "publisher")
-    filter_horizontal = ("authors", "categories", "genres")
-    # Assigned by core.archive_layout; editing it by hand would orphan the book's folder.
-    readonly_fields = ("archive_folder",)
+    filter_horizontal = ("authors", "categories")
+    inlines = (BookGenreInline,)
+    # archive_folder is assigned by core.archive_layout; editing it by hand would orphan
+    # the book's folder.
+    readonly_fields = ("genres_curated_at", "genres_curated_by", "archive_folder")
+
+    def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
+        super().save_formset(request, form, formset, change)
+        # Any admin edit of the genre links, removing the last one included, is a human
+        # decision that automatic assignment and backfills must not override.
+        if formset.model is BookGenre and formset.has_changed():
+            genres.mark_curated(form.instance, user=request.user)
 
 
 @admin.register(Author)
@@ -54,9 +79,26 @@ class CategoryAdmin(admin.ModelAdmin[Category]):
     list_display = ("name",)
 
 
+class GenreAliasInline(admin.TabularInline):  # type: ignore[type-arg]
+    model = GenreAlias
+    extra = 1
+    fields = ("alias", "key")
+    readonly_fields = ("key",)
+
+
 @admin.register(Genre)
 class GenreAdmin(admin.ModelAdmin[Genre]):
     list_display = ("name",)
+    search_fields = ("name", "aliases__alias")
+    inlines = (GenreAliasInline,)
+
+
+@admin.register(GenreAlias)
+class GenreAliasAdmin(admin.ModelAdmin[GenreAlias]):
+    list_display = ("alias", "genre", "key")
+    search_fields = ("alias", "genre__name")
+    list_select_related = ("genre",)
+    readonly_fields = ("key",)
 
 
 @admin.register(Identifier)
@@ -245,8 +287,12 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "recursive",
         "default_source_type",
         "is_active",
+        "is_paused",
+        "ingest_batch_size",
+        "ingest_max_per_hour",
     )
-    list_filter = ("transfer_mode", "is_active")
+    list_filter = ("transfer_mode", "is_active", "is_paused")
+    actions = ("pause_imports", "resume_imports")
     fieldsets = (
         (
             None,
@@ -278,7 +324,24 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
             "Formats of one book",
             {"fields": ("group_sibling_formats",)},
         ),
+        (
+            "Ingestion throttling",
+            {"fields": ("is_paused", "ingest_batch_size", "ingest_max_per_hour")},
+        ),
     )
+
+    @admin.action(description="Pause imports from selected sources")
+    def pause_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=True)
+        self.message_user(request, f"Paused {updated} source(s).")
+
+    @admin.action(description="Resume imports from selected sources")
+    def resume_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=False)
+        self.message_user(
+            request,
+            f"Resumed {updated} source(s). Run ingest_sources to re-queue waiting imports.",
+        )
 
 
 @admin.register(ProcessingJob)
@@ -302,9 +365,24 @@ class MetadataCandidateAdmin(admin.ModelAdmin[MetadataCandidate]):
         "title",
         "score",
         "state",
+        "superseded_at",
         "created_at",
     )
     list_filter = ("provider_id", "state")
+
+
+@admin.register(MetadataSearch)
+class MetadataSearchAdmin(admin.ModelAdmin[MetadataSearch]):
+    list_display = (
+        "import_job",
+        "scan_job",
+        "trigger",
+        "state",
+        "candidate_count",
+        "requested_by",
+        "finished_at",
+    )
+    list_filter = ("trigger", "state")
 
 
 @admin.register(ReviewTask)
