@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import pytest
+from django.db import IntegrityError, transaction
 from django.test import Client, override_settings
 from pypdf import PdfReader, PdfWriter
 
@@ -199,3 +202,180 @@ def test_uncombinable_formats_and_books_without_parts_are_refused(tmp_path: Path
             )
             assert response.status_code == 400
         assert not ProcessingJob.objects.exists()
+
+
+# --- review findings on PR #106 -----------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_output_identical_to_another_books_file_still_belongs_to_the_requested_book(
+    tmp_path: Path,
+) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, parts = _part_book(
+            tmp_path,
+            [("ch01.txt", b"First.\n", "Chapter 1"), ("ch02.txt", b"Second.\n", "Chapter 2")],
+        )
+        # Book 2 already holds a file with exactly the bytes the combine will produce.
+        expected = b"First.\n\nSecond.\n"
+        other_book = Book.objects.create(title="Some Other Upload")
+        other = FileVariant.objects.create(
+            book=other_book,
+            format="txt",
+            mime_type="text/plain",
+            original_filename="other.txt",
+            storage_location=parts[0].storage_location,
+            storage_identifier="books/other/other.txt",
+            size_bytes=len(expected),
+            sha256=hashlib.sha256(expected).hexdigest(),
+            source_type=FileVariant.SourceType.UPLOAD,
+            processing_state=FileVariant.ProcessingState.COMPLETE,
+        )
+
+        job = combine.request_combined_variant(book=book, target_format="txt")
+
+        assert job.state == ProcessingJob.JobState.SUCCESS, job.details
+        combined = FileVariant.objects.get(pk=job.details["output_variant_id"])
+        assert combined.id != other.id
+        assert combined.book_id == book.id
+        assert combined.sha256 == other.sha256
+        assert combined.storage_identifier != other.storage_identifier
+        assert combined.source_type == FileVariant.SourceType.GENERATED
+        assert combined.source_variant_id == parts[0].id
+        assert str(combined.job_id) == str(job.job_id)
+        assert combined.converter_options["operation"] == combine.OPERATION
+        assert combined.converter_options["part_variant_ids"] == [part.id for part in parts]
+        assert list(other_book.file_variants.values_list("id", flat=True)) == [other.id]
+        storage = LocalFilesystemStorage(str(tmp_path / "library-artifacts"))
+        assert storage.hash(combined.storage_identifier) == combined.sha256
+
+
+@pytest.mark.django_db(transaction=True)
+def test_part_grown_in_storage_is_not_staged_beyond_the_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, parts = _part_book(
+            tmp_path,
+            [("ch01.txt", b"a\n", "Chapter 1"), ("ch02.txt", b"b\n", "Chapter 2")],
+        )
+        storage = LocalFilesystemStorage(str(tmp_path / "library-artifacts"))
+        # Recorded as 2 bytes, but the stored file has grown to 100 bytes.
+        storage.resolve_location(parts[0].storage_identifier).write_bytes(b"x" * 100)
+        monkeypatch.setattr(combine, "MAX_COMBINED_INPUT_BYTES", 8)
+        read_sizes: list[int] = []
+        original_open = LocalFilesystemStorage.open
+
+        def counting_open(self: LocalFilesystemStorage, location: str) -> Any:
+            handle = original_open(self, location)
+            original_read = handle.read
+
+            def read(size: int = -1) -> bytes:
+                chunk = original_read(size)
+                read_sizes.append(len(chunk))
+                return chunk
+
+            handle.read = read  # type: ignore[method-assign]
+            return handle
+
+        monkeypatch.setattr(LocalFilesystemStorage, "open", counting_open)
+
+        job = combine.request_combined_variant(book=book, target_format="txt")
+
+        assert job.state == ProcessingJob.JobState.FAILED
+        assert "larger than its recorded size" in job.details["error"]
+        # At most one byte past the recorded size was read before failing.
+        assert sum(read_sizes) <= parts[0].size_bytes + 1
+        assert not FileVariant.objects.filter(part_index__isnull=True).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recorded_total_over_the_budget_is_refused_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, _parts = _part_book(
+            tmp_path,
+            [("ch01.txt", b"abcde\n", "Chapter 1"), ("ch02.txt", b"fghij\n", "Chapter 2")],
+        )
+        monkeypatch.setattr(combine, "MAX_COMBINED_INPUT_BYTES", 8)
+
+        job = combine.request_combined_variant(book=book, target_format="txt")
+
+        assert job.state == ProcessingJob.JobState.FAILED
+        assert "size limit" in job.details["error"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_at_most_one_active_combine_job_per_book_and_format(tmp_path: Path) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, parts = _part_book(
+            tmp_path,
+            [("ch01.pdf", _pdf_bytes(1), "Chapter 1"), ("ch02.pdf", _pdf_bytes(1), "Chapter 2")],
+        )
+        details = {"book_id": book.id, "target_format": "pdf", "part_variant_ids": []}
+        ProcessingJob.objects.create(
+            job_type=ProcessingJob.JobType.COMBINE_PARTS,
+            state=ProcessingJob.JobState.QUEUED,
+            file_variant=parts[0],
+            details=details,
+        )
+        with pytest.raises(IntegrityError), transaction.atomic():
+            ProcessingJob.objects.create(
+                job_type=ProcessingJob.JobType.COMBINE_PARTS,
+                state=ProcessingJob.JobState.RUNNING,
+                file_variant=parts[0],
+                details=details,
+            )
+        # Finished jobs and other formats or books are not constrained.
+        ProcessingJob.objects.create(
+            job_type=ProcessingJob.JobType.COMBINE_PARTS,
+            state=ProcessingJob.JobState.FAILED,
+            file_variant=parts[0],
+            details=details,
+        )
+        ProcessingJob.objects.create(
+            job_type=ProcessingJob.JobType.COMBINE_PARTS,
+            state=ProcessingJob.JobState.QUEUED,
+            file_variant=parts[0],
+            details={**details, "target_format": "txt"},
+        )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_first_request_reuses_the_job_that_won(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, parts = _part_book(
+            tmp_path,
+            [("ch01.pdf", _pdf_bytes(1), "Chapter 1"), ("ch02.pdf", _pdf_bytes(1), "Chapter 2")],
+        )
+        dispatched: list[str] = []
+        monkeypatch.setattr(combine, "process_combine_job", dispatched.append)
+        # Another request committed its job, but this request's check ran before that
+        # commit became visible (the race the review found): the check sees nothing.
+        winner = ProcessingJob.objects.create(
+            job_type=ProcessingJob.JobType.COMBINE_PARTS,
+            state=ProcessingJob.JobState.QUEUED,
+            file_variant=parts[0],
+            details={"book_id": book.id, "target_format": "pdf"},
+        )
+        original_active = combine._active_combine_job
+        calls: list[int] = []
+
+        def racing_active(book_arg: Book, fmt: str) -> ProcessingJob | None:
+            if not calls:
+                calls.append(1)
+                return None
+            return original_active(book_arg, fmt)
+
+        monkeypatch.setattr(combine, "_active_combine_job", racing_active)
+
+        job = combine.request_combined_variant(book=book, target_format="pdf")
+
+        assert (
+            ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.COMBINE_PARTS).count() == 1
+        )
+        assert job.job_id == winner.job_id
+        assert dispatched == []  # the losing request enqueued nothing

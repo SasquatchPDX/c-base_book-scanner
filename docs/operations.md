@@ -447,8 +447,13 @@ recorded SHA-256, joins them in `part_index` order (pypdf for PDF, adding one
 bookmark per part label; charset-normalizer-decoded UTF-8 text for TXT) and stores
 a new `generated` FileVariant. That variant records the first part as
 `source_variant`, the tool and version, the job ID and, in `converter_options`, the
-ordered part variant IDs, hashes and labels. Repeat requests reuse it. It is a normal
-conversion source (for example PDF → EPUB). Other formats have no safe
+ordered part variant IDs, hashes and labels. Repeat requests reuse it. If the
+output happens to equal a file of another book, it is still stored and recorded for
+the requested book. Staging counts the bytes actually read: a part larger than its
+recorded size, or a set over the combine size limit, fails the job without being
+copied in full. At most one combine job per book and format is queued or running
+(the request locks the Book row; a partial unique constraint enforces it). It is a
+normal conversion source (for example PDF → EPUB). Other formats have no safe
 concatenation and are not offered.
 
 Originals are never merged, rewritten or deleted by either path. Completeness cannot

@@ -11,6 +11,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.fields.json import KT
 from django.utils.timezone import now
 
 
@@ -779,6 +780,18 @@ class ProcessingJob(models.Model):
     scheduled_at = models.DateTimeField(default=now, db_index=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            # At most one queued/running combine job per book and target format (#60):
+            # concurrent first requests cannot both enqueue one.
+            models.UniqueConstraint(
+                KT("details__book_id"),
+                KT("details__target_format"),
+                condition=models.Q(job_type="combine_parts", state__in=["queued", "running"]),
+                name="uniq_active_combine_job_per_book_format",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"{self.job_id}:{self.job_type}"

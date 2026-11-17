@@ -14,7 +14,6 @@ offered.
 
 from __future__ import annotations
 
-import shutil
 import tempfile
 import uuid
 from importlib.metadata import PackageNotFoundError, version
@@ -23,7 +22,7 @@ from typing import Any
 
 import structlog
 from charset_normalizer import from_bytes
-from django.db import close_old_connections, transaction
+from django.db import IntegrityError, close_old_connections, transaction
 from django.utils import timezone
 from pypdf import PdfReader, PdfWriter
 
@@ -39,6 +38,8 @@ COMBINABLE_FORMATS = {"pdf": "application/pdf", "txt": "text/plain"}
 MAX_COMBINED_INPUT_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TEXT_INPUT_BYTES = 256 * 1024 * 1024
 OPERATION = "combine_parts"
+ACTIVE_STATES = (ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING)
+COPY_CHUNK_BYTES = 1 << 20
 
 
 class CombineError(RuntimeError):
@@ -107,31 +108,33 @@ def request_combined_variant(
     if not parts:
         raise CombineError(f"book has no {fmt} parts to combine")
     part_ids = [part.id for part in parts]
-    with transaction.atomic():
-        active = (
-            ProcessingJob.objects.select_for_update()
-            .filter(
+    try:
+        with transaction.atomic():
+            # Serialise requests for one book on its row: with no combine job yet there
+            # is no ProcessingJob row to lock, so two first requests would both enqueue.
+            # The partial unique constraint on active combine jobs per book and format
+            # backs this up at the database level.
+            Book.objects.select_for_update().filter(pk=book.pk).values_list("pk", flat=True).get()
+            active = _active_combine_job(book, fmt)
+            if active is not None:
+                return active
+            job = ProcessingJob.objects.create(
                 job_type=ProcessingJob.JobType.COMBINE_PARTS,
-                state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING],
-                details__book_id=book.id,
-                details__target_format=fmt,
+                state=ProcessingJob.JobState.QUEUED,
+                file_variant=parts[0],
+                details={
+                    "book_id": book.id,
+                    "target_format": fmt,
+                    "part_variant_ids": part_ids,
+                    "requested_by_user_id": requested_by_user_id,
+                    "error": "",
+                },
             )
-            .first()
-        )
-        if active is not None:
-            return active
-        job = ProcessingJob.objects.create(
-            job_type=ProcessingJob.JobType.COMBINE_PARTS,
-            state=ProcessingJob.JobState.QUEUED,
-            file_variant=parts[0],
-            details={
-                "book_id": book.id,
-                "target_format": fmt,
-                "part_variant_ids": part_ids,
-                "requested_by_user_id": requested_by_user_id,
-                "error": "",
-            },
-        )
+    except IntegrityError:
+        active = _active_combine_job(book, fmt)
+        if active is None:
+            raise
+        return active
     job_id = str(job.job_id)
     try:
         queue = get_queue()
@@ -146,6 +149,19 @@ def request_combined_variant(
             _fail(job, f"combine dispatch failed: {exc}")
     job.refresh_from_db()
     return job
+
+
+def _active_combine_job(book: Book, fmt: str) -> ProcessingJob | None:
+    return (
+        ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.COMBINE_PARTS,
+            state__in=ACTIVE_STATES,
+            details__book_id=book.id,
+            details__target_format=fmt,
+        )
+        .order_by("scheduled_at", "id")
+        .first()
+    )
 
 
 def _fail(job: ProcessingJob, message: str) -> None:
@@ -213,10 +229,41 @@ def _load_parts(details: dict[str, Any]) -> tuple[Book, str, list[FileVariant]]:
     return book, fmt, parts
 
 
+def _input_limit(fmt: str) -> int:
+    if fmt == "txt":
+        return min(MAX_COMBINED_INPUT_BYTES, MAX_TEXT_INPUT_BYTES)
+    return MAX_COMBINED_INPUT_BYTES
+
+
+def _copy_bounded(source: Any, target: Any, *, part: FileVariant, budget: int) -> int:
+    """Stream ``source`` into ``target``; stop as soon as a limit would be exceeded.
+
+    A part may never be larger than its recorded size (it would fail the checksum
+    anyway), and all parts together never more than ``budget``: the bytes are counted
+    as they are read, so a part that grew in storage is never staged in full.
+    """
+    limit = min(part.size_bytes, budget)
+    written = 0
+    while True:
+        chunk = source.read(min(COPY_CHUNK_BYTES, limit - written + 1))
+        if not chunk:
+            return written
+        written += len(chunk)
+        if written > part.size_bytes:
+            raise CombineError(f"part {part.id} is larger than its recorded size")
+        if written > budget:
+            raise CombineError("parts exceed the combine size limit")
+        target.write(chunk)
+
+
 def _stage_parts(parts: list[FileVariant], workdir: Path) -> list[Path]:
-    """Copy each original out of storage and verify it against its recorded hash."""
-    total = sum(part.size_bytes for part in parts)
-    if total > MAX_COMBINED_INPUT_BYTES:
+    """Copy each original out of storage and verify it against its recorded hash.
+
+    The size budget is checked against the recorded sizes up front and enforced on
+    the bytes actually read while streaming.
+    """
+    budget = _input_limit(parts[0].format)
+    if sum(part.size_bytes for part in parts) > budget:
         raise CombineError("parts exceed the combine size limit")
     staged = []
     for position, part in enumerate(parts, start=1):
@@ -227,7 +274,7 @@ def _stage_parts(parts: list[FileVariant], workdir: Path) -> list[Path]:
         path = workdir / f"part-{position:04d}.{part.format}"
         try:
             with storage.open(part.storage_identifier) as source, path.open("wb") as target:
-                shutil.copyfileobj(source, target, length=1 << 20)
+                budget -= _copy_bounded(source, target, part=part, budget=budget)
         except FileNotFoundError as exc:
             raise CombineError(f"part {part.id} is missing from storage") from exc
         if intake.compute_sha256(str(path)) != part.sha256:
@@ -285,9 +332,21 @@ def _combine(job: ProcessingJob, details: dict[str, Any]) -> FileVariant:
             tool = "text-concat"
         sha = intake.compute_sha256(str(output))
         size = output.stat().st_size
-        duplicate = FileVariant.objects.filter(sha256=sha).first()
-        if duplicate is not None:
-            return duplicate
+        # Identical bytes elsewhere in the library (even another Book's upload) are not
+        # this Book's combined variant: the output is always stored and recorded for
+        # the requested Book with its own derivation, never swapped for a foreign row.
+        identical_ids = list(
+            FileVariant.objects.filter(sha256=sha)
+            .exclude(book=book)
+            .values_list("id", flat=True)[:10]
+        )
+        if identical_ids:
+            logger.info(
+                "combine_output_matches_other_variant",
+                processing_job_id=str(job.job_id),
+                book_id=book.id,
+                matching_variant_ids=identical_ids,
+            )
         storage = backend_for_location(parts[0].storage_location)
         filename = intake.normalize_filename(
             f"{intake._sanitize_title_for_filename(book.title)} (combined).{fmt}"
