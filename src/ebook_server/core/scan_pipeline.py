@@ -29,6 +29,7 @@ from .models import (
     ScanTailorStageState,
     StorageLocation,
 )
+from .search import schedule_reindex
 
 logger = structlog.get_logger(__name__)
 
@@ -118,7 +119,10 @@ def _invalidate_file_variants_and_descendants(variant_ids: set[int]) -> int:
         frontier = descendants - stale_ids
         stale_ids.update(descendants)
 
-    return FileVariant.objects.filter(id__in=stale_ids).update(
+    stale_variants = FileVariant.objects.filter(id__in=stale_ids)
+    # `.update()` sends no signals; the books' available formats change (#28).
+    schedule_reindex(stale_variants.values_list("book_id", flat=True))
+    return stale_variants.update(
         processing_state=FileVariant.ProcessingState.FAILED,
     )
 

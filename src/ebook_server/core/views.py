@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,9 +22,8 @@ from django.conf import settings as django_settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
-from django.core.paginator import Paginator
 from django.db import connections, transaction
-from django.db.models import Count, Prefetch, Q, QuerySet
+from django.db.models import Count, Prefetch, Q
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -61,6 +61,7 @@ from . import (
     scan_identification,
     scan_pipeline,
     scantailor,
+    search,
 )
 from .metrics import PersistentStateCollector
 from .models import (
@@ -1468,146 +1469,158 @@ def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
     return value
 
 
-_LIBRARY_SORTS: dict[str, tuple[str, str]] = {
-    "created_at": ("created_at", "id"),
-    "-created_at": ("-created_at", "-id"),
-    "title": ("title", "id"),
-    "-title": ("-title", "-id"),
-}
+_LIBRARY_FILTER_PARAMS: Final = (
+    ("q", "query"),
+    ("title", "title"),
+    ("author", "author"),
+    ("category", "category"),
+    ("genre", "genre"),
+    ("language", "language"),
+    ("format", "book_format"),
+)
 
 
-def _book_ids_with_author(name: str) -> QuerySet[Any]:
-    return Book.authors.through.objects.filter(author__full_name__icontains=name).values("book_id")
-
-
-def _filtered_library_books(
-    *,
-    query: str = "",
-    title: str = "",
-    author: str = "",
-    category: str = "",
-    genre: str = "",
-    language: str = "",
-    book_format: str = "",
-    sort: str = "-created_at",
-) -> QuerySet[Book]:
-    """Build the browse/search queryset for `/library/books/`.
-
-    Filters over to-many relations are `pk IN (subquery)` conditions rather
-    than joins, so no row is duplicated and no `DISTINCT` is needed. The page
-    query and the paginator's `COUNT(*)` therefore stay narrow instead of
-    de-duplicating every column, `description` included (#28 phase 0). The
-    subqueries are uncorrelated, so PostgreSQL hashes each one once (and can
-    still scan books in parallel), which measured faster than correlated
-    `EXISTS` inside the `?q=` disjunction.
-
-    Each relation filter matches on its own, as the separate join per
-    `.filter()` call did before: `?q=` and `?author=` may match different
-    authors of the same book. The format filter keeps the format and the
-    COMPLETE state on one variant, as before.
-    """
-    books = Book.objects.select_related("front_cover", "back_cover").prefetch_related(
-        *_book_list_prefetches()
+def _library_search_request(request: HttpRequest) -> search.SearchRequest:
+    raw_page = request.GET.get("page")
+    page_size = min(_as_positive_int(request.GET.get("page_size"), 25), 100)
+    filters = {
+        attribute: request.GET.get(param, "").strip() for param, attribute in _LIBRARY_FILTER_PARAMS
+    }
+    return search.SearchRequest(
+        query=filters["query"],
+        title=filters["title"],
+        author=filters["author"],
+        category=filters["category"],
+        genre=filters["genre"],
+        language=filters["language"],
+        book_format=filters["book_format"],
+        sort=request.GET.get("sort", "").strip(),
+        cursor=request.GET.get("cursor", "").strip(),
+        page=_as_positive_int(raw_page, 1) if raw_page is not None else None,
+        page_size=page_size,
     )
-    if query:
-        books = books.filter(
-            Q(title__icontains=query)
-            | Q(subtitle__icontains=query)
-            | Q(description__icontains=query)
-            | Q(pk__in=_book_ids_with_author(query)),
-        )
-    if title:
-        books = books.filter(title__icontains=title)
-    if author:
-        books = books.filter(pk__in=_book_ids_with_author(author))
-    if category:
-        books = books.filter(
-            pk__in=Book.categories.through.objects.filter(
-                category__name__icontains=category,
-            ).values("book_id"),
-        )
-    if genre:
-        books = books.filter(
-            pk__in=Book.genres.through.objects.filter(
-                genre__name__icontains=genre,
-            ).values("book_id"),
-        )
-    if language:
-        books = books.filter(language__iexact=language)
-    if book_format:
-        books = books.filter(
-            pk__in=FileVariant.objects.filter(
-                format__iexact=book_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            ).values("book_id"),
-        )
-    # The id tiebreaker keeps offset pages stable when sort keys collide.
-    return books.order_by(*_LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["-created_at"]))
+
+
+def _library_books_url(request: HttpRequest, **changes: str) -> str:
+    params = request.GET.copy()
+    for name in ("cursor", "page"):
+        params.pop(name, None)
+    for name, value in changes.items():
+        params[name] = value
+    return f"?{params.urlencode()}"
+
+
+def _next_page_url(request: HttpRequest, result: search.SearchPage, page_size: int) -> str | None:
+    if result.next_cursor:
+        return _library_books_url(request, cursor=result.next_cursor)
+    if result.page is not None and not result.previous_cursor:
+        cap = min(result.count, int(result.extra.get("max_results", result.count)))
+        if result.page * page_size < cap:
+            return _library_books_url(request, page=str(result.page + 1))
+    return None
+
+
+def _previous_page_url(request: HttpRequest, result: search.SearchPage) -> str | None:
+    if result.previous_cursor:
+        return _library_books_url(request, cursor=result.previous_cursor)
+    if result.page is not None and result.page > 1:
+        return _library_books_url(request, page=str(result.page - 1))
+    return None
 
 
 @require_GET
 @login_required
 def library_books(request: HttpRequest) -> HttpResponseBase:
+    """Browse/search the library (#28): keyset cursors for browsing, ranked search by offset.
+
+    `?cursor=` (from `next_cursor`/`previous_cursor`) pages at constant cost at
+    any depth. `?page=` still works for one release and is marked deprecated
+    for browse sorts. `?facets=language,format,...` adds facet counts.
+    """
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
 
-    query = request.GET.get("q", "").strip()
-    title = request.GET.get("title", "").strip()
-    author = request.GET.get("author", "").strip()
-    category = request.GET.get("category", "").strip()
-    genre = request.GET.get("genre", "").strip()
-    language = request.GET.get("language", "").strip()
-    book_format = request.GET.get("format", "").strip()
-    sort = request.GET.get("sort", "-created_at").strip()
-
-    books = _filtered_library_books(
-        query=query,
-        title=title,
-        author=author,
-        category=category,
-        genre=genre,
-        language=language,
-        book_format=book_format,
-        sort=sort,
+    search_request = _library_search_request(request)
+    backend = search.get_search_backend()
+    started = time.perf_counter()
+    try:
+        result = backend.search(search_request)
+    except search.InvalidCursorError:
+        return JsonResponse({"detail": "invalid_cursor"}, status=400)
+    books_by_id = (
+        Book.objects.select_related("front_cover", "back_cover")
+        .prefetch_related(*_book_list_prefetches())
+        .in_bulk(result.book_ids)
     )
-
-    page = _as_positive_int(request.GET.get("page"), 1)
-    page_size = _as_positive_int(request.GET.get("page_size"), 25)
-    page_size = min(page_size, 100)
-    paginator = Paginator(books, page_size)
-    page_object = paginator.get_page(page)
-    page_books = list(page_object.object_list)
-    total = paginator.count
-    serialized = [_serialize_book(book, include_variants=False) for book in page_books]
+    serialized = [
+        _serialize_book(books_by_id[book_id], include_variants=False)
+        for book_id in result.book_ids
+        if book_id in books_by_id
+    ]
+    requested_facets = [
+        name.strip()
+        for name in request.GET.get("facets", "").split(",")
+        if name.strip() in search.FACETS
+    ]
+    facet_payload = {
+        name: [{"value": item.value, "count": item.count} for item in counts]
+        for name, counts in (
+            backend.facet_counts(search_request, requested_facets).items()
+            if requested_facets
+            else ()
+        )
+    }
+    # Never log the query text itself (#28 privacy).
+    logger.info(
+        "library_search",
+        backend=result.backend,
+        kind="search" if search_request.query else "browse",
+        sort=result.sort,
+        result_count=result.count,
+        fuzzy=result.fuzzy,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+    )
     if _wants_html(request):
         return render(
             request,
             "core/library_books.html",
             {
                 "books": serialized,
-                "page_object": page_object,
-                "count": total,
+                "count": result.count,
+                "fuzzy": result.fuzzy,
+                "page_number": result.page,
+                "next_url": _next_page_url(request, result, search_request.page_size),
+                "previous_url": _previous_page_url(request, result),
                 "filters": {
-                    "q": query,
-                    "title": title,
-                    "author": author,
-                    "category": category,
-                    "genre": genre,
-                    "language": language,
-                    "format": book_format,
-                    "sort": sort,
+                    "q": search_request.query,
+                    "title": search_request.title,
+                    "author": search_request.author,
+                    "category": search_request.category,
+                    "genre": search_request.genre,
+                    "language": search_request.language,
+                    "format": search_request.book_format,
+                    "sort": result.sort,
                 },
             },
         )
-    return JsonResponse(
-        {
-            "count": total,
-            "page": page,
-            "page_size": len(serialized),
-            "items": serialized,
-        },
-    )
+    payload: dict[str, Any] = {
+        "count": result.count,
+        "page": result.page,
+        "page_size": len(serialized),
+        "sort": result.sort,
+        "next_cursor": result.next_cursor,
+        "previous_cursor": result.previous_cursor,
+        "fuzzy": result.fuzzy,
+        "items": serialized,
+    }
+    if requested_facets:
+        payload["facets"] = facet_payload
+    response = JsonResponse(payload)
+    if search_request.page is not None and result.sort != search.RELEVANCE:
+        # Offset pages over the whole collection give way to cursors (#28).
+        response["Deprecation"] = "true"
+    return response
 
 
 @require_GET
