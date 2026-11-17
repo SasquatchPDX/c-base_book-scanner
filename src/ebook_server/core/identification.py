@@ -6,7 +6,7 @@ import importlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -17,14 +17,38 @@ from urllib.request import Request, urlopen
 import structlog
 from django.conf import settings as django_settings
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
-from rapidfuzz.fuzz import token_set_ratio
+from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
+from rapidfuzz.utils import default_process
+
+from .rate_limit import throttle_provider
 
 logger = structlog.get_logger(__name__)
 
 MAX_AUTHOR_LOOKUPS = 5
 MAX_RETRY_AFTER_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5
-DEFAULT_USER_AGENT = "ebook-server (self-hosted hackerspace library)"
+# Subject/genre tags are evidence only (#50); keep them bounded so an untrusted file or
+# a provider record with thousands of subjects cannot bloat job evidence or candidates.
+MAX_SUBJECTS = 25
+MAX_SUBJECT_LENGTH = 128
+OPEN_LIBRARY_SEARCH_FIELDS = ",".join(
+    (
+        "key",
+        "title",
+        "author_name",
+        "author_key",
+        "first_publish_year",
+        "language",
+        "edition_count",
+        "cover_i",
+        "cover_edition_key",
+        "subject",
+    )
+)
+DEFAULT_USER_AGENT = (
+    "ebook-server (+https://github.com/SasquatchPDX/c-base_book-scanner; "
+    "self-hosted hackerspace library)"
+)
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -32,6 +56,10 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Author-name variants (same surname, compatible given names) count as a partial match.
+AUTHOR_VARIANT_MATCH_SCORE = 0.9
+# Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
+AUTHOR_GIVEN_NAME_MIN_RATIO = 85.0
 
 
 class MetadataProvider(Protocol):
@@ -82,6 +110,7 @@ class IdentificationCandidate:
     publication_year: int | None
     score: float
     raw: dict[str, Any]
+    subjects: list[str] = field(default_factory=list)
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -159,6 +188,27 @@ def normalize_isbns(raw: str | None) -> list[str]:
             if converted not in values:
                 values.append(converted)
     return values
+
+
+def normalize_subjects(values: Any) -> list[str]:
+    """Return trimmed, de-duplicated (case-insensitive), bounded subject/genre tags.
+
+    Tags are kept as free text in first-seen order; no taxonomy mapping is applied here.
+    """
+    subjects: list[str] = []
+    seen: set[str] = set()
+    for value in _as_str_list(values):
+        tag = re.sub(r"\s+", " ", value).strip()
+        if not tag or len(tag) > MAX_SUBJECT_LENGTH:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        subjects.append(tag)
+        if len(subjects) >= MAX_SUBJECTS:
+            break
+    return subjects
 
 
 def normalize_text(value: str | None) -> str:
@@ -318,7 +368,9 @@ class OpenLibraryMetadataProvider:
         return names
 
     def _query_search(self, query: str) -> list[dict[str, Any]]:
-        encoded = urlencode({"q": query, "limit": "5"})
+        # Open Library's default search field set omits ``subject``; request it explicitly
+        # alongside the default fields the candidate normalizer and scorer rely on.
+        encoded = urlencode({"q": query, "limit": "5", "fields": OPEN_LIBRARY_SEARCH_FIELDS})
         url = f"https://openlibrary.org/search.json?{encoded}"
         try:
             payload = self._get_json(url)
@@ -338,6 +390,9 @@ class OpenLibraryMetadataProvider:
             getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
         )
         for attempt in range(2):
+            # Proactive client-side pacing (shared across workers via Redis when configured);
+            # the 429 handling below is only the fallback when the server still objects.
+            throttle_provider(self.provider_id)
             request = Request(url, headers={"User-Agent": user_agent})
             try:
                 with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -541,6 +596,13 @@ def _normalize_candidate(
         publication_year=publication_year,
         score=0.0,
         raw=payload,
+        # Open Library search docs use ``subject``, edition records ``subjects``;
+        # ``categories`` is the Google Books volumeInfo shape.
+        subjects=normalize_subjects(
+            _as_str_list(payload.get("subject"))
+            + _as_str_list(payload.get("subjects"))
+            + _as_str_list(payload.get("categories"))
+        ),
     )
     return _apply_scoring(signals, candidate)
 
@@ -554,17 +616,91 @@ def _as_str_list(value: Any) -> list[str]:
 
 
 def _title_match_score(left: str, right: str) -> float:
-    return token_set_ratio(normalize_text(left), normalize_text(right)) / 100.0
+    """Similarity of two titles in [0, 1], penalising tokens only one side has.
+
+    ``token_set_ratio`` alone scores 1.0 whenever one title's tokens are a subset of
+    the other's ("Foundation" vs "Foundation and Earth"), which are different books.
+    Averaging it with ``token_sort_ratio`` keeps word-order tolerance while making
+    unmatched tokens cost score; only genuinely equal titles reach 1.0.
+    """
+    left_processed = default_process(left)
+    right_processed = default_process(right)
+    if not left_processed or not right_processed:
+        return 0.0
+    set_score = token_set_ratio(left_processed, right_processed)
+    sort_score = token_sort_ratio(left_processed, right_processed)
+    return (set_score + sort_score) / 200.0
+
+
+def _author_name_tokens(name: str) -> list[str]:
+    """Lowercased, punctuation-free name tokens with "Last, First" reordered."""
+    if name.count(",") == 1:
+        last, first = name.split(",")
+        name = f"{first} {last}"
+    return default_process(name).split()
+
+
+def _given_names_compatible(left: list[str], right: list[str]) -> bool:
+    """True when the shorter given-name list aligns, in order, with the longer one.
+
+    Tokens align when equal, when one is a single-letter initial of the other, or when
+    they are close spellings of the same name; unmatched tokens in the longer list
+    (a missing middle name or initial) are skipped.
+    """
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    position = 0
+    for token in shorter:
+        while position < len(longer):
+            candidate = longer[position]
+            position += 1
+            if (
+                token == candidate
+                or (len(token) == 1 and candidate.startswith(token))
+                or (len(candidate) == 1 and token.startswith(candidate))
+                or ratio(token, candidate) >= AUTHOR_GIVEN_NAME_MIN_RATIO
+            ):
+                break
+        else:
+            return False
+    return True
+
+
+def _author_name_similarity(left: str, right: str) -> float:
+    """1.0 for the same name, a partial score for compatible variants, else 0.0.
+
+    Variants share the surname and have compatible given names: "Iain M. Banks" vs
+    "Iain Banks", "H. P. Lovecraft" vs "H P Lovecraft", "Banks, Iain" vs "Iain Banks".
+    A shared surname alone ("Frank Herbert" vs "Brian Herbert") is not a match.
+    """
+    left_tokens = _author_name_tokens(left)
+    right_tokens = _author_name_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    # Equal up to spacing too: "HP Lovecraft" / "H P Lovecraft", "Le Guin" / "LeGuin".
+    if "".join(left_tokens) == "".join(right_tokens):
+        return 1.0
+    if left_tokens[-1] != right_tokens[-1]:
+        return 0.0
+    left_given = left_tokens[:-1]
+    right_given = right_tokens[:-1]
+    if not left_given or not right_given:
+        return 0.0
+    if _given_names_compatible(left_given, right_given):
+        return AUTHOR_VARIANT_MATCH_SCORE
+    return 0.0
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:
     if not left or not right:
         return 0.0
-    left_set = {normalize_text(author) for author in left}
-    right_set = {normalize_text(author) for author in right}
-    if not left_set:
+    left_names = list(dict.fromkeys(normalize_text(author) for author in left))
+    right_names = list(dict.fromkeys(normalize_text(author) for author in right))
+    if not left_names:
         return 0.0
-    return len(left_set.intersection(right_set)) / len(left_set)
+    total = sum(
+        max(_author_name_similarity(name, other) for other in right_names) for name in left_names
+    )
+    return total / len(left_names)
 
 
 def _apply_scoring(
@@ -614,6 +750,7 @@ def _apply_scoring(
         publication_year=candidate.publication_year,
         score=min(score, 1.0),
         raw=candidate.raw,
+        subjects=candidate.subjects,
     )
     return normalized_candidate
 

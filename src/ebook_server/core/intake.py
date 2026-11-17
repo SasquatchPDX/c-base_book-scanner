@@ -668,6 +668,7 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
     return {
         "title": value("Title") or fallback["title"],
         "authors": authors,
+        "subjects": identification.normalize_subjects((value("Genre") or "").split(",")),
         "language": value("LanguageISO"),
         "description": value("Summary"),
         "publisher": value("Publisher"),
@@ -735,6 +736,12 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        subjects = identification.normalize_subjects(
+            [
+                "".join(element.itertext())
+                for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}subject")
+            ]
+        )
         identifier = _pick_epub_identifier(
             [
                 (element.attrib, "".join(element.itertext()).strip())
@@ -746,6 +753,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "authors": [author] if author else [],
             "language": language,
             "description": description,
+            "subjects": subjects,
             "identifier": identifier,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
@@ -828,6 +836,7 @@ def _save_metadata_candidates(
             isbn13=_fit(MetadataCandidate, "isbn13", candidate.isbn13),
             score=Decimal(str(candidate.score)),
             raw_payload=candidate.raw,
+            subjects=candidate.subjects,
             language=_fit(MetadataCandidate, "language", candidate.language),
             publisher=_fit(MetadataCandidate, "publisher", candidate.publisher),
             description=candidate.description or "",
