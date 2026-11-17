@@ -953,15 +953,15 @@ def _materialize_ocr_artifact(
             ]
 
         storage = _default_ocr_storage()
-        storage_identifier = archive_layout.derived_destination(
+        temp.flush()
+        storage_identifier = archive_layout.publish_derived(
             storage,
             source_book,
+            temp.name,
             f"{archive_layout.book_file_stem(source_book)} (OCR).{request_format}",
             legacy_namespace=f"books/{source_book.id}/ocr/{uuid4()}",
             legacy_filename=safe_name,
         )
-        temp.flush()
-        storage.store(temp.name, storage_identifier)
 
     variant = FileVariant.objects.create(
         book=source_book,
