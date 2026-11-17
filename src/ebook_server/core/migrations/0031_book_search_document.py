@@ -35,7 +35,7 @@ class TrigramExtensionOnPostgreSQL(TrigramExtension):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0023_file_variant_kindle_rtf_formats"),
+        ("core", "0030_metadata_search_runs"),
     ]
 
     operations = [
@@ -64,6 +64,7 @@ class Migration(migrations.Migration):
                 ("publication_decade", models.SmallIntegerField(blank=True, null=True)),
                 ("has_cover", models.BooleanField(default=False)),
                 ("book_created_at", models.DateTimeField()),
+                ("content_digest", models.CharField(blank=True, max_length=64)),
                 ("indexed_at", models.DateTimeField(auto_now=True)),
             ],
             options={

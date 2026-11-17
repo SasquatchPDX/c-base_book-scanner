@@ -1,0 +1,36 @@
+{% extends "core/base.html" %}
+{% block title %}Batch review result · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Human review</p>
+      <h1>Batch accept result</h1>
+    </div>
+    <span>{{ accepted }} accepted · {{ skipped }} left for review</span>
+  </div>
+  <p class="muted">
+    Minimum confidence {{ min_score|floatformat:2 }}; runner-ups within
+    {{ ambiguity_margin|floatformat:2 }} of the top candidate count as ambiguous.
+  </p>
+  <div class="list-stack">
+    {% for item in results %}
+      <article class="review-row">
+        <div class="grow">
+          <h2>{% if item.outcome == 'forbidden' or item.outcome == 'not_found' %}Task {{ item.task_id }}{% else %}<a href="{% url 'review-detail' item.task_id %}?view=html">{{ item.title|default:item.task_id }}</a>{% endif %}</h2>
+          <p class="muted">
+            {% if item.outcome == 'accepted' %}Accepted top candidate (confidence {{ item.top_score|floatformat:2 }}).
+            {% elif item.outcome == 'ambiguous' %}Skipped: runner-up {{ item.runner_up_score|floatformat:2 }} is too close to the top candidate {{ item.top_score|floatformat:2 }}.
+            {% elif item.outcome == 'below_min_score' %}Skipped: top candidate confidence {{ item.top_score|floatformat:2 }} is below the batch minimum.
+            {% elif item.outcome == 'no_candidates' %}Skipped: no metadata candidates.
+            {% elif item.outcome == 'closed' %}Skipped: task is already closed.
+            {% elif item.outcome == 'forbidden' %}Skipped: you may not resolve this task.
+            {% elif item.outcome == 'not_found' %}Skipped: task not found.
+            {% else %}Failed: {{ item.detail }}{% endif %}
+          </p>
+        </div>
+        <span class="status status-{% if item.outcome == 'accepted' %}resolved{% elif item.outcome == 'error' %}failed{% else %}open{% endif %}">{{ item.outcome }}</span>
+      </article>
+    {% endfor %}
+  </div>
+  <p><a href="{% url 'review-queue' %}?view=html">Back to the review queue</a></p>
+{% endblock %}

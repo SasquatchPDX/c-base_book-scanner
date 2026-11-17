@@ -23,7 +23,8 @@
       Category<input name="category" value="{{ filters.category }}">
     </label>
     <label>
-      Genre<input name="genre" value="{{ filters.genre }}">
+      Genre<input name="genre" value="{{ filters.genre }}" list="genre-options">
+      <datalist id="genre-options">{% for genre in all_genres %}<option value="{{ genre.name }}">{% endfor %}</datalist>
     </label>
     <label>
       Language<input name="language" value="{{ filters.language }}">
