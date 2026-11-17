@@ -209,6 +209,11 @@ urlpatterns = [
         name="review-multipart-order",
     ),
     path(
+        "reviews/<int:task_id>/multipart/acknowledge-incomplete/",
+        views.review_multipart_acknowledge_incomplete,
+        name="review-multipart-acknowledge-incomplete",
+    ),
+    path(
         "reviews/<int:task_id>/multipart/reject/",
         views.review_multipart_reject,
         name="review-multipart-reject",

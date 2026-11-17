@@ -283,6 +283,32 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Audio files and audiobooks
+
+This system does not manage audiobooks. The decision and its research are in
+`docs/design/32-audiobooks.md` (proposed in PR #107, issue #32): members who want
+audiobooks use a separate audiobook server such as Audiobookshelf, reading its own
+folder on the NAS. Intake therefore recognises audio files only to skip them:
+
+- Extensions `.m4b .m4a .mp3 .aac .ogg .oga .opus .flac .wav .wma .mka .ape .aif
+  .aiff .aa .aax .aaxc` are classified as `audio (not managed here)`. They never
+  create an `ImportJob`, are never hashed, copied, moved or converted, and a MOVE
+  source leaves them where they are.
+- Audible files (`.aa`, `.aax`, `.aaxc`) are DRM-protected and are reported as
+  such. This project never removes or works around DRM.
+- `ingest_sources --preview` lists them as `skipped [audio (not managed here)] =>
+  <path>` plus a `skipped_audio=N` total; with `--json` they are rows with
+  `"skipped": "audio"`, `"drm_protected"` and `"reason"` (no `source_type`).
+  A discovery run appends `skipped_audio=N` to its summary line.
+- Discovery logs one `intake_audio_files_skipped` event (source id and count, no
+  filenames) per source and pass. There is no Prometheus series for it, because
+  `/metrics/` only reports persisted state and skipped audio is not persisted.
+- Web uploads of audio files (by extension, or an `audio/*` content type on a
+  non-book extension) are refused with HTTP 415 before anything is staged. The
+  message links to `BOOK_SCANNER_AUDIOBOOK_SERVICE_URL` when it is set to an
+  `http(s)://` URL, and otherwise asks the member to contact the library admins.
+  The upload page shows the same pointer.
+
 ### Folder layouts (author/title from paths)
 
 Collections are organised differently, so each source can declare how its folders
@@ -323,6 +349,44 @@ Check a layout before importing; each preview row shows
 uv run python manage.py ingest_sources --source-id 1 --preview
 ```
 
+### Formats of one book (`group_sibling_formats`)
+
+Opt-in per source (admin → Source locations → "Formats of one book"), because
+generic same-name pairs such as `notes.txt` / `notes.pdf` are not one book in every
+collection. When enabled, files in the same folder with the same file name and
+different extensions (`Dune.epub`, `Dune.mobi`, `Dune.txt`; names compared
+case-insensitively) are *siblings*. Once one sibling is linked to a Book (automatic
+match, exact duplicate, or review decision), that Book becomes a strong candidate
+for the others. It never replaces verification:
+
+- every file is still looked up externally, and its provider candidates are stored;
+- the sibling's Book is scored like a provider candidate, plus
+  `BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS` (default 0.35), and must reach the
+  auto-accept threshold. An equal title is enough; the shared name alone is not;
+- the file goes to review instead when its embedded ISBN conflicts with the Book's
+  ISBNs (`conflicting_isbn`), when its embedded authors name different people than
+  the Book's (`author_conflict`), when a provider candidate confidently matches a
+  different book (`provider_match_differs`), or when the score stays below the
+  threshold (`below_threshold`);
+- siblings already waiting in review are re-assessed with the same rule when another
+  format is linked. An OPEN task that passes is resolved as "Merged with existing
+  book" without a reviewer, with `rule: group_sibling_formats` and the score in its
+  decision payload. A task a reviewer has CLAIMED is never resolved automatically;
+  it only gets a note under `decision_payload.format_sibling`.
+
+The assessment (sibling job, Book, score, accepted, reason) is stored in the import
+evidence under `format_sibling_of`. Decisions within one source are serialised with a
+row lock on the source, so two formats finishing at the same time cannot create two
+Books.
+
+The review queue (`/reviews/`) shows siblings waiting in review as one entry. The
+primary task is the one with the best candidate score, then the format most likely
+to carry embedded metadata (EPUB, AZW3, MOBI, FB2, PDF, DjVu, HTML, RTF, TXT), then
+the oldest. The other formats are listed under it with their own candidate counts and
+links. The JSON response keeps one item per task, so existing clients are unaffected.
+Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
+and the response gains `group_count`.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
@@ -356,6 +420,15 @@ settled, one review task of type `multipart_work` is opened for the whole folder
 searched by the folder name. `ingest_sources --preview --json` shows
 `multipart_group`/`part_label` for files that would be grouped.
 
+"All of them" is the membership detected from the folder listing (stored on the
+group with each file's source path), not only the jobs created so far: if a byte
+budget stopped discovery after some parts, the group waits until a later run
+imports the rest. A part whose import failed, whose source disappeared, or which was
+imported on its own is shown as *missing*; confirming the group then requires the
+reviewer to acknowledge the incomplete set first (**Confirm without the missing
+files**), and the decision records which files were left out. A file of an already
+confirmed or rejected group that turns up later is imported on its own.
+
 The reviewer can fix the proposed order and labels, then either
 
 - accept a candidate, enter metadata, or link an existing book: every part becomes
@@ -364,7 +437,8 @@ The reviewer can fix the proposed order and labels, then either
   or
 - choose **Not one book**: the group is rejected and every file is identified as an
   independent import in the background (auto-accepted only under the normal rules,
-  otherwise an ordinary review task).
+  otherwise an ordinary review task). A part still being processed when the grouping
+  is rejected is identified on its own as soon as its job finishes.
 
 Once confirmed, a book page offers **Combine N parts into one file** for PDF and TXT
 part sets (`POST /library/books/<id>/combine-parts/` with `target_format`; poll
