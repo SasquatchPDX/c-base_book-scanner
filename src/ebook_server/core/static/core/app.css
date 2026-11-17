@@ -6,4 +6,4 @@
 @media(max-width:850px){.scantailor-shell{grid-template-columns:1fr}.scantailor-sidebar{position:static}.stage-nav{grid-template-columns:repeat(3,1fr)}.scantailor-shell>noscript,.scantailor-shell>.scan-page-grid,.page-selection-toolbar{grid-column:auto}}
 @media(max-width:560px){.stage-nav{grid-template-columns:1fr 1fr}.editor-toolbar,.batch-toolbar{align-items:stretch;flex-direction:column}.geometry-frame{min-height:200px}}
 .geometry-layer{inset:auto;margin:0;width:auto;height:auto;top:50%;left:50%;transform:translate(-50%,-50%)}
-.cover-thumb{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:10px;background:#e8ebe7;box-shadow:0 8px 20px rgba(20,30,23,.12)}.cover-thumb.small{width:70px;flex:0 0 70px;border-radius:6px}
+.cover-thumb{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;border-radius:10px;background:#e8ebe7;box-shadow:0 8px 20px rgba(20,30,23,.12)}.cover-thumb.small{width:70px;flex:0 0 70px;border-radius:6px}.review-select input{width:auto}.review-row .badges{margin-top:0}

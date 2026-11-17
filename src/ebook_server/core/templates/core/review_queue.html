@@ -1,3 +1,98 @@
 {% extends "core/base.html" %}
 {% block title %}Review queue · Hackerspace Library{% endblock %}
-{% block content %}<div class="section-heading"><div><p class="eyebrow">Human review</p><h1>Metadata decisions</h1></div><span>{{ count }} open</span></div><div class="list-stack">{% for task in tasks %}<article class="review-row"><div><h2><a href="{% url 'review-detail' task.id %}?view=html">{{ task.inferred_title|default:task.source_filename }}</a></h2><p>{{ task.source_filename }}</p><p class="muted">{% for author in task.inferred_authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}No inferred author{% endfor %}</p></div><span class="status status-{{ task.state }}">{{ task.get_state_display }}</span></article>{% empty %}<p class="empty-state">Nothing needs review.</p>{% endfor %}</div>{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Human review</p>
+      <h1>Metadata decisions</h1>
+    </div>
+    <span>{{ count }} open</span>
+  </div>
+  <form class="filter-panel" method="get" aria-label="Filter review tasks">
+    <input type="hidden" name="view" value="html">
+    <label>
+      Source<select name="source">
+        <option value="">All sources</option>
+        <option value="upload" {% if filters.source == 'upload' %}selected{% endif %}>Web uploads</option>
+        <option value="scan" {% if filters.source == 'scan' %}selected{% endif %}>Scan jobs</option>
+        {% for location in source_locations %}
+          <option value="{{ location.id }}" {% if filters.source == location.id|stringformat:'d' %}selected{% endif %}>{{ location.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      State<select name="state">
+        <option value="">Open or claimed</option>
+        <option value="open" {% if filters.state == 'open' %}selected{% endif %}>Open</option>
+        <option value="claimed" {% if filters.state == 'claimed' %}selected{% endif %}>Claimed</option>
+      </select>
+    </label>
+    <label>
+      Min confidence<input name="min_score" type="number" min="0" max="1" step="0.01" value="{% if filters.min_score is not None %}{{ filters.min_score }}{% endif %}">
+    </label>
+    <label>
+      Max confidence<input name="max_score" type="number" min="0" max="1" step="0.01" value="{% if filters.max_score is not None %}{{ filters.max_score }}{% endif %}">
+    </label>
+    <label>
+      Candidates<select name="has_candidates">
+        <option value="">Any</option>
+        <option value="yes" {% if filters.has_candidates == 'yes' %}selected{% endif %}>Has candidates</option>
+        <option value="no" {% if filters.has_candidates == 'no' %}selected{% endif %}>No candidates</option>
+      </select>
+    </label>
+    <label>
+      Sort<select name="sort">
+        <option value="-created">Newest first</option>
+        <option value="created" {% if filters.sort == 'created' %}selected{% endif %}>Oldest first</option>
+        <option value="-confidence" {% if filters.sort == '-confidence' %}selected{% endif %}>Highest confidence</option>
+        <option value="confidence" {% if filters.sort == 'confidence' %}selected{% endif %}>Lowest confidence</option>
+      </select>
+    </label>
+    <button type="submit">Apply filters</button>
+  </form>
+  <form method="post" action="{% url 'review-batch-accept' %}">
+    {% csrf_token %}
+    <div class="batch-toolbar">
+      <p class="muted">
+        Batch accept resolves a selected task with its top candidate only when that
+        candidate scores at least {{ batch_min_score|floatformat:2 }} and leads the
+        runner-up by more than {{ batch_ambiguity_margin|floatformat:2 }}. Other selected
+        tasks stay open for individual review. At most {{ batch_max_tasks }} tasks per batch.
+      </p>
+      <button type="submit">Accept top candidate for selected</button>
+    </div>
+    <div class="list-stack">
+      {% for row in rows %}
+        <article class="review-row">
+          <label class="review-select" title="Select for batch accept">
+            <input type="checkbox" name="task_ids" value="{{ row.task.id }}" aria-label="Select {{ row.task.inferred_title|default:row.task.source_filename }}">
+          </label>
+          <div class="grow">
+            <h2><a href="{% url 'review-detail' row.task.id %}?view=html">{{ row.task.inferred_title|default:row.task.source_filename }}</a></h2>
+            <p>{{ row.task.source_filename }}</p>
+            <p class="muted">{% for author in row.task.inferred_authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}No inferred author{% endfor %}</p>
+            <p class="muted">
+              {% if row.task.import_job.source_location %}{{ row.task.import_job.source_location.name }}{% elif row.task.import_job_id %}Web upload{% else %}Scan job{% endif %}
+              · {{ row.candidate_count }} candidate{{ row.candidate_count|pluralize }}
+              {% if row.top_candidate %}· top: {{ row.top_candidate.title }} ({{ row.top_candidate.score }}){% endif %}
+              {% if row.eligibility.reason == 'ambiguous' %}· near-tied runner-up ({{ row.eligibility.runner_up_score|floatformat:2 }}){% endif %}
+            </p>
+          </div>
+          <div class="badges">
+            {% if row.eligibility.eligible %}<span>Batch-eligible</span>{% endif %}
+            <span class="status status-{{ row.task.state }}">{{ row.task.get_state_display }}</span>
+          </div>
+        </article>
+      {% empty %}
+        <p class="empty-state">Nothing needs review.</p>
+      {% endfor %}
+    </div>
+  </form>
+  {% if page_object.paginator.num_pages > 1 %}
+    <nav class="pagination" aria-label="Pagination">
+      {% if page_object.has_previous %}<a href="?{{ querystring }}&amp;page={{ page_object.previous_page_number }}">Previous</a>{% endif %}
+      <span>Page {{ page_object.number }} of {{ page_object.paginator.num_pages }}</span>
+      {% if page_object.has_next %}<a href="?{{ querystring }}&amp;page={{ page_object.next_page_number }}">Next</a>{% endif %}
+    </nav>
+  {% endif %}
+{% endblock %}
