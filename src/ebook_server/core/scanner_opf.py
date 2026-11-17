@@ -36,6 +36,8 @@ result is recorded in the Book's provenance and on the OPF version.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -106,6 +108,15 @@ class InvalidOpf(ValueError):
 
 class ScannerOpfError(RuntimeError):
     """A review action on a scanner-OPF task cannot be carried out."""
+
+
+class StaleReview(ScannerOpfError):
+    """The review no longer matches the scan's metadata (HTTP 409).
+
+    Its OPF version is no longer the effective one, the scan is linked to another Book,
+    the Book's metadata changed since the review was opened, or the evidence changed
+    since the reviewer loaded it. Nothing was written to the Book.
+    """
 
 
 # --- parsing -------------------------------------------------------------------------------
@@ -241,6 +252,9 @@ def store_opf(
     )
     if parsed.app_generated:
         return StoreResult(opf, True)
+    # Unclaimed reviews of earlier versions are obsolete now; claimed ones keep their
+    # evidence and are rejected (and closed) when someone tries to resolve them.
+    supersede_open_reviews(job, opf)
     update_fields = []
     if parsed.fields.get("title"):
         job.provisional_title = parsed.fields["title"]
@@ -351,6 +365,16 @@ def book_value(book: Book, field_name: str) -> Any:
 
 def snapshot_book(book: Book) -> dict[str, Any]:
     return {field_name: book_value(book, field_name) for field_name in FIELDS}
+
+
+def _digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def book_revision(book: Book, field_names: Iterable[str]) -> str:
+    """A fingerprint of the Book's values for ``field_names`` (what a review would write)."""
+    return _digest({field_name: book_value(book, field_name) for field_name in field_names})
 
 
 def opf_value(fields: dict[str, Any], field_name: str) -> Any:
@@ -872,8 +896,53 @@ def _signals(fields: dict[str, Any]) -> identification.IdentificationInput:
     )
 
 
+def _fence(job: ScanJob, opf_id: Any, book_id: Any) -> dict[str, Any] | None:
+    """Why a result for OPF ``opf_id`` on Book ``book_id`` no longer applies to ``job``.
+
+    ``None`` while that OPF is still the job's effective metadata and the job is still
+    linked to that Book. The caller holds the job's row lock.
+    """
+    effective = effective_opf(job)
+    if effective is None or effective.pk != opf_id:
+        return {
+            "reason": "opf_superseded",
+            "effective_opf_id": effective.pk if effective is not None else None,
+            "effective_opf_version": effective.version if effective is not None else None,
+        }
+    if job.book_id != book_id:
+        return {"reason": "book_changed", "linked_book_id": job.book_id}
+    return None
+
+
+def _finish_stale(
+    processing_job: ProcessingJob,
+    details: dict[str, Any],
+    stale: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> None:
+    """Keep a check that no longer applies as history only: nothing is published."""
+    processing_job.state = ProcessingJob.JobState.SUCCESS
+    processing_job.finished_at = timezone.now()
+    processing_job.details = {**details, "result": result, "stale": stale, "published": False}
+    processing_job.save(update_fields=["state", "finished_at", "details"])
+    logger.info(
+        "scanner_opf_check_stale",
+        job_id=str(processing_job.job_id),
+        opf_id=details.get("opf_id"),
+        reason=stale.get("reason"),
+        status=result.get("status") if result is not None else None,
+    )
+
+
 def process_provider_check_job(job_id: str, *, raise_on_error: bool = False) -> None:
-    """Run one provider check (worker entry point)."""
+    """Run one provider check (worker entry point).
+
+    The check is fenced to the OPF version and Book it was requested for: it publishes
+    (provenance, ``ScanJobOpf.provider_check``, a review task) only if, under the job's
+    row lock, that version is still the effective OPF and the job is still linked to that
+    Book. Otherwise the result is kept on the processing job as stale history and nothing
+    else changes - a delayed worker never replaces newer evidence.
+    """
     with transaction.atomic():
         processing_job = (
             ProcessingJob.objects.select_for_update()
@@ -889,14 +958,27 @@ def process_provider_check_job(job_id: str, *, raise_on_error: bool = False) -> 
         processing_job.details = details
         processing_job.save(update_fields=["state", "started_at", "details"])
     try:
-        opf = ScanJobOpf.objects.select_related("scan_job").get(pk=details["opf_id"])
+        opf = ScanJobOpf.objects.get(pk=details["opf_id"])
+        with transaction.atomic():
+            job = ScanJob.objects.select_for_update().get(pk=opf.scan_job_id)
+            stale = _fence(job, opf.pk, details.get("book_id"))
+            if stale is not None:  # superseded before the lookup: spare the providers
+                _finish_stale(processing_job, details, stale, None)
+                return
         fields = opf.fields if isinstance(opf.fields, dict) else {}
         candidates, outcomes = identification.resolve_candidates_with_report(_signals(fields))
         result = assess_provider_result(fields, candidates, outcomes)
         result["job_id"] = job_id
         with transaction.atomic():
-            book = Book.objects.select_for_update().get(pk=details["book_id"])
-            job = ScanJob.objects.get(pk=opf.scan_job_id)
+            # Lock order everywhere: scan job, Book, review tasks.
+            job = ScanJob.objects.select_for_update().get(pk=opf.scan_job_id)
+            stale = _fence(job, opf.pk, details.get("book_id"))
+            book = Book.objects.select_for_update().filter(pk=details.get("book_id")).first()
+            if stale is None and book is None:
+                stale = {"reason": "book_deleted"}
+            if stale is not None or book is None:
+                _finish_stale(processing_job, details, stale or {}, result)
+                return
             task = None
             if result["status"] == CHECK_CONTRADICTED:
                 task = _open_provider_conflict_review(job, book, opf, result)
@@ -943,10 +1025,80 @@ def _review_payload(task: ReviewTask) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _open_review(job: ScanJob, kind: str) -> ReviewTask | None:
-    for task in ReviewTask.objects.filter(scan_job=job, state__in=_OPEN_REVIEW_STATES):
+def review_fields(review: dict[str, Any]) -> tuple[str, ...]:
+    """The Book fields a scanner-OPF review shows and may write."""
+    if review.get("kind") == KIND_PROVIDER_CONFLICT:
+        return CHECKED_FIELDS
+    return tuple(
+        str(conflict.get("field"))
+        for conflict in review.get("conflicts") or []
+        if conflict.get("field") in FIELD_LABELS
+    )
+
+
+def review_revision(review: dict[str, Any]) -> str:
+    """A fingerprint of the evidence a reviewer sees (OPF version, Book revision, values).
+
+    The review form sends it back; resolving is rejected when it no longer matches.
+    """
+    return _digest({k: v for k, v in review.items() if k not in {"choice", "obsolete"}})[:32]
+
+
+def _mark_obsolete(task: ReviewTask, stale: dict[str, Any], *, note: str) -> None:
+    """Close a review whose OPF version or Book no longer applies; its evidence stays."""
+    payload = dict(task.decision_payload) if isinstance(task.decision_payload, dict) else {}
+    review = dict(payload.get(REVIEW_KEY) or {})
+    review["obsolete"] = {**stale, "at": timezone.now().isoformat()}
+    payload[REVIEW_KEY] = review
+    task.decision_payload = payload
+    task.state = ReviewTask.State.CANCELLED
+    task.decision_notes = note
+    task.decided_at = timezone.now()
+    task.save()
+
+
+def supersede_open_reviews(job: ScanJob, opf: ScanJobOpf) -> list[int]:
+    """Cancel unclaimed scanner-OPF conflict reviews of other OPF versions of ``job``.
+
+    A *claimed* review is left untouched (someone is looking at its evidence); resolving
+    it is rejected later because its OPF version is no longer the effective one.
+    """
+    cancelled = []
+    for task in ReviewTask.objects.select_for_update().filter(
+        scan_job=job, state=ReviewTask.State.OPEN
+    ):
         review = _review_payload(task)
-        if review is not None and review.get("kind") == kind:
+        if review is None or review.get("kind") not in CONFLICT_KINDS:
+            continue
+        if review.get("opf_id") == opf.pk:
+            continue
+        _mark_obsolete(
+            task,
+            {
+                "reason": "opf_superseded",
+                "effective_opf_id": opf.pk,
+                "effective_opf_version": opf.version,
+            },
+            note=f"Superseded by scanner metadata.opf version {opf.version}",
+        )
+        cancelled.append(task.pk)
+    if cancelled:
+        logger.info(
+            "scanner_opf_reviews_superseded",
+            scan_job_id=str(job.pk),
+            version=opf.version,
+            review_task_ids=cancelled,
+        )
+    return cancelled
+
+
+def _owned_review(job: ScanJob, kind: str, opf: ScanJobOpf) -> ReviewTask | None:
+    """The open or claimed review of ``kind`` for exactly this OPF version (locked)."""
+    for task in ReviewTask.objects.select_for_update().filter(
+        scan_job=job, state__in=_OPEN_REVIEW_STATES
+    ):
+        review = _review_payload(task)
+        if review is not None and review.get("kind") == kind and review.get("opf_id") == opf.pk:
             return task
     return None
 
@@ -959,6 +1111,12 @@ def _save_review(
     *,
     provider_snapshot: list[dict[str, Any]] | None = None,
 ) -> ReviewTask:
+    """Create, or refresh while still unclaimed, this OPF version's review of a kind.
+
+    A claimed review is never modified: its evidence is what the reviewer is deciding on.
+    The review records the Book revision it was opened against.
+    """
+    review = {**review, "book_revision": book_revision(book, review_fields(review))}
     fields = opf.fields if isinstance(opf.fields, dict) else {}
     values: dict[str, Any] = {
         "task_type": ReviewTask.TaskType.QUALITY_REVIEW,
@@ -973,9 +1131,17 @@ def _save_review(
         "decision_payload": {REVIEW_KEY: review},
         "resolved_book": book,
     }
-    task = _open_review(job, str(review["kind"]))
+    task = _owned_review(job, str(review["kind"]), opf)
     if task is None:
         return ReviewTask.objects.create(scan_job=job, **values)
+    if task.state != ReviewTask.State.OPEN:
+        logger.info(
+            "scanner_opf_review_kept_claimed",
+            scan_job_id=str(job.pk),
+            review_task_id=task.pk,
+            version=opf.version,
+        )
+        return task
     for name, value in values.items():
         setattr(task, name, value)
     task.save()
@@ -1110,6 +1276,12 @@ def review_context(task: ReviewTask) -> dict[str, Any] | None:
             )
     else:
         return None
+    is_open = task.state in _OPEN_REVIEW_STATES
+    obsolete = review.get("obsolete")
+    if is_open and job is not None:
+        # Shown before anyone tries: a newer OPF version or another Book link makes this
+        # review's evidence obsolete (resolving it is rejected and closes it).
+        obsolete = _fence(job, review.get("opf_id"), review.get("book_id"))
     return {
         "kind": kind,
         "is_conflict": True,
@@ -1118,7 +1290,9 @@ def review_context(task: ReviewTask) -> dict[str, Any] | None:
         "preselected": review.get("preselected"),
         "choice": review.get("choice"),
         "book": Book.objects.filter(pk=review.get("book_id")).first(),
-        "open": task.state in _OPEN_REVIEW_STATES,
+        "open": is_open and obsolete is None,
+        "obsolete": obsolete,
+        "revision": review_revision(review),
     }
 
 
@@ -1143,15 +1317,89 @@ CONFLICT_CHOICES: Final = {
 }
 
 
-def resolve_conflict(task: ReviewTask, *, choice: str, user: Any) -> Book:
+def _refresh_stale_review(
+    task: ReviewTask, review: dict[str, Any], job: ScanJob, book: Book
+) -> str | None:
+    """``None`` if the review still applies; otherwise refresh it and say why it does not.
+
+    The caller holds the job, Book and task row locks.
+    """
+    stale = _fence(job, review.get("opf_id"), book.pk)
+    if stale is not None:
+        if stale["reason"] == "opf_superseded":
+            version = stale.get("effective_opf_version")
+            why = (
+                f"the scanner has since sent metadata.opf version {version}"
+                if version is not None
+                else "its scanner metadata.opf is no longer used"
+            )
+        else:
+            why = "the scan is now linked to another book"
+        _mark_obsolete(task, stale, note=f"Obsolete: {why}")
+        logger.info(
+            "scanner_opf_review_obsolete",
+            review_task_id=task.pk,
+            scan_job_id=str(job.pk),
+            reason=stale["reason"],
+        )
+        return (
+            f"This review is obsolete: it was opened for metadata.opf version "
+            f"{review.get('opf_version')}, but {why}. Nothing was changed and the review "
+            "was closed; the current metadata gets its own review if it needs one."
+        )
+    current_revision = book_revision(book, review_fields(review))
+    if current_revision == review.get("book_revision"):
+        return None
+    payload = dict(task.decision_payload) if isinstance(task.decision_payload, dict) else {}
+    refreshed = dict(review)
+    refreshed["book_revision"] = current_revision
+    if refreshed.get("kind") == KIND_FIELD_CONFLICT:
+        refreshed["conflicts"] = [
+            {**conflict, "current": book_value(book, str(conflict.get("field")))}
+            if conflict.get("field") in FIELD_LABELS
+            else conflict
+            for conflict in refreshed.get("conflicts") or []
+        ]
+    payload[REVIEW_KEY] = refreshed
+    task.decision_payload = payload
+    task.save(update_fields=["decision_payload", "updated_at"])
+    logger.info("scanner_opf_review_refreshed", review_task_id=task.pk, scan_job_id=str(job.pk))
+    return (
+        "The book's metadata changed after this review was opened. Nothing was changed; "
+        "the review now shows the current values. Decide again."
+    )
+
+
+def resolve_conflict(
+    task: ReviewTask, *, choice: str, user: Any, revision: str | None = None
+) -> Book:
     """Apply a reviewer's decision on a scanner-OPF conflict task.
 
     Provider conflict: ``scanner`` keeps the scanner metadata (recorded as confirmed, so
     later OPFs still update it); ``provider`` writes the provider's title, authors and
     ISBN as reviewer edits. Field conflict: ``current`` keeps the Book's values;
     ``scanner`` writes the OPF values with scanner provenance.
+
+    The decision is only applied to the evidence it was made on. :class:`StaleReview`
+    (nothing written to the Book) when ``revision`` (what the reviewer loaded, see
+    :func:`review_revision`) no longer matches the task; when the task's OPF version is
+    no longer the effective one or the scan is linked to another Book (the task is then
+    closed as obsolete); or when the Book's values for the reviewed fields changed since
+    the task was opened (the task is refreshed with the current values to decide again).
     """
+    stale_message: str | None = None
     with transaction.atomic():
+        # Lock order everywhere: scan job, Book, review tasks.
+        unlocked = ReviewTask.objects.filter(pk=task.pk).first()
+        if unlocked is None:
+            raise ScannerOpfError("the review task no longer exists")
+        first_look = _review_payload(unlocked) or {}
+        job = (
+            ScanJob.objects.select_for_update().filter(pk=unlocked.scan_job_id).first()
+            if unlocked.scan_job_id is not None
+            else None
+        )
+        book = Book.objects.select_for_update().filter(pk=first_look.get("book_id")).first()
         locked = ReviewTask.objects.select_for_update().get(pk=task.pk)
         review = _review_payload(locked)
         if review is None or review.get("kind") not in CONFLICT_KINDS:
@@ -1161,82 +1409,92 @@ def resolve_conflict(task: ReviewTask, *, choice: str, user: Any) -> Book:
         kind = str(review["kind"])
         if choice not in CONFLICT_CHOICES[kind]:
             raise ScannerOpfError(f"choice must be one of: {', '.join(CONFLICT_CHOICES[kind])}")
-        book = Book.objects.select_for_update().filter(pk=review.get("book_id")).first()
-        if book is None:
+        if job is None:
+            raise ScannerOpfError("not a scan review")
+        if book is None or review.get("book_id") != book.pk:
             raise ScannerOpfError("the book no longer exists")
-        job = locked.scan_job
-        opf = ScanJobOpf.objects.filter(pk=review.get("opf_id")).first()
-        reviewer_source = BookMetadataProvenance.Source.REVIEWER
-        details = {"review_task_id": locked.pk, "choice": choice}
-        if kind == KIND_PROVIDER_CONFLICT and choice == "provider":
-            provider = review.get("provider") or {}
-            scanner = review.get("scanner") or {}
-            new_isbn = metadata_search.canonical_isbn13(
-                provider.get("isbn13") or provider.get("isbn10")
+        if revision is not None and revision != review_revision(review):
+            raise StaleReview(
+                "This review changed after you loaded it. Reload it and decide again."
             )
-            values: dict[str, Any] = {
-                "title": provider.get("title"),
-                "authors": list(provider.get("authors") or []),
-                "isbn": [new_isbn] if new_isbn else None,
-            }
-            for field_name, value in values.items():
-                if _is_empty(value):
-                    continue
-                set_field(
-                    book,
-                    field_name,
-                    value,
-                    source=reviewer_source,
-                    job=job,
-                    opf=opf,
-                    user=user,
-                    details=details,
-                    replaces=[scanner["isbn"]]
-                    if field_name == "isbn" and scanner.get("isbn")
-                    else None,
+        stale_message = _refresh_stale_review(locked, review, job, book)
+        if stale_message is None:
+            opf = ScanJobOpf.objects.filter(pk=review.get("opf_id")).first()
+            reviewer_source = BookMetadataProvenance.Source.REVIEWER
+            details = {"review_task_id": locked.pk, "choice": choice}
+            if kind == KIND_PROVIDER_CONFLICT and choice == "provider":
+                provider = review.get("provider") or {}
+                scanner = review.get("scanner") or {}
+                new_isbn = metadata_search.canonical_isbn13(
+                    provider.get("isbn13") or provider.get("isbn10")
                 )
-        elif kind == KIND_FIELD_CONFLICT and choice == "scanner":
-            for conflict in review.get("conflicts") or []:
-                field_name = conflict.get("field")
-                if field_name not in FIELD_LABELS:
-                    continue
-                owner = latest_set(book, field_name)
-                set_field(
-                    book,
-                    field_name,
-                    conflict.get("scanner"),
-                    source=PROVENANCE_SOURCE,
-                    job=job,
-                    opf=opf,
-                    user=user,
-                    details={**details, "confirmed_by_reviewer": True},
-                    replaces=(owner.value if field_name == "isbn" and owner is not None else None),
+                values: dict[str, Any] = {
+                    "title": provider.get("title"),
+                    "authors": list(provider.get("authors") or []),
+                    "isbn": [new_isbn] if new_isbn else None,
+                }
+                for field_name, value in values.items():
+                    if _is_empty(value):
+                        continue
+                    set_field(
+                        book,
+                        field_name,
+                        value,
+                        source=reviewer_source,
+                        job=job,
+                        opf=opf,
+                        user=user,
+                        details=details,
+                        replaces=[scanner["isbn"]]
+                        if field_name == "isbn" and scanner.get("isbn")
+                        else None,
+                    )
+            elif kind == KIND_FIELD_CONFLICT and choice == "scanner":
+                for conflict in review.get("conflicts") or []:
+                    field_name = conflict.get("field")
+                    if field_name not in FIELD_LABELS:
+                        continue
+                    owner = latest_set(book, field_name)
+                    set_field(
+                        book,
+                        field_name,
+                        conflict.get("scanner"),
+                        source=PROVENANCE_SOURCE,
+                        job=job,
+                        opf=opf,
+                        user=user,
+                        details={**details, "confirmed_by_reviewer": True},
+                        replaces=(
+                            owner.value if field_name == "isbn" and owner is not None else None
+                        ),
+                    )
+            else:
+                fields = (
+                    CHECKED_FIELDS
+                    if kind == KIND_PROVIDER_CONFLICT
+                    else tuple(str(c.get("field")) for c in review.get("conflicts") or [])
                 )
-        else:
-            fields = (
-                CHECKED_FIELDS
-                if kind == KIND_PROVIDER_CONFLICT
-                else tuple(str(c.get("field")) for c in review.get("conflicts") or [])
+                for field_name in fields:
+                    _record(
+                        book,
+                        field_name=field_name,
+                        source=reviewer_source,
+                        action=BookMetadataProvenance.Action.CONFIRMED,
+                        value=book_value(book, field_name),
+                        details=details,
+                        job=job,
+                        opf=opf,
+                        user=user,
+                    )
+            _close_task(
+                locked,
+                book=book,
+                user=user,
+                choice=choice,
+                notes=f"Scanner metadata conflict: kept {choice}",
             )
-            for field_name in fields:
-                _record(
-                    book,
-                    field_name=field_name,
-                    source=reviewer_source,
-                    action=BookMetadataProvenance.Action.CONFIRMED,
-                    value=book_value(book, field_name),
-                    details=details,
-                    job=job,
-                    opf=opf,
-                    user=user,
-                )
-        _close_task(
-            locked,
-            book=book,
-            user=user,
-            choice=choice,
-            notes=f"Scanner metadata conflict: kept {choice}",
-        )
+    if stale_message is not None:
+        raise StaleReview(stale_message)
     return book
 
 

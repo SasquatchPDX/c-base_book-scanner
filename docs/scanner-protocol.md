@@ -272,6 +272,33 @@ metadata verification is mandatory for intake. The project owner decided to sati
 - The result is recorded on the OPF version (`ScanJobOpf.provider_check`), in the Book's
   provenance (`action=provider_check`) and in the processing job's details.
 
+### Out-of-order workers and stale reviews
+
+A provider check can finish after the scanner has sent a newer OPF. Results and review
+decisions are therefore fenced to the OPF version and Book they were made for (lock order
+everywhere: scan job, Book, review tasks):
+
+- A check records the OPF version id and Book id it was started for. Before the lookup
+  and again when it completes, under the job's row lock, it only publishes if that OPF is
+  still the job's effective one and the job is still linked to that Book. Otherwise the
+  result stays on the processing job as history (`details.stale`, `published: false`) and
+  nothing else changes.
+- A check only creates or refreshes an **open** review task for its own OPF version. A
+  **claimed** (or resolved) review is never modified: its evidence is what the reviewer is
+  deciding on. A new OPF version cancels unclaimed conflict reviews of older versions.
+- Each scanner-OPF conflict review stores its OPF version id and a fingerprint of the
+  Book's values for the fields it shows (`book_revision`). The review detail exposes
+  `scanner_opf.revision`, a fingerprint of that evidence; `action=resolve` must send it
+  back (`revision`, required). Resolving is rejected - `409` with the reason and the
+  current `revision` for API clients, a form error on the review page for browsers - and
+  nothing is written to the Book when:
+  - the revision no longer matches the task (its evidence changed after it was loaded);
+  - the task's OPF version is no longer the effective one, or the scan is linked to
+    another Book: the task is closed as obsolete (`state=cancelled`, evidence kept, plus
+    an `obsolete` marker), and the current OPF gets its own review if it needs one;
+  - the Book's values for the reviewed fields changed since the task was opened: the task
+    is refreshed with the current values and a new revision, to be decided again.
+
 ## Raw scans (#127, contract §5)
 
 ```

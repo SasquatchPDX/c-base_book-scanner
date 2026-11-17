@@ -43,7 +43,7 @@
     </table>
     {% if scanner_opf_review.open %}
       <form method="post" action="{% url 'review-scanner-opf' task.id %}">
-        {% csrf_token %}<input type="hidden" name="action" value="resolve">
+        {% csrf_token %}<input type="hidden" name="action" value="resolve"><input type="hidden" name="revision" value="{{ scanner_opf_review.revision }}">
         {% if scanner_opf_review.kind == "provider_conflict" %}
           <label><input type="radio" name="choice" value="scanner"{% if scanner_opf_review.preselected == "scanner" %} checked{% endif %}> Keep the scanner metadata</label>
           <label><input type="radio" name="choice" value="provider"{% if scanner_opf_review.preselected == "provider" %} checked{% endif %}> Use the provider record</label>
@@ -53,6 +53,8 @@
         {% endif %}
         <button type="submit">Decide</button>
       </form>
+    {% elif scanner_opf_review.obsolete %}
+      <p data-scanner-opf-obsolete="{{ scanner_opf_review.obsolete.reason }}">This review is obsolete: {% if scanner_opf_review.obsolete.reason == "opf_superseded" %}the scanner sent a newer metadata.opf{% if scanner_opf_review.obsolete.effective_opf_version %} (version {{ scanner_opf_review.obsolete.effective_opf_version }}){% endif %} after it was opened{% else %}the scan is no longer linked to this book{% endif %}. It cannot be decided; the current metadata gets its own review if it needs one.</p>
     {% else %}
       <p class="muted">Decided: {{ scanner_opf_review.choice|default:task.get_decision_display }}.</p>
     {% endif %}

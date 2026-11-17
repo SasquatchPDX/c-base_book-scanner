@@ -137,6 +137,24 @@ def _finish(client: Client) -> Any:
     return client.post(f"/scan/jobs/{JOB_ID}/finish/", data={"allow_raw_pages": "true"})
 
 
+def _revision(client: Client, task: ReviewTask) -> str:
+    """The evidence revision the review page shows (sent back with the decision)."""
+    revision = client.get(f"/reviews/{task.pk}/").json()["scanner_opf"]["revision"]
+    assert isinstance(revision, str) and revision
+    return revision
+
+
+def _resolve(client: Client, task: ReviewTask, choice: str, revision: str | None = None) -> Any:
+    return client.post(
+        f"/reviews/{task.pk}/scanner-opf/",
+        {
+            "action": "resolve",
+            "choice": choice,
+            "revision": revision if revision is not None else _revision(client, task),
+        },
+    )
+
+
 # --- PUT jobs/{id}/metadata (§6.8) -------------------------------------------------------
 
 
@@ -465,9 +483,13 @@ def test_opf_after_linking_updates_scanner_fields_but_not_hand_edits(
     assert 'data-scanner-opf-review="field_conflict"' in html
     assert 'value="current" checked' in html
 
-    resolved = admin_client.post(
-        f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "scanner"}
+    assert (
+        admin_client.post(
+            f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "scanner"}
+        ).status_code
+        == 400  # the evidence revision the reviewer saw is required
     )
+    resolved = _resolve(admin_client, task, "scanner")
     assert resolved.status_code == 200, resolved.content
     book.refresh_from_db()
     assert book.language == "de"
@@ -534,15 +556,8 @@ def test_provider_contradiction_opens_review_with_scanner_preselected(
     assert 'value="scanner" checked' in html
     assert "A Completely Different Book" in html
 
-    assert (
-        admin_client.post(
-            f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "bogus"}
-        ).status_code
-        == 400
-    )
-    resolved = admin_client.post(
-        f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "provider"}
-    )
+    assert _resolve(admin_client, task, "bogus").status_code == 400
+    resolved = _resolve(admin_client, task, "provider")
     assert resolved.status_code == 200, resolved.content
     book.refresh_from_db()
     assert book.title == "A Completely Different Book"
@@ -574,3 +589,234 @@ def test_assess_ignores_weak_matches() -> None:
         {"title": "The Physical Book", "authors": ["Ada Scanner"], "isbn": None}, [weak], []
     )
     assert result["status"] == scanner_opf.CHECK_INCONCLUSIVE
+
+
+# --- out-of-order provider workers and stale reviews (PR #143 review) -----------------------
+
+V1_TITLE = "The Physical Book"
+V2_TITLE = "Another Physical Volume"
+
+
+class _RecordingQueue:
+    """Holds dispatched provider checks so a test decides when (and in what order) they run."""
+
+    def __init__(self) -> None:
+        self.job_ids: list[str] = []
+
+    def enqueue(self, func: Any, job_id: str, **_kwargs: Any) -> None:
+        self.job_ids.append(job_id)
+
+
+def _provider_record(title: str, author: str) -> dict[str, Any]:
+    return {"key": f"/works/{title}", "title": title, "author_name": [author], "isbn": [ISBN]}
+
+
+def _check_job_for(version: int) -> ProcessingJob:
+    return ProcessingJob.objects.get(
+        job_type=ProcessingJob.JobType.SCANNER_OPF_CHECK, details__opf_version=version
+    )
+
+
+def _claim(task: ReviewTask) -> None:
+    task.state = ReviewTask.State.CLAIMED
+    task.claimed_by = get_or_create_profile("opf-admin").user
+    task.save(update_fields=["state", "claimed_by", "updated_at"])
+
+
+@pytest.fixture
+def held_checks(monkeypatch: pytest.MonkeyPatch) -> _RecordingQueue:
+    """Provider checks are queued, not run: the test runs them in the order it wants."""
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    recording = _RecordingQueue()
+    monkeypatch.setattr(scanner_opf, "get_queue", lambda: recording)
+    return recording
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("v1_lookup", ["before_v2", "during_v2"])
+def test_delayed_v1_check_cannot_replace_claimed_v2_evidence(
+    key: str,
+    admin_client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    held_checks: _RecordingQueue,
+    v1_lookup: str,
+) -> None:
+    """The reviewer's sequence: OPF v2 is current and its review claimed when v1's lookup
+    completes. The v1 result is stale history; the claimed v2 evidence stays; resolving
+    applies the v2 decision; the Book keeps v2's title."""
+    v2_record = _provider_record("Provider Title For V2", "Provider Person")
+    v1_record = _provider_record("Obsolete Candidate For V1", "Old Person")
+    claimed: dict[str, Any] = {}
+
+    def open_and_claim_v2_review() -> None:
+        assert _put_opf(key, _opf(title=V2_TITLE)).status_code == 201
+        scanner_opf.process_provider_check_job(str(_check_job_for(2).job_id))
+        task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+        _claim(task)
+        claimed["task"] = task
+        claimed["payload"] = ReviewTask.objects.get(pk=task.pk).decision_payload
+        claimed["revision"] = _revision(admin_client, task)
+
+    v1_lookups: list[str] = []
+
+    class _OrderedProvider:
+        provider_id = "opf-stub"
+
+        def search(self, title: str | None = None, **_kwargs: Any) -> list[dict[str, Any]]:
+            if title == V2_TITLE:
+                return [v2_record]
+            v1_lookups.append(str(title))
+            if v1_lookup == "during_v2":
+                # The v1 worker is mid-lookup (no transaction, no locks) while v2 arrives,
+                # is checked, contradicted and its review claimed.
+                open_and_claim_v2_review()
+            return [v1_record]
+
+    monkeypatch.setattr(identification, "_provider_instances", lambda: [_OrderedProvider()])
+    _prepare_finish(key, admin_client, _opf(title=V1_TITLE))
+    assert _finish(admin_client).status_code == 202
+    v1_job = _check_job_for(1)
+    assert v1_job.state == ProcessingJob.JobState.QUEUED  # held back: the delayed worker
+    if v1_lookup == "before_v2":
+        open_and_claim_v2_review()
+
+    scanner_opf.process_provider_check_job(str(v1_job.job_id))
+
+    v1_job.refresh_from_db()
+    assert v1_job.state == ProcessingJob.JobState.SUCCESS
+    assert v1_job.details["published"] is False
+    assert v1_job.details["stale"]["reason"] == "opf_superseded"
+    assert v1_job.details["stale"]["effective_opf_version"] == 2
+    if v1_lookup == "during_v2":
+        assert v1_lookups == [V1_TITLE]  # the completion was fenced
+        assert v1_job.details["result"]["record"]["title"] == "Obsolete Candidate For V1"
+    else:
+        assert v1_lookups == []  # fenced before calling the providers at all
+    v1_opf = ScanJobOpf.objects.get(scan_job_id=JOB_ID, version=1)
+    assert v1_opf.provider_check == {}
+    assert not BookMetadataProvenance.objects.filter(action="provider_check", opf=v1_opf).exists()
+    # The claimed v2 review is untouched and still the only one.
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+    assert task.pk == claimed["task"].pk
+    assert task.state == ReviewTask.State.CLAIMED
+    assert task.decision_payload == claimed["payload"]
+    assert task.decision_payload["scanner_opf"]["provider"]["title"] == "Provider Title For V2"
+
+    resolved = _resolve(admin_client, task, "scanner", claimed["revision"])
+    assert resolved.status_code == 200, resolved.content
+    book = Book.objects.get()
+    assert book.title == V2_TITLE
+    assert ReviewTask.objects.get(pk=task.pk).state == ReviewTask.State.RESOLVED
+    effective = scanner_opf.effective_opf(ScanJob.objects.get(pk=JOB_ID))
+    assert effective is not None and effective.version == 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("client_kind", ["api", "html"])
+def test_resolving_a_review_of_a_superseded_opf_is_rejected(
+    key: str,
+    admin_client: Client,
+    held_checks: _RecordingQueue,
+    providers: list[dict[str, Any]],
+    client_kind: str,
+) -> None:
+    """A claimed v1 review is not rewritten when v2 arrives, and deciding it afterwards
+    does not write v1's provider record over v2: 409 / form error, review closed."""
+    providers.append(_provider_record("Obsolete Candidate For V1", "Old Person"))
+    _prepare_finish(key, admin_client, _opf(title=V1_TITLE))
+    assert _finish(admin_client).status_code == 202
+    scanner_opf.process_provider_check_job(str(_check_job_for(1).job_id))
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+    _claim(task)
+    revision = _revision(admin_client, task)
+    evidence = ReviewTask.objects.get(pk=task.pk).decision_payload["scanner_opf"]
+
+    assert _put_opf(key, _opf(title=V2_TITLE)).status_code == 201
+    book = Book.objects.get()
+    assert book.title == V2_TITLE  # the scanner-owned title follows the newer OPF
+    still = ReviewTask.objects.get(pk=task.pk)
+    assert still.state == ReviewTask.State.CLAIMED  # claimed evidence is preserved
+    assert still.decision_payload["scanner_opf"] == evidence
+    html = admin_client.get(f"/reviews/{task.pk}/?view=html").content.decode()
+    assert 'data-scanner-opf-obsolete="opf_superseded"' in html
+    assert 'name="choice"' not in html
+
+    data = {"action": "resolve", "choice": "provider", "revision": revision}
+    url = f"/reviews/{task.pk}/scanner-opf/"
+    if client_kind == "api":
+        response = admin_client.post(url, data)
+        assert response.status_code == 409, response.content
+        body = response.json()
+        assert "version 2" in body["error"]
+        assert body["state"] == ReviewTask.State.CANCELLED
+    else:
+        response = admin_client.post(url, data, HTTP_ACCEPT="text/html", follow=True)
+        assert response.status_code == 200
+        page = response.content.decode()
+        assert 'data-message-level="error"' in page
+        assert "This review is obsolete" in page
+
+    book.refresh_from_db()
+    assert book.title == V2_TITLE
+    assert [a.full_name for a in book.authors.all()] == ["Ada Scanner"]
+    assert not BookMetadataProvenance.objects.filter(book=book, source="reviewer").exists()
+    closed = ReviewTask.objects.get(pk=task.pk)
+    assert closed.state == ReviewTask.State.CANCELLED
+    review = closed.decision_payload["scanner_opf"]
+    assert review["obsolete"]["reason"] == "opf_superseded"
+    assert {k: v for k, v in review.items() if k != "obsolete"} == evidence
+
+
+@pytest.mark.django_db(transaction=True)
+def test_new_opf_supersedes_unclaimed_reviews_of_older_versions(
+    key: str, admin_client: Client, held_checks: _RecordingQueue, providers: list[dict[str, Any]]
+) -> None:
+    providers.append(_provider_record("Obsolete Candidate For V1", "Old Person"))
+    _prepare_finish(key, admin_client, _opf(title=V1_TITLE))
+    assert _finish(admin_client).status_code == 202
+    scanner_opf.process_provider_check_job(str(_check_job_for(1).job_id))
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID, state=ReviewTask.State.OPEN)
+
+    assert _put_opf(key, _opf(title=V2_TITLE)).status_code == 201
+
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.CANCELLED
+    assert task.decision_payload["scanner_opf"]["obsolete"]["effective_opf_version"] == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_resolution_is_rejected_when_the_book_or_evidence_changed(
+    key: str, admin_client: Client, held_checks: _RecordingQueue, providers: list[dict[str, Any]]
+) -> None:
+    providers.append(_provider_record("A Completely Different Book", "Someone Else"))
+    _prepare_finish(key, admin_client, _opf())
+    assert _finish(admin_client).status_code == 202
+    scanner_opf.process_provider_check_job(str(_check_job_for(1).job_id))
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+    revision = _revision(admin_client, task)
+
+    # An outdated or forged revision is rejected without touching anything.
+    assert _resolve(admin_client, task, "provider", "0" * 32).status_code == 409
+    assert Book.objects.get().title == "The Physical Book"
+
+    # Someone edits the title by hand after the review was opened.
+    book = Book.objects.get()
+    before = scanner_opf.snapshot_book(book)
+    book.title = "Hand-Corrected Title"
+    book.save()
+    scanner_opf.record_reviewer_edits(book, before, user=None)
+
+    rejected = _resolve(admin_client, task, "provider", revision)
+    assert rejected.status_code == 409, rejected.content
+    assert "metadata changed" in rejected.json()["error"]
+    book.refresh_from_db()
+    assert book.title == "Hand-Corrected Title"  # the decision on old evidence is not applied
+    assert ReviewTask.objects.get(pk=task.pk).state == ReviewTask.State.OPEN  # to decide again
+    new_revision = rejected.json()["revision"]
+    assert new_revision != revision
+    assert new_revision == _revision(admin_client, task)
+
+    accepted = _resolve(admin_client, task, "provider", new_revision)
+    assert accepted.status_code == 200, accepted.content
+    book.refresh_from_db()
+    assert book.title == "A Completely Different Book"

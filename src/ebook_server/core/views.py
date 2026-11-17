@@ -4175,6 +4175,10 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
             "rows": scanner_opf_review.get("rows", []),
             "preselected": scanner_opf_review.get("preselected"),
             "reason": scanner_opf_review.get("reason"),
+            # Send back with action=resolve; a review whose evidence changed is rejected.
+            "revision": scanner_opf_review.get("revision"),
+            "open": scanner_opf_review.get("open"),
+            "obsolete": scanner_opf_review.get("obsolete"),
             "possible_duplicate_book_ids": [
                 book.pk for book in scanner_opf_review.get("duplicates", [])
             ],
@@ -4984,14 +4988,40 @@ def review_scanner_opf(request: HttpRequest, task_id: str) -> HttpResponseBase:
     action = str(payload.get("action") or "")
     try:
         if action == "resolve":
+            revision = str(payload.get("revision") or "")
+            if not revision:
+                return HttpResponseBadRequest(
+                    "revision is required: send the scanner_opf.revision of the review you "
+                    "decided on"
+                )
             book = scanner_opf.resolve_conflict(
-                task, choice=str(payload.get("choice") or ""), user=profile.user
+                task,
+                choice=str(payload.get("choice") or ""),
+                user=profile.user,
+                revision=revision,
             )
         elif action == "create_book":
             book = scanner_opf.create_book_from_review(task, user=profile.user)
             contributions.record_review_resolution(task)
         else:
             return HttpResponseBadRequest("action must be resolve or create_book")
+    except scanner_opf.StaleReview as exc:
+        # The decision was made on evidence that no longer applies: reject it and show
+        # the refreshed review (form error on the page, 409 for API clients).
+        if _wants_html(request):
+            messages.error(request, str(exc))
+            return redirect("review-detail", task_id=task.id)
+        task.refresh_from_db()
+        context = scanner_opf.review_context(task)
+        return JsonResponse(
+            {
+                "task_id": str(task.id),
+                "error": str(exc),
+                "state": task.state,
+                "revision": context["revision"] if context is not None else None,
+            },
+            status=409,
+        )
     except scanner_opf.ScannerOpfError as exc:
         return HttpResponseBadRequest(str(exc))
     return _review_action_response(
