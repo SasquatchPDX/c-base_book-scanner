@@ -25,7 +25,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ebook_server.storage import StorageBackend
 
-from . import intake
+from . import archive_layout, intake
 from .models import Book, CoverImage, FileVariant, ImportJob
 from .storage_registry import backend_for_location, writable_location_for
 
@@ -421,9 +421,12 @@ def extract_front_cover(
         payload, extractor_tool, extractor_version = extracted
 
     sha256 = hashlib.sha256(payload).hexdigest()
-    destination = storage.generate_destination(
-        f"books/{variant.book_id}/covers",
-        f"{uuid4()}-front.jpg",
+    destination = archive_layout.derived_destination(
+        storage,
+        variant.book,
+        "cover.jpg",
+        legacy_namespace=f"books/{variant.book_id}/covers",
+        legacy_filename=f"{uuid4()}-front.jpg",
     )
     with NamedTemporaryFile(suffix=".jpg", delete_on_close=False) as output_file:
         output_file.write(payload)

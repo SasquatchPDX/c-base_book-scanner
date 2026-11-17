@@ -40,6 +40,8 @@ class BookAdmin(admin.ModelAdmin[Book]):
     list_display = ("title", "publisher", "publication_year", "publication_date")
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories", "genres")
+    # Assigned by core.archive_layout; editing it by hand would orphan the book's folder.
+    readonly_fields = ("archive_folder",)
 
 
 @admin.register(Author)
