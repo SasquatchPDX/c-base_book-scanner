@@ -32,6 +32,7 @@ from .models import (
     ProcessingJob,
     ReviewDecisionCorrection,
     ReviewTask,
+    ScanEvent,
     ScanJob,
     ScanLog,
     ScanPage,
@@ -244,6 +245,26 @@ class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
     search_fields = ("id", "scanner_id")
 
 
+@admin.register(ScanEvent)
+class ScanEventAdmin(admin.ModelAdmin[ScanEvent]):
+    """scan.jsonl lines are append-only evidence: viewable, never edited here (#129)."""
+
+    list_display = ("id", "scan_job", "origin", "line_no", "type", "received_at")
+    list_filter = ("origin", "type")
+    search_fields = ("scan_job__id",)
+    readonly_fields = ("scan_job", "origin", "line_no", "type", "raw", "received_at")
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        # Deleting a line would open a gap in the scanner's numbering.
+        return False
+
+
 @admin.register(ScanLog)
 class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
     list_display = (
@@ -289,7 +310,15 @@ class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
 
 @admin.register(ScanPage)
 class ScanPageAdmin(admin.ModelAdmin[ScanPage]):
-    list_display = ("id", "scan_job", "logical_sequence_number", "side", "updated_at")
+    list_display = (
+        "id",
+        "scan_job",
+        "logical_sequence_number",
+        "side",
+        "recognized_page_number",
+        "status",
+        "updated_at",
+    )
     list_filter = ("side",)
 
 

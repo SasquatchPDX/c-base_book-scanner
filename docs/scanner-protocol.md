@@ -184,8 +184,82 @@ see `docs/operations.md`).
   job and an unknown ID both answer `404`, so job IDs cannot be probed.
 
   The response body is the job status (`job_id`, `state`, `portal_url`,
-  `scan_started_at`, `capture_layout`, `pages`, `open_rescans`). `portal_url` is built
-  from `BOOK_SCANNER_PUBLIC_BASE_URL`.
+  `scan_started_at`, `capture_layout`, `events.sans_last_line_no`, `pages`,
+  `open_rescans`). `portal_url` is built from `BOOK_SCANNER_PUBLIC_BASE_URL`.
+
+### `scan.jsonl` event lines (`POST /api/scanner/v1/jobs/{job_id}/events`)
+
+The scanner's append-only process log (`scan.jsonl`, libreflip/sans#48, contract §4.4
+and §6.7) arrives line by line. Each line is stored raw as a `ScanEvent` (`origin`,
+`line_no`, `raw`, `type`, `received_at`).
+
+- Request: `{"first_line_no": 58, "lines": ["{\"type\":\"attempt\",...}", ...]}`. The
+  scanner numbers its lines `1, 2, 3...` in file order; `(job, line_no)` is unique and is
+  the idempotency key.
+- `200 {"sans_last_line_no": N}`: stored. Lines at or below the stored high-water mark
+  must be byte-identical; they are confirmed and skipped, so re-sending an overlapping
+  batch changes nothing.
+- `409 event_gap`: `first_line_no` is beyond the high-water mark + 1;
+  `details.expected_first_line_no` says where to resume.
+- `409 event_conflict`: a stored line differs (`details.line_no`). Nothing of the batch
+  is stored.
+- `422 invalid_event`: a line is not one JSON object with a non-empty string `type`, is
+  longer than 64 KiB, or contains a line break (`details.line_no`). Nothing is stored.
+- `413 payload_too_large`: more than 1000 lines or 1 MiB of line bytes in one batch.
+- `409 job_state`: the job is cancelled. Every other state accepts events, so the final
+  `completeness_check` still arrives after capture.
+- `404 not_found`: no such job, or a web-created job (only `source=scanner` jobs are
+  served).
+
+Overlapping batches that arrive concurrently are serialised by the job's row lock, with
+the unique constraint as the backstop: no duplicate and no gap can be stored.
+
+Known event types are projected into the database; all others (`attempt`, future
+telemetry) are stored only. For each projected field the latest valid value wins; a
+malformed field (wrong type, a number that does not fit a float, NaN/Infinity, a
+`sequence_number` beyond 2147483647) is ignored while the line itself is stored:
+
+| Event | Projection |
+|---|---|
+| `job` | `ScanJob.page_width_mm`, `ScanJob.page_number_crop` |
+| `page` | `ScanPage.recognized_page_number`, `ScanPage.status` (for `sequence_number`, side `single`) |
+| `completeness_check` | `ScanJob.completeness_flags` (shown in the scan workspace), `completeness_checked_at` |
+
+A `page` event that arrives before its page image is applied when the page is created
+(`scan_events.project_page_from_events`). serif appends its own lines (origin `serif`:
+`rescan_flag`, `rescan_replace`, each with `"origin": "serif"`, `"at"` and `"todo_id"`)
+with `scan_events.append_serif_event`. `scan_events.sans_high_water_mark(job)` gives the
+scanner's high-water mark, as `GET jobs/{job_id}` and `capture-complete` report it.
+
+**The rendered file.** After every change, once the transaction has committed, a
+background job writes the combined `scan.jsonl`: every stored line in arrival order, each
+followed by `\n`. The scanner's lines therefore appear byte-for-byte in `line_no` order,
+with serif's lines at the positions where they arrived. The write is atomic (temporary
+file in the same folder, then rename) and goes through the storage backend:
+
+- into the job folder in scan storage: `scan-artifacts/scan-jobs/<job_id>/scan.jsonl`;
+- once the job is finished (`complete`, linked to a Book), also into the book's archive
+  folder as `scan.jsonl` (`books/<book id>/scan.jsonl` under the `job` layout). Events
+  that arrive after finish update the book's copy too.
+
+serif never overwrites a file it did not write. The first write to each folder claims a
+name with an exclusive create (the allocation `publish_unique` uses): `scan.jsonl`, else
+`scan-<job_id>.jsonl`, else `scan-<job_id>-<token>.jsonl`. A name that already exists (a
+log uploaded independently, another tool's file) or that another scan job of the same
+book has claimed is skipped. The claimed name is kept on the job
+(`scan_jsonl_job_identifier`, `scan_jsonl_book_identifier`), and later renders replace
+only that file.
+
+Concurrent renders are fenced: each pass takes the next `scan_jsonl_render_generation`
+under the job's row lock, stages its snapshot beside the file, and renames it into place
+only while still holding the newest generation, again under the row lock. An older pass
+that a newer one overtook discards its snapshot. A pass records its high-water mark
+(`scan_jsonl_*_rendered_through`) only after the file reads back as the snapshot, and a
+render decides whether a file is current by its size and SHA-256, never by the mark, so
+a retry after an interrupted or failed write always repairs the file.
+
+The database is authoritative; the files are renderings and can be rebuilt with
+`scan_events.write_scan_jsonl(job_id)`.
 
 ### Upgrade note: migration `0041_scanjob_string_pk`
 

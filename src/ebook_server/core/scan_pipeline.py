@@ -20,7 +20,7 @@ from rq import get_current_job
 from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import archive_layout, contributions, conversion, intake, ocr, scan_logs
+from . import archive_layout, contributions, conversion, intake, ocr, scan_events, scan_logs
 from .models import (
     FileVariant,
     ProcessingJob,
@@ -717,6 +717,8 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
             scan_job.state = ScanJob.State.COMPLETE
             scan_job.finished_at = finished_at
             scan_job.save(update_fields=["state", "finished_at", "updated_at"])
+            # The scanner's log joins the book folder now that the scan is a book (#129).
+            scan_events.schedule_scan_jsonl_render([scan_job.pk])
         # Pending recognition for the members whose pages made the final set (#27).
         contributions.record_scan_completion(scan_job)
         logger.info(

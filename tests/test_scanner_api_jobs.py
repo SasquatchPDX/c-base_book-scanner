@@ -140,6 +140,7 @@ def test_put_job_creates_open_job(key: str, settings: Any) -> None:
         "portal_url": f"https://serif.c-base.lan/j/{JOB_ID}",
         "scan_started_at": STARTED,
         "capture_layout": "single_page",
+        "events": {"sans_last_line_no": 0},
         "pages": [],
         "open_rescans": 0,
     }

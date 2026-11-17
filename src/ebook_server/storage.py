@@ -280,6 +280,42 @@ class StorageBackend(Protocol):
         ``OSError`` where hard links are unsupported). Returns the storage id written.
         """
 
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        """Atomically make ``destination`` hold exactly ``data``, replacing any old file.
+
+        The bytes go to a hidden temporary file beside the destination first, which is
+        then renamed over it, so readers see either the old or the new file, never a
+        partial one. Only for files the caller alone owns and regenerates (a rendered
+        log); never for archive originals, which use ``publish_unique``.
+        """
+
+    def stage_bytes(self, destination: str, data: bytes) -> str:
+        """Write ``data`` to a hidden temporary file beside ``destination``; return its id.
+
+        Readers of ``destination`` never see the staged file. ``commit_staged`` or
+        ``commit_staged_exclusive`` gives it the final name and ``discard_staged``
+        removes it. Splitting the slow write from the quick rename lets a caller fence
+        the rename against competing writers (for example under a database row lock).
+        """
+
+    def commit_staged(self, staged: str, destination: str) -> str:
+        """Atomically rename ``staged`` over ``destination``, replacing any old file.
+
+        Same contract as ``replace_bytes``: only for a file the caller alone owns.
+        """
+
+    def commit_staged_exclusive(self, staged: str, destination: str) -> str:
+        """Give ``staged``'s bytes the name ``destination`` only if nothing is there.
+
+        The exclusive allocation of ``publish_unique``: raises ``FileExistsError`` when
+        the name is taken (even by a file created a moment ago) and never replaces an
+        existing file. ``staged`` is removed on success and kept on ``FileExistsError``,
+        so the caller can try another name.
+        """
+
+    def discard_staged(self, staged: str) -> None:
+        """Remove a staged file that will not be committed; a missing one is fine."""
+
     def write_atomic(self, location: str, data: bytes) -> str:
         """Create or replace a small artifact so readers never see a partial file."""
 
@@ -519,6 +555,41 @@ class LocalFilesystemStorage:
             dest.unlink(missing_ok=True)
             raise
 
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        staged = self.stage_bytes(destination, data)
+        try:
+            return self.commit_staged(staged, destination)
+        finally:
+            self.discard_staged(staged)
+
+    def stage_bytes(self, destination: str, data: bytes) -> str:
+        dest = self._prepare_destination(destination)
+        staged = dest.with_name(f".{uuid.uuid4().hex}.partial")
+        try:
+            with staged.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+        return self.relative_identifier(staged)
+
+    def commit_staged(self, staged: str, destination: str) -> str:
+        dest = self._prepare_destination(destination)
+        os.replace(self.resolve_location(staged), dest)
+        return destination
+
+    def commit_staged_exclusive(self, staged: str, destination: str) -> str:
+        dest = self._prepare_destination(destination)
+        staged_path = self.resolve_location(staged)
+        self._create_exclusive(staged_path, dest, copy_fallback=True)
+        staged_path.unlink(missing_ok=True)
+        return destination
+
+    def discard_staged(self, staged: str) -> None:
+        self.resolve_location(staged).unlink(missing_ok=True)
+
     def stat(self, location: str) -> tuple[int, int]:
         result = self.resolve_location(location).stat()
         return result.st_size, result.st_mtime_ns
@@ -601,6 +672,21 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
         mode: PublishMode = "copy",
     ) -> str:
         raise self._refuse("publish")
+
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        raise self._refuse("replace")
+
+    def stage_bytes(self, destination: str, data: bytes) -> str:
+        raise self._refuse("write")
+
+    def commit_staged(self, staged: str, destination: str) -> str:
+        raise self._refuse("replace")
+
+    def commit_staged_exclusive(self, staged: str, destination: str) -> str:
+        raise self._refuse("publish")
+
+    def discard_staged(self, staged: str) -> None:
+        raise self._refuse("delete")
 
     def ensure_free_space(self, required_bytes: int) -> None:
         raise self._refuse("write")
