@@ -284,6 +284,11 @@ application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
 
+Imported variants record their origin in `FileVariant.source_type`: `upload` for
+web uploads, otherwise the source location's `default_source_type`
+(`incoming_folder` or `network_source`). An exact duplicate reuses the existing
+variant and keeps that variant's original origin.
+
 ### Metadata provider rate limits
 
 Every outbound metadata-provider request waits for a client-side slot before it is
