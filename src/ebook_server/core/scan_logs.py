@@ -403,7 +403,7 @@ def retry_failed_scan_log(log: ScanLog) -> bool:
         return False
     with transaction.atomic():
         locked = (
-            ScanLog.objects.select_for_update()
+            ScanLog.objects.select_for_update(of=("self",))
             .select_related("processing_job")
             .filter(pk=log.pk, state=ScanLog.State.FAILED)
             .first()
@@ -487,7 +487,7 @@ def place_scan_logs_in_book_folder(job: ScanJob) -> int:
     for log_id in candidate_ids:
         with transaction.atomic():
             log = (
-                ScanLog.objects.select_for_update()
+                ScanLog.objects.select_for_update(of=("self",))
                 .select_related("storage_location")
                 .filter(pk=log_id, state=ScanLog.State.STORED)
                 .exclude(storage_location=library_location)
