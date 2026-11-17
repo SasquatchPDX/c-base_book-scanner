@@ -12,7 +12,7 @@ Three parts:
   (Meilisearch) could replace PostgreSQL later without touching the views:
   `PostgresSearchBackend` uses full-text search (`simple` configuration over
   accent- and case-folded text), `pg_trgm` substring and fuzzy matching, and
-  the B-tree/GIN indexes of migration 0031. `DatabaseFallbackSearchBackend`
+  the B-tree/GIN indexes of migration 0032. `DatabaseFallbackSearchBackend`
   is the phase 0 `icontains` query over `Book`, used on SQLite (development and
   unit tests) and on PostgreSQL until the index has been built.
 - **Keyset pagination.** Browse sorts (newest, oldest, title A-Z/Z-A) page with
@@ -572,7 +572,7 @@ def search_index_ready() -> bool:
     """Whether every Book has a search row, so the PostgreSQL backend sees them all.
 
     Cached for a few minutes; the fallback answers until `rebuild_search_index`
-    has run once after migration 0031.
+    has run once after migration 0032.
     """
     ready = cache.get(_READY_CACHE_KEY)
     if ready is None:

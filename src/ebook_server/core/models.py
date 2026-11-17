@@ -545,7 +545,7 @@ class BookSearchDocument(models.Model):
             models.Index(fields=["title_sort", "book"], name="booksearch_title_idx"),
             models.Index(fields=["author_sort", "book"], name="booksearch_author_idx"),
             models.Index(fields=["language", "book"], name="booksearch_language_idx"),
-            # PostgreSQL only; migration 0031 skips these on other databases.
+            # PostgreSQL only; migration 0032 skips these on other databases.
             GinIndex(fields=["document"], name="booksearch_document_gin"),
             GinIndex(
                 fields=["title_sort"],
