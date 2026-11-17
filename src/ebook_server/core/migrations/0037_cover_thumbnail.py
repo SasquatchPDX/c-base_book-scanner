@@ -86,6 +86,7 @@ class Migration(migrations.Migration):
                 ),
                 ("storage_identifier", models.CharField(max_length=512)),
                 ("sha256", models.CharField(max_length=64)),
+                ("size_bytes", models.PositiveIntegerField(default=0)),
                 ("unreferenced_since", models.DateTimeField(blank=True, null=True)),
                 ("created_at", models.DateTimeField(auto_now_add=True)),
                 (

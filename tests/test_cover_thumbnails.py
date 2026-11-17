@@ -461,19 +461,20 @@ def test_worker_fences_on_the_bytes_it_rendered_not_the_row_it_read(
 def test_shared_file_collected_between_reuse_and_publication_is_written_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Probe 2: B sees A's shared bytes, A is refreshed and its old bytes collected,
-    then B publishes. B's thumbnails must still point at files that exist."""
+    """Probe 2: B renders the bytes A's files already hold, A is refreshed and its old
+    files collected, then B publishes. B's thumbnails must still point at files that
+    exist."""
     shared = _png(color="#445566")
     cover_a = _cover(Book.objects.create(title="Cover A"), shared)
     cover_b = _cover(Book.objects.create(title="Cover B"), shared, name="b.png")
     assert thumbnails.generate_cover_thumbnails(cover_a.pk) == "created"
     shared_paths = [_thumbnail_path(row) for row in CoverThumbnail.objects.filter(cover=cover_a)]
 
-    original_store = thumbnails._store
+    original_render = thumbnails.render_thumbnails
     steps: list[str] = []
 
-    def store_then_interleave(location: StorageLocation, rendered: Any) -> str:
-        identifier = original_store(location, rendered)
+    def render_then_interleave(payload: bytes) -> list[Any]:
+        rendered = original_render(payload)
         if not steps:
             steps.append("B saw the shared file")
             assert all(path.exists() for path in shared_paths)
@@ -486,9 +487,9 @@ def test_shared_file_collected_between_reuse_and_publication_is_written_again(
             assert thumbnails.collect_unreferenced_files(grace_seconds=0).deleted == 2
             assert not any(path.exists() for path in shared_paths)
             steps.append("shared files collected")
-        return identifier
+        return rendered
 
-    monkeypatch.setattr(thumbnails, "_store", store_then_interleave)
+    monkeypatch.setattr(thumbnails, "render_thumbnails", render_then_interleave)
 
     assert thumbnails.generate_cover_thumbnails(cover_b.pk) == "created"
 
@@ -538,3 +539,216 @@ def test_current_requires_the_files_to_exist() -> None:
     assert thumbnails.generate_cover_thumbnails(thumbnail.cover_id) == "created"
     assert _thumbnail_path(thumbnail).exists()
     assert thumbnails.generate_cover_thumbnails(thumbnail.cover_id) == "current"
+
+
+# ------------------------------------------- atomic writes and content checks
+
+
+def _failing_copy(written: list[Path], *, check: Callable[[], None] | None = None) -> Any:
+    """A `_copy_file` that writes 3 bytes and then fails, like a broken network write."""
+
+    def copy(src: Path, dest: Path) -> None:
+        written.append(dest)
+        dest.write_bytes(src.read_bytes()[:3])
+        if check is not None:
+            check()
+        raise OSError("simulated write failure after 3 bytes")
+
+    return staticmethod(copy)
+
+
+def _partial_files(root: Path) -> list[Path]:
+    return [path for path in root.rglob("*") if path.name.endswith(".partial")]
+
+
+def test_store_atomic_failure_leaves_the_destination_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = LocalFilesystemStorage(str(tmp_path / "store"))
+    source = tmp_path / "new.bin"
+    source.write_bytes(b"new complete content")
+    destination = storage.resolve_location("ab/abc.webp")
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"old complete content")
+
+    def reader_sees_old_bytes() -> None:
+        assert destination.read_bytes() == b"old complete content"
+
+    written: list[Path] = []
+    monkeypatch.setattr(
+        LocalFilesystemStorage, "_copy_file", _failing_copy(written, check=reader_sees_old_bytes)
+    )
+    with pytest.raises(OSError, match="simulated"):
+        storage.store_atomic(str(source), "ab/abc.webp")
+
+    assert written and written[0] != destination  # staged beside it, never in place
+    assert destination.read_bytes() == b"old complete content"
+    assert _partial_files(tmp_path) == []
+
+    monkeypatch.undo()
+    storage.store_atomic(str(source), "ab/abc.webp")
+    assert destination.read_bytes() == b"new complete content"
+    assert _partial_files(tmp_path) == []
+
+
+@pytest.mark.django_db
+def test_competing_failed_write_cannot_corrupt_a_published_shared_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe 3 (review of 8b03dd9): worker 1 is past its own checks when worker 2
+    publishes the same content-addressed files; every write worker 1 attempts after
+    that fails after 3 bytes. The published bytes must stay intact."""
+    shared = _png(color="#5a5a5a")
+    cover_1 = _cover(Book.objects.create(title="Worker 1"), shared)
+    cover_2 = _cover(Book.objects.create(title="Worker 2"), shared, name="two.png")
+    original_render = thumbnails.render_thumbnails
+    written: list[Path] = []
+    steps: list[str] = []
+
+    def render_then_let_worker_2_publish(payload: bytes) -> list[Any]:
+        rendered = original_render(payload)
+        if not steps:
+            steps.append("worker 1 rendered")
+            assert thumbnails.generate_cover_thumbnails(cover_2.pk) == "created"
+            steps.append("worker 2 published")
+            monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", _failing_copy(written))
+        return rendered
+
+    monkeypatch.setattr(thumbnails, "render_thumbnails", render_then_let_worker_2_publish)
+
+    # The complete files are verified and reused: worker 1 writes nothing.
+    assert thumbnails.generate_cover_thumbnails(cover_1.pk) == "created"
+
+    assert steps == ["worker 1 rendered", "worker 2 published"]
+    assert written == []
+    for cover in (cover_1, cover_2):
+        _assert_served(cover)
+        assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
+    row = CoverThumbnail.objects.filter(cover=cover_1).first()
+    assert row is not None
+    assert _partial_files(_thumbnail_path(row).parents[1]) == []
+
+
+@pytest.mark.django_db
+def test_failed_write_publishes_nothing_and_the_retry_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cover = _cover(Book.objects.create(title="Broken Share"), _png(color="#7b7b7b"))
+    written: list[Path] = []
+    monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", _failing_copy(written))
+
+    with pytest.raises(OSError, match="simulated"):  # raised, so the queue retries
+        thumbnails.generate_cover_thumbnails(cover.pk)
+
+    assert written
+    assert not CoverThumbnail.objects.filter(cover=cover).exists()
+    assert not CoverThumbnailFile.objects.exists()
+    root = Path(django_settings.APP_DATA_DIR) / thumbnails.thumbnail_storage_location().base_path
+    assert [path for path in root.rglob("*.webp")] == []  # no partial file at a final name
+    assert _partial_files(root) == []
+
+    monkeypatch.undo()
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "created"
+    _assert_served(cover)
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
+
+
+@pytest.mark.django_db
+def test_damaged_shared_file_is_not_current_and_is_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The state probe 3 left behind on 8b03dd9: a live row, a file with wrong bytes."""
+    shared = _png(color="#3c3c3c")
+    cover_1 = _cover(Book.objects.create(title="Damaged 1"), shared)
+    cover_2 = _cover(Book.objects.create(title="Damaged 2"), shared, name="two.png")
+    assert thumbnails.generate_cover_thumbnails(cover_1.pk) == "created"
+    assert thumbnails.generate_cover_thumbnails(cover_2.pk) == "created"
+    row = CoverThumbnail.objects.get(cover=cover_1, size="medium")
+    path = _thumbnail_path(row)
+    complete = path.read_bytes()
+
+    # A failed repair attempt leaves the damaged file as it was, never a new partial.
+    path.write_bytes(complete[:3])
+    written: list[Path] = []
+    monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", _failing_copy(written))
+    with pytest.raises(OSError, match="simulated"):
+        thumbnails.generate_cover_thumbnails(cover_2.pk)
+    assert written and path not in written
+    assert path.read_bytes() == complete[:3]
+    monkeypatch.undo()
+
+    # Existence alone is not "current": the retry replaces the bytes.
+    assert thumbnails.generate_cover_thumbnails(cover_2.pk) == "created"
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == row.sha256
+    for cover in (cover_1, cover_2):
+        _assert_served(cover)
+        assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
+    record = CoverThumbnailFile.objects.get(storage_identifier=row.storage_identifier)
+    assert (record.sha256, record.size_bytes) == (row.sha256, len(complete))
+
+
+@pytest.mark.django_db
+def test_backfill_verify_repairs_damaged_files_that_look_current() -> None:
+    cover = _cover(Book.objects.create(title="Verify Me"), _png(color="#246824"))
+    intact = _cover(Book.objects.create(title="Intact"), _png(color="#682424"), name="i.png")
+    for item in (cover, intact):
+        assert thumbnails.generate_cover_thumbnails(item.pk) == "created"
+    row = CoverThumbnail.objects.get(cover=cover, size="small")
+    _thumbnail_path(row).write_bytes(b"\x00" * row.size_bytes)  # right size, wrong bytes
+
+    plain = StringIO()
+    call_command("generate_cover_thumbnails", stdout=plain)
+    assert "nothing to do" in plain.getvalue()  # the rows alone look current
+
+    verified = StringIO()
+    call_command("generate_cover_thumbnails", "--verify", stdout=verified)
+    assert "created: 1" in verified.getvalue() and "current: 1" in verified.getvalue()
+    assert hashlib.sha256(_thumbnail_path(row).read_bytes()).hexdigest() == row.sha256
+    _assert_served(cover)
+
+
+@pytest.mark.django_db
+def test_writer_failing_after_a_competitor_published_leaves_the_complete_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe 3 at the verifier's exact point: worker 1 has found the file absent and
+    is about to write it; worker 2 writes the same file; worker 1's write then fails
+    after 3 bytes. (On one SQLite connection worker 2 runs inside worker 1's
+    transaction, so its rows roll back with worker 1's; PostgreSQL, where worker 2
+    waits for the lock, is in tests/integration/test_cover_thumbnails_postgres.py.)"""
+    shared = _png(color="#8a2be2")
+    cover_1 = _cover(Book.objects.create(title="Writer 1"), shared)
+    cover_2 = _cover(Book.objects.create(title="Writer 2"), shared, name="two.png")
+    original_matches = thumbnails._file_matches
+    written: list[Path] = []
+    published: dict[str, bytes] = {}
+    interleaved: list[bool] = []
+
+    def absent_then_interleave(storage: Any, identifier: str, sha256: str, size: int) -> bool:
+        result = original_matches(storage, identifier, sha256, size)
+        if not interleaved:
+            interleaved.append(True)
+            assert result is False  # worker 1 found nothing and will write
+            assert thumbnails.generate_cover_thumbnails(cover_2.pk) == "created"
+            for row in CoverThumbnail.objects.filter(cover=cover_2):
+                published[row.storage_identifier] = _thumbnail_path(row).read_bytes()
+            monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", _failing_copy(written))
+        return result
+
+    monkeypatch.setattr(thumbnails, "_file_matches", absent_then_interleave)
+
+    with pytest.raises(OSError, match="simulated"):
+        thumbnails.generate_cover_thumbnails(cover_1.pk)
+
+    assert written and len(published) == 2
+    root = Path(django_settings.APP_DATA_DIR) / thumbnails.thumbnail_storage_location().base_path
+    for identifier, payload in published.items():
+        assert (root / identifier).read_bytes() == payload  # never truncated
+        assert hashlib.sha256(payload).hexdigest() in identifier
+    assert _partial_files(root) == []
+
+    monkeypatch.undo()
+    for cover in (cover_1, cover_2):
+        assert thumbnails.generate_cover_thumbnails(cover.pk) == "created"
+        _assert_served(cover)
+        assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"

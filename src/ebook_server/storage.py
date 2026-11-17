@@ -226,6 +226,9 @@ class StorageBackend(Protocol):
     def store(self, source: str, destination: str) -> str:
         """Copy a source path into storage and return canonical storage id."""
 
+    def store_atomic(self, source: str, destination: str) -> str:
+        """Like ``store``, but readers never see a partial file (temp file + rename)."""
+
     def copy(self, source: str, destination: str) -> str:
         """Copy an existing storage artifact."""
 
@@ -334,6 +337,27 @@ class LocalFilesystemStorage:
         destination_path = self._prepare_destination(destination)
         source_path = self._resolve_source(source)
         self._copy_file(source_path, destination_path)
+        return destination
+
+    def store_atomic(self, source: str, destination: str) -> str:
+        """Copy ``source`` to ``destination`` so readers see the old file or the whole new one.
+
+        The bytes are copied into a hidden temp file beside the destination, flushed to
+        disk, and then renamed over the destination (``os.replace``, atomic on one
+        filesystem). A copy that fails part way leaves the destination untouched and
+        removes the temp file. Use it for fixed, shared names such as content-addressed
+        cache files; ``store`` writes in place.
+        """
+        dest = self._prepare_destination(destination)
+        src = self._resolve_source(source)
+        staged = dest.with_name(f".{uuid.uuid4().hex}.partial")
+        try:
+            self._copy_file(src, staged)
+            with staged.open("rb+") as handle:
+                os.fsync(handle.fileno())
+            os.replace(staged, dest)
+        finally:
+            staged.unlink(missing_ok=True)
         return destination
 
     def copy(self, source: str, destination: str) -> str:
@@ -516,6 +540,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
         return ReadOnlyStorageError(f"storage location is read-only; refusing {operation}")
 
     def store(self, source: str, destination: str) -> str:
+        raise self._refuse("store")
+
+    def store_atomic(self, source: str, destination: str) -> str:
         raise self._refuse("store")
 
     def copy(self, source: str, destination: str) -> str:

@@ -13,6 +13,11 @@ background and addressed by their own SHA-256:
   touched.
 - Publication is conditional on the cover's current hash (under the cover row
   lock), so a slow worker cannot overwrite a newer cover's thumbnails.
+- Files are written only by `_publish`, under the file's registry row lock and
+  after the cover-hash check, through a temp file and an atomic rename: a reader
+  never sees a partial file and a failed write never clobbers a complete one. A
+  file counts as present only when its size and SHA-256 match the registry, so
+  a damaged file is replaced, not reused.
 - Identical covers share files, so files are never deleted inline. A file whose
   last reference goes is marked in `CoverThumbnailFile`, and
   `collect_unreferenced_files` (`manage.py collect_cover_thumbnails`) deletes it
@@ -238,25 +243,26 @@ def _read_cover(cover: CoverImage) -> bytes:
 
 
 def _write_file(storage: Any, identifier: str, payload: bytes) -> None:
+    """Write (or replace) a thumbnail file atomically: temp file, then rename.
+
+    Only called by `_publish` while it holds the file's registry row lock.
+    """
     storage.ensure_free_space(len(payload))
     with NamedTemporaryFile(suffix=".webp", delete_on_close=False) as output_file:
         output_file.write(payload)
         output_file.close()
-        storage.store(output_file.name, identifier)
+        storage.store_atomic(output_file.name, identifier)
 
 
-def _store(location: StorageLocation, rendered: RenderedThumbnail) -> str:
-    """Write a rendition unless identical bytes are already stored (content addressing).
-
-    Runs before publication and without locks, so seeing the file here proves
-    nothing: collection may remove it before this worker's rows exist.
-    `_publish` checks again under the file's registry lock and rewrites it.
-    """
-    storage = backend_for_location(location)
-    identifier = thumbnail_storage_identifier(rendered.sha256)
-    if not storage.exists(identifier):
-        _write_file(storage, identifier, rendered.payload)
-    return identifier
+def _file_matches(storage: Any, identifier: str, sha256: str, size_bytes: int) -> bool:
+    """Whether the stored file has exactly the expected content (size, then SHA-256)."""
+    try:
+        actual_size, _mtime = storage.stat(identifier)
+        if size_bytes and actual_size != size_bytes:
+            return False
+        return bool(storage.hash(identifier) == sha256)
+    except FileNotFoundError:
+        return False
 
 
 def is_current(cover: CoverImage, thumbnails: Iterable[CoverThumbnail]) -> bool:
@@ -267,10 +273,21 @@ def is_current(cover: CoverImage, thumbnails: Iterable[CoverThumbnail]) -> bool:
     )
 
 
-def _files_exist(thumbnails: Iterable[CoverThumbnail]) -> bool:
+def _files_verified(thumbnails: Iterable[CoverThumbnail]) -> bool:
+    """Whether every row's file is registered and holds exactly the registered bytes.
+
+    Hashes the files (a few KB each). The serving path trusts the rows; the job
+    and the backfill verify, so a damaged or lost file is regenerated.
+    """
     for thumbnail in thumbnails:
+        record = CoverThumbnailFile.objects.filter(
+            storage_location_id=thumbnail.storage_location_id,
+            storage_identifier=thumbnail.storage_identifier,
+        ).first()
+        if record is None or record.sha256 != thumbnail.sha256:
+            return False
         storage = backend_for_location(thumbnail.storage_location)
-        if not storage.exists(thumbnail.storage_identifier):
+        if not _file_matches(storage, record.storage_identifier, record.sha256, record.size_bytes):
             return False
     return True
 
@@ -279,8 +296,9 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
     """Create or refresh the thumbnails of one cover (worker job). Returns an outcome.
 
     Outcomes: `created`; `current` (rows derive from the cover's current bytes and
-    their files exist: nothing to do); `stale` (the cover changed while this job
-    rendered it: nothing published, the newer cover's own job publishes);
+    their files hold exactly the registered bytes: nothing to do); `stale` (the
+    cover changed while this job rendered it: nothing published, the newer
+    cover's own job publishes);
     `missing` (cover gone) or `failed` (unreadable cover; logged, not retried; the
     list falls back to the full cover). Storage outages raise, so the queue
     retries them.
@@ -290,7 +308,7 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
     except CoverImage.DoesNotExist:
         return "missing"
     existing = list(cover.thumbnails.select_related("storage_location"))
-    if not force and is_current(cover, existing) and _files_exist(existing):
+    if not force and is_current(cover, existing) and _files_verified(existing):
         return "current"
     try:
         payload = _read_cover(cover)
@@ -306,8 +324,7 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
         return "failed"
 
     location = thumbnail_storage_location()
-    for item in rendered:
-        _store(location, item)
+    # Nothing is written before publication: `_publish` writes under the locks.
     # Fence on the bytes actually rendered, not on the row read before reading them.
     outcome = _publish(cover.pk, hashlib.sha256(payload).hexdigest(), location, rendered)
     if outcome == "created":
@@ -318,7 +335,7 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
 
 
 def _lock_file_record(
-    location: StorageLocation, identifier: str, sha256: str
+    location: StorageLocation, identifier: str, sha256: str, size_bytes: int
 ) -> CoverThumbnailFile:
     """Create, or lock, the registry row of one thumbnail file.
 
@@ -330,7 +347,7 @@ def _lock_file_record(
         record, _created = CoverThumbnailFile.objects.get_or_create(
             storage_location=location,
             storage_identifier=identifier,
-            defaults={"sha256": sha256},
+            defaults={"sha256": sha256, "size_bytes": size_bytes},
         )
         locked = CoverThumbnailFile.objects.select_for_update().filter(pk=record.pk).first()
         if locked is not None:
@@ -350,11 +367,15 @@ def _publish(
     the cover's current hash equals the hash of the bytes that were rendered. An
     old worker therefore cannot overwrite what a newer cover's job published.
 
-    Each file's registry row is locked before the file's existence is checked
-    and before a reference to it is written, and collection takes the same lock
-    before it re-checks references and deletes. A file seen by `_store` but
-    collected since is written again here, so a published row never points at a
-    missing file. Replaced files are only marked unreferenced, never deleted.
+    Each file's registry row is locked before the file is checked and before a
+    reference to it is written, and collection takes the same lock before it
+    re-checks references and deletes. This is the only place thumbnail files are
+    written. An existing file is reused only when its size and SHA-256 match; a
+    missing or damaged one (collected meanwhile, cut short by an older version,
+    corrupted on disk) is written through a temp file and an atomic rename. A
+    published row therefore never points at missing or wrong bytes, and a failed
+    write leaves the previous file untouched. Replaced files are only marked
+    unreferenced, never deleted.
     """
     storage = backend_for_location(location)
     tool_version = _tool_version()
@@ -372,11 +393,24 @@ def _publish(
         # One lock order (by file hash) for every publisher.
         for item in sorted(rendered, key=lambda thumbnail: thumbnail.sha256):
             identifier = thumbnail_storage_identifier(item.sha256)
-            record = _lock_file_record(location, identifier, item.sha256)
+            size_bytes = len(item.payload)
+            record = _lock_file_record(location, identifier, item.sha256, size_bytes)
+            changed: list[str] = []
             if record.unreferenced_since is not None:
                 record.unreferenced_since = None
-                record.save(update_fields=["unreferenced_since"])
-            if not storage.exists(identifier):
+                changed.append("unreferenced_since")
+            if (record.sha256, record.size_bytes) != (item.sha256, size_bytes):
+                record.sha256, record.size_bytes = item.sha256, size_bytes
+                changed.extend(["sha256", "size_bytes"])
+            if changed:
+                record.save(update_fields=changed)
+            if not _file_matches(storage, identifier, item.sha256, size_bytes):
+                if storage.exists(identifier):
+                    logger.warning(
+                        "cover_thumbnail_file_repaired",
+                        cover_id=cover_id,
+                        storage_identifier=identifier,
+                    )
                 _write_file(storage, identifier, item.payload)
         previous = set(
             CoverThumbnail.objects.filter(cover_id=cover_id).values_list(

@@ -238,3 +238,65 @@ def test_publisher_waits_for_collection_and_rewrites_the_collected_file(
         unreferenced_since__isnull=False,
     ).exists()
     assert thumbnails.collect_unreferenced_files(grace_seconds=0).deleted == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failed_write_never_exposes_partial_bytes_and_the_waiting_publisher_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe 3: worker 1 holds the file lock and is part way through writing a shared
+    file when worker 2 publishes the same bytes. Worker 2 waits for the lock; readers
+    never see the 3 bytes worker 1 wrote; worker 1's failure leaves nothing behind and
+    worker 2 then writes and publishes complete files."""
+    shared = _png("#2f4f4f")
+    cover_1 = _cover("Writer 1", shared)
+    cover_2 = _cover("Writer 2", shared)
+    copying = threading.Event()
+    fail_copy = threading.Event()
+    original_copy = LocalFilesystemStorage._copy_file
+    staged: list[Path] = []
+
+    def pausing_copy(src: Path, dest: Path) -> None:
+        if threading.current_thread().name != "worker-1":
+            original_copy(src, dest)
+            return
+        staged.append(dest)
+        dest.write_bytes(src.read_bytes()[:3])
+        copying.set()
+        assert fail_copy.wait(WAIT_SECONDS)
+        raise OSError("simulated write failure after 3 bytes")
+
+    monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", staticmethod(pausing_copy))
+    results_1: list[Any] = []
+    worker_1 = _in_thread(
+        lambda: thumbnails.generate_cover_thumbnails(cover_1.pk), results_1, name="worker-1"
+    )
+    assert copying.wait(WAIT_SECONDS)
+
+    root = Path(django_settings.APP_DATA_DIR) / thumbnails.thumbnail_storage_location().base_path
+    assert list(root.rglob("*.webp")) == []  # the 3 bytes are only in a temp file
+
+    results_2: list[Any] = []
+    worker_2 = _in_thread(
+        lambda: thumbnails.generate_cover_thumbnails(cover_2.pk), results_2, name="worker-2"
+    )
+    _wait_for_lock_waiter()  # worker 2 waits for worker 1's file row
+    assert list(root.rglob("*.webp")) == []
+    fail_copy.set()
+    worker_1.join(WAIT_SECONDS)
+    worker_2.join(WAIT_SECONDS)
+
+    assert len(results_1) == 1 and isinstance(results_1[0], OSError)
+    assert results_2 == ["created"]
+    assert staged and not any(path.exists() for path in staged)
+    assert not CoverThumbnail.objects.filter(cover=cover_1).exists()
+    _assert_served(cover_2)
+    for row in CoverThumbnail.objects.filter(cover=cover_2).select_related("storage_location"):
+        assert hashlib.sha256(_path(row).read_bytes()).hexdigest() == row.sha256
+
+    # The queue's retry of worker 1 reuses the verified files.
+    monkeypatch.setattr(LocalFilesystemStorage, "_copy_file", staticmethod(original_copy))
+    assert thumbnails.generate_cover_thumbnails(cover_1.pk) == "created"
+    _assert_served(cover_1)
+    for cover in (cover_1, cover_2):
+        assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"

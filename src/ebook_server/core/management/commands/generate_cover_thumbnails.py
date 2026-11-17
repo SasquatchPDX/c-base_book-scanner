@@ -27,6 +27,15 @@ class Command(BaseCommand):
             help="Regenerate thumbnails for every front cover, current or not.",
         )
         parser.add_argument(
+            "--verify",
+            action="store_true",
+            help=(
+                "Check every front cover, including those whose rows look current: files "
+                "whose size or SHA-256 differ from the registry (or are missing) are "
+                "regenerated. Intact covers report 'current'."
+            ),
+        )
+        parser.add_argument(
             "--enqueue",
             action="store_true",
             help="Queue one background job per cover instead of rendering in this process.",
@@ -38,7 +47,7 @@ class Command(BaseCommand):
     def handle(self, *args: Any, **options: Any) -> None:
         covers = (
             CoverImage.objects.filter(position=CoverImage.CoverPosition.FRONT)
-            if options["force"]
+            if options["force"] or options["verify"]
             else thumbnails.covers_needing_thumbnails()
         )
         cover_ids = covers.order_by("pk").values_list("pk", flat=True)

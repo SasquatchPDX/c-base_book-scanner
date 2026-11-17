@@ -713,7 +713,8 @@ class CoverThumbnailFile(models.Model):
     are never deleted inline: `unreferenced_since` marks a file nothing points
     at, and `thumbnails.collect_unreferenced_files` deletes it after a grace
     period. Publication and collection both lock this row, so a file cannot be
-    deleted while a worker is attaching a new reference to it.
+    deleted while a worker is attaching a new reference to it. Files are only
+    written under this lock, through a temp file and an atomic rename.
     """
 
     storage_location = models.ForeignKey(
@@ -722,7 +723,9 @@ class CoverThumbnailFile(models.Model):
         related_name="cover_thumbnail_files",
     )
     storage_identifier = models.CharField(max_length=512)
+    # The expected content: a file is current only when its size and SHA-256 match.
     sha256 = models.CharField(max_length=64)
+    size_bytes = models.PositiveIntegerField(default=0)
     unreferenced_since = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

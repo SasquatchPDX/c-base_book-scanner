@@ -1353,7 +1353,13 @@ above zero, backfill them:
 uv run python manage.py generate_cover_thumbnails            # missing or stale only
 uv run python manage.py generate_cover_thumbnails --enqueue  # one RQ job per cover
 uv run python manage.py generate_cover_thumbnails --force    # regenerate all
+uv run python manage.py generate_cover_thumbnails --verify   # also repair damaged files
 ```
+
+`--verify` checks every front cover, including those whose rows look current,
+and regenerates only covers whose files are missing or whose size or SHA-256
+differ from the `CoverThumbnailFile` registry. Run it after restoring the cache
+from an old snapshot or after a disk error.
 
 Thumbnail URLs (`/library/covers/<sha256>/<size>.webp`) contain the file's
 hash and are served with `Cache-Control: private, max-age=31536000, immutable`.
@@ -1372,7 +1378,17 @@ deleted, the file's `CoverThumbnailFile` registry row is marked unreferenced.
 A periodic collection deletes files that stayed unreferenced for longer than
 `BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS` (default one day). It re-checks
 references under the same registry row lock that publication takes, and a
-publisher that finds a file collected writes it again. Run collection from cron
+publisher that finds a file collected writes it again.
+
+Thumbnail files are written only while the publishing job holds the file's
+registry row lock, after the cover-hash check, and always through a temporary
+file in the same directory that is then renamed over the final name. Readers
+(Django or nginx) therefore never see a partial file, and a write that fails
+part way leaves the previous file as it was. An existing file is reused only
+when its size and SHA-256 match the registry; otherwise it is replaced (logged
+as `cover_thumbnail_file_repaired`). A job reports `current` only after the
+same check, so a retry repairs a damaged file instead of trusting that it
+exists. Serving trusts the rows and does not hash files. Run collection from cron
 or a systemd timer, for example hourly:
 
 ```bash
