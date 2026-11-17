@@ -23,7 +23,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q, QuerySet
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -1325,8 +1325,8 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     if _wants_html(request):
         recent_books = (
             Book.objects.select_related("front_cover", "back_cover")
-            .prefetch_related("authors", "file_variants")
-            .order_by("-created_at")[:12]
+            .prefetch_related(*_book_list_prefetches())
+            .order_by("-created_at", "-id")[:12]
         )
         return render(
             request,
@@ -1345,6 +1345,43 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     return JsonResponse(
         {"status": "ok", "user": request.user.username, "role": profile.role},
     )
+
+
+# Attribute that `_book_list_prefetches` fills with the book's COMPLETE variants.
+_COMPLETE_VARIANTS_ATTR = "complete_file_variants"
+
+
+def _book_list_prefetches() -> list[str | Prefetch[Any]]:
+    """Prefetches that let `_serialize_book` render a list row without extra queries.
+
+    The COMPLETE variants are prefetched once for the whole page into
+    `_COMPLETE_VARIANTS_ATTR`, so `formats_available` is not a per-book query (#28).
+    """
+    return [
+        "authors",
+        "categories",
+        "genres",
+        Prefetch(
+            "file_variants",
+            queryset=FileVariant.objects.filter(
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            ).only("id", "book_id", "format", "processing_state"),
+            to_attr=_COMPLETE_VARIANTS_ATTR,
+        ),
+    ]
+
+
+def _complete_variants(book: Book) -> list[FileVariant]:
+    prefetched: list[FileVariant] | None = getattr(book, _COMPLETE_VARIANTS_ATTR, None)
+    if prefetched is not None:
+        return prefetched
+    # `.all()` reuses a plain `file_variants` prefetch when there is one; a
+    # `.filter()` here would bypass it and cost one query per book (#28).
+    return [
+        variant
+        for variant in book.file_variants.all()
+        if variant.processing_state == FileVariant.ProcessingState.COMPLETE
+    ]
 
 
 def _serialize_book(
@@ -1378,11 +1415,7 @@ def _serialize_book(
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
-        file_variants = list(
-            book.file_variants.filter(
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            ),
-        )
+        file_variants = _complete_variants(book)
         variants = [
             {
                 "id": file_variant.id,
@@ -1403,12 +1436,7 @@ def _serialize_book(
         )
     else:
         book_payload["formats_available"] = sorted(
-            {
-                variant.format
-                for variant in book.file_variants.filter(
-                    processing_state=FileVariant.ProcessingState.COMPLETE,
-                )
-            }
+            {variant.format for variant in _complete_variants(book)}
         )
     if include_conversion_options:
         book_payload["conversion_options"] = conversion.conversion_options_for_book(book)
@@ -1440,6 +1468,83 @@ def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
     return value
 
 
+_LIBRARY_SORTS: dict[str, tuple[str, str]] = {
+    "created_at": ("created_at", "id"),
+    "-created_at": ("-created_at", "-id"),
+    "title": ("title", "id"),
+    "-title": ("-title", "-id"),
+}
+
+
+def _book_ids_with_author(name: str) -> QuerySet[Any]:
+    return Book.authors.through.objects.filter(author__full_name__icontains=name).values("book_id")
+
+
+def _filtered_library_books(
+    *,
+    query: str = "",
+    title: str = "",
+    author: str = "",
+    category: str = "",
+    genre: str = "",
+    language: str = "",
+    book_format: str = "",
+    sort: str = "-created_at",
+) -> QuerySet[Book]:
+    """Build the browse/search queryset for `/library/books/`.
+
+    Filters over to-many relations are `pk IN (subquery)` conditions rather
+    than joins, so no row is duplicated and no `DISTINCT` is needed. The page
+    query and the paginator's `COUNT(*)` therefore stay narrow instead of
+    de-duplicating every column, `description` included (#28 phase 0). The
+    subqueries are uncorrelated, so PostgreSQL hashes each one once (and can
+    still scan books in parallel), which measured faster than correlated
+    `EXISTS` inside the `?q=` disjunction.
+
+    Each relation filter matches on its own, as the separate join per
+    `.filter()` call did before: `?q=` and `?author=` may match different
+    authors of the same book. The format filter keeps the format and the
+    COMPLETE state on one variant, as before.
+    """
+    books = Book.objects.select_related("front_cover", "back_cover").prefetch_related(
+        *_book_list_prefetches()
+    )
+    if query:
+        books = books.filter(
+            Q(title__icontains=query)
+            | Q(subtitle__icontains=query)
+            | Q(description__icontains=query)
+            | Q(pk__in=_book_ids_with_author(query)),
+        )
+    if title:
+        books = books.filter(title__icontains=title)
+    if author:
+        books = books.filter(pk__in=_book_ids_with_author(author))
+    if category:
+        books = books.filter(
+            pk__in=Book.categories.through.objects.filter(
+                category__name__icontains=category,
+            ).values("book_id"),
+        )
+    if genre:
+        books = books.filter(
+            pk__in=Book.genres.through.objects.filter(
+                genre__name__icontains=genre,
+            ).values("book_id"),
+        )
+    if language:
+        books = books.filter(language__iexact=language)
+    if book_format:
+        books = books.filter(
+            pk__in=FileVariant.objects.filter(
+                format__iexact=book_format,
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            ).values("book_id"),
+        )
+    # The id tiebreaker keeps offset pages stable when sort keys collide.
+    return books.order_by(*_LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["-created_at"]))
+
+
 @require_GET
 @login_required
 def library_books(request: HttpRequest) -> HttpResponseBase:
@@ -1456,48 +1561,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     book_format = request.GET.get("format", "").strip()
     sort = request.GET.get("sort", "-created_at").strip()
 
-    books = (
-        Book.objects.all()
-        .select_related("front_cover", "back_cover")
-        .prefetch_related(
-            "authors",
-            "categories",
-            "genres",
-            "identifiers",
-            "file_variants",
-        )
+    books = _filtered_library_books(
+        query=query,
+        title=title,
+        author=author,
+        category=category,
+        genre=genre,
+        language=language,
+        book_format=book_format,
+        sort=sort,
     )
-
-    if query:
-        books = books.filter(
-            Q(title__icontains=query)
-            | Q(subtitle__icontains=query)
-            | Q(description__icontains=query)
-            | Q(authors__full_name__icontains=query),
-        )
-    if title:
-        books = books.filter(title__icontains=title)
-    if author:
-        books = books.filter(authors__full_name__icontains=author)
-    if category:
-        books = books.filter(categories__name__icontains=category)
-    if genre:
-        books = books.filter(genres__name__icontains=genre)
-    if language:
-        books = books.filter(language__iexact=language)
-    if book_format:
-        books = books.filter(
-            file_variants__format__iexact=book_format,
-            file_variants__processing_state=FileVariant.ProcessingState.COMPLETE,
-        )
-
-    sort_map = {
-        "created_at": "created_at",
-        "-created_at": "-created_at",
-        "title": "title",
-        "-title": "-title",
-    }
-    books = books.distinct().order_by(sort_map.get(sort, "-created_at"))
 
     page = _as_positive_int(request.GET.get("page"), 1)
     page_size = _as_positive_int(request.GET.get("page_size"), 25)
