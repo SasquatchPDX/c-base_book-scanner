@@ -1099,6 +1099,23 @@ enums or configured provider IDs; filenames, titles, usernames, and book content
 are never labels. Structured logs record provider latency/failure and processing
 job lifecycle events without document content.
 
+The scanner device API (`/api/scanner/v1/`, contract §9) adds:
+
+- `scanner_api_requests_total{endpoint,status}`: every request to the namespace, by
+  route name (`ping`, `not-found`, and the job routes as they are added) and HTTP
+  status, including `401`/`503` answers. The raw path is never a label.
+- `scanner_bytes_received_total`: request-body bytes (`Content-Length`) sent by
+  authenticated devices.
+- `scanner_jobs{state}`: scan jobs whose `scanner_id` belongs to a registered device,
+  by state; every state is reported, zero included.
+- `scanner_last_seen_timestamp{scanner_id}`: Unix time of the last authenticated
+  request of each active device (devices never seen are omitted).
+
+Both counters are kept in the database (`ScannerApiRequestCount`, one row per route
+and status), so every web process adds to the same totals and they survive restarts;
+the gauges are computed at scrape time. The dashboard's scanner row shows request
+rate, upload throughput, jobs by state and the time since each scanner was last seen.
+
 The deployable scrape example, alert rules, 30-day retention policy, and Grafana
 dashboard are under `deploy/prometheus/` and `deploy/grafana/`. Validate them with
 `promtool`, provision the dashboard against a Prometheus data source whose UID is
@@ -1156,3 +1173,14 @@ log events (they carry the error class and model, never book content). Imports a
 unaffected: they stay in review without AI hints. Disable the assist with
 `BOOK_SCANNER_LLM_ENABLED=false` if the server will be down for long, and re-run
 `evaluate_llm_identification` after any model change.
+
+### Book Scanner scanner silent
+
+Scanner jobs are `open` or `capturing`, but no active scanner device has made an
+authenticated request (`scanner_last_seen_timestamp`) for 15 minutes. Check that the
+scanner is powered and on the LAN, that its upload worker shows no error on its
+status screen, and the `scanner_api_requests_total` panel: a run of `401` means the
+device key was rotated or revoked (`manage.py scanner_device list`), `503` means
+`BOOK_SCANNER_SCANNER_API_ENABLED` is off. If the scan was abandoned, abort it on the
+scanner (Abort Book) or have an admin set the job to `cancelled` in `/admin/`; the
+alert clears once no scanner job is open or capturing.

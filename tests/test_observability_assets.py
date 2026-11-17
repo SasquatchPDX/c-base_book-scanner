@@ -53,5 +53,48 @@ def test_grafana_dashboard_tracks_every_major_workflow() -> None:
         "ebook_server_scan_jobs",
         "ebook_server_scantailor_stages",
         "ebook_server_metadata_confidence_bucket_population",
+        "scanner_api_requests_total",
+        "scanner_bytes_received_total",
+        "scanner_jobs",
+        "scanner_last_seen_timestamp",
     }:
         assert metric in expressions
+
+
+def test_grafana_scanner_panels_follow_the_existing_grid() -> None:
+    dashboard = json.loads(
+        (PROJECT_ROOT / "deploy/grafana/dashboards/book-scanner-dashboard.json").read_text(),
+    )
+    scanner_panels = [
+        panel
+        for panel in dashboard["panels"]
+        if any("scanner_" in target["expr"] for target in panel.get("targets", []))
+    ]
+    assert len(scanner_panels) >= 3
+    occupied: set[tuple[int, int]] = set()
+    for panel in dashboard["panels"]:
+        grid = panel["gridPos"]
+        assert grid["x"] + grid["w"] <= 24
+        cells = {
+            (x, y)
+            for x in range(grid["x"], grid["x"] + grid["w"])
+            for y in range(grid["y"], grid["y"] + grid["h"])
+        }
+        assert not cells & occupied, panel["title"]
+        occupied |= cells
+    for panel in scanner_panels:
+        assert panel["datasource"] == {"type": "prometheus", "uid": "prometheus"}
+
+
+def test_scanner_silent_alert_watches_open_scanner_jobs() -> None:
+    alerts = yaml.safe_load((PROJECT_ROOT / "deploy/prometheus/alerts.yml").read_text())
+    rules = {rule["alert"]: rule for group in alerts["groups"] for rule in group["rules"]}
+
+    rule = rules["BookScannerScannerSilent"]
+    assert "scanner_jobs" in rule["expr"]
+    assert "scanner_last_seen_timestamp" in rule["expr"]
+    assert rule["labels"]["severity"] == "warning"
+    anchor = rule["annotations"]["runbook_url"].rsplit("#", 1)[1]
+    operations = (PROJECT_ROOT / "docs/operations.md").read_text(encoding="utf-8")
+    assert "### Book Scanner scanner silent" in operations
+    assert anchor == "book-scanner-scanner-silent"

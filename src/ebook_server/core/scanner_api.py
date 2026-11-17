@@ -24,6 +24,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .models import ScannerDevice
 from .scanner_devices import authenticate_key, bearer_token
+from .scanner_metrics import declared_body_bytes, endpoint_label, record_request
 
 API_VERSION: Final = 1
 # §6.12: event batches are fixed by the contract rather than configured per deployment.
@@ -77,6 +78,21 @@ def scanner_api_view(methods: Iterable[str]) -> Callable[[DeviceView], Callable[
         @csrf_exempt
         @wraps(view)
         def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> JsonResponse:
+            # §9 metrics: every request is counted by route name and status, and the
+            # body bytes of authenticated requests are added, so routes added later
+            # (uploads, events, metadata) are covered without their own bookkeeping.
+            received = [0]
+            try:
+                response = serve(request, received, *args, **kwargs)
+            except Exception:
+                record_request(endpoint_label(request), 500, received[0])
+                raise
+            record_request(endpoint_label(request), response.status_code, received[0])
+            return response
+
+        def serve(
+            request: HttpRequest, received: list[int], *args: Any, **kwargs: Any
+        ) -> JsonResponse:
             if not getattr(settings, "BOOK_SCANNER_SCANNER_API_ENABLED", True):
                 return error_response(
                     503, "scanner_api_disabled", "The scanner API is disabled on this server."
@@ -92,6 +108,8 @@ def scanner_api_view(methods: Iterable[str]) -> Callable[[DeviceView], Callable[
             seen_at = timezone.now()
             ScannerDevice.objects.filter(pk=device.pk).update(last_seen_at=seen_at)
             device.last_seen_at = seen_at
+            # Only bodies from authenticated devices count as received scanner data.
+            received[0] = declared_body_bytes(request)
             if request.method not in allowed:
                 response = error_response(
                     405,

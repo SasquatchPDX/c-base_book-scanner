@@ -96,3 +96,12 @@ groups:
           summary: Most LLM identification requests are failing
           description: More than half of the LLM identification requests in the last hour failed or returned invalid output; the AI server is probably down or its model changed.
           runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-llm-assist-failing
+      - alert: BookScannerScannerSilent
+        expr: sum(scanner_jobs{state=~"open|capturing"}) > 0 unless on() (time() - max(scanner_last_seen_timestamp)) < 900
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: No scanner has contacted the device API during an open scan
+          description: Scanner jobs are open or capturing, but no active scanner device has made an authenticated request for over 15 minutes.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-scanner-silent

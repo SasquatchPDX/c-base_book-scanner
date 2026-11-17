@@ -797,6 +797,33 @@ class ScannerDevice(models.Model):
         return self.scanner_id
 
 
+class ScannerApiRequestCount(models.Model):
+    """Cumulative scanner device API traffic, one row per (route name, HTTP status) (§9).
+
+    The counters live in the database rather than in process memory, so every web
+    process adds to the same totals and ``/metrics/`` reports them like the other
+    persisted-state metrics. Rows stay bounded: a fixed set of route names times the
+    status codes the API answers with. Paths, job IDs and keys are never stored here.
+    """
+
+    endpoint = models.CharField(max_length=64)
+    status = models.PositiveSmallIntegerField()
+    requests = models.PositiveBigIntegerField(default=0)
+    bytes_received = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        ordering = ("endpoint", "status")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["endpoint", "status"],
+                name="core_scanner_api_request_count_unique",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.endpoint}:{self.status}"
+
+
 class ScanJob(models.Model):
     """Persistent scan job for physical book capture."""
 

@@ -10,7 +10,7 @@ from typing import Any
 from django.conf import settings
 from django.db.models import Count
 from django.utils import timezone
-from prometheus_client.core import GaugeMetricFamily
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from redis import Redis
 from rq import Queue
 
@@ -25,6 +25,8 @@ from .models import (
     ProcessingJob,
     ReviewTask,
     ScanJob,
+    ScannerApiRequestCount,
+    ScannerDevice,
     ScanTailorStageState,
 )
 
@@ -68,7 +70,7 @@ def _bucket_population(values: Iterable[float], bounds: Sequence[float]) -> list
 class PersistentStateCollector:
     """Collect bounded-cardinality metrics visible across web and worker processes."""
 
-    def collect(self) -> Iterator[GaugeMetricFamily]:
+    def collect(self) -> Iterator[Metric]:
         collection = GaugeMetricFamily(
             "ebook_server_collection_objects",
             "Current canonical collection object counts.",
@@ -177,6 +179,65 @@ class PersistentStateCollector:
 
         yield self._queue_metric()
         yield from self._llm_metrics(now)
+        yield from self._scanner_api_metrics()
+
+    @staticmethod
+    def _scanner_api_metrics() -> Iterator[Metric]:
+        """Scanner device API v1 (contract §9, #133).
+
+        Request and byte counters are persisted per (route name, status) by
+        ``core.scanner_metrics``; jobs and last-seen times are read from the models.
+        """
+        requests = CounterMetricFamily(
+            "scanner_api_requests",
+            "Scanner device API requests by route name and HTTP status.",
+            labels=["endpoint", "status"],
+        )
+        received_bytes = 0
+        for endpoint, status, total, body_bytes in ScannerApiRequestCount.objects.values_list(
+            "endpoint", "status", "requests", "bytes_received"
+        ):
+            requests.add_metric([endpoint, str(status)], float(total))
+            received_bytes += body_bytes
+        yield requests
+        yield CounterMetricFamily(
+            "scanner_bytes_received",
+            "Request-body bytes received from authenticated scanner devices.",
+            value=float(received_bytes),
+        )
+
+        # Scanner jobs are the scan jobs carrying a registered device's scanner_id
+        # (revoked devices included: their jobs remain). Every state is reported, zero
+        # included, so the series exist before the first job reaches them.
+        counts = dict(
+            ScanJob.objects.filter(
+                scanner_id__in=ScannerDevice.objects.values("scanner_id"),
+            )
+            .values_list("state")
+            .annotate(total=Count("id"))
+        )
+        jobs = GaugeMetricFamily(
+            "scanner_jobs",
+            "Scan jobs of registered scanner devices by state.",
+            labels=["state"],
+        )
+        for state in ScanJob.State.values:
+            jobs.add_metric([state], float(counts.get(state, 0)))
+        yield jobs
+
+        last_seen = GaugeMetricFamily(
+            "scanner_last_seen_timestamp",
+            "Unix time of the last authenticated request from each active scanner device.",
+            labels=["scanner_id"],
+        )
+        devices = ScannerDevice.objects.filter(
+            is_active=True, last_seen_at__isnull=False
+        ).values_list("scanner_id", "last_seen_at")
+        for scanner_id, seen_at in devices:
+            if seen_at is None:
+                continue
+            last_seen.add_metric([scanner_id], seen_at.timestamp())
+        yield last_seen
 
     @staticmethod
     def _llm_metrics(now: datetime) -> Iterator[GaugeMetricFamily]:

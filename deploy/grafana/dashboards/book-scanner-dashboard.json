@@ -143,6 +143,46 @@
       "targets": [{"expr": "ebook_server_llm_assisted_reviews", "legendFormat": "{{resolution}}", "refId": "A"}],
       "title": "LLM-assisted review resolutions",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 36},
+      "id": 14,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (endpoint, status) (rate(scanner_api_requests_total[5m]))", "legendFormat": "{{endpoint}} {{status}}", "refId": "A"}],
+      "title": "Scanner API requests / s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 36},
+      "id": 15,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "rate(scanner_bytes_received_total[5m])", "legendFormat": "received", "refId": "A"}],
+      "title": "Scanner upload throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 36},
+      "id": 16,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (state) (scanner_jobs)", "legendFormat": "{{state}}", "refId": "A"}],
+      "title": "Scanner jobs by state",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [], "unit": "s", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 300}, {"color": "red", "value": 900}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 44},
+      "id": 17,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "time() - scanner_last_seen_timestamp", "legendFormat": "{{scanner_id}}", "refId": "A"}],
+      "title": "Seconds since scanner last seen",
+      "type": "stat"
     }
   ],
   "refresh": "30s",
