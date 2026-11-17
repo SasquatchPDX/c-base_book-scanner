@@ -4091,77 +4091,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     return JsonResponse(payload)
 
 
-def _book_for_candidate(candidate: MetadataCandidate) -> Book:
-    """Find the canonical Book a provider candidate describes, creating it if new."""
-    candidate_isbn13 = candidate.isbn13 or None
-    if candidate_isbn13:
-        existing_identifier = (
-            Identifier.objects.filter(
-                value=candidate_isbn13,
-            )
-            .select_related("book")
-            .first()
-        )
-        if existing_identifier is not None:
-            book = existing_identifier.book
-        else:
-            book = None
-    else:
-        book = None
-
-    if book is None:
-        candidate_isbn10 = candidate.isbn10 or None
-        if candidate_isbn10:
-            existing_identifier = (
-                Identifier.objects.filter(
-                    value=candidate_isbn10,
-                )
-                .select_related("book")
-                .first()
-            )
-            if existing_identifier is not None:
-                book = existing_identifier.book
-
-    if book is None:
-        candidate_author_set = {name.lower() for name in candidate.authors if isinstance(name, str)}
-        for existing_book in Book.objects.filter(title__iexact=candidate.title):
-            known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
-            if candidate_author_set.intersection(known_authors):
-                book = existing_book
-                break
-
-    if book is None:
-        candidate_edition = getattr(candidate, "edition", "")
-        book = Book.objects.create(
-            title=candidate.title,
-            publisher=candidate.publisher or "",
-            language=candidate.language or "",
-            description=candidate.description or "",
-            edition=candidate_edition or "",
-        )
-        book.publication_year = clean_publication_year(candidate.publication_year)
-        for author_name in candidate.authors:
-            if not isinstance(author_name, str):
-                continue
-            author, _ = Author.objects.get_or_create(full_name=author_name.strip())
-            if author_name.strip():
-                book.authors.add(author)
-        if candidate.isbn10:
-            Identifier.objects.get_or_create(
-                book=book,
-                kind=Identifier.IdentifierType.ISBN10,
-                value=candidate.isbn10,
-                defaults={"normalized_value": candidate.isbn10},
-            )
-        if candidate.isbn13:
-            Identifier.objects.get_or_create(
-                book=book,
-                kind=Identifier.IdentifierType.ISBN13,
-                value=candidate.isbn13,
-                defaults={"normalized_value": candidate.isbn13},
-            )
-        book.save()
-    return book
+_book_for_candidate = review_accept.book_for_candidate
 
 
 def _accept_review_candidate(
