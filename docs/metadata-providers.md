@@ -81,11 +81,28 @@ authors of its first work record (`works[0]`), where Open Library usually keeps 
 - Reliability: practical; acceptable for initial MVP with retries and backoff.
 - Notes: strong for discovery and open catalogs; useful primary signal, not canonical truth.
 
-### Google Books API (secondary)
+### Google Books API (secondary, opt-in)
 
-- Query style: ISBN/title/author lookup and broader coverage in some domains.
+- Provider: `ebook_server.core.metadata_providers.GoogleBooksMetadataProvider`
+- Query style: `isbn:` lookup first, then `intitle:`/`inauthor:` search (5 results).
 - Fit: useful for fallback/confirmatory evidence where Open Library misses coverage.
+- Enabled only when listed in `BOOK_SCANNER_METADATA_PROVIDERS` **and**
+  `BOOK_SCANNER_GOOGLE_BOOKS_API_KEY` is set; without a key it is skipped with a
+  warning. The key travels in the query string, so errors and logs never include
+  the request URL.
 - Notes: operational terms and quotas need environment-specific validation before go-live.
+
+### Deutsche Nationalbibliothek (optional, opt-in)
+
+- Provider: `ebook_server.core.metadata_providers.DnbMetadataProvider`
+- Public SRU interface (`services.dnb.de/sru/dnb`, `oai_dc` records, no key): `num=`
+  ISBN lookup first, then `tit=`/`per=` search. Strong coverage of German-language
+  books. Responses are parsed with `defusedxml` and capped at 2 MiB.
+- Titles are cleaned of DNB's uniform-title prefix and statement of responsibility;
+  creators marked `[Verfasser]`/`[Autor]` are preferred and reordered to "First Last".
+- Enabled only when listed in `BOOK_SCANNER_METADATA_PROVIDERS`. Both extra providers
+  use the shared per-provider rate limiter (`metadata_rate_limits`, keys `dnb` and
+  `googlebooks`, default `metadata_rate_limit_default`).
 
 ### Hardcover.app (optional, opt-in)
 
