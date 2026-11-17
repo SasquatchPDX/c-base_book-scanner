@@ -1668,3 +1668,222 @@ def get_or_create_profile(
         },
     )
     return profile
+
+
+# --- Contribution recognition (#27, docs/contributions.md) ------------------------------
+
+
+class ContributionKind(models.TextChoices):
+    REVIEW_RESOLVED = "review_resolved", "Review resolved"
+    REVIEW_UNIDENTIFIED = "review_unidentified", "Review marked unidentified"
+    SCAN_COMPLETED = "scan_completed", "Scan finished into the library"
+    CLAWBACK = "clawback", "Clawback"
+    ADMIN_ADJUSTMENT = "admin_adjustment", "Admin adjustment"
+
+
+class ContributionEvent(models.Model):
+    """Append-only ledger of contribution outcomes.
+
+    Emitters create PENDING rows next to the state transitions they describe; they do
+    not compute points. Only the settlement job (and the admin void action) moves a row
+    from PENDING to SETTLED or VOIDED and fills ``points``. A reversal found after
+    settlement never edits the row: it adds a negative CLAWBACK row that ``reverses`` it.
+    """
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SETTLED = "settled", "Settled"
+        VOIDED = "voided", "Voided"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="contribution_events",
+    )
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.PENDING)
+    points = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    weight_version = models.PositiveIntegerField(default=0)
+    own_upload = models.BooleanField(default=False)
+    # Idempotency key of the outcome, e.g. "review:<task>:<decided_at>"; one event per
+    # (user, kind, outcome) so retries and reprocessing never double-count.
+    outcome_key = models.CharField(max_length=200)
+    # Snapshot of the outcome when it happened; settlement compares the source rows
+    # against it to find reversals.
+    outcome = models.JSONField(default=dict, blank=True)
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    book = models.ForeignKey(
+        Book,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    reverses = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reversals",
+    )
+    reason = models.CharField(max_length=255, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    occurred_at = models.DateTimeField()
+    settle_after = models.DateTimeField()
+    settled_at = models.DateTimeField(null=True, blank=True)
+    voided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "kind", "outcome_key"],
+                name="uniq_contribution_event_outcome",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["state", "settle_after"]),
+            models.Index(fields=["user", "state", "occurred_at"]),
+            models.Index(fields=["kind", "state", "occurred_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.kind}:{self.state}:{self.points}"
+
+
+class ContributionWeight(models.Model):
+    """Admin-configurable points per outcome kind; every edit is a new version."""
+
+    version = models.PositiveIntegerField()
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    base_points = models.DecimalField(max_digits=7, decimal_places=2)
+    per_unit_points = models.DecimalField(max_digits=7, decimal_places=3, default=0)
+    cap = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    own_upload_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["version", "kind"],
+                name="uniq_contribution_weight_version_kind",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"v{self.version}:{self.kind}:{self.base_points}"
+
+
+class ContributorPreference(models.Model):
+    """Leaderboard consent and display handle; no row means "not on the board"."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="contributor_preference",
+    )
+    leaderboard_opt_in = models.BooleanField(default=False)
+    display_handle = models.CharField(max_length=40, blank=True)
+    opted_in_at = models.DateTimeField(null=True, blank=True)
+    excluded_from_leaderboard = models.BooleanField(default=False)
+    excluded_reason = models.CharField(max_length=255, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                Lower("display_handle"),
+                condition=models.Q(leaderboard_opt_in=True) & ~models.Q(display_handle=""),
+                name="uniq_contributor_handle_opted_in",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.display_handle}:{self.leaderboard_opt_in}"
+
+
+class ReviewDecisionCorrection(models.Model):
+    """A later finding that a resolved ReviewTask decision no longer stands."""
+
+    class Source(models.TextChoices):
+        REOPENED = "reopened", "Review reopened"
+        RE_RESOLVED = "re_resolved", "Resolved again"
+        BOOK_DELETED = "book_deleted", "Resolved book deleted"
+        BOOK_MERGED = "book_merged", "Resolved book merged away"
+        SPOT_CHECK = "spot_check", "Spot-check found it wrong"
+        ADMIN = "admin", "Admin flagged it wrong"
+
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.CASCADE,
+        related_name="decision_corrections",
+    )
+    found_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    source = models.CharField(max_length=16, choices=Source.choices)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["review_task", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.review_task_id}:{self.source}"
+
+
+class ContributionMonthlyTotal(models.Model):
+    """Monthly aggregate kept after retention pruning removes the detailed events."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="contribution_monthly_totals",
+    )
+    month = models.DateField()
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    points = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    event_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "month", "kind"],
+                name="uniq_contribution_monthly_total",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.month}:{self.kind}:{self.points}"

@@ -15,6 +15,10 @@ from .models import (
     Book,
     BookGenre,
     Category,
+    ContributionEvent,
+    ContributionMonthlyTotal,
+    ContributionWeight,
+    ContributorPreference,
     CoverImage,
     FileVariant,
     Genre,
@@ -26,6 +30,7 @@ from .models import (
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
+    ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
     ScanPage,
@@ -423,6 +428,47 @@ class ScanTodoAdmin(admin.ModelAdmin[ScanTodo]):
         "created_at",
     )
     list_filter = ("todo_type", "state")
+
+
+class _ReadOnlyLedgerAdmin(admin.ModelAdmin[Any]):
+    """The contribution ledger is append-only; changes go through /contributions/admin/."""
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+
+@admin.register(ContributionEvent)
+class ContributionEventAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "kind", "state", "points", "occurred_at", "settle_after")
+    list_filter = ("kind", "state")
+    search_fields = ("user__username", "outcome_key", "reason")
+
+
+@admin.register(ContributionWeight)
+class ContributionWeightAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("version", "kind", "base_points", "per_unit_points", "cap")
+
+
+@admin.register(ReviewDecisionCorrection)
+class ReviewDecisionCorrectionAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("review_task", "source", "found_by", "created_at")
+    list_filter = ("source",)
+
+
+@admin.register(ContributorPreference)
+class ContributorPreferenceAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "leaderboard_opt_in", "display_handle", "excluded_from_leaderboard")
+
+
+@admin.register(ContributionMonthlyTotal)
+class ContributionMonthlyTotalAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "month", "kind", "points", "event_count")
 
 
 @admin.register(LLMSuggestion)

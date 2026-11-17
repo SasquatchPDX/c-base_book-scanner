@@ -1,0 +1,19 @@
+{% extends "core/base.html" %}
+{% block title %}Together · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">No names, just what members did together</p>
+      <h1>Library work this month</h1>
+    </div>
+    <a href="{% url 'my-contributions' %}?view=html">My contributions</a>
+  </div>
+  <section class="stats" aria-label="Collective statistics">
+    <div><strong>{{ stats.reviews_this_month }}</strong><span>reviews resolved by members this month</span></div>
+    <div><strong>{{ stats.books_scanned_this_week }}</strong><span>books scanned this week</span></div>
+    <div><strong>{{ stats.books_scanned_this_month }}</strong><span>books scanned this month</span></div>
+    <div><strong>{{ stats.open_reviews }}</strong><span>reviews waiting for someone</span></div>
+  </section>
+  <p><a class="button" href="{% url 'review-queue' %}?view=html">Help with the review queue</a></p>
+  {% if leaderboard_enabled %}<p class="muted">Some members also chose to appear on the <a href="{% url 'contributions-leaderboard' %}?view=html">leaderboard</a>.</p>{% endif %}
+{% endblock %}
