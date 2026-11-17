@@ -35,6 +35,96 @@ database polling load when sizing large concurrent scanning sessions.
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.
 
+### Static files
+
+Uvicorn does not serve `/static/` (CSS, JavaScript, and the compiled ScanTailor
+editor), and the application deliberately has no static-file middleware: the
+reverse proxy serves them. Without this step pages load unstyled and the
+ScanTailor workspace does not start. Collect them after every install or upgrade:
+
+```bash
+uv run python manage.py collectstatic --noinput --clear
+```
+
+This writes to `STATIC_ROOT`, which is `src/staticfiles/` inside the checkout.
+Make that directory available to Nginx at the path used by the example's
+`location /static/ { alias /srv/book-scanner/static/; }`, either by copying it:
+
+```bash
+sudo rsync -a --delete src/staticfiles/ /srv/book-scanner/static/
+```
+
+or by pointing the `alias` directly at `<checkout>/src/staticfiles/` (keep the
+trailing slash, and make sure the Nginx user can read and traverse the path).
+The Docker acceptance suite does the equivalent by mounting `src/staticfiles`
+into its Nginx container.
+
+`manage.py runserver` serves static files itself only when
+`BOOK_SCANNER_DEBUG=true` (or with `--insecure`), which is why a development
+checkout can appear to work without `collectstatic`. Do not use `runserver` or
+`DEBUG` for a shared install.
+
+### Deployment walkthrough (single host)
+
+Example `systemd` units for the web process and RQ workers are in
+`deploy/systemd/` (see its README for the assumed user and paths). A minimal
+single-host install, run as the unprivileged service user from the checkout:
+
+```bash
+uv sync --frozen
+cp .env.example .env && chmod 600 .env   # then edit: see below
+uv run python manage.py migrate
+uv run python manage.py collectstatic --noinput --clear
+uv run python manage.py set_local_password <admin-username> --admin   # local mode
+uv run python manage.py check            # add --deploy in production mode
+```
+
+Then publish `src/staticfiles/` to Nginx as described above, install the
+Nginx site (changing its upstream to `127.0.0.1:8000` when Uvicorn runs on the
+same host), and enable `book-scanner-web` and at least one
+`book-scanner-worker@N`. Repeat `migrate`, `collectstatic`, and the static copy
+on every upgrade before restarting the units.
+
+### Plain-HTTP test or lab install
+
+`BOOK_SCANNER_ENVIRONMENT=production` requires HTTPS: startup fails unless the
+HTTPS redirect, secure cookies, and HSTS are enabled, and with those enabled a
+browser on plain HTTP is redirected to `https://` and secure cookies are never
+sent, so sign-in cannot work. For a short-lived, non-TLS lab install keep
+`BOOK_SCANNER_ENVIRONMENT=development` and leave the `BOOK_SCANNER_SECURE_*`,
+`..._COOKIE_SECURE`, and HSTS settings at their `false`/`0` defaults. Development
+mode skips the production safety validation, so set everything it would have
+enforced yourself: a random `BOOK_SCANNER_SECRET_KEY`, PostgreSQL and Redis URLs
+(without Redis, jobs run synchronously inside web requests), and
+`BOOK_SCANNER_LDAP_MODE=local` or `ldap` — never `stub`, which accepts any
+password. Leave `BOOK_SCANNER_DEBUG` unset. Do not expose such an install
+beyond a trusted network; credentials and session cookies travel unencrypted.
+
+`BOOK_SCANNER_ALLOWED_HOSTS` must contain every name or address browsers use to
+reach the site, as seen in the `Host` header the proxy forwards. When members
+connect by bare IP, list that IP; otherwise Django answers `400 Bad Request`.
+List hosts without a port or scheme:
+
+```text
+BOOK_SCANNER_ALLOWED_HOSTS=["192.0.2.10","library.lab.example"]
+```
+
+`BOOK_SCANNER_CSRF_TRUSTED_ORIGINS` is not needed when the browser's origin
+matches the forwarded `Host` exactly, for example `http://192.0.2.10` through
+Nginx on port 80. It **is** needed when Nginx listens on a non-default port: the
+example config forwards `Host $host`, which drops the port, so a form posted from
+`http://192.0.2.10:8080` fails Django's origin check with `403 CSRF verification
+failed` unless that origin is trusted (the acceptance suite sets this for the
+same reason). Entries include scheme and port:
+
+```text
+BOOK_SCANNER_CSRF_TRUSTED_ORIGINS=["http://192.0.2.10:8080"]
+```
+
+Behind HTTPS, set `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` instead (see
+below); without it every request looks like HTTP and `https://` origins are
+rejected.
+
 ## Production configuration
 
 Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
@@ -204,6 +294,33 @@ lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
 (no delay) when none exists, logging `rq_scheduler_not_running_retries_immediate`.
 Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
 no scheduler lock is present.
+
+### Worker concurrency (ScanTailor-Web batches)
+
+One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
+job per page and stage, so a stage batch over a realistic book (hundreds of
+pages) on a single worker takes as long as the sum of all pages (#54). Run
+several worker processes against the same Redis queue to process pages in
+parallel; this is standard RQ and needs no code change. With a systemd template
+unit, for example:
+
+```bash
+systemctl enable --now book-scanner-worker@2 book-scanner-worker@3 book-scanner-worker@4
+```
+
+Size the count to the VM's cores and memory: each stage job decodes a
+full-resolution page (a 600 dpi colour scan is tens of MB decoded), and other
+job types (conversion, OCR orchestration, finalization) share the same queue.
+Keep `--with-scheduler` on at least one of them (several is fine; they
+coordinate through a Redis lock).
+
+Stage jobs are safe to run concurrently: each claims its stage row by revision
+and only writes its result if that revision is still current. The one ordering
+caveat is between stages of the same page. A stage job whose upstream stage has
+not finished yet fails with `upstream stage <name> not complete` instead of
+waiting. With one worker, FIFO order hides this. With several, wait for a stage
+batch to finish before you start the next stage's batch, or re-run the affected
+pages afterwards.
 
 ### Recovering from killed workers
 
