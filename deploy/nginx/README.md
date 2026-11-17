@@ -46,7 +46,9 @@ server-level `client_max_body_size` and 64m for `/api/scanner/`, plus a
 - Install it next to `book-scanner.conf`. It reuses the `book_scanner_asgi`
   upstream (point that at `127.0.0.1:8000`) with the same
   `proxy_http_version 1.1` and forwarded headers, and carries over the
-  unbuffered ScanTailor event-stream location.
+  unbuffered ScanTailor event-stream location and the `internal` cover-thumbnail
+  location (same alias), so `BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX` works
+  through either front end.
 - **It fails closed.** As shipped, both servers contain only `deny all;` and
   commented example `allow` lines (RFC 5737 documentation ranges), so every
   client gets `403` until the real LAN ranges are added above `deny all;`.
