@@ -172,51 +172,76 @@ class ContributionKind(models.TextChoices):
     REVIEW_UNIDENTIFIED = "review_unidentified"
     SCAN_COMPLETED = "scan_completed"
     RESCAN_COMPLETED = "rescan_completed"
-    STAGE_APPROVED = "stage_approved"          # phase 3
+    STAGE_APPROVED = "stage_approved"  # phase 3
     VARIANT_ADDED = "variant_added"
-    METADATA_EDIT = "metadata_edit"            # phase 3
+    METADATA_EDIT = "metadata_edit"  # phase 3
     CLAWBACK = "clawback"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
+
 class ContributionEvent(models.Model):
     """Append-only. Never updated except state PENDING -> SETTLED/VOIDED by the settlement job."""
+
     id = UUIDField(primary_key=True, default=uuid4)
     user = FK(User, on_delete=CASCADE, related_name="contribution_events")
     kind = CharField(choices=ContributionKind.choices)
     state = CharField(choices=["pending", "settled", "voided"])
-    points = DecimalField(max_digits=7, decimal_places=2)       # computed at creation from weights
-    weight_version = PositiveIntegerField()                     # which weight table applied
+    points = DecimalField(max_digits=7, decimal_places=2)  # computed at creation from weights
+    weight_version = PositiveIntegerField()  # which weight table applied
     # Generic subject reference without GenericForeignKey overhead:
     review_task = FK(ReviewTask, null=True, on_delete=SET_NULL)
     scan_job = FK(ScanJob, null=True, on_delete=SET_NULL)
     scan_todo = FK(ScanTodo, null=True, on_delete=SET_NULL)
     file_variant = FK(FileVariant, null=True, on_delete=SET_NULL)
     book = FK(Book, null=True, on_delete=SET_NULL)
-    reverses = FK("self", null=True, on_delete=PROTECT)         # for CLAWBACK
-    reason = CharField(max_length=255, blank=True)              # void/clawback/adjustment reason
-    actor = FK(User, null=True, related_name="+")               # admin for adjustments
-    occurred_at = DateTimeField(); settle_after = DateTimeField(); settled_at = DateTimeField(null=True)
-    class Meta:
-        constraints = [UniqueConstraint(fields=["user", "kind", "review_task"], condition=Q(kind__in=[...]),
-                                        name="one_review_event_per_task_user"), ...]   # idempotent emitters
-        indexes = [Index(fields=["state", "settle_after"]), Index(fields=["user", "state", "occurred_at"])]
+    reverses = FK("self", null=True, on_delete=PROTECT)  # for CLAWBACK
+    reason = CharField(max_length=255, blank=True)  # void/clawback/adjustment reason
+    actor = FK(User, null=True, related_name="+")  # admin for adjustments
+    occurred_at = DateTimeField()
+    settle_after = DateTimeField()
+    settled_at = DateTimeField(null=True)
 
-class ContributionWeight(models.Model):        # versioned; admin edits create a new version
-    version = PositiveIntegerField(); kind = CharField(); base_points = DecimalField()
-    per_unit_points = DecimalField(default=0); cap = DecimalField(null=True)
-    own_upload_multiplier = DecimalField(default=Decimal("0.5")); active_from = DateTimeField()
+    class Meta:
+        constraints = [
+            UniqueConstraint(
+                fields=["user", "kind", "review_task"],
+                condition=Q(kind__in=[...]),
+                name="one_review_event_per_task_user",
+            ),
+            ...,
+        ]  # idempotent emitters
+        indexes = [
+            Index(fields=["state", "settle_after"]),
+            Index(fields=["user", "state", "occurred_at"]),
+        ]
+
+
+class ContributionWeight(models.Model):  # versioned; admin edits create a new version
+    version = PositiveIntegerField()
+    kind = CharField()
+    base_points = DecimalField()
+    per_unit_points = DecimalField(default=0)
+    cap = DecimalField(null=True)
+    own_upload_multiplier = DecimalField(default=Decimal("0.5"))
+    active_from = DateTimeField()
+
 
 class ContributorPreference(models.Model):
     user = OneToOneField(User, primary_key=True, on_delete=CASCADE)
     leaderboard_opt_in = BooleanField(default=False)
-    display_handle = CharField(max_length=40, blank=True)   # validated, unique among opted-in
+    display_handle = CharField(max_length=40, blank=True)  # validated, unique among opted-in
     opted_in_at = DateTimeField(null=True)
+
 
 class ReviewDecisionCorrection(models.Model):
     """A later finding that a resolved ReviewTask's decision was wrong (by spot-check, merge, or reopen)."""
-    review_task = FK(ReviewTask, on_delete=CASCADE); found_by = FK(User, null=True)
+
+    review_task = FK(ReviewTask, on_delete=CASCADE)
+    found_by = FK(User, null=True)
     source = CharField(choices=["spot_check", "reopened", "book_merged", "book_deleted", "admin"])
-    note = TextField(blank=True); created_at = DateTimeField(auto_now_add=True)
+    note = TextField(blank=True)
+    created_at = DateTimeField(auto_now_add=True)
+
 
 # Prerequisites (phase 3):
 # ScanTailorStageState.edited_by = FK(User, null=True)   # attribution of stage edits

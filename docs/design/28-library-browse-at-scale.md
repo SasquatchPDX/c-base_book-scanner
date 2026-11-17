@@ -302,13 +302,15 @@ shelf can come later.
 ```python
 # INSTALLED_APPS += ["django.contrib.postgres"]
 
+
 class BookSearchDocument(models.Model):
     """Denormalised, rebuildable search/facet row. Never a source of truth."""
+
     book = OneToOneField(Book, primary_key=True, on_delete=CASCADE, related_name="search_doc")
     document = SearchVectorField()
-    title_sort = CharField(max_length=255)          # normalised, for A–Z keyset + trigram
-    author_sort = CharField(max_length=255)         # first author "Last, First" normalised
-    author_text = TextField()                       # all author names, trigram
+    title_sort = CharField(max_length=255)  # normalised, for A–Z keyset + trigram
+    author_sort = CharField(max_length=255)  # first author "Last, First" normalised
+    author_text = TextField()  # all author names, trigram
     language = CharField(max_length=8, blank=True)  # normalised ISO 639-1
     formats = ArrayField(CharField(max_length=16), default=list)
     author_ids = ArrayField(BigIntegerField(), default=list)
@@ -316,23 +318,37 @@ class BookSearchDocument(models.Model):
     category_ids = ArrayField(BigIntegerField(), default=list)
     publication_decade = SmallIntegerField(null=True)
     has_cover = BooleanField(default=False)
-    thumbnail_key = CharField(max_length=64, blank=True)   # sha256 of thumbnail
-    book_created_at = DateTimeField()               # copy, for keyset without join
+    thumbnail_key = CharField(max_length=64, blank=True)  # sha256 of thumbnail
+    book_created_at = DateTimeField()  # copy, for keyset without join
     indexed_at = DateTimeField(auto_now=True)
-    class Meta:
-        indexes = [GinIndex(fields=["document"]),
-                   GinIndex(fields=["title_sort"], opclasses=["gin_trgm_ops"], name=...),
-                   GinIndex(fields=["author_text"], opclasses=["gin_trgm_ops"], name=...),
-                   GinIndex(fields=["formats"]), GinIndex(fields=["genre_ids"]),
-                   GinIndex(fields=["category_ids"]), GinIndex(fields=["author_ids"]),
-                   Index(fields=["-book_created_at", "-book"]), Index(fields=["title_sort", "book"]),
-                   Index(fields=["author_sort", "book"]), Index(fields=["language"])]
 
-class CoverThumbnail(models.Model):       # derived artifact of a CoverImage
+    class Meta:
+        indexes = [
+            GinIndex(fields=["document"]),
+            GinIndex(fields=["title_sort"], opclasses=["gin_trgm_ops"], name=...),
+            GinIndex(fields=["author_text"], opclasses=["gin_trgm_ops"], name=...),
+            GinIndex(fields=["formats"]),
+            GinIndex(fields=["genre_ids"]),
+            GinIndex(fields=["category_ids"]),
+            GinIndex(fields=["author_ids"]),
+            Index(fields=["-book_created_at", "-book"]),
+            Index(fields=["title_sort", "book"]),
+            Index(fields=["author_sort", "book"]),
+            Index(fields=["language"]),
+        ]
+
+
+class CoverThumbnail(models.Model):  # derived artifact of a CoverImage
     cover = OneToOneField(CoverImage, on_delete=CASCADE, related_name="thumbnail")
-    storage_location = FK(StorageLocation, PROTECT); storage_identifier = CharField(512)
-    sha256 = CharField(64, unique=True); width = PositiveSmallIntegerField(); mime_type = CharField(32)
-    tool = CharField(64); tool_version = CharField(32); created_at = DateTimeField(auto_now_add=True)
+    storage_location = FK(StorageLocation, PROTECT)
+    storage_identifier = CharField(512)
+    sha256 = CharField(64, unique=True)
+    width = PositiveSmallIntegerField()
+    mime_type = CharField(32)
+    tool = CharField(64)
+    tool_version = CharField(32)
+    created_at = DateTimeField(auto_now_add=True)
+
 
 # Phase 3: class Series(name unique-ish, sort_name); Book.series FK null, Book.series_index Decimal null
 # Phase 4: class Shelf(owner FK null, title, slug, visibility); class ShelfItem(shelf, book, position, added_by)
