@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
+from django.db import connection
 from django.test import Client
+from django.test.utils import CaptureQueriesContext
 
 from ebook_server.core import intake_progress
 from ebook_server.core.models import (
@@ -102,3 +104,24 @@ def test_cli_status_reuses_the_same_data(library: SourceLocation) -> None:
     call_command("ingest_sources", "--status", "--json", stdout=stdout)
     (row,) = json.loads(stdout.getvalue())
     assert row == intake_progress.source_status(library)
+
+
+@pytest.mark.django_db
+def test_progress_query_count_does_not_grow_with_sources(
+    library: SourceLocation, tmp_path: Path
+) -> None:
+    def _queries() -> int:
+        with CaptureQueriesContext(connection) as captured:
+            intake_progress.intake_progress()
+        return len(captured.captured_queries)
+
+    few = _queries()
+    for index in range(10):
+        extra = SourceLocation.objects.create(name=f"extra-{index}", root_path=str(tmp_path))
+        _job(extra, ImportJob.State.COMPLETE, 1)
+    assert _queries() == few
+    rows = intake_progress.intake_progress()["sources"]
+    assert len(rows) == 11
+    assert next(r for r in rows if r["source_location_id"] == library.id) == (
+        intake_progress.source_status(library)
+    )
