@@ -17,6 +17,7 @@
         {% if book.publisher %}<div><dt>Publisher</dt><dd>{{ book.publisher }}</dd></div>{% endif %}
         {% if book.publication_date %}<div><dt>Published</dt><dd>{{ book.publication_date }}</dd></div>{% elif book.publication_year %}<div><dt>Published</dt><dd>{{ book.publication_year }}</dd></div>{% endif %}
         {% if book.edition %}<div><dt>Edition</dt><dd>{{ book.edition }}</dd></div>{% endif %}
+        {% if book.genres.all %}<div><dt>Genres</dt><dd>{% for genre in book.genres.all %}<a href="{% url 'library-books' %}?view=html&amp;genre={{ genre.name|urlencode }}">{{ genre.name }}</a>{% if not forloop.last %}, {% endif %}{% endfor %}</dd></div>{% endif %}
         {% for identifier in identifiers %}<div><dt>{{ identifier.kind|upper }}</dt><dd>{{ identifier.value }}</dd></div>{% endfor %}
       </dl>
       {% if book.description %}<section class="description"><h2>About</h2><p>{{ book.description|linebreaksbr }}</p></section>{% endif %}
@@ -24,7 +25,7 @@
         <h2>Available files</h2>
         <div class="variant-list">
           {% for variant in variants %}
-            <div><div><strong>{{ variant.format|upper }}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
+            <div><div><strong>{{ variant.format|upper }}{% if variant.part_index is not None %} · {{ variant.part_index }}. {{ variant.part_label|default:"Part" }}{% endif %}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
    href="{% url 'library-book-download' book.id %}?variant_id={{ variant.id }}">Download</a></div>
 {% empty %}<p>No downloadable variants are ready.</p>{% endfor %}
   </div>

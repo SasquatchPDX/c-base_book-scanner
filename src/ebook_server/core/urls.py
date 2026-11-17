@@ -162,6 +162,7 @@ urlpatterns = [
     path("imports/upload/", views.upload_file, name="imports-upload"),
     path("imports/<uuid:job_id>/", views.import_status, name="imports-status"),
     path("reviews/", views.review_queue, name="review-queue"),
+    path("reviews/batch-accept/", views.review_batch_accept, name="review-batch-accept"),
     path("reviews/<int:task_id>/", views.review_detail, name="review-detail"),
     path(
         "reviews/<int:task_id>/accept-candidate/",
@@ -192,6 +193,21 @@ urlpatterns = [
         "reviews/<int:task_id>/edit-search-terms/",
         views.review_edit_search_terms,
         name="review-edit-search-terms",
+    ),
+    path(
+        "reviews/<int:task_id>/multipart/order/",
+        views.review_multipart_order,
+        name="review-multipart-order",
+    ),
+    path(
+        "reviews/<int:task_id>/multipart/acknowledge-incomplete/",
+        views.review_multipart_acknowledge_incomplete,
+        name="review-multipart-acknowledge-incomplete",
+    ),
+    path(
+        "reviews/<int:task_id>/multipart/reject/",
+        views.review_multipart_reject,
+        name="review-multipart-reject",
     ),
     path(
         "review-identifications/<uuid:job_id>/",

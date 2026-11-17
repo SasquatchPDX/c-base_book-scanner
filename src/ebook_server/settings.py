@@ -52,7 +52,13 @@ class Settings(BaseSettings):
     storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
+    ingest_batch_size: int = 100
+    ingest_max_per_hour: int = 0
+    # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
+    ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    multipart_detection: bool = True
+    sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -88,6 +94,9 @@ class Settings(BaseSettings):
     # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
     hardcover_api_token: SecretStr = SecretStr("")
     hardcover_timeout_seconds: float = 10.0
+    # Google Books (opt-in): also add
+    # "ebook_server.core.metadata_providers.GoogleBooksMetadataProvider" to metadata_providers.
+    google_books_api_key: SecretStr = SecretStr("")
     # Client-side request pacing per metadata provider_id (requests/second; <= 0 disables).
     # Providers not listed use metadata_rate_limit_default. Shared across worker processes
     # through Redis when redis_url is set, otherwise enforced per process.
@@ -97,6 +106,10 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    review_queue_page_size: int = 50
+    review_batch_min_score: float = 0.75
+    review_batch_ambiguity_margin: float = 0.05
+    review_batch_max_tasks: int = 100
     ocr_service_url: str = "http://localhost:8020"
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
@@ -126,6 +139,10 @@ class Settings(BaseSettings):
     contributions_daily_soft_cap: float = 50.0
     contributions_retention_months: int = 24
     contributions_season: Literal["month", "quarter"] = "month"
+    # How scanners deliver pages (#55): ``single_page`` (one page per image, the
+    # project's own scanner) or ``spread`` (one photo holds two facing pages).
+    scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
+    scan_spread_scanner_ids: list[str] = []
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -257,6 +274,15 @@ LOGIN_REDIRECT_URL = "/library/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 APP_DATA_DIR = Path(settings.storage_root)
+# The one attached storage: a writable network share mounted on the VM. It holds the
+# archive (copied/moved/uploaded originals plus every derived artifact: conversions,
+# covers, OCR output), scan artifacts and upload staging. The VM disk keeps only the
+# database, Redis and caches. Files indexed in place are read from their own
+# read-only StorageLocation and are never copied here.
+# The archive root is APP_DATA_DIR / BOOK_SCANNER_ARCHIVE_DIRNAME. It is deliberately
+# not separately configurable: keeping it under the storage root keeps it behind the
+# mount/sentinel check, and renaming it would orphan every archived artifact.
+BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
@@ -269,7 +295,12 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
+BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
+BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
+BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
     settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT
@@ -302,9 +333,14 @@ BOOK_SCANNER_AUDIOBOOK_SERVICE_URL = settings.audiobook_service_url
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
 BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
+BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_value()
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
+BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
+BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin
+BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS = settings.review_batch_max_tasks
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts
@@ -325,6 +361,8 @@ BOOK_SCANNER_CONTRIBUTIONS_HOLD_DAYS = settings.contributions_hold_days
 BOOK_SCANNER_CONTRIBUTIONS_DAILY_SOFT_CAP = settings.contributions_daily_soft_cap
 BOOK_SCANNER_CONTRIBUTIONS_RETENTION_MONTHS = settings.contributions_retention_months
 BOOK_SCANNER_CONTRIBUTIONS_SEASON = settings.contributions_season
+BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
+BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds

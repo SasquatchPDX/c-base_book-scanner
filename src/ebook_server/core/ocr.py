@@ -33,6 +33,7 @@ from ebook_server.storage import LocalFilesystemStorage
 
 from . import conversion, intake
 from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
+from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 logger = structlog.get_logger(__name__)
@@ -824,6 +825,10 @@ def _resolve_source_artifact(
         raise OCRJobError("source variant missing")
     if source_variant.storage_identifier is None:
         raise OCRJobError("source artifact storage missing")
+    try:
+        ensure_reference_intact(source_variant)
+    except ReferencedFileError as exc:
+        raise OCRJobError(str(exc)) from exc
     try:
         source_storage = backend_for_location(source_variant.storage_location)
     except StorageConfigurationError as exc:

@@ -10,7 +10,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
     dependencies = [
         ("auth", "0012_alter_user_first_name_max_length"),
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0031_multipart_works"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

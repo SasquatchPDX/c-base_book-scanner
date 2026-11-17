@@ -70,6 +70,10 @@ def check_storage_root(
     return target
 
 
+class ReadOnlyStorageError(PermissionError):
+    """Raised when a write, move or delete targets a read-only (indexed-in-place) location."""
+
+
 class InsufficientStorageError(StorageUnavailableError):
     """Raised when writing would push the storage volume below its free-space reserve."""
 
@@ -172,6 +176,9 @@ class StorageBackend(Protocol):
     def generate_destination(self, namespace: str, original_name: str) -> str:
         """Generate a stable storage id for a new artifact."""
 
+    def stat(self, location: str) -> tuple[int, int]:
+        """Return ``(size_bytes, mtime_ns)`` for an artifact."""
+
     def free_bytes(self) -> int | None:
         """Free bytes available to this backend, or None when unknown."""
 
@@ -262,8 +269,58 @@ class LocalFilesystemStorage:
         safe_name = cap_filename(Path(original_name).name.replace(" ", "_"))
         return f"{namespace}/{safe_name}"
 
+    def stat(self, location: str) -> tuple[int, int]:
+        result = self.resolve_location(location).stat()
+        return result.st_size, result.st_mtime_ns
+
     def free_bytes(self) -> int | None:
         return free_bytes(Path(self.root))
 
     def ensure_free_space(self, required_bytes: int) -> None:
         ensure_free_space(Path(self.root), required_bytes)
+
+    def relative_identifier(self, path: str | Path) -> str:
+        """Storage id (POSIX-style, relative to the root) for a file already under the root.
+
+        Raises ``ValueError`` when the resolved path lies outside the root, which also
+        rejects symlinks that point out of the share.
+        """
+        base = Path(self.root).resolve()
+        target = Path(path).resolve()
+        try:
+            relative = target.relative_to(base)
+        except ValueError as exc:
+            raise ValueError("path escapes storage root") from exc
+        if not relative.parts:
+            raise ValueError("path is the storage root itself")
+        return relative.as_posix()
+
+
+@dataclass(frozen=True)
+class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
+    """Filesystem backend for files indexed in place: reads only, never writes or deletes.
+
+    Used for collections the application references where they already live (often a
+    read-only network share). Every mutating operation fails closed.
+    """
+
+    def _refuse(self, operation: str) -> ReadOnlyStorageError:
+        return ReadOnlyStorageError(f"storage location is read-only; refusing {operation}")
+
+    def store(self, source: str, destination: str) -> str:
+        raise self._refuse("store")
+
+    def copy(self, source: str, destination: str) -> str:
+        raise self._refuse("copy")
+
+    def move(self, source: str, destination: str) -> str:
+        raise self._refuse("move")
+
+    def delete(self, location: str) -> None:
+        raise self._refuse("delete")
+
+    def generate_destination(self, namespace: str, original_name: str) -> str:
+        raise self._refuse("new artifact")
+
+    def ensure_free_space(self, required_bytes: int) -> None:
+        raise self._refuse("write")
