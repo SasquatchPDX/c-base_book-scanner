@@ -31,3 +31,42 @@ suite do.
 
 `integration.conf` is only for the Docker-backed acceptance suite. It connects a
 pinned Nginx container to the host Uvicorn process and must not be deployed.
+
+## libreflip scanner: TLS 1.3, LAN only (`serif-lan-tls.conf`)
+
+The scanner device API `/api/scanner/v1/` must only be reachable inside the
+LAN and only over TLS 1.3 (contract: libreflip/serif
+`docs/sans-serif-interface.md` §3, currently
+[libreflip/serif#37](https://github.com/libreflip/serif/pull/37)).
+`serif-lan-tls.conf` is the front end for that: a `listen 443 ssl` server with
+`ssl_protocols TLSv1.3`, LAN `allow`/`deny`, `server_tokens off`, a 150m
+server-level `client_max_body_size` and 64m for `/api/scanner/`, plus a
+`listen 80` server that redirects browsers to HTTPS and refuses the API.
+
+- Install it next to `book-scanner.conf`. It reuses the `book_scanner_asgi`
+  upstream (point that at `127.0.0.1:8000`) with the same
+  `proxy_http_version 1.1` and forwarded headers, and carries over the
+  unbuffered ScanTailor event-stream location.
+- **It fails closed.** As shipped, both servers contain only `deny all;` and
+  commented example `allow` lines (RFC 5737 documentation ranges), so every
+  client gets `403` until the real LAN ranges are added above `deny all;`.
+- Replace the `REPLACE` placeholders: the LAN host name (must match the
+  certificate) and the certificate paths.
+- `book-scanner.conf`'s plain-HTTP `listen 8080` server answers `403` on
+  `/api/scanner/`, so a device key never travels over plain HTTP through it.
+  On the VM, bind it to `127.0.0.1:8080` or delete that server block, so the
+  portal is only reachable through the TLS server.
+- Set `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true`. Without it Django sees
+  every proxied request as HTTP and the production HTTPS redirect loops.
+- Run Uvicorn on `127.0.0.1` only (`deploy/systemd/book-scanner-web.service`
+  already does).
+- The port-80 redirect uses `try_files` into a named location instead of a
+  bare `return 301`, because `return` runs before `allow`/`deny` and would
+  answer hosts outside the LAN.
+
+Certificates, NTP and scanner onboarding are in `docs/operations.md`
+("libreflip scanner deployment"). CI runs `nginx -t` on both files together,
+and `scripts/test_scanner_tls_proxy.sh` (part of the infrastructure suite)
+checks a live nginx: TLS 1.2-only clients cannot connect, sources outside the
+allowed ranges and the unedited file get `403`, `/api/scanner/` rejects bodies
+above 64 MiB with `413`, and neither plain-HTTP listener serves the API.
