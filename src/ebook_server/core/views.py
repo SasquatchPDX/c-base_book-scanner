@@ -1144,9 +1144,12 @@ def _resolve_review_source(
     selected_candidate: MetadataCandidate | None = None,
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant | None:
     import_job = task.import_job
     if import_job is not None:
+        # Cover extraction is queued after commit, never done in this request when a
+        # queue is configured; ``inline_cover_fallback`` only matters without one.
         return intake.resolve_import_with_review_data(
             job=import_job,
             review_task=task,
@@ -1156,6 +1159,7 @@ def _resolve_review_source(
             decision=decision,
             decision_notes=decision_notes,
             decision_payload=decision_payload,
+            inline_cover_fallback=inline_cover_fallback,
         )
     if task.scan_job_id is None:
         raise ValueError("review task has no source")
@@ -4094,12 +4098,16 @@ def _accept_review_candidate(
     decision_payload: dict[str, Any] | None = None,
     reviewer_authors: list[str] | None = None,
     reviewer_genres: list[Genre] | None = None,
+    inline_cover_fallback: bool = True,
 ) -> tuple[Book, FileVariant | None]:
     """Resolve ``task`` with ``candidate``; shared by single and batch accept.
 
     ``reviewer_authors`` only fill a Book that has no authors yet (provider authors
     always win). ``reviewer_genres`` is an explicit reviewer choice; ``None`` assigns
-    genres automatically from provider/embedded subjects.
+    genres automatically from provider/embedded subjects. Front-cover extraction is
+    a background job queued after commit; batch accept passes
+    ``inline_cover_fallback=False`` so it never extracts in the request, even without
+    a configured queue.
     """
     book = _book_for_candidate(candidate)
     decision_additions: dict[str, Any] = {}
@@ -4133,6 +4141,7 @@ def _accept_review_candidate(
         decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
         decision_notes=decision_notes or f"Accepted candidate {candidate.id}",
         decision_payload=decision_payload,
+        inline_cover_fallback=inline_cover_fallback,
     )
     return book, variant
 
@@ -4265,6 +4274,8 @@ def _batch_accept_one(
                     "min_score": min_score,
                     "ambiguity_margin": ambiguity_margin,
                 },
+                # Up to BATCH_MAX_TASKS books: covers are background jobs only.
+                inline_cover_fallback=False,
             )
     except Exception as exc:  # one failing task must not abort the rest of the batch
         logger.warning(

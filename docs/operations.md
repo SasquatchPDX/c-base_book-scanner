@@ -531,10 +531,16 @@ Everything else stays open and is reported per task (`accepted`, `ambiguous`,
 `error`). A batch holds at most `BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
 100) tasks. Batch-resolved tasks record `batch_accept`, the scores and the
 thresholds used in `decision_payload`. The originals were already archived when
-the review task was created, so accepting only links records (and attempts the
-same front-cover extraction as a single accept); no archive copy happens in the
-request. Batch accept never changes the intake auto-accept threshold
-(`BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`).
+the review task was created, so accepting only links records; no archive copy,
+parsing or rendering happens in the request. Front-cover extraction for each
+accepted file is a background job (`intake.extract_front_cover_job`) queued after
+that task's transaction commits, exactly as for a single accept; see "Covers from
+review decisions" below. Batch accept never changes the intake auto-accept
+threshold (`BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`).
+
+The queue shows formats of one book (see `group_sibling_formats`) as one entry,
+grouped within the current page; only that entry has a batch checkbox, and the
+other formats are re-assessed when it is accepted.
 
 ## Workers and external tools
 
@@ -687,6 +693,20 @@ read with member size/compression limits; Pillow warnings for decompression bomb
 are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
+
+### Covers from review decisions
+
+Resolving an import in review (accept candidate, merge, manual entry, batch accept,
+or a format sibling linked automatically) does not extract the cover in the web
+request. It queues `ebook_server.core.intake.extract_front_cover_job` with
+`transaction.on_commit`, so the job is dispatched only once the decision is committed
+(a rolled-back decision queues nothing) and runs without holding any row locks. The
+job is idempotent: the Book's existing front cover is reused, so a repeated delivery
+does no storage work. Failing to dispatch is logged as
+`cover_extraction_dispatch_failed` and never undoes the decision. Without a configured
+queue (development only; production requires Redis) a single decision extracts inline
+after commit, while batch accept skips extraction and logs
+`cover_extraction_skipped_no_queue`.
 
 Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
 or `cover.png` (Calibre-style) over format extraction, but only when the folder

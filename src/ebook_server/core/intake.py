@@ -34,6 +34,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
 
+from ebook_server.jobs import get_queue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -46,6 +47,7 @@ from . import genres, identification, source_layout
 from .models import (
     Author,
     Book,
+    CoverImage,
     FileVariant,
     Identifier,
     ImportJob,
@@ -1550,6 +1552,73 @@ def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None)
         )
 
 
+def extract_front_cover_job(file_variant_id: int, import_job_id: str | None = None) -> None:
+    """Background job: extract a variant's front cover once.
+
+    Idempotent: ``covers.extract_front_cover`` returns the Book's existing front cover,
+    so a repeated or duplicate delivery does no storage work.
+    """
+    variant = (
+        FileVariant.objects.select_related("book", "storage_location")
+        .filter(pk=file_variant_id)
+        .first()
+    )
+    if variant is None:
+        logger.info("cover_extraction_variant_missing", file_variant_id=file_variant_id)
+        return
+    job = (
+        ImportJob.objects.select_related("source_location").filter(pk=import_job_id).first()
+        if import_job_id
+        else None
+    )
+    _try_extract_front_cover(variant, job)
+
+
+def schedule_front_cover_extraction(
+    variant: FileVariant,
+    job: ImportJob | None = None,
+    *,
+    inline_fallback: bool = True,
+) -> None:
+    """Extract the front cover in a background job after the current transaction commits.
+
+    Cover extraction copies the whole archived file from network storage and parses or
+    renders it, so review decisions must not do it inside the request or while holding
+    row locks. Without a configured queue (development only; production requires Redis)
+    the extraction runs inline after commit when ``inline_fallback`` is set, and is
+    skipped otherwise (batch review); it is optional and never blocks the decision.
+    """
+    if CoverImage.objects.filter(
+        book_id=variant.book_id,
+        position=CoverImage.CoverPosition.FRONT,
+    ).exists():
+        return
+    file_variant_id = variant.pk
+    import_job_id = str(job.pk) if job is not None else None
+
+    def dispatch() -> None:
+        try:
+            queue = get_queue()
+            if queue is None:
+                if inline_fallback:
+                    extract_front_cover_job(file_variant_id, import_job_id)
+                else:
+                    logger.warning(
+                        "cover_extraction_skipped_no_queue",
+                        file_variant_id=file_variant_id,
+                    )
+                return
+            queue.enqueue(extract_front_cover_job, file_variant_id, import_job_id)
+        except Exception as exc:  # optional work; the committed decision stands
+            logger.warning(
+                "cover_extraction_dispatch_failed",
+                file_variant_id=file_variant_id,
+                error_type=type(exc).__name__,
+            )
+
+    transaction.on_commit(dispatch)
+
+
 def _provision_book_from_manual_metadata(
     *,
     title: str,
@@ -1603,11 +1672,14 @@ def resolve_import_with_review_data(
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
     propagate_to_siblings: bool = True,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant:
     """Resolve a reviewed import; ``source_type`` defaults to the job's origin.
 
     Other formats of the same book waiting in review are then offered ``book``
-    (``_propagate_book_to_siblings``), under the same sibling-group lock.
+    (``_propagate_book_to_siblings``), under the same sibling-group lock. Front-cover
+    extraction is queued after commit (``schedule_front_cover_extraction``); pass
+    ``inline_cover_fallback=False`` where it must never run in the caller's process.
     """
     with _sibling_group_lock(job):
         variant = _resolve_import(
@@ -1620,9 +1692,10 @@ def resolve_import_with_review_data(
             decision=decision,
             decision_notes=decision_notes,
             decision_payload=decision_payload,
+            inline_cover_fallback=inline_cover_fallback,
         )
         if propagate_to_siblings:
-            _propagate_book_to_siblings(job, book)
+            _propagate_book_to_siblings(job, book, inline_cover_fallback=inline_cover_fallback)
     return variant
 
 
@@ -1637,11 +1710,12 @@ def _resolve_import(
     decision: str,
     decision_notes: str,
     decision_payload: dict[str, Any] | None,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant, job)
+    schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -1905,7 +1979,13 @@ def _annotate_review_task(task: ReviewTask, payload: dict[str, Any]) -> None:
     task.save(update_fields=["decision_payload", "updated_at"])
 
 
-def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: ImportJob) -> bool:
+def _offer_book_to_waiting_job(
+    waiting: ImportJob,
+    book: Book,
+    *,
+    source_job: ImportJob,
+    inline_cover_fallback: bool = True,
+) -> bool:
     """Resolve a sibling waiting in review with ``book`` if the evidence allows it.
 
     Call under ``_sibling_group_lock``. Returns whether the job was linked.
@@ -1975,6 +2055,7 @@ def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: Im
             "rule": "group_sibling_formats",
             SIBLING_REVIEW_PAYLOAD_KEY: assessment.as_evidence(),
         },
+        inline_cover_fallback=inline_cover_fallback,
     )
     logger.info(
         "intake_linked_format_sibling",
@@ -1987,7 +2068,12 @@ def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: Im
     return True
 
 
-def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
+def _propagate_book_to_siblings(
+    job: ImportJob,
+    book: Book,
+    *,
+    inline_cover_fallback: bool = True,
+) -> None:
     """Offer ``book`` to other formats of it that wait in review.
 
     Siblings not processed yet consider it themselves in ``process_import_job``. A
@@ -2001,7 +2087,12 @@ def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
                 continue
             try:
                 with transaction.atomic():
-                    _offer_book_to_waiting_job(sibling, book, source_job=job)
+                    _offer_book_to_waiting_job(
+                        sibling,
+                        book,
+                        source_job=job,
+                        inline_cover_fallback=inline_cover_fallback,
+                    )
             except Exception:
                 logger.exception(
                     "intake_sibling_propagation_failed",

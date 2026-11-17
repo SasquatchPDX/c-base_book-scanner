@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
 import pytest
 from django.contrib.auth.models import User
+from django.db import connection
 from django.test import Client
 
-from ebook_server.core import review_batch
+from ebook_server.core import covers, intake, review_batch, views
 from ebook_server.core.models import (
     AppUserProfile,
+    FileVariant,
     ImportJob,
     MetadataCandidate,
     ReviewTask,
@@ -377,3 +380,145 @@ def test_batch_accept_html_form_round_trip() -> None:
     assert "too close to the top candidate" in body
     good.refresh_from_db()
     assert good.state == ReviewTask.State.RESOLVED
+
+
+# --- cover extraction stays out of the request (PR #84 review) -------------------------
+
+
+class _RecordingQueue:
+    """Queue double: records each enqueue and whether a transaction was still open."""
+
+    def __init__(self) -> None:
+        self.jobs: list[tuple[Callable[..., Any], tuple[Any, ...], bool]] = []
+
+    def enqueue(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        self.jobs.append((func, args, connection.in_atomic_block))
+
+
+def _record_cover_extraction(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Replace the slow extractor; each call records whether a transaction was open."""
+    calls: list[bool] = []
+
+    def fake_extract(variant: FileVariant, *, import_job: ImportJob | None = None) -> None:
+        calls.append(connection.in_atomic_block)
+
+    monkeypatch.setattr(covers, "extract_front_cover", fake_extract)
+    return calls
+
+
+@pytest.mark.django_db(transaction=True)
+def test_batch_accept_queues_cover_extraction_after_commit_not_in_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = get_or_create_profile("batch-cover-owner")
+    tasks = [_make_task(owner.user, f"cover{index}", [0.95]) for index in range(5)]
+    extraction_calls = _record_cover_extraction(monkeypatch)
+    queue = _RecordingQueue()
+    monkeypatch.setattr(intake, "get_queue", lambda: queue)
+
+    response = _client(owner).post(
+        "/reviews/batch-accept/",
+        data={"task_ids": [task.id for task in tasks]},
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == len(tasks)
+    # The request itself never copied or parsed an archived file.
+    assert extraction_calls == []
+    # One job per accepted variant, each dispatched only after its task committed.
+    assert len(queue.jobs) == len(tasks)
+    assert all(func is intake.extract_front_cover_job for func, _, _ in queue.jobs)
+    assert [in_atomic for _, _, in_atomic in queue.jobs] == [False] * len(tasks)
+    variant_ids = {ImportJob.objects.get(pk=task.import_job_id).file_variant_id for task in tasks}
+    assert {args[0] for _, args, _ in queue.jobs} == variant_ids
+
+    # The worker runs the extraction outside any transaction, so no row locks are held.
+    for func, args, _ in queue.jobs:
+        func(*args)
+    assert extraction_calls == [False] * len(tasks)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_batch_accept_never_extracts_covers_inline_without_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = get_or_create_profile("batch-cover-noqueue")
+    tasks = [_make_task(owner.user, f"noqueue{index}", [0.95]) for index in range(3)]
+    extraction_calls = _record_cover_extraction(monkeypatch)
+    monkeypatch.setattr(intake, "get_queue", lambda: None)
+
+    response = _client(owner).post(
+        "/reviews/batch-accept/",
+        data={"task_ids": [task.id for task in tasks]},
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == len(tasks)
+    assert extraction_calls == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_batch_accept_dispatches_no_cover_job_for_rolled_back_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = get_or_create_profile("batch-cover-rollback")
+    good = _make_task(owner.user, "good", [0.95])
+    bad = _make_task(owner.user, "bad", [0.95])
+    queue = _RecordingQueue()
+    monkeypatch.setattr(intake, "get_queue", lambda: queue)
+    original = views._resolve_review_source
+
+    def failing_after_resolve(**kwargs: Any) -> FileVariant | None:
+        variant = original(**kwargs)
+        if kwargs["task"].pk == bad.pk:
+            raise RuntimeError("simulated failure after the cover was scheduled")
+        return variant
+
+    monkeypatch.setattr(views, "_resolve_review_source", failing_after_resolve)
+
+    response = _client(owner).post(
+        "/reviews/batch-accept/",
+        data={"task_ids": [good.id, bad.id]},
+        content_type="application/json",
+    )
+
+    outcomes = {item["task_id"]: item["outcome"] for item in response.json()["results"]}
+    assert outcomes == {str(good.id): "accepted", str(bad.id): "error"}
+    # Only the committed task's cover job was dispatched.
+    good_job = ImportJob.objects.get(pk=good.import_job_id)
+    assert [args[0] for _, args, _ in queue.jobs] == [good_job.file_variant_id]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_single_accept_queues_cover_job_and_falls_back_inline_after_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = get_or_create_profile("single-cover-owner")
+    queued = _make_task(owner.user, "queued", [0.95])
+    inline = _make_task(owner.user, "inline", [0.95])
+    extraction_calls = _record_cover_extraction(monkeypatch)
+    client = _client(owner)
+
+    def accept(task: ReviewTask) -> None:
+        candidate = MetadataCandidate.objects.get(import_job_id=task.import_job_id)
+        response = client.post(
+            f"/reviews/{task.id}/accept-candidate/",
+            data={"candidate_id": candidate.id},
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+    queue = _RecordingQueue()
+    monkeypatch.setattr(intake, "get_queue", lambda: queue)
+    accept(queued)
+    assert extraction_calls == []
+    assert [(func, in_atomic) for func, _, in_atomic in queue.jobs] == [
+        (intake.extract_front_cover_job, False),
+    ]
+
+    # Development without a queue: a single accept still gets its cover, after commit.
+    monkeypatch.setattr(intake, "get_queue", lambda: None)
+    accept(inline)
+    assert extraction_calls == [False]
