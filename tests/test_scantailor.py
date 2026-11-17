@@ -1876,6 +1876,75 @@ def test_text_line_detection_rejects_too_few_lines() -> None:
     assert scantailor._detect_text_line_quad(page) is None
 
 
+def _thumbnail_size(client: Client, page_id: str) -> tuple[tuple[int, int], str]:
+    response = client.get(f"/scan/pages/{page_id}/image/")
+    assert response.status_code == 200
+    assert response["Content-Type"] == "image/jpeg"
+    streaming = cast(StreamingHttpResponse, response)
+    body = b"".join(cast(Iterable[bytes], streaming.streaming_content))
+    with Image.open(io.BytesIO(body)) as thumb:
+        return thumb.size, response["ETag"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_page_thumbnail_follows_latest_completed_stage() -> None:
+    """#58: the overview thumbnail shows the latest completed stage, not the raw scan."""
+    client, job = _create_scan_job("scan-user-thumbnail-stage")
+    portrait = io.BytesIO()
+    _text_page(300, 400).save(portrait, format="PNG")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=portrait.getvalue(),
+        filename="portrait.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+
+    raw_size, raw_etag = _thumbnail_size(client, str(page.id))
+    assert raw_size == (300, 400)
+
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 90}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+
+    # Deskew rotated the page by 90 degrees: the thumbnail now shows landscape.
+    stage_size, stage_etag = _thumbnail_size(client, str(page.id))
+    assert stage_size == (400, 300)
+    assert stage_etag != raw_etag
+    revalidated = client.get(f"/scan/pages/{page.id}/image/", HTTP_IF_NONE_MATCH=stage_etag)
+    assert revalidated.status_code == 304
+    assert "max-age=0" in revalidated["Cache-Control"]
+
+    # A stale (invalidated) stage is never shown; fall back to the last good one.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.INVALIDATED,
+    )
+    fallback_size, fallback_etag = _thumbnail_size(client, str(page.id))
+    assert fallback_size == (300, 400)
+    assert fallback_etag not in {raw_etag, stage_etag}
+
+    # Downstream success after an upstream that is not complete does not count either.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.SUCCESS,
+    )
+    ScanTailorStageState.objects.filter(scan_page=page, stage="page_split").update(
+        status=ScanTailorStageState.StageStatus.QUEUED,
+    )
+    assert _thumbnail_size(client, str(page.id))[1] == raw_etag
+
+
 def test_passthrough_byte_copies_normalised_png(tmp_path: Path) -> None:
     """#54: an unchanged normalised PNG is copied, not decoded and re-encoded."""
     source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(200, 200))
