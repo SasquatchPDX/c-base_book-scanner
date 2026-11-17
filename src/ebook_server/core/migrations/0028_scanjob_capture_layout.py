@@ -10,7 +10,7 @@ class Migration(migrations.Migration):
     """
 
     dependencies = [
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0027_seed_genres"),
     ]
 
     operations = [
