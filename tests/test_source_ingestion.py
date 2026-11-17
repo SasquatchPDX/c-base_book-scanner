@@ -143,6 +143,7 @@ def test_preview_lists_skipped_unsupported_files_with_extension_counts(
         {
             "importable": 1,
             "skipped": 4,
+            "skipped_audio": 0,
             "skipped_by_extension": {".chm": 2, "(no extension)": 1, ".lit": 1},
         }
     ]

@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0016_storage_identifier_lengths_and_source_stat"),
+        ("core", "0022_source_location_group_sibling_formats"),
     ]
 
     operations = [
