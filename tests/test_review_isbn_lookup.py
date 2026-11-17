@@ -603,3 +603,31 @@ def test_generic_accept_does_not_pair_isbns_of_different_editions() -> None:
 
     assert book.pk != unrelated.pk
     assert _identifier_values(book) == {DUNE_13}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_bound_isbn_acceptance_keeps_sparse_edition_metadata_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "isbn-sparse-edition")
+    record = _edition("Dune", key="/works/OL1W")
+    record.pop("publishers")
+    record["language"] = ["eng", "fre"]
+    record["publisher"] = ["Ace", "Gollancz"]
+    record["isbn"] = [DUNE_13]
+    record["editions"] = {"docs": [{"key": "/books/OL1M", "isbn": [DUNE_13]}]}
+    _use_providers(monkeypatch, _RecordingProvider("stub", [record]))
+
+    response = client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_13})
+
+    assert response.status_code == 202
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.RESOLVED
+    candidate = import_job.metadata_candidates.get(superseded_at__isnull=True)
+    assert not candidate.language
+    assert not candidate.publisher
+    book = task.resolved_book
+    assert book is not None
+    assert book.language == ""
+    assert book.publisher == ""
+    assert _identifier_values(book) == {DUNE_13, DUNE_10}
