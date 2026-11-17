@@ -533,6 +533,22 @@ def test_dangerous_filename_is_rejected() -> None:
     assert not ImportJob.objects.exists()
 
 
+def test_book_title_with_slash_is_sanitized_before_naming_the_archive() -> None:
+    """Regression: an Open Library omnibus/anthology title containing "/" (e.g.
+    "Franchise / The Fun They Had / The Last Question / ...") made
+    normalize_filename(f"{book.title}{suffix}") raise "dangerous filename" and fail the
+    whole import, even though the title itself is perfectly legitimate - it's just not
+    safe to use raw in a path component."""
+    title = "Franchise / The Fun They Had / The Last Question"
+    sanitized = intake._sanitize_title_for_filename(title)
+
+    assert "/" not in sanitized
+    assert (
+        intake.normalize_filename(f"{sanitized}.txt")
+        == "Franchise_-_The_Fun_They_Had_-_The_Last_Question.txt"
+    )
+
+
 @pytest.mark.django_db(transaction=True)
 def test_unsupported_format_is_rejected() -> None:
     profile = get_or_create_profile("docx-user")
