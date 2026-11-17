@@ -59,7 +59,9 @@ class BookAdmin(admin.ModelAdmin[Book]):
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories")
     inlines = (BookGenreInline,)
-    readonly_fields = ("genres_curated_at", "genres_curated_by")
+    # archive_folder is assigned by core.archive_layout; editing it by hand would orphan
+    # the book's folder.
+    readonly_fields = ("genres_curated_at", "genres_curated_by", "archive_folder")
 
     def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
         super().save_formset(request, form, formset, change)

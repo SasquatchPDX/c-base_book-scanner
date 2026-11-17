@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0032_processingjob_combine_parts"),
+        ("core", "0033_book_archive_folder"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

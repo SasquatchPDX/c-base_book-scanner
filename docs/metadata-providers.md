@@ -149,6 +149,24 @@ authors without placeholder creators such as "Microsoft Office User", "Owner" or
 authors. They are applied only when a reviewer accepts a candidate that has no
 authors of its own, and only to a Book without authors; provider authors always win.
 
+**Ties.** Candidates at or above the threshold whose score is within
+`BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN` (default 0.02) of the best one count as
+tied (the comparison allows for floating-point rounding, so 1.0 and 0.98 tie). With
+several providers an ISBN match often scores 1.0 at each of them, and their order is
+only the configured provider order. Intake therefore applies the author checks *and*
+the edition checks (see "Edition checks before auto-accept"; `decide_auto_accept`
+receives the normalised file ISBNs, language and publisher as `file_evidence`) to every
+tied candidate and accepts the first one that passes, recording `auto_accept_tie_break`
+(the chosen candidate and the ones passed over, with their block reasons and edition
+conflicts) in the evidence. A tied fallback whose ISBN contradicts the file's, or that
+has no ISBN when the file has one, is never eligible. Passed-over candidates stay in
+`REVIEW` state. If tied candidates that pass describe different books, the import
+goes to review as `ambiguous_tie`. Two records are the same book when they share an
+ISBN; otherwise they need the same title and agreeing authors, and neither disjoint
+ISBN lists (two editions) nor disjoint languages. If none passes, the first-ranked
+candidate's block reason applies. A candidate outside the margin is never accepted in
+place of a blocked better one.
+
 For Open Library ISBN lookups, an edition record without `authors` falls back to the
 authors of its first work record (`works[0]`), where Open Library usually keeps them.
 
@@ -281,6 +299,61 @@ that started, and the review is still open (not resolved/cancelled, the import
 not complete, the scan not linked to a book). Otherwise the run is stored as a
 `discarded` ("Not applied") search whose candidates are history only: a review
 resolved while the providers ran keeps its decision and is never reopened.
+
+### ISBN lookup from the review page (#59)
+
+"Look up by ISBN" (`POST /reviews/<id>/isbn-lookup/`, field `isbn`) queues the
+same background search with ISBN-only signals: no title, author or folder
+fallback, and the task's saved title/author terms are left alone. The value must
+be one ISBN-10/13 with a valid check digit (spaces, hyphens and an `ISBN:` prefix
+are ignored). The run is recorded with `query.mode = "isbn"`.
+
+Reviewers usually judge an import from the actual ebook (the review page's
+reader, #6), so the ISBN they type is normally read from the book itself (its
+copyright page or metadata). It is still only a query (external verification is
+mandatory): a candidate counts as *ISBN verified* only when the provider's own
+record lists that ISBN, in either its 10- or 13-digit form (compared with
+isbnlib). Only identifiers in the stored raw provider payload count; keys
+starting with `_` are ours, so the `_queried_isbn` that Open Library's ISBN
+lookup echoes into the payload is never evidence, and normalization no longer
+copies it onto a record that does not list it.
+
+- **Exactly one distinct book verified** (one provider, or several describing
+  the same book): the review is resolved automatically by accepting the best such
+  record through the normal accept path (`ReviewTask.Decision.ACCEPT_CANDIDATE`,
+  `selected_candidate`, the record's metadata used fully), with
+  `decision_payload.resolution_source = "reviewer_isbn"` and `decision_payload.isbn`;
+  the reviewer who entered the ISBN is the task's reviewer. This happens only
+  while the lookup is still the source's current search and the review is still
+  unresolved (the same fencing as above), and only when the record names its
+  authors; an authorless record is offered for one-click "Accept ISBN match"
+  with an authors field instead (#42).
+- **Several distinct books carry the ISBN:** nothing is accepted; the page shows
+  the verified records for the reviewer to choose. Records are different books
+  when their normalized titles differ, when both name authors and none of them is
+  the same person (the scorer's name matching: "Dickinson, Emily" and "Emily
+  Dickinson" agree, Emily Dickinson and William Blake do not, so two "Selected
+  Poems" are two books), or when both list ISBNs and share none. A record only
+  joins a book when it agrees with every record already in it.
+- **Nothing verified, or providers failed:** the task stays open with its
+  earlier candidates.
+
+**Identifiers on the accepted Book.** A provider record can list several ISBNs
+(other editions, print and ebook), and the candidate's normalized `isbn13` is the
+record's first one. When a candidate is accepted, the ISBN that identifies the
+edition is:
+
+- the reviewer-entered ISBN, for an automatic acceptance; or
+- the searched ISBN that the record itself lists (an ISBN lookup's query, or the
+  file's ISBN used by an intake search), for any other accept of such a candidate.
+
+That ISBN, in both forms (ISBN-13 and, for `978` ISBNs, ISBN-10), is used to
+find an existing Book and is always written to the Book, including an existing
+Book matched by title and author. The record's other ISBNs are neither looked up
+nor written, so a multi-ISBN record never merges into a Book that only holds one
+of its other ISBNs. Without a searched ISBN, the candidate's ISBN-13 is used,
+together with its ISBN-10 only when that is the same ISBN (a record's first
+ISBN-10 and first ISBN-13 can belong to different editions).
 
 ## Subject / genre evidence
 

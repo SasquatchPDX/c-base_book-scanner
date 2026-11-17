@@ -16,6 +16,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models.fields.json import KT
+from django.db.models.functions import Lower
 from django.utils.timezone import now
 
 
@@ -416,6 +417,12 @@ class Book(models.Model):
     edition = models.CharField(max_length=128, blank=True)
     language = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)
+    # Folder, relative to a writable archive location, that holds this book's files
+    # under a book-scoped archive layout (for example ``Author/Title``). It is assigned
+    # when the first file is archived and kept when the title or author is corrected
+    # later, so existing files stay where they are; only an explicit reorganize moves
+    # them (see core.archive_layout). Empty until assigned and under the ``job`` layout.
+    archive_folder = models.CharField(max_length=512, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -472,6 +479,15 @@ class Book(models.Model):
 
     class Meta:
         ordering = ["title"]
+        constraints = [
+            # Case-insensitive, because SMB shares and Windows/macOS clients treat
+            # "Asimov/Foundation" and "asimov/foundation" as the same folder.
+            models.UniqueConstraint(
+                Lower("archive_folder"),
+                condition=~models.Q(archive_folder=""),
+                name="uniq_book_archive_folder_ci",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.title

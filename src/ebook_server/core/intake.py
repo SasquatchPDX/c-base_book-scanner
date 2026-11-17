@@ -44,7 +44,14 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import genres, identification, metadata_search, referenced_files, source_layout
+from . import (
+    archive_layout,
+    genres,
+    identification,
+    metadata_search,
+    referenced_files,
+    source_layout,
+)
 from .models import (
     Author,
     Book,
@@ -59,7 +66,13 @@ from .models import (
     StorageLocation,
     clean_publication_year,
 )
-from .storage_registry import archive_root, backend_for_location, default_archive_location
+from .storage_registry import (
+    DEFAULT_ARCHIVE_LOCATION_IDENTIFIER,
+    archive_root,
+    backend_for_location,
+    default_archive_location,
+    filesystem_backend_for_location,
+)
 from .text_header import parse_text_header
 
 logger = structlog.get_logger(__name__)
@@ -233,6 +246,7 @@ MAX_UPLOAD_BYTES = getattr(
 )
 AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
+AUTO_ACCEPT_TIE_MARGIN = identification.TIE_MARGIN
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 # Bound for short OPF evidence values (publisher, date) copied into job evidence.
@@ -290,9 +304,16 @@ BLOCK_AUTHOR_CONFLICT = "author_conflict"
 # guess is the weakest evidence the system has, so such candidates always need a person.
 BLOCK_LLM_DERIVED = "llm_derived"
 LLM_HINT_SOURCE_KEY = "_hint_source"
+# Several different books tie for the best score and pass the author checks.
+BLOCK_AMBIGUOUS_TIE = "ambiguous_tie"
 # The provider record stands for another edition than the file: its ISBNs, language or
 # publisher contradict the file's (see identification.edition_conflicts).
 BLOCK_EDITION_CONFLICT = "edition_conflict"
+# ImportJob.evidence key recording that a tied candidate was accepted instead of the
+# first-ranked one, and why the others were passed over.
+AUTO_ACCEPT_TIE_BREAK_KEY = "auto_accept_tie_break"
+# Floating-point slack for the tie margin: 1.0 - 0.98 is 0.020000000000000018.
+_TIE_MARGIN_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
@@ -302,6 +323,54 @@ class AutoAcceptDecision:
     candidate: identification.IdentificationCandidate | None
     blocked_reason: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # Set when the accepted candidate is not the first-ranked one (see decide_auto_accept).
+    tie_break: dict[str, Any] | None = None
+    # Candidates at or above the threshold that were not accepted.
+    passed_over: tuple[identification.IdentificationCandidate, ...] = ()
+
+
+def _author_block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> str | None:
+    """Why the author checks forbid accepting ``candidate`` automatically, if they do."""
+    provider_authors = [
+        name for name in candidate.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return BLOCK_NO_PROVIDER_AUTHORS
+    if identification.authors_conflict(provider_authors, file_authors):
+        return BLOCK_AUTHOR_CONFLICT
+    return None
+
+
+def _block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+    file_evidence: identification.IdentificationInput,
+) -> tuple[str | None, list[str]]:
+    """Why ``candidate`` may not be accepted automatically (author, then edition checks).
+
+    Returns the block reason (``None`` when it may be accepted) and the edition
+    conflicts found, which are reported even when an author check blocks first.
+    """
+    conflicts = identification.edition_conflicts(candidate, file_evidence)
+    if isinstance(candidate.raw, dict) and candidate.raw.get(LLM_HINT_SOURCE_KEY) == "llm":
+        return BLOCK_LLM_DERIVED, conflicts
+    reason = _author_block_reason(candidate, file_authors)
+    if reason is None and conflicts:
+        reason = BLOCK_EDITION_CONFLICT
+    return reason, conflicts
+
+
+def _candidate_summary(candidate: identification.IdentificationCandidate) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "title": candidate.title,
+        "authors": list(candidate.authors),
+        "score": float(candidate.score),
+    }
 
 
 def _block_details(
@@ -326,50 +395,81 @@ def decide_auto_accept(
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
-    candidate must not have been found through LLM-proposed search terms, it must name
-    at least one real author, and its authors must not contradict the file's own
-    embedded authors. A high score from an ISBN match alone is no evidence about
-    authorship. Finally the candidate must be the file's edition:
-    ``file_evidence`` (the normalised file signals) is checked with
-    ``identification.edition_conflicts``, so a file ISBN must be one of the edition's
-    own ISBNs and the file's language/publisher must not contradict the edition's.
+    Candidates found through LLM-proposed search terms require human review.
+    candidate must also name at least one real author, and its authors must not
+    contradict the file's own embedded authors. A high score from an ISBN match alone
+    is no evidence about authorship. The candidate must also be the file's edition:
+    ``file_evidence`` (the normalised file signals: ISBNs, language, publisher) is
+    checked with ``identification.edition_conflicts``, so a file ISBN must be one of the
+    edition's own ISBNs and the file's language/publisher must not contradict it.
+
+    Candidates within ``AUTO_ACCEPT_TIE_MARGIN`` of the best score count as tied (two
+    providers often both score an ISBN match at 1.0, and their order is only the
+    configured provider order). Among tied candidates the first one that passes the
+    author *and* edition checks is accepted, so a tied fallback whose identifiers
+    contradict the file's is never eligible. If tied candidates that pass describe
+    different books, the choice is ambiguous and goes to review.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
         return AutoAcceptDecision(candidate=None)
-    if isinstance(top.raw, dict) and top.raw.get(LLM_HINT_SOURCE_KEY) == "llm":
-        return AutoAcceptDecision(
-            candidate=None,
-            blocked_reason=BLOCK_LLM_DERIVED,
-            details=_block_details(top, file_authors),
-        )
-    provider_authors = [
-        name for name in top.authors if not identification.is_placeholder_author(name)
+    above_threshold = [c for c in candidates if c.score >= AUTO_ACCEPT_SCORE]
+    tied = [
+        candidate
+        for candidate in above_threshold
+        if top.score - candidate.score <= AUTO_ACCEPT_TIE_MARGIN + _TIE_MARGIN_EPSILON
     ]
-    if not provider_authors:
+    checks = [_block_reason(candidate, file_authors, file_evidence) for candidate in tied]
+    eligible = [
+        candidate for candidate, (reason, _) in zip(tied, checks, strict=True) if reason is None
+    ]
+    if not eligible:
+        top_reason, top_conflicts = checks[0]
+        details = _block_details(top, file_authors)
+        if top_conflicts:
+            details = {
+                **details,
+                "edition_conflicts": top_conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            }
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
-            details=_block_details(top, file_authors),
+            blocked_reason=top_reason,
+            details=details,
+            passed_over=tuple(above_threshold),
         )
-    if identification.authors_conflict(provider_authors, file_authors):
+    chosen = eligible[0]
+    if any(
+        not identification.candidates_describe_same_book(chosen, other) for other in eligible[1:]
+    ):
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_AUTHOR_CONFLICT,
-            details=_block_details(top, file_authors),
-        )
-    conflicts = identification.edition_conflicts(top, file_evidence)
-    if conflicts:
-        return AutoAcceptDecision(
-            candidate=None,
-            blocked_reason=BLOCK_EDITION_CONFLICT,
+            blocked_reason=BLOCK_AMBIGUOUS_TIE,
             details={
                 **_block_details(top, file_authors),
-                "edition_conflicts": conflicts,
-                **identification.edition_evidence(top, file_evidence),
+                "tied_candidates": [_candidate_summary(candidate) for candidate in eligible],
             },
+            passed_over=tuple(above_threshold),
         )
-    return AutoAcceptDecision(candidate=top)
+    tie_break: dict[str, Any] | None = None
+    if chosen is not top:
+        passed_over_summaries: list[dict[str, Any]] = []
+        for candidate, (reason, conflicts) in zip(tied, checks, strict=True):
+            if reason is None:
+                continue
+            summary = {**_candidate_summary(candidate), "reason": reason}
+            if conflicts:
+                summary["edition_conflicts"] = conflicts
+            passed_over_summaries.append(summary)
+        tie_break = {"chosen": _candidate_summary(chosen), "passed_over": passed_over_summaries}
+    eligible_ids = {id(candidate) for candidate in eligible}
+    return AutoAcceptDecision(
+        candidate=chosen,
+        tie_break=tie_break,
+        passed_over=tuple(
+            candidate for candidate in above_threshold if id(candidate) not in eligible_ids
+        ),
+    )
 
 
 def normalize_filename(raw: str) -> str:
@@ -554,6 +654,14 @@ def _default_storage() -> LocalFilesystemStorage:
 
 def _default_storage_location() -> StorageLocation:
     return default_archive_location()
+
+
+def _storage_for_location(job: ImportJob) -> LocalFilesystemStorage:
+    """Filesystem backend for the location ``job`` archived its file to."""
+    location = job.storage_location
+    if location is None or location.identifier == DEFAULT_ARCHIVE_LOCATION_IDENTIFIER:
+        return _default_storage()
+    return filesystem_backend_for_location(location)
 
 
 def _source_transfer_mode(job: ImportJob) -> str:
@@ -1831,11 +1939,11 @@ def _save_metadata_candidates(
     *,
     signals: identification.IdentificationInput,
     outcomes: list[identification.ProviderOutcome],
-    allow_match: bool = True,
+    passed_over: Iterable[identification.IdentificationCandidate] = (),
 ) -> None:
     """Record the intake search run and its candidates.
 
-    ``allow_match=False`` keeps all candidates in REVIEW state.
+    ``passed_over`` candidates stay in REVIEW state whatever their score.
     """
     with transaction.atomic():
         # Ensure idempotence if jobs are retried: drop the earlier intake attempt.
@@ -1851,7 +1959,8 @@ def _save_metadata_candidates(
         metadata_search.save_candidates(
             search=search,
             candidates=candidates,
-            match_threshold=AUTO_ACCEPT_SCORE if allow_match else None,
+            match_threshold=AUTO_ACCEPT_SCORE,
+            passed_over=passed_over,
         )
 
 
@@ -1963,13 +2072,15 @@ def _create_or_reuse_file_variant(
             return duplicate_variant
 
     storage = _default_storage()
+    if not storage_identifier and job.storage_identifier:
+        # Archived while awaiting review: move it from _unsorted/ into the book folder.
+        archive_layout.place_pending_original(job, book, _storage_for_location(job))
     storage_id = storage_identifier or job.storage_identifier
     if not storage_id:
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
-            storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
             storage.ensure_free_space(Path(job.source_path).stat().st_size)
-            storage.store(job.source_path, storage_id)
+            storage_id = archive_layout.publish_original(storage, job, book, job.source_path)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
         else:
@@ -2689,6 +2800,9 @@ def _link_variant_and_complete(
 ) -> FileVariant:
     job.storage_identifier = destination
     job.storage_location = storage_location
+    # Move it out of _unsorted/ into the book's archive folder (no-op under "job").
+    archive_layout.place_pending_original(job, book, _storage_for_location(job))
+    destination = job.storage_identifier
     job.normalized_filename = normalize_filename(
         f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
     )
@@ -2809,7 +2923,9 @@ def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[st
         verified = referenced_files.index_source_file(job)
         return job.storage_identifier, verified
     storage_location = _default_storage_location()
-    destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    # The Book is not known yet: under a book-scoped layout the file goes to _unsorted/
+    # and is moved into the book folder once identification or review settles the Book.
+    destination = archive_layout.pending_destination(storage, job)
     # Checked per file, so a bulk import already queued still stops before the disk fills.
     storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):
@@ -3274,12 +3390,22 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 provider_id=decision.details.get("provider_id"),
                 score=decision.details.get("score"),
             )
+        elif decision.tie_break is not None:
+            metadata[AUTO_ACCEPT_TIE_BREAK_KEY] = decision.tie_break
+            job.evidence = metadata
+            _save_job(job, update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_tie_break",
+                import_job_id=str(job.id),
+                provider_id=decision.tie_break["chosen"]["provider_id"],
+                passed_over_count=len(decision.tie_break["passed_over"]),
+            )
         _save_metadata_candidates(
             job,
             candidates,
             signals=signals,
             outcomes=provider_outcomes,
-            allow_match=decision.blocked_reason is None,
+            passed_over=decision.passed_over,
         )
 
         sidecar_conflicts = sidecar_conflicts_in(metadata)

@@ -470,6 +470,21 @@ def test_decide_auto_accept_blocks_llm_derived_candidates_even_at_score_one() ->
         intake.decide_auto_accept([normal], ["Jane Example"], file_evidence=file_evidence).candidate
         is normal
     )
+    # Tie-breaking must apply the AI veto to fallback candidates too: skipping a
+    # provider record with no authors must not silently accept the AI-derived one.
+    missing_authors = _candidate(score=1.0, authors=[])
+    fallback = intake.decide_auto_accept(
+        [missing_authors, llm_candidate], ["Jane Example"], file_evidence=file_evidence
+    )
+    assert fallback.candidate is None
+    assert llm_candidate in fallback.passed_over
+    # An independently verified record stays eligible even when an AI-only record
+    # ranks ahead of it; the AI record is still passed over and never accepted.
+    independent = intake.decide_auto_accept(
+        [llm_candidate, normal], ["Jane Example"], file_evidence=file_evidence
+    )
+    assert independent.candidate is normal
+    assert llm_candidate in independent.passed_over
 
 
 def _import_job(*, source: SourceLocation | None = None) -> ImportJob:

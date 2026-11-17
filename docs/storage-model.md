@@ -31,10 +31,28 @@ The `StorageBackend` protocol defines:
   - computes SHA-256 as required for duplicate detection.
   - stores artifacts as file blobs for immediate development and test usage.
 
-## Example destination format
+## Destination format
 
-- `<namespace>/<original_filename>`
-- where namespace is domain-defined (`ingests`, `derived/scan/<scan_job_id>`, etc.).
+- `generate_destination(namespace, name)` returns `<namespace>/<name>`; namespaces
+  containing `..`, empty components or an absolute prefix are rejected. The id is
+  not reserved, so it is only used for namespaces one job or artifact owns
+  (`books/<import job id>/`, `_unsorted/<import job id>/`, a per-revision scan
+  folder); writing to it again replaces that owner's own file.
+- `publish_unique(source, namespace, name, mode=copy|move|link)` is the only way to
+  write into a namespace several writers share (a book's archive folder). Allocation
+  and publication are one exclusive step: the source is copied to a hidden temp file
+  beside the destination and given its final name with a hard link, which fails if
+  the name exists (where hard links are unsupported the name is claimed with
+  `O_CREAT|O_EXCL` and filled). On a collision, including one with a competing
+  writer that won a moment earlier, a short random token is appended and the write
+  retried. The readable name is sanitized by `storage.safe_filename` (NFC, no
+  control/separator/Windows-invalid characters, no device names, byte-capped). An
+  existing artifact is never overwritten.
+- Archive namespaces come from `core.archive_layout` (`BOOK_SCANNER_ARCHIVE_LAYOUT`):
+  a per-book folder such as `<Author>/<Title>/` assigned once and stored on
+  `Book.archive_folder`, `_unsorted/<import job id>/` while an import awaits
+  review, or the original `books/<import job id>/` under the `job` layout. See
+  `docs/operations.md` ("Archive layout").
 
 ## Backend resolution and streaming
 

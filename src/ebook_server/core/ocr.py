@@ -31,7 +31,7 @@ from ebook_server.jobs import (
 )
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import conversion, intake
+from . import archive_layout, conversion, intake
 from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
@@ -953,12 +953,15 @@ def _materialize_ocr_artifact(
             ]
 
         storage = _default_ocr_storage()
-        storage_identifier = storage.generate_destination(
-            f"books/{source_book.id}/ocr/{uuid4()}",
-            safe_name,
-        )
         temp.flush()
-        storage.store(temp.name, storage_identifier)
+        storage_identifier = archive_layout.publish_derived(
+            storage,
+            source_book,
+            temp.name,
+            f"{archive_layout.book_file_stem(source_book)} (OCR).{request_format}",
+            legacy_namespace=f"books/{source_book.id}/ocr/{uuid4()}",
+            legacy_filename=safe_name,
+        )
 
     variant = FileVariant.objects.create(
         book=source_book,

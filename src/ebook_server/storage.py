@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
+import unicodedata
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 MAX_STORAGE_FILENAME_LENGTH = 150
+# How ``publish_unique`` brings the source to its new name.
+PublishMode = Literal["copy", "move", "link"]
+# Collision retries before ``publish_unique`` gives up; each retry draws a fresh token.
+MAX_PUBLISH_ATTEMPTS = 16
 
 
 class StorageUnavailableError(OSError):
@@ -26,6 +33,73 @@ def cap_filename(name: str, limit: int = MAX_STORAGE_FILENAME_LENGTH) -> str:
         suffix = ""
     stem = name[: len(name) - len(suffix)] if suffix else name
     return stem[: max(limit - len(suffix), 1)] + suffix
+
+
+# Characters that are path separators or invalid on Windows/SMB shares.
+_UNSAFE_COMPONENT_CHARS = re.compile(r'[\\/:*?"<>|]')
+_WHITESPACE_RUN = re.compile(r"\s+")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)},
+)
+# Most filesystems cap one path component at 255 bytes; stay well below it so a
+# collision suffix and an extension still fit, and full paths stay short for SMB clients.
+MAX_COMPONENT_BYTES = 120
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """Cut ``value`` to at most ``max_bytes`` UTF-8 bytes without splitting a character."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def safe_path_component(
+    value: str,
+    *,
+    fallback: str = "Unknown",
+    max_bytes: int = MAX_COMPONENT_BYTES,
+) -> str:
+    """Turn untrusted text (a title, an author) into one safe path component.
+
+    Unicode is NFC-normalized (so the same title never yields two folders), control and
+    format characters are dropped, separators and Windows-invalid characters become
+    ``_``, leading/trailing dots and spaces are stripped (no ``..``, no hidden files, no
+    names Windows silently truncates), Windows device names get a ``_`` prefix, and the
+    result is capped in UTF-8 bytes. An empty result becomes ``fallback``.
+    """
+    text = _WHITESPACE_RUN.sub(" ", unicodedata.normalize("NFC", value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in {"Cc", "Cf", "Cs"})
+    text = _UNSAFE_COMPONENT_CHARS.sub("_", text)
+    text = _WHITESPACE_RUN.sub(" ", text).strip(" .")
+    text = _truncate_utf8(text, max_bytes).strip(" .")
+    if not text:
+        text = fallback
+    if text.split(".", 1)[0].strip().upper() in _WINDOWS_RESERVED_NAMES:
+        text = f"_{text}"
+    return text
+
+
+def safe_filename(name: str, *, max_bytes: int = MAX_COMPONENT_BYTES) -> str:
+    """Sanitize a filename like ``safe_path_component`` while keeping a short extension."""
+    base = Path(unicodedata.normalize("NFC", name or "")).name
+    suffix = Path(base).suffix
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+        suffix = ""
+    stem = base[: len(base) - len(suffix)] if suffix else base
+    safe_stem = safe_path_component(stem, fallback="file", max_bytes=max_bytes - len(suffix))
+    return f"{safe_stem}{suffix.lower()}"
+
+
+def _validate_namespace(namespace: str) -> str:
+    """Reject namespaces that are absolute or climb out of the storage root."""
+    normalized = namespace.replace("\\", "/").strip("/")
+    parts = normalized.split("/") if normalized else []
+    if namespace.startswith(("/", "\\")) or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("unsafe storage namespace")
+    return normalized
 
 
 def _storage_policy() -> tuple[Path | None, bool, str]:
@@ -174,7 +248,32 @@ class StorageBackend(Protocol):
         """Yield file bytes in chunks."""
 
     def generate_destination(self, namespace: str, original_name: str) -> str:
-        """Generate a stable storage id for a new artifact."""
+        """Generate a storage id for a new artifact in a namespace the caller owns.
+
+        The id is *not* reserved: ``store``/``copy``/``move`` to it replace whatever is
+        there. Use it only for namespaces that belong to one job or artifact (a per-import
+        or per-revision folder). For a namespace shared by several writers (a book's
+        archive folder) use ``publish_unique``, which allocates and writes atomically.
+        """
+
+    def publish_unique(
+        self,
+        source: str,
+        namespace: str,
+        original_name: str,
+        *,
+        mode: PublishMode = "copy",
+    ) -> str:
+        """Write ``source`` under ``namespace`` with a name no other artifact has.
+
+        Allocation and publication are one exclusive operation: the readable
+        (sanitized) name is tried first and, when anything already exists there (even
+        one created a moment ago by a competing writer), a short random token is
+        appended and the write is retried. An existing artifact is never overwritten.
+        ``mode`` is ``copy`` (the source stays), ``move`` (the source is removed once
+        the new name exists) or ``link`` (a hard link inside this storage; raises
+        ``OSError`` where hard links are unsupported). Returns the storage id written.
+        """
 
     def stat(self, location: str) -> tuple[int, int]:
         """Return ``(size_bytes, mtime_ns)`` for an artifact."""
@@ -201,13 +300,20 @@ class LocalFilesystemStorage:
 
     def resolve_location(self, location: str) -> Path:
         """Resolve and validate a logical storage id to an absolute filesystem path."""
-        base = Path(self.root).resolve()
-        target = (base / location).resolve()
-        base_string = str(base)
-        target_string = str(target)
-        if not (target_string == base_string or target_string.startswith(base_string + os.sep)):
-            raise ValueError("path escapes storage root")
-        return target
+        # Windows' non-strict realpath can return a garbled path while another writer is
+        # creating one of the folders on it; that is transient, so resolve once more
+        # before refusing. Both attempts must pass the containment check.
+        for attempt in range(2):
+            base = Path(self.root).resolve()
+            target = (base / location).resolve()
+            base_string = str(base)
+            target_string = str(target)
+            if target_string == base_string or target_string.startswith(base_string + os.sep):
+                return target
+            if attempt == 0 and os.name == "nt":
+                continue
+            break
+        raise ValueError("path escapes storage root")
 
     def _prepare_destination(self, destination: str) -> Path:
         dest = self.resolve_location(destination)
@@ -242,6 +348,17 @@ class LocalFilesystemStorage:
         shutil.move(src, dest, copy_function=shutil.copyfile)
         return destination
 
+    def link(self, source: str, destination: str) -> str:
+        """Give an existing artifact a second name (hard link) inside this storage.
+
+        Instant and byte-identical; raises ``OSError`` where hard links are unsupported
+        or the destination exists. Never overwrites.
+        """
+        src = self.resolve_location(source)
+        dest = self._prepare_destination(destination)
+        os.link(src, dest)
+        return destination
+
     def delete(self, location: str) -> None:
         target = self.resolve_location(location)
         target.unlink(missing_ok=True)
@@ -266,12 +383,103 @@ class LocalFilesystemStorage:
             yield from iter(lambda: handle.read(chunk_size), b"")
 
     def generate_destination(self, namespace: str, original_name: str) -> str:
+        prefix = f"{_validate_namespace(namespace)}/".lstrip("/")
         safe_name = cap_filename(Path(original_name).name.replace(" ", "_"))
-        return f"{namespace}/{safe_name}"
+        return f"{prefix}{safe_name}"
+
+    @staticmethod
+    def _unique_candidates(prefix: str, original_name: str) -> Iterator[str]:
+        safe_name = safe_filename(original_name)
+        yield f"{prefix}{safe_name}"
+        suffix = Path(safe_name).suffix
+        stem = safe_name[: len(safe_name) - len(suffix)] if suffix else safe_name
+        for _attempt in range(MAX_PUBLISH_ATTEMPTS - 1):
+            yield f"{prefix}{stem}-{uuid.uuid4().hex[:8]}{suffix}"
+
+    def publish_unique(
+        self,
+        source: str,
+        namespace: str,
+        original_name: str,
+        *,
+        mode: PublishMode = "copy",
+    ) -> str:
+        if mode not in ("copy", "move", "link"):
+            raise ValueError(f"unknown publish mode {mode!r}")
+        prefix = f"{_validate_namespace(namespace)}/".lstrip("/")
+        src = self.resolve_location(source) if mode == "link" else self._resolve_source(source)
+        if not src.is_file():
+            raise FileNotFoundError(f"publish source {source!r} is not a file")
+        staged: Path | None = None
+        try:
+            for candidate in self._unique_candidates(prefix, original_name):
+                dest = self._prepare_destination(candidate)
+                if mode == "copy" and staged is None:
+                    # Copy once into a hidden temp file beside the destination, then give
+                    # it its final name with an exclusive hard link: readers never see a
+                    # partial file and a name taken meanwhile is never replaced.
+                    staged = dest.with_name(f".{uuid.uuid4().hex}.partial")
+                    self._copy_file(src, staged)
+                try:
+                    self._create_exclusive(
+                        staged if staged is not None else src,
+                        dest,
+                        copy_fallback=mode != "link",
+                    )
+                except FileExistsError:
+                    continue
+                if mode == "move":
+                    src.unlink(missing_ok=True)
+                return candidate
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+        raise FileExistsError(
+            f"no free name for {original_name!r} under {namespace!r} after "
+            f"{MAX_PUBLISH_ATTEMPTS} attempts",
+        )
+
+    def _create_exclusive(self, src: Path, dest: Path, *, copy_fallback: bool) -> None:
+        """Give ``src``'s bytes the name ``dest``; ``FileExistsError`` if it is taken.
+
+        A hard link is atomic and fails if ``dest`` exists. Where hard links are not
+        available (another volume, some SMB mounts) and ``copy_fallback`` is set, the
+        name is claimed with ``O_CREAT | O_EXCL`` and filled; a failed fill removes the
+        claimed name again. Without ``copy_fallback`` the link error propagates.
+        """
+        try:
+            os.link(src, dest)
+            return
+        except FileExistsError:
+            raise
+        except OSError:
+            if not copy_fallback:
+                raise
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(dest, flags, 0o644)
+        try:
+            with os.fdopen(descriptor, "wb") as handle, src.open("rb") as reader:
+                shutil.copyfileobj(reader, handle, 1 << 20)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
 
     def stat(self, location: str) -> tuple[int, int]:
         result = self.resolve_location(location).stat()
         return result.st_size, result.st_mtime_ns
+
+    def prune_empty_parents(self, location: str) -> None:
+        """Remove now-empty folders above ``location``, up to (not including) the root."""
+        base = Path(self.root).resolve()
+        current = self.resolve_location(location).parent
+        while current != base and base in current.parents:
+            try:
+                current.rmdir()  # only succeeds when the folder is empty
+            except OSError:
+                return
+            current = current.parent
 
     def free_bytes(self) -> int | None:
         return free_bytes(Path(self.root))
@@ -316,11 +524,27 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
     def move(self, source: str, destination: str) -> str:
         raise self._refuse("move")
 
+    def link(self, source: str, destination: str) -> str:
+        raise self._refuse("link")
+
     def delete(self, location: str) -> None:
         raise self._refuse("delete")
 
     def generate_destination(self, namespace: str, original_name: str) -> str:
         raise self._refuse("new artifact")
 
+    def publish_unique(
+        self,
+        source: str,
+        namespace: str,
+        original_name: str,
+        *,
+        mode: PublishMode = "copy",
+    ) -> str:
+        raise self._refuse("publish")
+
     def ensure_free_space(self, required_bytes: int) -> None:
         raise self._refuse("write")
+
+    def prune_empty_parents(self, location: str) -> None:
+        raise self._refuse("folder removal")

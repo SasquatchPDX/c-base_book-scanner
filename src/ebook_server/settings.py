@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     storage_sentinel_file: str = ""
     # Free space to keep on the archive volume (bytes); 0 disables the check.
     storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
+    # On-disk layout for files written to the archive (see core.archive_layout):
+    # "author_title" (Author/Title/, Calibre-style), "calibre" (Author/Title (id)/),
+    # "job" (the original books/<import job id>/), or a custom template.
+    archive_layout: str = "author_title"
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     ingest_batch_size: int = 100
@@ -106,6 +110,8 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    # Candidates within this score margin of the best one count as tied for auto-accept.
+    identification_tie_margin: float = 0.02
     identification_work_isbn_bonus: float = 0.3
     review_queue_page_size: int = 50
     review_batch_min_score: float = 0.75
@@ -291,6 +297,9 @@ APP_DATA_DIR = Path(settings.storage_root)
 # not separately configurable: keeping it under the storage root keeps it behind the
 # mount/sentinel check, and renaming it would orphan every archived artifact.
 BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
+# Folder layout inside the archive. Changing it applies to newly archived files only;
+# existing files stay where they are until an admin runs a reorganize.
+BOOK_SCANNER_ARCHIVE_LAYOUT = settings.archive_layout
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
@@ -345,6 +354,7 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
 BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
 BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
