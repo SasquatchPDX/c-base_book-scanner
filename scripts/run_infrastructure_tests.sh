@@ -6,11 +6,11 @@ book_scanner_compose_file="${book_scanner_project_root}/compose.integration.yml"
 book_scanner_storage_root="$(mktemp -d -t book-scanner-integration.XXXXXX)"
 book_scanner_pandoc_root="$(mktemp -d -t book-scanner-pandoc.XXXXXX)"
 book_scanner_calibre_root="$(mktemp -d -t book-scanner-calibre.XXXXXX)"
-book_scanner_postgres_port="${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-55432}"
-book_scanner_redis_port="${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-56379}"
-book_scanner_ldap_port="${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-55389}"
-book_scanner_proxy_port="${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-58080}"
-book_scanner_ocr_port="${BOOK_SCANNER_INTEGRATION_OCR_PORT:-58082}"
+book_scanner_postgres_port="${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-15432}"
+book_scanner_redis_port="${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-16379}"
+book_scanner_ldap_port="${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-13389}"
+book_scanner_proxy_port="${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-18080}"
+book_scanner_ocr_port="${BOOK_SCANNER_INTEGRATION_OCR_PORT:-18082}"
 book_scanner_uvicorn_pid=""
 book_scanner_uvicorn_log="$(mktemp -t book-scanner-uvicorn.XXXXXX.log)"
 book_scanner_ocr_pid=""
@@ -154,7 +154,7 @@ book_scanner_worker_pid=$!
 
 uv run uvicorn ebook_server.asgi:application \
   --host 0.0.0.0 \
-  --port 58081 \
+  --port 18081 \
   --log-level warning \
   --no-access-log \
   --no-server-header \
@@ -166,7 +166,7 @@ for _ in {1..100}; do
   if ! kill -0 "${book_scanner_uvicorn_pid}" 2>/dev/null; then
     break
   fi
-  if curl --fail --silent --show-error "http://127.0.0.1:58081/healthz/" >/dev/null; then
+  if curl --fail --silent --show-error "http://127.0.0.1:18081/healthz/" >/dev/null; then
     book_scanner_uvicorn_ready="true"
     break
   fi

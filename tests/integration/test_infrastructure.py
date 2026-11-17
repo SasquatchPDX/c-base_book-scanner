@@ -131,7 +131,7 @@ def _running_uvicorn() -> Iterator[subprocess.Popen[str]]:
             "--host",
             "0.0.0.0",
             "--port",
-            "58081",
+            "18081",
             "--log-level",
             "warning",
             "--no-access-log",
@@ -144,7 +144,7 @@ def _running_uvicorn() -> Iterator[subprocess.Popen[str]]:
         text=True,
     )
     try:
-        _wait_for_http("http://127.0.0.1:58081/healthz/", process)
+        _wait_for_http("http://127.0.0.1:18081/healthz/", process)
         yield process
     finally:
         if process.poll() is None:

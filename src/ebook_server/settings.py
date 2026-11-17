@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     storage_root: str = str(BASE_DIR / "data" / "storage")
     storage_require_existing_root: bool = True
     storage_sentinel_file: str = ""
+    # Free space to keep on the archive volume (bytes); 0 disables the check.
+    storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
+    sidecar_covers_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -78,6 +81,10 @@ class Settings(BaseSettings):
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
     ]
     metadata_user_agent: str = DEFAULT_METADATA_USER_AGENT
+    # Hardcover.app (opt-in): also add
+    # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
+    hardcover_api_token: SecretStr = SecretStr("")
+    hardcover_timeout_seconds: float = 10.0
     # Client-side request pacing per metadata provider_id (requests/second; <= 0 disables).
     # Providers not listed use metadata_rate_limit_default. Shared across worker processes
     # through Redis when redis_url is set, otherwise enforced per process.
@@ -239,6 +246,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 APP_DATA_DIR = Path(settings.storage_root)
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
+BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
 if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
     # Development convenience only: production must never create the root itself,
     # because that is how an unmounted share silently fills the local disk.
@@ -248,6 +256,7 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
     settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT
@@ -277,6 +286,8 @@ BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
 BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
+BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
+BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
