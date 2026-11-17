@@ -254,6 +254,9 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# The provider record stands for another edition than the file: its ISBNs, language or
+# publisher contradict the file's (see identification.edition_conflicts).
+BLOCK_EDITION_CONFLICT = "edition_conflict"
 
 
 @dataclass(frozen=True)
@@ -281,13 +284,18 @@ def _block_details(
 def decide_auto_accept(
     candidates: list[identification.IdentificationCandidate],
     file_authors: list[str],
+    *,
+    file_evidence: identification.IdentificationInput,
 ) -> AutoAcceptDecision:
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
-    is no evidence about authorship.
+    is no evidence about authorship. Finally the candidate must be the file's edition:
+    ``file_evidence`` (the normalised file signals) is checked with
+    ``identification.edition_conflicts``, so a file ISBN must be one of the edition's
+    own ISBNs and the file's language/publisher must not contradict the edition's.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
@@ -306,6 +314,17 @@ def decide_auto_accept(
             candidate=None,
             blocked_reason=BLOCK_AUTHOR_CONFLICT,
             details=_block_details(top, file_authors),
+        )
+    conflicts = identification.edition_conflicts(top, file_evidence)
+    if conflicts:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_EDITION_CONFLICT,
+            details={
+                **_block_details(top, file_authors),
+                "edition_conflicts": conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            },
         )
     return AutoAcceptDecision(candidate=top)
 
@@ -2512,7 +2531,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_job(job, update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
         file_authors = identification.evidence_author_names(metadata)
-        decision = decide_auto_accept(candidates, file_authors)
+        decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
             metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details

@@ -60,17 +60,43 @@ lists cover every edition. Search requests ask for these lists and for
 `editions` (the one edition that best matches the query) through `fields=`.
 A Book record stands for the edition it was matched to:
 
-- the candidate's ISBN, publisher and language come from that best-matching
-  edition, or from the edition record of an `/isbn/` lookup. Only those ISBNs
-  become `Identifier` rows; the work-level lists are comparison evidence only;
-- a file ISBN equal to the candidate's edition ISBN adds 0.95 (near-proof);
+- the candidate's ISBN, publisher and language come from that edition, or from
+  the edition record of an `/isbn/` lookup. When Open Library lists several
+  editions, the one carrying the file's ISBN wins, then one agreeing with the
+  file's language and publisher. Only edition ISBNs become `Identifier` rows; the
+  work-level lists are comparison evidence only;
+- a file ISBN equal to one of the edition's ISBNs (ISBN-10 or -13) adds 0.95;
 - a file ISBN found only among the work's other editions proves the work, not
   the edition, and adds `BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS` (default
-  0.3). That alone cannot auto-accept; matching title and author are still needed.
+  0.3);
+- the language and publisher bonuses compare with the edition; the work's lists
+  count only for a candidate that names no edition.
 
 The ISBN path (`/isbn/<isbn>.json`) runs first whenever the file has an ISBN, so
 in practice the work-level comparison matters only when that lookup misses.
 `publication_year` is still the work's `first_publish_year` (see "Publication year").
+
+### Edition checks before auto-accept
+
+Scores identify the work; accepting a candidate stores its *edition* on the Book.
+`identification.edition_conflicts(candidate, signals)` therefore compares the
+normalised file evidence with the candidate's edition, and `intake.decide_auto_accept`
+(which receives the file signals as `file_evidence`) routes any conflict to review as
+`edition_conflict`, with the reasons and both sides' values in
+`auto_accept_block_details`:
+
+- `edition_isbn_mismatch`: the file has an ISBN that is not one of the edition's
+  (for example an ISBN of another edition of the same work);
+- `edition_isbn_unconfirmed`: the file has an ISBN and the candidate none;
+- `edition_language_mismatch`: the file's language is not the edition's (or the
+  work's, when no edition language is known);
+- `edition_publisher_mismatch`: the file's publisher does not match the edition's,
+  and no file ISBN confirms the edition (with a confirmed ISBN a differing publisher
+  is usually an imprint or distributor and is tolerated).
+
+Missing values on either side are no conflict. Among equally scored candidates, one
+without edition conflicts ranks first, so an `/isbn/` edition record wins a tie with
+a search hit for another edition.
 
 ### Author checks before auto-accept
 

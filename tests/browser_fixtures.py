@@ -33,9 +33,11 @@ class BrowserMetadataProvider:
         resolved_title = (title or "Browser Acceptance Book").strip()
         resolved_author = (author or "Acceptance Researcher").strip()
         provider_ref = hashlib.sha256(resolved_title.encode()).hexdigest()[:16]
-        # No language on purpose: echoing title and author scores 0.85, just below
-        # auto-accept, so the digital scenario exercises manual review. Since language
-        # codes are normalised (#36), "eng" would now match the EPUB's "en" (+0.05).
+        # One concrete English edition from "Hackerspace Acceptance Press". The digital
+        # scenario's EPUB (scripts/run_infrastructure_tests.sh) is English but names
+        # another publisher, so title, author and language score above auto-accept and
+        # the edition check (#37) routes the import to manual review as an
+        # ``edition_conflict``.
         return [
             {
                 "key": f"/works/{provider_ref}",
@@ -43,6 +45,16 @@ class BrowserMetadataProvider:
                 "author_name": [resolved_author],
                 "publisher": ["Hackerspace Acceptance Press"],
                 "first_publish_year": 2026,
+                "language": ["eng"],
+                "editions": {
+                    "docs": [
+                        {
+                            "key": f"/books/{provider_ref}M",
+                            "language": ["eng"],
+                            "publisher": ["Hackerspace Acceptance Press"],
+                        }
+                    ]
+                },
             },
         ]
 

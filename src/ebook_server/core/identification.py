@@ -170,11 +170,17 @@ class IdentificationCandidate:
     score: float
     raw: dict[str, Any]
     subjects: list[str] = field(default_factory=list)
-    # Comparison-only evidence, never stored as Book data or Identifiers: every
-    # normalised language, publisher and ISBN-13 the provider knows for the *work*.
-    languages: tuple[str, ...] = ()
-    publishers: tuple[str, ...] = ()
+    # Comparison-only evidence, never stored as Book data or Identifiers.
+    # Edition level: the one concrete edition this candidate stands for (ISBN-13 forms,
+    # normalised language codes, publisher names as given).
+    edition_isbns: tuple[str, ...] = ()
+    edition_languages: tuple[str, ...] = ()
+    edition_publishers: tuple[str, ...] = ()
+    # Work level: every edition the provider knows for the *work*. A value found only
+    # here proves the work, never the edition (#37).
     work_isbns: tuple[str, ...] = ()
+    work_languages: tuple[str, ...] = ()
+    work_publishers: tuple[str, ...] = ()
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -627,7 +633,11 @@ def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandi
     for provider, payload in raw_candidates:
         normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
 
-    normalized.sort(key=lambda item: item.score, reverse=True)
+    # Among equal scores, a candidate whose edition agrees with the file ranks first
+    # (e.g. the ISBN-lookup edition before a search hit for another edition, #37).
+    normalized.sort(
+        key=lambda item: (item.score, not edition_conflicts(item, signals)), reverse=True
+    )
     return normalized
 
 
@@ -718,9 +728,13 @@ def _normalize_candidate(
 
     # A search hit describes a *work*; ``editions`` adds the one edition that best
     # matches the query. Edition values describe something concrete, work lists do not.
-    edition = _best_edition(payload)
+    edition = _best_edition(payload, signals)
     if isbn10 is None and isbn13 is None and edition:
-        for value in _as_str_list(edition.get("isbn")):
+        # Prefer the file's own ISBN when this edition lists several.
+        edition_values = _as_str_list(edition.get("isbn"))
+        signal_isbns = _isbn13_set(signals.isbns)
+        edition_values.sort(key=lambda value: not (_isbn13_set([value]) & signal_isbns))
+        for value in edition_values:
             normalized = _normalize_identifier(value)
             if normalized is None:
                 continue
@@ -728,12 +742,13 @@ def _normalize_candidate(
                 isbn13 = normalized
             elif len(normalized) == 10 and isbn10 is None:
                 isbn10 = normalized
-    work_isbns = (
-        _isbn13_set(payload.get("isbn"))
+    edition_isbns = (
+        _isbn13_set([value for value in (isbn10, isbn13) if value])
         | _isbn13_set(payload.get("isbn_10"))
         | _isbn13_set(payload.get("isbn_13"))
         | _isbn13_set(edition.get("isbn"))
     )
+    work_isbns = edition_isbns | _isbn13_set(payload.get("isbn"))
 
     # Edition publisher: search ``editions`` doc, edition record ``publishers``, or a
     # plain-string ``publisher`` (single-edition shape, e.g. Hardcover). The search
@@ -749,10 +764,13 @@ def _normalize_candidate(
         (normalize_text(value) for value in edition_publishers if normalize_text(value)),
         None,
     )
-    publishers = tuple(
+    edition_publisher_names = tuple(
+        dict.fromkeys(value.strip() for value in edition_publishers if value.strip())
+    )
+    work_publisher_names = tuple(
         dict.fromkeys(
             value.strip()
-            for value in edition_publishers + _as_str_list(raw_publisher)
+            for value in list(edition_publisher_names) + _as_str_list(raw_publisher)
             if value.strip()
         )
     )
@@ -774,7 +792,8 @@ def _normalize_candidate(
         _as_language_values(payload.get("languages"))
     )
     work_language_values = _as_language_values(payload.get("language"))
-    languages = tuple(normalize_languages(edition_language_values + work_language_values))
+    edition_languages = tuple(normalize_languages(edition_language_values))
+    work_languages = tuple(normalize_languages(edition_language_values + work_language_values))
     language = _pick_language(edition_language_values, work_language_values, signals.language)
 
     candidate = IdentificationCandidate(
@@ -800,9 +819,12 @@ def _normalize_candidate(
             + _as_str_list(payload.get("subjects"))
             + _as_str_list(payload.get("categories"))
         ),
-        languages=languages,
-        publishers=publishers,
+        edition_isbns=tuple(sorted(edition_isbns)),
+        edition_languages=edition_languages,
+        edition_publishers=edition_publisher_names,
         work_isbns=tuple(sorted(work_isbns)),
+        work_languages=work_languages,
+        work_publishers=work_publisher_names,
     )
     return _apply_scoring(signals, candidate)
 
@@ -824,13 +846,30 @@ def _first_str(value: Any) -> str | None:
     return None
 
 
-def _best_edition(payload: dict[str, Any]) -> dict[str, Any]:
-    """The best-matching edition Open Library returns for ``fields=editions``."""
+def _best_edition(payload: dict[str, Any], signals: IdentificationInput) -> dict[str, Any]:
+    """The edition of an Open Library search hit (``fields=editions``) to stand for.
+
+    Open Library returns the edition that best matches the query first. When it lists
+    several, one carrying the file's ISBN wins, then one agreeing with the file's
+    language and publisher; otherwise the first.
+    """
     editions = payload.get("editions")
-    docs = editions.get("docs") if isinstance(editions, dict) else None
-    if isinstance(docs, list) and docs and isinstance(docs[0], dict):
-        return docs[0]
-    return {}
+    raw_docs = editions.get("docs") if isinstance(editions, dict) else None
+    docs = [doc for doc in raw_docs if isinstance(doc, dict)] if isinstance(raw_docs, list) else []
+    if not docs:
+        return {}
+    signal_isbns = _isbn13_set(signals.isbns)
+
+    def rank(doc: dict[str, Any]) -> tuple[bool, bool, bool]:
+        languages = normalize_languages(_as_language_values(doc.get("language")))
+        publishers = tuple(_as_str_list(doc.get("publisher")))
+        return (
+            bool(signal_isbns & _isbn13_set(doc.get("isbn"))),
+            bool(signals.language) and signals.language in languages,
+            _publisher_match(signals.publisher, publishers),
+        )
+
+    return max(docs, key=rank)  # max keeps the first of equal ranks
 
 
 def _isbn13_set(values: Any) -> set[str]:
@@ -1068,6 +1107,90 @@ def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) 
     )
 
 
+# Reasons an otherwise acceptable candidate stands for another edition than the file.
+# The file's ISBN is not among the edition's ISBNs (it may be another edition's).
+EDITION_ISBN_MISMATCH = "edition_isbn_mismatch"
+# The file has an ISBN, the candidate none: nothing confirms it is the file's edition.
+EDITION_ISBN_UNCONFIRMED = "edition_isbn_unconfirmed"
+# The file's language is not the edition's (or, with no edition, not the work's).
+EDITION_LANGUAGE_MISMATCH = "edition_language_mismatch"
+# The file's publisher is not the edition's, and no ISBN confirms the edition.
+EDITION_PUBLISHER_MISMATCH = "edition_publisher_mismatch"
+
+
+def _edition_isbn13s(candidate: IdentificationCandidate) -> set[str]:
+    """ISBN-13 forms of the candidate's own edition (never the work's other editions)."""
+    return set(candidate.edition_isbns) | _isbn13_set(
+        [value for value in (candidate.isbn10, candidate.isbn13) if value]
+    )
+
+
+def _candidate_languages(candidate: IdentificationCandidate) -> set[str]:
+    """Normalised languages of the edition, else of the work, else the stored one."""
+    if candidate.edition_languages:
+        return set(candidate.edition_languages)
+    if candidate.work_languages:
+        return set(candidate.work_languages)
+    language = normalize_language(candidate.language)
+    return {language} if language else set()
+
+
+def _edition_publishers(candidate: IdentificationCandidate) -> tuple[str, ...]:
+    if candidate.edition_publishers:
+        return candidate.edition_publishers
+    return (candidate.publisher,) if candidate.publisher else ()
+
+
+def edition_conflicts(
+    candidate: IdentificationCandidate,
+    signals: IdentificationInput,
+) -> list[str]:
+    """Why ``candidate`` cannot be accepted automatically as the file's edition.
+
+    Empty when nothing in the file's normalised evidence contradicts it. A file ISBN
+    must be one of the candidate edition's own ISBNs: an ISBN of another edition of the
+    work proves the work, not the edition, and a candidate without ISBNs confirms
+    nothing. A file language must be the edition's (or the work's, when the candidate
+    names no edition). A file publisher must match the edition's unless the ISBN
+    already confirms the edition (ebook metadata often names a distributor or imprint).
+    Values missing on either side are no contradiction.
+    """
+    reasons: list[str] = []
+    file_isbns = _isbn13_set(signals.isbns)
+    edition_isbns = _edition_isbn13s(candidate)
+    isbn_confirmed = bool(file_isbns & edition_isbns)
+    if file_isbns and not isbn_confirmed:
+        reasons.append(EDITION_ISBN_MISMATCH if edition_isbns else EDITION_ISBN_UNCONFIRMED)
+    languages = _candidate_languages(candidate)
+    if signals.language and languages and signals.language not in languages:
+        reasons.append(EDITION_LANGUAGE_MISMATCH)
+    publishers = _edition_publishers(candidate)
+    if (
+        not isbn_confirmed
+        and publishers
+        and signals.publisher
+        and _publisher_tokens(signals.publisher)
+        and not _publisher_match(signals.publisher, publishers)
+    ):
+        reasons.append(EDITION_PUBLISHER_MISMATCH)
+    return reasons
+
+
+def edition_evidence(
+    candidate: IdentificationCandidate,
+    signals: IdentificationInput,
+) -> dict[str, Any]:
+    """The file and edition values ``edition_conflicts`` compared, for the reviewer."""
+    return {
+        "file_isbns": sorted(_isbn13_set(signals.isbns)),
+        "edition_isbns": sorted(_edition_isbn13s(candidate)),
+        "file_language": signals.language,
+        "edition_languages": sorted(_candidate_languages(candidate)),
+        "file_publisher": signals.publisher,
+        "edition_publishers": list(_edition_publishers(candidate)),
+    }
+
+
 def _apply_scoring(
     signals: IdentificationInput,
     candidate: IdentificationCandidate,
@@ -1076,8 +1199,7 @@ def _apply_scoring(
 
     if signals.isbns:
         signal_isbns = _isbn13_set(signals.isbns)
-        edition_isbns = _isbn13_set([v for v in (candidate.isbn10, candidate.isbn13) if v])
-        if signal_isbns & edition_isbns:
+        if signal_isbns & _edition_isbn13s(candidate):
             score += 0.95
         elif signal_isbns & set(candidate.work_isbns):
             score += WORK_ISBN_MATCH_SCORE
@@ -1091,17 +1213,14 @@ def _apply_scoring(
     author_score = _author_match_score(signals.author_hints, candidate.authors)
     score += 0.3 * author_score
 
-    if signals.language:
-        candidate_languages = set(candidate.languages)
-        candidate_language = normalize_language(candidate.language)
-        if candidate_language:
-            candidate_languages.add(candidate_language)
-        if signals.language in candidate_languages:
-            score += 0.05
+    # Language and publisher are compared with the selected edition; the work's lists
+    # count only for a candidate that names no edition (#37).
+    if signals.language and signals.language in _candidate_languages(candidate):
+        score += 0.05
 
     if _publisher_match(
         signals.publisher,
-        candidate.publishers or ((candidate.publisher,) if candidate.publisher else ()),
+        _edition_publishers(candidate) or candidate.work_publishers,
     ):
         score += 0.05
 
