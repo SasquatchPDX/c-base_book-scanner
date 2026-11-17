@@ -120,7 +120,8 @@ def test_finish_with_raw_pages_returns_json_hint() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_bytes_are_copied_outside_the_job_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, job = _create_scan_job("capture-lock")
+    # spread: no automatic Page Split run, so only the upload itself stores bytes
+    client, job = _create_scan_job("capture-lock", capture_layout="spread")
     observed: list[bool] = []
     original = LocalFilesystemStorage.store
 
@@ -137,7 +138,8 @@ def test_bytes_are_copied_outside_the_job_lock(monkeypatch: pytest.MonkeyPatch) 
 def test_duplicate_and_failed_uploads_leave_no_orphan_files(
     _app_data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client, job = _create_scan_job("capture-orphans")
+    # spread: no automatic Page Split artifacts, only uploaded page files are counted
+    client, job = _create_scan_job("capture-orphans", capture_layout="spread")
     payload = _png_for(b"dup")
     assert _post_page(client, job, payload).status_code == 201
     assert len(_stored_files(_app_data_dir)) == 1

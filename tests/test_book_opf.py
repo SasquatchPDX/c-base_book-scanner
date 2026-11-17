@@ -22,6 +22,7 @@ from ebook_server.core.intake import parse_opf_metadata
 from ebook_server.core.models import (
     Author,
     Book,
+    BookGenre,
     BookOpfState,
     Category,
     CoverImage,
@@ -112,7 +113,7 @@ def test_opf_content_is_calibre_shaped_escaped_and_defusedxml_parsable() -> None
     )
     Identifier.objects.create(book=book, kind="doi", value="10.1000/hobbit")
     Identifier.objects.create(book=book, kind="other", value="mystery")
-    book.genres.add(Genre.objects.create(name="Fantasy"))
+    book.genres.add(Genre.objects.get_or_create(name="Fantasy")[0])
     book.categories.add(
         Category.objects.create(name="fantasy"), Category.objects.create(name="Kids")
     )
@@ -244,7 +245,7 @@ def test_written_into_book_folder_with_cover_and_regenerated_on_metadata_change(
     assert parse_opf_metadata(opf.read_bytes())["authors"] == ["Jane Austen", "Fiona Stafford"]
     Identifier.objects.create(book=book, kind="isbn13", value="9780141439587")
     assert parse_opf_metadata(opf.read_bytes())["identifier"] == "9780141439587"
-    book.genres.add(Genre.objects.create(name="Romance"))
+    book.genres.add(Genre.objects.get_or_create(name="Romance")[0])
     assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance"]
     Author.objects.filter(full_name="Fiona Stafford").get().save()  # rename path: no crash
     assert _is_current(book)
@@ -273,7 +274,7 @@ def test_irrelevant_saves_do_not_queue_and_bursts_coalesce(
         book.save()
         book.authors.add(Author.objects.create(full_name="Second Author"))
         Identifier.objects.create(book=book, kind="isbn13", value="9780141439587")
-        book.genres.add(Genre.objects.create(name="Classics"))
+        book.genres.add(Genre.objects.get_or_create(name="Classics")[0])
         assert queued == []  # nothing before commit
     assert queued == [book.pk]  # one job for the whole burst
 
@@ -440,7 +441,7 @@ def test_deleting_attached_author_genre_or_category_regenerates(
     book = _book("Emma", "Jane Austen", folder="Jane Austen/Emma")
     removed = Author.objects.create(full_name="Removed Author")
     book.authors.add(removed)
-    genre = Genre.objects.create(name="Romance")
+    genre = Genre.objects.get_or_create(name="Romance")[0]
     category = Category.objects.create(name="Classics")
     book.genres.add(genre)
     book.categories.add(category)
@@ -488,19 +489,18 @@ def test_deleting_attached_author_genre_or_category_regenerates(
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.skipif(
-    Book.genres.through._meta.auto_created is not False,
-    reason="needs the explicit BookGenre through model (master); auto-created ones send none",
-)
 def test_link_rows_written_directly_regenerate(tmp_path: Path) -> None:
     """Genre links written through the through model (``BookGenre``) bypass m2m_changed."""
     book = _book("Emma", "Jane Austen", folder="Jane Austen/Emma")
     _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
     opf = _opf_path(tmp_path, "Jane Austen/Emma")
-    link_model = Book.genres.through
-    link = link_model.objects.create(book=book, genre=Genre.objects.create(name="Romance"))
+    link_model = BookGenre
+    assert Book.genres.through is BookGenre
+    link = link_model.objects.create(
+        book=book, genre=Genre.objects.get_or_create(name="Romance")[0]
+    )
     assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance"]
-    link_model.objects.get_or_create(book=book, genre=Genre.objects.create(name="Satire"))
+    link_model.objects.get_or_create(book=book, genre=Genre.objects.get_or_create(name="Satire")[0])
     assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance", "Satire"]
     link.delete()
     assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Satire"]

@@ -398,15 +398,15 @@ def create_cleaned_variant_for_scan_job(
     # Into the book's archive folder on the attached storage (<Author>/<Title>/ by
     # default), next to its other formats, cover and scan.log.
     assert job.book is not None
-    destination = archive_layout.derived_destination(
-        file_storage,
-        job.book,
-        f"{archive_layout.book_file_stem(job.book)}.pdf",
-        legacy_namespace=f"books/{job.book_id}/cleaned",
-        legacy_filename=f"{uuid.uuid4()}-{safe_name}.pdf",
-    )
     try:
-        file_storage.store(str(pdf_path), destination)
+        destination = archive_layout.publish_derived(
+            file_storage,
+            job.book,
+            str(pdf_path),
+            f"{archive_layout.book_file_stem(job.book)}.pdf",
+            legacy_namespace=f"books/{job.book_id}/cleaned",
+            legacy_filename=f"{uuid.uuid4()}-{safe_name}.pdf",
+        )
     finally:
         pdf_path.unlink(missing_ok=True)
 

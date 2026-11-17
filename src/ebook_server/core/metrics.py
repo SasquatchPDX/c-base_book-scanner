@@ -156,7 +156,10 @@ class PersistentStateCollector:
         yield duration_metric
 
         confidence_values: dict[str, list[float]] = defaultdict(list)
-        candidates = MetadataCandidate.objects.values_list("provider_id", "score")
+        # Superseded candidates are search history; count only the current ones.
+        candidates = MetadataCandidate.objects.filter(superseded_at__isnull=True).values_list(
+            "provider_id", "score"
+        )
         for provider_id, score in candidates.iterator():
             confidence_values[provider_id].append(float(score))
         confidence_metric = GaugeMetricFamily(
