@@ -35,7 +35,7 @@ class TrigramExtensionOnPostgreSQL(TrigramExtension):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0031_multipart_works"),
+        ("core", "0032_processingjob_combine_parts"),
     ]
 
     operations = [

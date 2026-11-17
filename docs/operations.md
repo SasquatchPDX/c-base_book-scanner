@@ -986,7 +986,7 @@ errors, storage capacity, and health endpoint status. Do not log document conten
 ## Library search index
 
 `/library/books/` searches a denormalised row per book (`BookSearchDocument`
-plus `BookSearchFacet`, migration 0032, #28). On PostgreSQL it uses full-text
+plus `BookSearchFacet`, migration 0033, #28). On PostgreSQL it uses full-text
 search (`simple` configuration over accent- and case-folded text), `pg_trgm`
 substring and typo matching, and GIN/B-tree indexes. On SQLite, and on
 PostgreSQL until every book has a row, it falls back to plain `icontains`
@@ -994,7 +994,7 @@ filters (slow on large libraries, but correct).
 
 Rows are rewritten automatically after every committed change to a book, its
 authors, genres, categories, identifiers, covers or file variants. Build them
-once after upgrading to migration 0032, and rebuild nightly as a safety net:
+once after upgrading to migration 0033, and rebuild nightly as a safety net:
 
 ```bash
 uv run python manage.py rebuild_search_index     # all books; safe to repeat
