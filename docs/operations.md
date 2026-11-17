@@ -35,6 +35,96 @@ database polling load when sizing large concurrent scanning sessions.
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.
 
+### Static files
+
+Uvicorn does not serve `/static/` (CSS, JavaScript, and the compiled ScanTailor
+editor), and the application deliberately has no static-file middleware: the
+reverse proxy serves them. Without this step pages load unstyled and the
+ScanTailor workspace does not start. Collect them after every install or upgrade:
+
+```bash
+uv run python manage.py collectstatic --noinput --clear
+```
+
+This writes to `STATIC_ROOT`, which is `src/staticfiles/` inside the checkout.
+Make that directory available to Nginx at the path used by the example's
+`location /static/ { alias /srv/book-scanner/static/; }`, either by copying it:
+
+```bash
+sudo rsync -a --delete src/staticfiles/ /srv/book-scanner/static/
+```
+
+or by pointing the `alias` directly at `<checkout>/src/staticfiles/` (keep the
+trailing slash, and make sure the Nginx user can read and traverse the path).
+The Docker acceptance suite does the equivalent by mounting `src/staticfiles`
+into its Nginx container.
+
+`manage.py runserver` serves static files itself only when
+`BOOK_SCANNER_DEBUG=true` (or with `--insecure`), which is why a development
+checkout can appear to work without `collectstatic`. Do not use `runserver` or
+`DEBUG` for a shared install.
+
+### Deployment walkthrough (single host)
+
+Example `systemd` units for the web process and RQ workers are in
+`deploy/systemd/` (see its README for the assumed user and paths). A minimal
+single-host install, run as the unprivileged service user from the checkout:
+
+```bash
+uv sync --frozen
+cp .env.example .env && chmod 600 .env   # then edit: see below
+uv run python manage.py migrate
+uv run python manage.py collectstatic --noinput --clear
+uv run python manage.py set_local_password <admin-username> --admin   # local mode
+uv run python manage.py check            # add --deploy in production mode
+```
+
+Then publish `src/staticfiles/` to Nginx as described above, install the
+Nginx site (changing its upstream to `127.0.0.1:8000` when Uvicorn runs on the
+same host), and enable `book-scanner-web` and at least one
+`book-scanner-worker@N`. Repeat `migrate`, `collectstatic`, and the static copy
+on every upgrade before restarting the units.
+
+### Plain-HTTP test or lab install
+
+`BOOK_SCANNER_ENVIRONMENT=production` requires HTTPS: startup fails unless the
+HTTPS redirect, secure cookies, and HSTS are enabled, and with those enabled a
+browser on plain HTTP is redirected to `https://` and secure cookies are never
+sent, so sign-in cannot work. For a short-lived, non-TLS lab install keep
+`BOOK_SCANNER_ENVIRONMENT=development` and leave the `BOOK_SCANNER_SECURE_*`,
+`..._COOKIE_SECURE`, and HSTS settings at their `false`/`0` defaults. Development
+mode skips the production safety validation, so set everything it would have
+enforced yourself: a random `BOOK_SCANNER_SECRET_KEY`, PostgreSQL and Redis URLs
+(without Redis, jobs run synchronously inside web requests), and
+`BOOK_SCANNER_LDAP_MODE=local` or `ldap` — never `stub`, which accepts any
+password. Leave `BOOK_SCANNER_DEBUG` unset. Do not expose such an install
+beyond a trusted network; credentials and session cookies travel unencrypted.
+
+`BOOK_SCANNER_ALLOWED_HOSTS` must contain every name or address browsers use to
+reach the site, as seen in the `Host` header the proxy forwards. When members
+connect by bare IP, list that IP; otherwise Django answers `400 Bad Request`.
+List hosts without a port or scheme:
+
+```text
+BOOK_SCANNER_ALLOWED_HOSTS=["192.0.2.10","library.lab.example"]
+```
+
+`BOOK_SCANNER_CSRF_TRUSTED_ORIGINS` is not needed when the browser's origin
+matches the forwarded `Host` exactly, for example `http://192.0.2.10` through
+Nginx on port 80. It **is** needed when Nginx listens on a non-default port: the
+example config forwards `Host $host`, which drops the port, so a form posted from
+`http://192.0.2.10:8080` fails Django's origin check with `403 CSRF verification
+failed` unless that origin is trusted (the acceptance suite sets this for the
+same reason). Entries include scheme and port:
+
+```text
+BOOK_SCANNER_CSRF_TRUSTED_ORIGINS=["http://192.0.2.10:8080"]
+```
+
+Behind HTTPS, set `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` instead (see
+below); without it every request looks like HTTP and `https://` origins are
+rejected.
+
 ## Production configuration
 
 Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
@@ -112,13 +202,17 @@ OCR variant. The OCR service is a contract fixture; it validates orchestration
 and provenance, not recognition quality. Containers are removed when the suite
 exits.
 
-The suite reserves host ports 55432, 56379, 55389, 58080, 58081, and 58082 by default.
+The suite reserves host ports 15432, 16379, 13389, 18080, 18081, and 18082 by default.
+These sit below Linux's ephemeral port range (32768-60999) on purpose: ports
+inside it can be taken at random as source ports by the job's own outbound
+connections (image pulls, package downloads), which made binds fail
+intermittently with "address already in use". Keep any overrides below 32768.
 Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with
 `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
 `BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
 `BOOK_SCANNER_INTEGRATION_LDAP_PORT`, and
 `BOOK_SCANNER_INTEGRATION_PROXY_PORT`; override the OCR fixture port with
-`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 58081 is the suite-internal host
+`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 18081 is the suite-internal host
 Uvicorn listener. Credentials in
 `compose.integration.yml` belong only to the public seeded test fixtures and must
 never be copied into a deployment.
@@ -140,6 +234,25 @@ uv run python manage.py verify_storage --verify-hashes
 The hash mode is I/O intensive and should run off peak. The command is read-only
 and exits non-zero for missing artifacts, hash mismatches, path errors, or an
 unsupported backend.
+
+### Free-space reserve
+
+Intake keeps `BOOK_SCANNER_STORAGE_MIN_FREE_BYTES` (default 2 GiB; `0`
+disables the check) free on the archive volume. This matters most when the volume
+also holds PostgreSQL or Redis data.
+
+- `ingest_sources` estimates the space it has left: free space, minus the
+  reserve, minus the source size of imports that are queued but not yet
+  archived. It queues files only while they fit. When it stops early it prints
+  `insufficient free space on the archive volume` to stderr; files not queued
+  are picked up by a later run once there is room.
+- Every import, including web uploads and jobs that were already queued, checks
+  free space again right before archiving. If the copy would breach the reserve,
+  the job fails with a clear `insufficient free space ...` error. The MOVE source
+  is left untouched. After freeing space, run `ingest_sources --retry-failed`.
+- `/healthz/dependencies/` reports `free_bytes` and `min_free_bytes` for the
+  storage root. The storage status becomes `degraded` (not `down`, so readiness
+  stays green) while free space is below the reserve.
 
 Confirmed book deletion is available only to local application admins. It checks
 artifact hashes, moves files into backend-local quarantine, commits the database
@@ -194,11 +307,146 @@ skipped by the worker and stay DISCOVERED. After "Resume imports", the next
 no longer have an RQ job (for example after `rq empty` or a Redis flush); a job
 that ends up queued twice is still processed only once. If the RQ queue cannot
 be inspected, re-queueing is skipped with a warning.
+### Audio files and audiobooks
+
+This system does not manage audiobooks. The decision and its research are in
+`docs/design/32-audiobooks.md` (proposed in PR #107, issue #32): members who want
+audiobooks use a separate audiobook server such as Audiobookshelf, reading its own
+folder on the NAS. Intake therefore recognises audio files only to skip them:
+
+- Extensions `.m4b .m4a .mp3 .aac .ogg .oga .opus .flac .wav .wma .mka .ape .aif
+  .aiff .aa .aax .aaxc` are classified as `audio (not managed here)`. They never
+  create an `ImportJob`, are never hashed, copied, moved or converted, and a MOVE
+  source leaves them where they are.
+- Audible files (`.aa`, `.aax`, `.aaxc`) are DRM-protected and are reported as
+  such. This project never removes or works around DRM.
+- `ingest_sources --preview` lists them as `skipped [audio (not managed here)] =>
+  <path>` plus a `skipped_audio=N` total; with `--json` they are rows with
+  `"skipped": "audio"`, `"drm_protected"` and `"reason"` (no `source_type`).
+  A discovery run appends `skipped_audio=N` to its summary line.
+- Discovery logs one `intake_audio_files_skipped` event (source id and count, no
+  filenames) per source and pass. There is no Prometheus series for it, because
+  `/metrics/` only reports persisted state and skipped audio is not persisted.
+- Web uploads of audio files (by extension, or an `audio/*` content type on a
+  non-book extension) are refused with HTTP 415 before anything is staged. The
+  message links to `BOOK_SCANNER_AUDIOBOOK_SERVICE_URL` when it is set to an
+  `http(s)://` URL, and otherwise asks the member to contact the library admins.
+  The upload page shows the same pointer.
+
+### Folder layouts (author/title from paths)
+
+Collections are organised differently, so each source can declare how its folders
+are structured (Django admin → Source locations → "Folder layout"). This is opt-in:
+a source without layouts behaves as before, because not every folder names an
+author. `path_layouts` is an ordered JSON list of templates matched against the
+path relative to the source root, without the file extension. The first template
+that yields a non-ignored value supplies hints:
+
+| Collection | `path_layouts` |
+|---|---|
+| `Austen, Jane/Pride and Prejudice.txt` | `["{author}/**"]` |
+| Calibre library `Jane Austen/Emma (12)/Emma - Jane Austen.epub` | `["{author}/{title} ({*})/{*}"]` |
+| flat `Emma - Jane Austen.epub` | `["{title} - {author}"]` |
+| author folders plus loose `Author - Title` files | `["{author}/**", "{author} - {title}"]` |
+| `Genre/Weber, David & Evans, Linda/Hell's Gate.epub` | `["{*}/{authors}/{title}"]` |
+
+Placeholders: `{author}`, `{authors}` (split on `&`, `;`, `and`, `und`), `{title}`,
+`{series}`, and `{*}` (ignored text within one folder or file name). `**` spans
+whole folders: zero or more in the middle, one or more at the end. Limits keep
+matching cheap: at most 20 templates per source, 3 placeholders per folder/file
+name, 4 `{*}` and 2 `**` per template. Names longer than 255 characters and paths
+longer than 1024 characters never match.
+
+`author_name_order` controls reordering: `auto` turns `Last, First` into
+`First Last`, `last_first` also reorders names without a comma, and `first_last`
+never reorders. `layout_ignore_values` lists captured values that are not names,
+for example `["Unknown", "Misc", "Cliff Notes"]`.
+
+Path hints are stored in the import evidence under `path_layout` and are only
+*evidence* for the external lookup. A layout author replaces the ambiguous filename
+"A - B" split guesses but never outranks embedded authors. A layout title goes after
+the embedded title. Hints never bypass provider verification or review thresholds.
+Check a layout before importing; each preview row shows
+`[layout: author=[...] title=... series=...]` or `[layout: no match]`:
+
+```bash
+uv run python manage.py ingest_sources --source-id 1 --preview
+```
+
+### Formats of one book (`group_sibling_formats`)
+
+Opt-in per source (admin → Source locations → "Formats of one book"), because
+generic same-name pairs such as `notes.txt` / `notes.pdf` are not one book in every
+collection. When enabled, files in the same folder with the same file name and
+different extensions (`Dune.epub`, `Dune.mobi`, `Dune.txt`; names compared
+case-insensitively) are *siblings*. Once one sibling is linked to a Book (automatic
+match, exact duplicate, or review decision), that Book becomes a strong candidate
+for the others. It never replaces verification:
+
+- every file is still looked up externally, and its provider candidates are stored;
+- the sibling's Book is scored like a provider candidate, plus
+  `BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS` (default 0.35), and must reach the
+  auto-accept threshold. An equal title is enough; the shared name alone is not;
+- the file goes to review instead when its embedded ISBN conflicts with the Book's
+  ISBNs (`conflicting_isbn`), when its embedded authors name different people than
+  the Book's (`author_conflict`), when a provider candidate confidently matches a
+  different book (`provider_match_differs`), or when the score stays below the
+  threshold (`below_threshold`);
+- siblings already waiting in review are re-assessed with the same rule when another
+  format is linked. An OPEN task that passes is resolved as "Merged with existing
+  book" without a reviewer, with `rule: group_sibling_formats` and the score in its
+  decision payload. A task a reviewer has CLAIMED is never resolved automatically;
+  it only gets a note under `decision_payload.format_sibling`.
+
+The assessment (sibling job, Book, score, accepted, reason) is stored in the import
+evidence under `format_sibling_of`. Decisions within one source are serialised with a
+row lock on the source, so two formats finishing at the same time cannot create two
+Books.
+
+The review queue (`/reviews/`) shows siblings waiting in review as one entry. The
+primary task is the one with the best candidate score, then the format most likely
+to carry embedded metadata (EPUB, AZW3, MOBI, FB2, PDF, DjVu, HTML, RTF, TXT), then
+the oldest. The other formats are listed under it with their own candidate counts and
+links. The JSON response keeps one item per task, so existing clients are unaffected.
+Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
+and the response gains `group_count`.
 
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
+
+Imported variants record their origin in `FileVariant.source_type`: `upload` for
+web uploads, otherwise the source location's `default_source_type`
+(`incoming_folder` or `network_source`). An exact duplicate reuses the existing
+variant and keeps that variant's original origin.
+
+### Metadata provider rate limits
+
+Every outbound metadata-provider request waits for a client-side slot before it is
+sent; a server-side HTTP 429 is only the fallback. Limits are minimum intervals per
+provider ID, configured in requests/second:
+
+```text
+BOOK_SCANNER_METADATA_RATE_LIMITS={"openlibrary":1.0}   # per provider_id; <= 0 disables
+BOOK_SCANNER_METADATA_RATE_LIMIT_DEFAULT=1.0            # providers not listed above
+BOOK_SCANNER_METADATA_RATE_LIMIT_MAX_WAIT_SECONDS=60
+```
+
+When `BOOK_SCANNER_REDIS_URL` is set, slots are reserved atomically in Redis
+(`ebook-server:ratelimit:metadata:<provider_id>`, using Redis server time), so the
+limit holds across all web and worker processes. Without Redis the limit is
+per process. If Redis is unreachable the lookup falls back to the per-process
+limiter and logs `rate_limiter_redis_unavailable`. A lookup whose slot would be more
+than the maximum wait away is treated as a failed provider request
+(`metadata_provider_rate_limit_wait_exceeded`), which routes the import to review
+like any other provider failure; raise the maximum or lower worker concurrency if
+this appears during bulk imports. New providers call
+`ebook_server.core.rate_limit.throttle_provider(provider_id)` before each request.
+
+`BOOK_SCANNER_METADATA_USER_AGENT` defaults to a project identifier with the
+repository URL; an empty value uses that default. Override it to add a contact
+address for your deployment.
 
 ## Workers and external tools
 
@@ -229,6 +477,33 @@ lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
 (no delay) when none exists, logging `rq_scheduler_not_running_retries_immediate`.
 Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
 no scheduler lock is present.
+
+### Worker concurrency (ScanTailor-Web batches)
+
+One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
+job per page and stage, so a stage batch over a realistic book (hundreds of
+pages) on a single worker takes as long as the sum of all pages (#54). Run
+several worker processes against the same Redis queue to process pages in
+parallel; this is standard RQ and needs no code change. With the
+`deploy/systemd/` template unit, for example:
+
+```bash
+systemctl enable --now book-scanner-worker@2 book-scanner-worker@3 book-scanner-worker@4
+```
+
+Size the count to the VM's cores and memory: each stage job decodes a
+full-resolution page (a 600 dpi colour scan is tens of MB decoded), and other
+job types (conversion, OCR orchestration, finalization) share the same queue.
+Keep `--with-scheduler` on at least one of them (several is fine; they
+coordinate through a Redis lock).
+
+Stage jobs are safe to run concurrently: each claims its stage row by revision
+and only writes its result if that revision is still current. The one ordering
+caveat is between stages of the same page. A stage job whose upstream stage has
+not finished yet fails with `upstream stage <name> not complete` instead of
+waiting. With one worker, FIFO order hides this. With several, wait for a stage
+batch to finish before you start the next stage's batch, or re-run the affected
+pages afterwards.
 
 ### Recovering from killed workers
 
@@ -293,12 +568,34 @@ handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
 extraction still requires an explicitly configured external archive tool in a
 restricted worker environment.
 
+MOBI (and other Kindle-family formats once intake accepts them) metadata is read
+with Calibre's `ebook-meta --to-opf` when it is on `PATH`. It runs through the
+conversion runner with a 30 s timeout that kills the whole process group, and its
+OPF output (capped at 2 MiB) is parsed with defusedxml. A missing tool, timeout,
+failure, or unusable output falls back to filename signals and does not fail the
+import (`ebook_meta_unavailable` / `ebook_meta_failed` are logged).
+
 EPUB, PDF, and CBZ intake attempts front-cover extraction in the ingestion worker.
 PDF pages are rendered by liberal-licensed PDFium bindings; archive images are
 read with member size/compression limits; Pillow warnings for decompression bombs
 are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
+
+Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
+or `cover.png` (Calibre-style) over format extraction, but only when the folder
+holds a single book: every intake-supported file in it, and every file previously
+queued from it, must share the job file's name stem (`metadata.opf` and the cover
+itself are ignored). A folder of several books never lends its cover to any of them.
+The sidecar is untrusted input: symlinks and folders outside the source root are
+ignored, files over 25 MiB or 40 megapixels are rejected, and the image is verified
+and decoded by Pillow (JPEG/PNG only, decompression-bomb warnings are failures)
+before the usual normalization. An invalid sidecar is logged
+(`sidecar_cover_rejected`) and format extraction is used instead. Such covers record
+`extractor_tool=sidecar+pillow`. The sidecar file is only read: it is left in place
+for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
+reviewed MOVE import can still use it later. Disable with
+`BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
 
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original

@@ -6,7 +6,7 @@ import importlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -17,14 +17,38 @@ from urllib.request import Request, urlopen
 import structlog
 from django.conf import settings as django_settings
 from isbnlib import is_isbn10, is_isbn13, to_isbn13
-from rapidfuzz.fuzz import token_set_ratio
+from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
+from rapidfuzz.utils import default_process
+
+from .rate_limit import throttle_provider
 
 logger = structlog.get_logger(__name__)
 
 MAX_AUTHOR_LOOKUPS = 5
 MAX_RETRY_AFTER_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5
-DEFAULT_USER_AGENT = "ebook-server (self-hosted hackerspace library)"
+# Subject/genre tags are evidence only (#50); keep them bounded so an untrusted file or
+# a provider record with thousands of subjects cannot bloat job evidence or candidates.
+MAX_SUBJECTS = 25
+MAX_SUBJECT_LENGTH = 128
+OPEN_LIBRARY_SEARCH_FIELDS = ",".join(
+    (
+        "key",
+        "title",
+        "author_name",
+        "author_key",
+        "first_publish_year",
+        "language",
+        "edition_count",
+        "cover_i",
+        "cover_edition_key",
+        "subject",
+    )
+)
+DEFAULT_USER_AGENT = (
+    "ebook-server (+https://github.com/SasquatchPDX/c-base_book-scanner; "
+    "self-hosted hackerspace library)"
+)
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -32,6 +56,20 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Added to an already linked Book's score when the file is another format of it (same
+# source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
+# title (0.55) it clears auto-accept; alone it does not (#39).
+SIBLING_FORMAT_BONUS = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS",
+    0.35,
+)
+# Title similarity above which two candidates may describe the same book.
+SAME_BOOK_TITLE_MIN_SCORE = 0.9
+# Author-name variants (same surname, compatible given names) count as a partial match.
+AUTHOR_VARIANT_MATCH_SCORE = 0.9
+# Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
+AUTHOR_GIVEN_NAME_MIN_RATIO = 85.0
 
 
 class MetadataProvider(Protocol):
@@ -82,6 +120,7 @@ class IdentificationCandidate:
     publication_year: int | None
     score: float
     raw: dict[str, Any]
+    subjects: list[str] = field(default_factory=list)
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -161,6 +200,27 @@ def normalize_isbns(raw: str | None) -> list[str]:
     return values
 
 
+def normalize_subjects(values: Any) -> list[str]:
+    """Return trimmed, de-duplicated (case-insensitive), bounded subject/genre tags.
+
+    Tags are kept as free text in first-seen order; no taxonomy mapping is applied here.
+    """
+    subjects: list[str] = []
+    seen: set[str] = set()
+    for value in _as_str_list(values):
+        tag = re.sub(r"\s+", " ", value).strip()
+        if not tag or len(tag) > MAX_SUBJECT_LENGTH:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        subjects.append(tag)
+        if len(subjects) >= MAX_SUBJECTS:
+            break
+    return subjects
+
+
 def normalize_text(value: str | None) -> str:
     if not value:
         return ""
@@ -192,6 +252,11 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+# Evidence key holding hints from the source's configured folder layout (#35); written
+# by intake from ``core.source_layout``, read here when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -214,6 +279,10 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    title_hints, author_hints = _apply_path_layout_hints(
+        extracted_metadata, list(title_hints), list(author_hints)
+    )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -242,6 +311,45 @@ def build_identification_input(
         if isinstance(extracted_metadata.get("description"), str)
         else None,
     )
+
+
+def _apply_path_layout_hints(
+    extracted_metadata: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge folder-layout hints (evidence, not truth) into the title/author hints.
+
+    A layout title goes after an embedded title (usually the best signal) and before
+    the raw filename guesses. A layout author replaces the filename "A - B" split
+    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    """
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if not isinstance(layout, dict):
+        return title_hints, author_hints
+
+    metadata_title = extracted_metadata.get("title")
+    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
+    layout_title = layout.get("title")
+    if isinstance(layout_title, str) and layout_title.strip():
+        title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
+
+    raw_layout_authors = layout.get("authors")
+    layout_authors = [
+        author.strip()
+        for author in (raw_layout_authors if isinstance(raw_layout_authors, list) else [])
+        if isinstance(author, str) and author.strip()
+    ]
+    if layout_authors:
+        raw_embedded = extracted_metadata.get("authors")
+        embedded = [
+            author.strip()
+            for author in (raw_embedded if isinstance(raw_embedded, list) else [])
+            if isinstance(author, str) and author.strip()
+        ]
+        known = {normalize_text(author) for author in embedded}
+        author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+    return title_hints, author_hints
 
 
 class OpenLibraryMetadataProvider:
@@ -293,15 +401,16 @@ class OpenLibraryMetadataProvider:
         return payload
 
     def _resolve_author_names(self, payload: dict[str, Any]) -> list[str]:
-        """Resolve edition ``authors: [{key}]`` references to names (bounded, best effort)."""
-        raw_authors = payload.get("authors")
-        if not isinstance(raw_authors, list):
-            return []
+        """Resolve an edition's author references to names (bounded, best effort).
+
+        Many edition records carry no ``authors`` at all, only ``works: [{key}]``;
+        the authors are then taken from the (first) work record.
+        """
+        keys = _open_library_author_keys(payload.get("authors"))
+        if not keys:
+            keys = self._work_author_keys(payload.get("works"))
         names: list[str] = []
-        for entry in raw_authors[:MAX_AUTHOR_LOOKUPS]:
-            key = entry.get("key") if isinstance(entry, dict) else None
-            if not isinstance(key, str) or not re.fullmatch(r"/authors/OL\d+A", key):
-                continue
+        for key in keys[:MAX_AUTHOR_LOOKUPS]:
             try:
                 author_payload = self._get_json(f"https://openlibrary.org{key}.json")
             except (OSError, ValueError) as exc:
@@ -317,8 +426,32 @@ class OpenLibraryMetadataProvider:
                 names.append(name.strip())
         return names
 
+    def _work_author_keys(self, works: Any) -> list[str]:
+        """Author keys of the edition's first work record (``/works/OL...W``)."""
+        if not isinstance(works, list) or not works:
+            return []
+        entry = works[0]
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if not isinstance(key, str) or not re.fullmatch(r"/works/OL\d+W", key):
+            return []
+        try:
+            work_payload = self._get_json(f"https://openlibrary.org{key}.json")
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "metadata_provider_request_failed",
+                provider_id=self.provider_id,
+                operation="work",
+                error_type=type(exc).__name__,
+            )
+            return []
+        if not isinstance(work_payload, dict):
+            return []
+        return _open_library_author_keys(work_payload.get("authors"))
+
     def _query_search(self, query: str) -> list[dict[str, Any]]:
-        encoded = urlencode({"q": query, "limit": "5"})
+        # Open Library's default search field set omits ``subject``; request it explicitly
+        # alongside the default fields the candidate normalizer and scorer rely on.
+        encoded = urlencode({"q": query, "limit": "5", "fields": OPEN_LIBRARY_SEARCH_FIELDS})
         url = f"https://openlibrary.org/search.json?{encoded}"
         try:
             payload = self._get_json(url)
@@ -338,6 +471,9 @@ class OpenLibraryMetadataProvider:
             getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
         )
         for attempt in range(2):
+            # Proactive client-side pacing (shared across workers via Redis when configured);
+            # the 429 handling below is only the fallback when the server still objects.
+            throttle_provider(self.provider_id)
             request = Request(url, headers={"User-Agent": user_agent})
             try:
                 with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -349,6 +485,23 @@ class OpenLibraryMetadataProvider:
                     raise
                 time.sleep(_retry_after_seconds(exc))
         raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
+
+
+def _open_library_author_keys(raw_authors: Any) -> list[str]:
+    """Author keys from ``[{"key": ...}]`` (editions) or ``[{"author": {"key": ...}}]`` (works)."""
+    if not isinstance(raw_authors, list):
+        return []
+    keys: list[str] = []
+    for entry in raw_authors:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        nested = entry.get("author")
+        if not isinstance(key, str) and isinstance(nested, dict):
+            key = nested.get("key")
+        if isinstance(key, str) and re.fullmatch(r"/authors/OL\d+A", key) and key not in keys:
+            keys.append(key)
+    return keys
 
 
 def _retry_after_seconds(error: HTTPError) -> float:
@@ -377,6 +530,15 @@ def _provider_instances() -> list[MetadataProvider]:
             cls = getattr(module, symbol)
             provider = cls()
             providers.append(provider)
+        except ValueError as exc:
+            # A provider that cannot run as configured (e.g. a missing API key) is
+            # skipped with a warning instead of failing every lookup.
+            logger.warning(
+                "metadata_provider_unavailable",
+                provider_ref=provider_ref,
+                reason=str(exc),
+            )
+            continue
         except (ImportError, AttributeError, TypeError):
             continue
     return providers
@@ -541,6 +703,13 @@ def _normalize_candidate(
         publication_year=publication_year,
         score=0.0,
         raw=payload,
+        # Open Library search docs use ``subject``, edition records ``subjects``;
+        # ``categories`` is the Google Books volumeInfo shape.
+        subjects=normalize_subjects(
+            _as_str_list(payload.get("subject"))
+            + _as_str_list(payload.get("subjects"))
+            + _as_str_list(payload.get("categories"))
+        ),
     )
     return _apply_scoring(signals, candidate)
 
@@ -554,17 +723,178 @@ def _as_str_list(value: Any) -> list[str]:
 
 
 def _title_match_score(left: str, right: str) -> float:
-    return token_set_ratio(normalize_text(left), normalize_text(right)) / 100.0
+    """Similarity of two titles in [0, 1], penalising tokens only one side has.
+
+    ``token_set_ratio`` alone scores 1.0 whenever one title's tokens are a subset of
+    the other's ("Foundation" vs "Foundation and Earth"), which are different books.
+    Averaging it with ``token_sort_ratio`` keeps word-order tolerance while making
+    unmatched tokens cost score; only genuinely equal titles reach 1.0.
+    """
+    left_processed = default_process(left)
+    right_processed = default_process(right)
+    if not left_processed or not right_processed:
+        return 0.0
+    set_score = token_set_ratio(left_processed, right_processed)
+    sort_score = token_sort_ratio(left_processed, right_processed)
+    return (set_score + sort_score) / 200.0
+
+
+def _author_name_tokens(name: str) -> list[str]:
+    """Lowercased, punctuation-free name tokens with "Last, First" reordered."""
+    if name.count(",") == 1:
+        last, first = name.split(",")
+        name = f"{first} {last}"
+    return default_process(name).split()
+
+
+def _given_names_compatible(left: list[str], right: list[str]) -> bool:
+    """True when the shorter given-name list aligns, in order, with the longer one.
+
+    Tokens align when equal, when one is a single-letter initial of the other, or when
+    they are close spellings of the same name; unmatched tokens in the longer list
+    (a missing middle name or initial) are skipped.
+    """
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    position = 0
+    for token in shorter:
+        while position < len(longer):
+            candidate = longer[position]
+            position += 1
+            if (
+                token == candidate
+                or (len(token) == 1 and candidate.startswith(token))
+                or (len(candidate) == 1 and token.startswith(candidate))
+                or ratio(token, candidate) >= AUTHOR_GIVEN_NAME_MIN_RATIO
+            ):
+                break
+        else:
+            return False
+    return True
+
+
+def _author_name_similarity(left: str, right: str) -> float:
+    """1.0 for the same name, a partial score for compatible variants, else 0.0.
+
+    Variants share the surname and have compatible given names: "Iain M. Banks" vs
+    "Iain Banks", "H. P. Lovecraft" vs "H P Lovecraft", "Banks, Iain" vs "Iain Banks".
+    A shared surname alone ("Frank Herbert" vs "Brian Herbert") is not a match.
+    """
+    left_tokens = _author_name_tokens(left)
+    right_tokens = _author_name_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    # Equal up to spacing too: "HP Lovecraft" / "H P Lovecraft", "Le Guin" / "LeGuin".
+    if "".join(left_tokens) == "".join(right_tokens):
+        return 1.0
+    if left_tokens[-1] != right_tokens[-1]:
+        return 0.0
+    left_given = left_tokens[:-1]
+    right_given = right_tokens[:-1]
+    if not left_given or not right_given:
+        return 0.0
+    if _given_names_compatible(left_given, right_given):
+        return AUTHOR_VARIANT_MATCH_SCORE
+    return 0.0
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:
     if not left or not right:
         return 0.0
-    left_set = {normalize_text(author) for author in left}
-    right_set = {normalize_text(author) for author in right}
-    if not left_set:
+    left_names = list(dict.fromkeys(normalize_text(author) for author in left))
+    right_names = list(dict.fromkeys(normalize_text(author) for author in right))
+    if not left_names:
         return 0.0
-    return len(left_set.intersection(right_set)) / len(left_set)
+    total = sum(
+        max(_author_name_similarity(name, other) for other in right_names) for name in left_names
+    )
+    return total / len(left_names)
+
+
+# Creator values that say nothing about who wrote the book: office-suite and PDF
+# tool defaults, account names, and "unknown" in a few languages. Compared after
+# normalize_text().
+_PLACEHOLDER_AUTHORS = frozenset(
+    {
+        "unknown",
+        "unknown author",
+        "unbekannt",
+        "unbekannter autor",
+        "inconnu",
+        "anonymous",
+        "anonym",
+        "administrator",
+        "admin",
+        "user",
+        "owner",
+        "author",
+        "n/a",
+        "none",
+        "various",
+        "various authors",
+        "multiple authors",
+        "microsoft office user",
+        "microsoft word",
+        "windows user",
+        "default",
+    }
+)
+
+
+def is_placeholder_author(name: str) -> bool:
+    """True for creator values such as "Microsoft Office User" that name nobody."""
+    return normalize_text(name).strip(" .,;:-_") in _PLACEHOLDER_AUTHORS
+
+
+def evidence_author_names(metadata: dict[str, Any]) -> list[str]:
+    """Author names the file's own embedded metadata gives, without placeholders.
+
+    This is evidence, not truth: it is only used to check a provider match and to
+    suggest authors to a reviewer, never written onto a Book automatically.
+    """
+    raw_authors = metadata.get("authors")
+    if not isinstance(raw_authors, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in raw_authors:
+        if not isinstance(value, str):
+            continue
+        name = " ".join(value.split()).strip(" ,;")
+        key = normalize_text(name)
+        if not key or is_placeholder_author(name) or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def _author_names_agree(left: str, right: str) -> bool:
+    """Same person per the scorer's name matching, or a bare surname on one side."""
+    if _author_name_similarity(normalize_text(left), normalize_text(right)) > 0:
+        return True
+    left_tokens = _author_name_tokens(normalize_text(left))
+    right_tokens = _author_name_tokens(normalize_text(right))
+    if not left_tokens or not right_tokens:
+        return False
+    # "Tolkien" vs "J. R. R. Tolkien": a surname-only credit is not a contradiction.
+    single_token = len(left_tokens) == 1 or len(right_tokens) == 1
+    return single_token and left_tokens[-1] == right_tokens[-1]
+
+
+def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) -> bool:
+    """True when both sides name authors and none of them is the same person.
+
+    Names are compared with the scorer's author matching (``_author_name_similarity``),
+    so "Banks, Iain" and "Iain M. Banks" agree while "Frank Herbert" and "Brian
+    Herbert" do not. Missing authors on either side are not a conflict.
+    """
+    candidates = [name for name in candidate_authors if normalize_text(name)]
+    evidence = [name for name in evidence_authors if normalize_text(name)]
+    if not candidates or not evidence:
+        return False
+    return not any(
+        _author_names_agree(candidate, other) for candidate in candidates for other in evidence
+    )
 
 
 def _apply_scoring(
@@ -614,6 +944,7 @@ def _apply_scoring(
         publication_year=candidate.publication_year,
         score=min(score, 1.0),
         raw=candidate.raw,
+        subjects=candidate.subjects,
     )
     return normalized_candidate
 
@@ -626,3 +957,30 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+def score_candidate(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> IdentificationCandidate:
+    """Score any candidate (e.g. an existing library Book) with the provider scorer."""
+    return _apply_scoring(signals, candidate)
+
+
+def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> bool:
+    """Whether two candidates describe the same book.
+
+    Shared ISBN, or near-equal titles with compatible authors (authors are only
+    compared when both sides list some).
+    """
+    left_isbns = {value for value in (left.isbn10, left.isbn13) if value}
+    right_isbns = {value for value in (right.isbn10, right.isbn13) if value}
+    expanded_left = {isbn for value in left_isbns for isbn in normalize_isbns(value)}
+    expanded_right = {isbn for value in right_isbns for isbn in normalize_isbns(value)}
+    if expanded_left & expanded_right:
+        return True
+    if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
+        return False
+    if left.authors and right.authors:
+        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+    return True

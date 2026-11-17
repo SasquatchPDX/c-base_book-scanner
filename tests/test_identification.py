@@ -4,9 +4,16 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from ebook_server.core.identification import (
+    AUTHOR_VARIANT_MATCH_SCORE,
+    AUTO_ACCEPT_SCORE,
     IdentificationCandidate,
     IdentificationInput,
+    _author_match_score,
+    _author_name_similarity,
+    _title_match_score,
     build_identification_input,
     parse_filename_signals,
     resolve_candidates,
@@ -174,3 +181,92 @@ def test_conflicting_metadata_keeps_filename_signal() -> None:
 
     assert payload.title_hints[0] == "Wrong Title"
     assert payload.title_hints[1] == "The%20War%20of%20The%20Worlds"
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("H P Lovecraft", "H. P. Lovecraft"),
+        ("HP Lovecraft", "H. P. Lovecraft"),
+        ("Banks, Iain", "Iain Banks"),
+        ("Ursula K. Le Guin", "Ursula K. LeGuin"),
+        ("ANDY WEIR", "Andy Weir"),
+    ],
+)
+def test_author_name_similarity_treats_formatting_variants_as_equal(left: str, right: str) -> None:
+    assert _author_name_similarity(left, right) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("Iain M. Banks", "Iain Banks"),
+        ("J. R. R. Tolkien", "John Ronald Reuel Tolkien"),
+        ("Gebrüder Grimm", "Brüder Grimm"),
+    ],
+)
+def test_author_name_similarity_gives_partial_score_to_name_variants(left: str, right: str) -> None:
+    # Regression for #18: these scored 0 with exact string comparison.
+    assert _author_name_similarity(left, right) == AUTHOR_VARIANT_MATCH_SCORE
+    assert _author_name_similarity(right, left) == AUTHOR_VARIANT_MATCH_SCORE
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("Frank Herbert", "Brian Herbert"),
+        ("Christopher Tolkien", "J. R. R. Tolkien"),
+        ("Jane Smith", "John Smith"),
+        ("Herbert", "Frank Herbert"),
+        ("Neal Stephenson", "Neal Asher"),
+        ("Snow Crash", "Neal Stephenson"),
+    ],
+)
+def test_author_name_similarity_rejects_different_people(left: str, right: str) -> None:
+    assert _author_name_similarity(left, right) == 0.0
+
+
+def test_author_match_score_uses_best_variant_per_hint() -> None:
+    assert _author_match_score(["Iain M. Banks"], ["Iain Banks"]) == AUTHOR_VARIANT_MATCH_SCORE
+    assert _author_match_score(["Andy Weir"], ["Someone Else", "Andy Weir"]) == 1.0
+    # Unmatched hints still dilute the score, as before.
+    assert _author_match_score(["Andy Weir", "The Martian"], ["Andy Weir"]) == 0.5
+    assert _author_match_score([], ["Andy Weir"]) == 0.0
+
+
+def test_title_match_score_does_not_give_full_marks_to_subset_titles() -> None:
+    # Regression for #8: token_set_ratio alone scored these 1.0.
+    assert _title_match_score("Foundation", "Foundation and Earth") < 0.9
+    assert _title_match_score("Dune", "Dune - House Harkonnen") < 0.75
+    assert _title_match_score("Gold", "Gold - 03 - Frustration") < 0.75
+
+
+def test_title_match_score_still_tolerates_case_punctuation_and_word_order() -> None:
+    assert _title_match_score("Snow Crash", "snow crash") == 1.0
+    assert _title_match_score("The Hobbit", "Hobbit, The") == 1.0
+    assert _title_match_score("Dune", "") == 0.0
+
+
+def test_subset_title_with_matching_author_stays_below_auto_accept() -> None:
+    signals = IdentificationInput(
+        title_hints=["Foundation"],
+        author_hints=["Isaac Asimov"],
+        isbns=[],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+    payloads = [
+        {"title": "Foundation and Earth", "author_name": ["Isaac Asimov"]},
+        {"title": "Foundation", "author_name": ["Isaac Asimov"]},
+    ]
+    with patch(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [_stub_provider_from_candidates(payloads)()],
+    ):
+        candidates = resolve_candidates(signals)
+
+    assert [candidate.title for candidate in candidates] == ["Foundation", "Foundation and Earth"]
+    assert candidates[1].score < AUTO_ACCEPT_SCORE
+    assert candidates[0].score > candidates[1].score

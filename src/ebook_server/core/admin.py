@@ -38,7 +38,7 @@ class AppUserProfileAdmin(admin.ModelAdmin[AppUserProfile]):
 
 @admin.register(Book)
 class BookAdmin(admin.ModelAdmin[Book]):
-    list_display = ("title", "publisher", "publication_date")
+    list_display = ("title", "publisher", "publication_year", "publication_date")
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories", "genres")
 
@@ -145,6 +145,41 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
     )
     list_filter = ("is_active", "is_paused")
     actions = ("pause_imports", "resume_imports")
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "name",
+                    "root_path",
+                    "transfer_mode",
+                    "recursive",
+                    "default_source_type",
+                    "is_active",
+                    "default_metadata",
+                ),
+            },
+        ),
+        (
+            "Folder layout (identification hints)",
+            {
+                "description": (
+                    "Describe how this collection is organised so folder and file names "
+                    "become author/title hints for the external lookup. Check the result "
+                    "with <code>manage.py ingest_sources --source-id N --preview</code>."
+                ),
+                "fields": ("path_layouts", "author_name_order", "layout_ignore_values"),
+            },
+        ),
+        (
+            "Formats of one book",
+            {"fields": ("group_sibling_formats",)},
+        ),
+        (
+            "Ingestion throttling",
+            {"fields": ("is_paused", "ingest_batch_size", "ingest_max_per_hour")},
+        ),
+    )
 
     @admin.action(description="Pause imports from selected sources")
     def pause_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
