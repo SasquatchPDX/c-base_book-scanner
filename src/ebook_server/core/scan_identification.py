@@ -78,6 +78,7 @@ def _save_candidates(
             isbn13=candidate.isbn13 or "",
             score=Decimal(str(candidate.score)),
             raw_payload=candidate.raw,
+            subjects=candidate.subjects,
             language=candidate.language or "",
             publisher=candidate.publisher or "",
             description=candidate.description or "",
