@@ -691,6 +691,101 @@ def test_html_fb2_and_cbz_metadata_use_format_aware_parsers(tmp_path: Path) -> N
     assert cbz_metadata["publisher"] == "Panel Press"
 
 
+_MOBI_OPF_FIXTURE = b"""<?xml version='1.0' encoding='utf-8'?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="calibre_id" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Mobi Book</dc:title>
+    <dc:creator opf:role="aut">Megan Mobi</dc:creator>
+    <dc:identifier id="calibre_id" opf:scheme="calibre">not-an-isbn-uuid</dc:identifier>
+    <dc:language>eng</dc:language>
+    <dc:publisher>Kindle Press</dc:publisher>
+    <dc:identifier opf:scheme="ISBN">9780306406157</dc:identifier>
+  </metadata>
+</package>
+"""
+
+
+def test_mobi_metadata_uses_ebook_meta_opf_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ebook-meta --to-opf`` output is parsed with the same dc:* field lookups as EPUB."""
+    mobi_path = tmp_path / "book.mobi"
+    mobi_path.write_bytes(b"irrelevant-for-this-test")
+    monkeypatch.setattr(
+        intake,
+        "_run_ebook_meta_to_opf",
+        lambda file_path: _MOBI_OPF_FIXTURE,
+    )
+
+    metadata = intake.extract_metadata(str(mobi_path), "mobi", original_filename=mobi_path.name)
+
+    assert metadata["title"] == "Mobi Book"
+    assert metadata["authors"] == ["Megan Mobi"]
+    assert metadata["language"] == "eng"
+    assert metadata["publisher"] == "Kindle Press"
+    # The calibre-internal UUID identifier must not win over the real ISBN.
+    assert metadata["identifier"] == "9780306406157"
+    assert metadata["container_type"] == "mobi"
+
+
+def test_mobi_metadata_falls_back_to_filename_when_tool_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mobi_path = tmp_path / "Untooled Book.mobi"
+    mobi_path.write_bytes(b"irrelevant-for-this-test")
+    monkeypatch.setattr(intake, "_run_ebook_meta_to_opf", lambda file_path: None)
+
+    metadata = intake.extract_metadata(str(mobi_path), "mobi", original_filename=mobi_path.name)
+
+    assert metadata == {
+        "title": "Untooled Book",
+        "raw_metadata": {},
+        "container_type": "mobi",
+    }
+
+
+def test_mobi_metadata_falls_back_on_unparseable_opf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mobi_path = tmp_path / "Garbled.mobi"
+    mobi_path.write_bytes(b"irrelevant-for-this-test")
+    monkeypatch.setattr(
+        intake,
+        "_run_ebook_meta_to_opf",
+        lambda file_path: b"not xml at all",
+    )
+
+    metadata = intake.extract_metadata(str(mobi_path), "mobi", original_filename=mobi_path.name)
+
+    assert metadata["title"] == "Garbled"
+    assert metadata["container_type"] == "mobi"
+
+
+def test_run_ebook_meta_to_opf_returns_none_when_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(intake.shutil, "which", lambda binary: None)
+
+    assert intake._run_ebook_meta_to_opf("/does/not/matter.mobi") is None
+
+
+def test_run_ebook_meta_to_opf_returns_none_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(intake.shutil, "which", lambda binary: "/usr/bin/ebook-meta")
+
+    def _raise_timeout(*args: Any, **kwargs: Any) -> None:
+        raise intake.subprocess.TimeoutExpired(cmd="ebook-meta", timeout=20)
+
+    monkeypatch.setattr(intake.subprocess, "run", _raise_timeout)
+
+    assert intake._run_ebook_meta_to_opf(str(tmp_path / "book.mobi")) is None
+
+
 @pytest.mark.django_db(transaction=True)
 def test_txt_upload_uses_normal_ingestion_and_external_verification(
     tmp_path: Path,

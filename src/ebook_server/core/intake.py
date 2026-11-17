@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import shutil
+import subprocess
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, cast
 from urllib.parse import unquote
 from zipfile import ZipFile, ZipInfo, is_zipfile
@@ -126,6 +128,7 @@ MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+MOBI_METADATA_TIMEOUT_SECONDS = 20
 
 
 def normalize_filename(raw: str) -> str:
@@ -525,6 +528,8 @@ def extract_metadata(
             return _extract_fb2_metadata(file_path, original_filename=original_filename)
         if detected_format == "cbz":
             return _extract_cbz_metadata(file_path, original_filename=original_filename)
+        if detected_format == "mobi":
+            return _extract_mobi_metadata(file_path, original_filename=original_filename)
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
@@ -661,6 +666,74 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
         "publisher": value("Publisher"),
         "raw_metadata": {"comic_info": True},
         "container_type": "cbz",
+    }
+
+
+def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
+    """Read a MOBI/Kindle-family file's metadata via Calibre's ``ebook-meta`` CLI.
+
+    Returns the OPF document it writes, or ``None`` if the tool isn't installed, times
+    out, or produces nothing usable — callers fall back to filename-only metadata in
+    that case, the same degraded mode MOBI files are already in without this at all.
+    """
+    binary = shutil.which("ebook-meta")
+    if binary is None:
+        logger.warning("mobi_metadata_tool_unavailable", binary="ebook-meta")
+        return None
+    with TemporaryDirectory(prefix="mobi-meta-") as workdir:
+        opf_path = Path(workdir) / "meta.opf"
+        try:
+            subprocess.run(
+                [binary, file_path, "--to-opf", str(opf_path)],
+                capture_output=True,
+                timeout=MOBI_METADATA_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("mobi_metadata_tool_failed", error_type=type(exc).__name__)
+            return None
+        if not opf_path.is_file():
+            return None
+        payload = opf_path.read_bytes()
+    return payload or None
+
+
+def _extract_mobi_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
+    fallback = {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {},
+        "container_type": "mobi",
+    }
+    opf_bytes = _run_ebook_meta_to_opf(file_path)
+    if opf_bytes is None:
+        return fallback
+    try:
+        opf_root = ET.fromstring(opf_bytes)
+    except ET.ParseError:
+        return fallback
+
+    # Same OPF/Dublin-Core shape ebook-meta writes for every Kindle-family format
+    # (MOBI/AZW/AZW3/PRC), so this reuses the EPUB field lookups as-is.
+    title = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title")
+    author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
+    language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
+    description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+    publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+    identifier = _pick_epub_identifier(
+        [
+            (element.attrib, "".join(element.itertext()).strip())
+            for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}identifier")
+        ],
+    )
+    return {
+        "title": title or fallback["title"],
+        "authors": [author] if author else [],
+        "language": language,
+        "description": description,
+        "publisher": publisher,
+        "identifier": identifier,
+        "raw_metadata": {},
+        "container_type": "mobi",
     }
 
 
