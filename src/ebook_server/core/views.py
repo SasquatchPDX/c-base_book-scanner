@@ -43,7 +43,12 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from ebook_server.jobs import enqueue
-from ebook_server.storage import LocalFilesystemStorage, check_storage_root, probe_storage_writable
+from ebook_server.storage import (
+    LocalFilesystemStorage,
+    StorageBackend,
+    check_storage_root,
+    probe_storage_writable,
+)
 
 from . import (
     book_deletion,
@@ -776,28 +781,90 @@ def _store_scan_page(
 SCAN_THUMBNAIL_MAX_EDGE: Final[int] = 1600
 
 
-def _scan_thumbnail_cache_path(version: ScanPageVersion) -> Path:
+@dataclass(frozen=True)
+class _ThumbnailSource:
+    """The artifact a page thumbnail is rendered from, plus its cache identity."""
+
+    storage: StorageBackend
+    identifier: str
+    cache_key: str
+
+
+def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None:
+    """Last stage of the page's unbroken run of successful stages that has an artifact.
+
+    Walks ``stage_order()`` from the first stage and stops at the first stage that
+    is not SUCCESS, so an output whose upstream was edited/invalidated or is
+    re-running is never shown as current (#58).
+    """
+    states = {
+        state.stage: state
+        for state in ScanTailorStageState.objects.filter(
+            scan_job_id=page.scan_job_id,
+            scan_page=page,
+        ).select_related("preview_storage_location", "output_storage_location")
+    }
+    latest: ScanTailorStageState | None = None
+    for stage_name in scantailor.stage_order():
+        state = states.get(stage_name)
+        if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
+            break
+        if state.preview_storage_identifier or state.output_storage_identifier:
+            latest = state
+    return latest
+
+
+def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
+    """Thumbnail source: latest completed stage output, else the raw active version."""
+    state = _latest_completed_stage_state(page)
+    if state is not None:
+        if state.preview_storage_identifier:
+            identifier = state.preview_storage_identifier
+            location = state.preview_storage_location
+        else:
+            identifier = state.output_storage_identifier
+            location = state.output_storage_location
+        return _ThumbnailSource(
+            storage=(
+                backend_for_location(location) if location is not None else _default_scan_storage()
+            ),
+            identifier=identifier,
+            cache_key=(
+                f"stage-{state.id}-{state.stage}-r{state.revision}-{state.output_sha256[:16]}"
+            ),
+        )
+    version = page.active_version()
+    if version is None:
+        return None
+    return _ThumbnailSource(
+        storage=(
+            backend_for_location(version.storage_location)
+            if version.storage_location_id is not None
+            else _default_scan_storage()
+        ),
+        identifier=version.storage_identifier,
+        cache_key=f"{version.id}-{version.checksum_sha256[:32]}",
+    )
+
+
+def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
     return (
         Path(django_settings.APP_DATA_DIR)
         / SCANNING_STORAGE_ROOT
         / "thumbnails"
-        / f"{version.id}-{version.checksum_sha256[:32]}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
+        / f"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
     )
 
 
-def _render_scan_thumbnail(version: ScanPageVersion, cache_path: Path) -> None:
-    """Generate a downscaled, browser-displayable JPEG for a page version."""
+def _render_scan_thumbnail(source_artifact: _ThumbnailSource, cache_path: Path) -> None:
+    """Generate a downscaled, browser-displayable JPEG for a page artifact."""
     from PIL import Image, ImageOps
 
-    storage = (
-        backend_for_location(version.storage_location)
-        if version.storage_location_id is not None
-        else _default_scan_storage()
-    )
+    storage = source_artifact.storage
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
     try:
-        with storage.open(version.storage_identifier) as stream, Image.open(stream) as source:
+        with storage.open(source_artifact.identifier) as stream, Image.open(stream) as source:
             image = ImageOps.exif_transpose(source) or source
             if image.mode in {"I;16", "I;16L", "I;16B", "I"}:
                 image = image.convert("I").point(lambda value: value * (1 / 256)).convert("L")
@@ -2993,19 +3060,21 @@ def scan_page_thumbnail(
         page = ScanPage.objects.get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    version = page.active_version()
-    if version is None:
+    source = _scan_thumbnail_source(page)
+    if source is None:
         return HttpResponseNotFound("no page version")
 
-    etag = f'"{version.checksum_sha256[:32]}-{version.id}-{SCAN_THUMBNAIL_MAX_EDGE}"'
-    headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+    etag = f'"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}"'
+    # The thumbnail URL is stable while its content follows stage processing, so
+    # browsers must revalidate (cheap: ETag -> 304) instead of caching for an hour.
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
     if request.headers.get("If-None-Match") == etag:
         return HttpResponse(status=304, headers=headers)
 
-    cache_path = _scan_thumbnail_cache_path(version)
+    cache_path = _scan_thumbnail_cache_path(source)
     if not cache_path.exists():
         try:
-            _render_scan_thumbnail(version, cache_path)
+            _render_scan_thumbnail(source, cache_path)
         except (FileNotFoundError, StorageConfigurationError):
             return HttpResponseNotFound("artifact missing")
         except Exception:  # undecodable image data
