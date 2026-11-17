@@ -38,6 +38,28 @@ other's initial, or when they are close spellings, so a missing middle name or
 initial is allowed ("Iain M. Banks" vs "Iain Banks"). A shared surname alone is
 not a match ("Frank Herbert" vs "Brian Herbert").
 
+Author hints are grouped by provenance and meaning (`IdentificationInput.author_evidence`):
+
+- **Alternatives** come from the filename. An ambiguous "Stephen King - Pet Sematary"
+  yields both halves, and at most one is the author, so the group scores its best
+  single match.
+- **Coauthors** come from embedded metadata (every author-role `dc:creator`, with a
+  joint "A & B" entry split into names) or a configured folder layout. Every name is a
+  real author, so the group scores the share of names the candidate covers: a
+  candidate naming only Terry Pratchett covers half of Good Omens' [Terry Pratchett,
+  Neil Gaiman]. When the candidate matches a coauthor group at all, that coverage
+  decides the author score, so a filename guess naming one coauthor cannot restore
+  full credit. A coauthor group the candidate does not match at all is left to the
+  author-conflict check below.
+
+Title hints carry their source too (`title_evidence`), ranked embedded > sidecar >
+header > folder layout > filename, for rules that must not let a filename guess
+override stronger title evidence.
+
+Filename "Last, First" detection ignores comma phrases that contain an edition,
+volume, part or ordinal word ("Python Development, Second Edit", "Faust, Zweite
+Auflage"), so such titles are never read as author names.
+
 Title similarity is the mean of rapidfuzz `token_set_ratio` and `token_sort_ratio`
 over punctuation-normalized titles. `token_set_ratio` alone gives full marks when one
 title's words are a subset of the other's ("Foundation" vs "Foundation and Earth"),

@@ -1227,7 +1227,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         opf_root = ET.fromstring(opf_bytes)
         # Namespace-safe extraction; these fields are best-effort only.
         title = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title")
-        author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
+        authors = _epub_creator_authors(opf_root)
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
         subjects = identification.normalize_subjects(
@@ -1244,7 +1244,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         )
         return {
             "title": title or Path(original_filename).stem,
-            "authors": [author] if author else [],
+            "authors": authors,
             "language": language,
             "description": description,
             "subjects": subjects,
@@ -1254,6 +1254,23 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             },
             "container_type": "epub",
         }
+
+
+def _epub_creator_authors(opf_root: Any) -> list[str]:
+    """Every author-role dc:creator, in order: coauthors are all genuine evidence.
+
+    Creators with another ``opf:role`` (editor, translator, ...) are skipped; when no
+    creator is marked as an author, the first creator is kept as before.
+    """
+    creators = [
+        (element, " ".join("".join(element.itertext()).split()))
+        for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}creator")
+    ]
+    creators = [(element, text) for element, text in creators if text]
+    authors = [text for element, text in creators if _opf_creator_is_author(element)]
+    if not authors and creators:
+        authors = [creators[0][1]]
+    return list(dict.fromkeys(authors))
 
 
 def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:

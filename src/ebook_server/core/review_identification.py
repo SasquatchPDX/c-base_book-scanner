@@ -53,14 +53,24 @@ def _review_signals(task: ReviewTask, import_job: ImportJob) -> identification.I
         for author in task.inferred_authors
         if isinstance(author, str) and author.strip()
     ]
+    # Keep the typed evidence of whatever the reviewer left as inferred; terms the
+    # reviewer typed in are scored as plain alternatives.
+    authors_kept = not authors or authors == base.author_hints
+    title_evidence = (
+        base.title_evidence
+        if not title
+        else tuple(item for item in base.title_evidence if item.title == title)[:1]
+    )
     return identification.IdentificationInput(
         title_hints=[title] if title else base.title_hints,
-        author_hints=authors if authors else base.author_hints,
+        author_hints=base.author_hints if authors_kept else authors,
         isbns=base.isbns,
         folder_hints=base.folder_hints,
         language=base.language,
         publisher=base.publisher,
         description=base.description,
+        author_evidence=base.author_evidence if authors_kept else (),
+        title_evidence=title_evidence,
     )
 
 
