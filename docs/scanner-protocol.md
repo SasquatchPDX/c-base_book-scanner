@@ -167,8 +167,13 @@ see `docs/operations.md`).
   (`finished_at`, `sans_last_line_no`, `pages`, `covers`, `metadata_opf`):
   - `200 {"verified": true, "state": "captured", "portal_url"}`: every listed item is
     held with exactly that active checksum and the event high-water marks agree. The job
-    moves `open`/`capturing` -> `captured`. Repeating it, or calling it once the job is
-    `captured`, `finalizing` or `complete`, answers `200` again and changes nothing.
+    moves `open`/`capturing` -> `captured` and serif stores a digest of the verified
+    manifest (its items and `sans_last_line_no`; not `finished_at`).
+  - Once the job is `captured`, `finalizing` or `complete`, repeating the verified
+    manifest (items in any order) answers `200` again and changes nothing. Any other
+    manifest is checked against what serif holds now: `200` only if every listed item is
+    held and the high-water marks agree, else `409 incomplete`. Success is never answered
+    from the job state alone, because a `200` lets the scanner delete its local copy.
   - `409 incomplete`: `details.missing` and `details.mismatched` list item keys
     (`page:<n>`, `cover:<position>`, `metadata_opf`, `events`); `details.sans_last_line_no`
     is serif's high-water mark. The job stays where it was.
@@ -192,15 +197,19 @@ see `docs/operations.md`).
     (`details.sha256`). Replacements go through the rescan flow only.
   - `409 job_state`: the job is not `open`/`capturing` (`details.state`).
   - `422 camera_role_parity` (even numbers are `left`, odd `right`),
-    `422 checksum_mismatch`, `422 invalid_image` (not a decodable JPEG/PNG/TIFF/WebP).
+    `422 checksum_mismatch`, `422 invalid_image`: not a JPEG/PNG/TIFF/WebP whose pixels
+    fully decode within Pillow's decompression-bomb limit (`Image.MAX_IMAGE_PIXELS`).
+    Valid headers and PNG chunk checksums are not enough; the staged file is decoded
+    before anything is published, so no version is created.
   - `413 payload_too_large`: the image is above `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES`
     (the `max_image_bytes` that `ping` reports), or `Content-Length` is above that plus
     1 MiB of multipart overhead. `415` for a body that is not `multipart/form-data`;
-    `400` for malformed metadata (`details.field`) or a missing part;
+    `400` for malformed metadata (`details.field`) or a missing part, including a
+    `captured_at` that is not a real ISO 8601 timestamp with a zone (`2026-02-30T...`);
     `400 upload_interrupted` when the body ends early.
   - `507 insufficient_storage` / `503 storage_unavailable`: transient, retry.
 - `PUT /api/scanner/v1/jobs/{job_id}/covers/{front|back}` (§6.6) has the same shape with
-  `metadata` `{"sha256", "captured_at"}`. The active checksum is `200`; a new checksum
+  `metadata` `{"sha256", "captured_at"}` (same `400`/`422` rules). The active checksum is `200`; a new checksum
   adds a version (`201`) and keeps the earlier ones (`ScanCover`). Allowed in `open`,
   `capturing` and `captured`; a cover does not move the job to `capturing`. At finish
   (scan finalization) the active covers become the Book's front/back `CoverImage`s with
@@ -226,14 +235,16 @@ before the view runs; it is still never one in-memory blob.)
 `core/scan_manifest.py`. Each source owns one field (`pages`, `covers`, `metadata_opf`):
 what serif holds, its JSON status and how the request's field is parsed. Pages and
 covers (S4, `core/scan_covers.py`, registered at app start) exist so far. Until a feature
-is stored on serif it is "nothing expected":
+is stored on serif, nothing of it can be verified:
 
-- a field with no registered source is left out of `GET jobs/{id}` and ignored in a
-  `capture-complete` request (`metadata_opf` until S6). `metadata_opf` may be `null`
-  either way;
+- a field with no registered source is left out of `GET jobs/{id}` (`metadata_opf` until
+  S6). In a `capture-complete` request it **fails closed**: an empty value (`null` or
+  `[]`) is accepted, but a declared item is reported `missing` (`metadata_opf`), because
+  serif cannot have stored it;
 - the event high-water mark is the highest stored scanner `line_no` of the job's
   `scan.jsonl` lines (S5, `scan_events.sans_high_water_mark`, registered at app start
-  with `scan_manifest.register_event_high_water_mark`), `0` before the first line.
+  with `scan_manifest.register_event_high_water_mark`), `0` before the first line. A
+  request `sans_last_line_no` that differs from it is `mismatched` (`events`).
 
 S4 and S6 call `scan_manifest.register_manifest_source(...)`.
 

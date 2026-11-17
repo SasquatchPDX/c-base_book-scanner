@@ -259,6 +259,130 @@ def test_capture_complete_lists_missing_and_mismatched_items(key: str, member: C
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("extra", "missing"),
+    [
+        ({"covers": [{"position": "front", "sha256": "a" * 64}]}, ["cover:front"]),
+        (
+            {
+                "covers": [
+                    {"position": "front", "sha256": "a" * 64},
+                    {"position": "back", "sha256": "b" * 64},
+                ]
+            },
+            ["cover:front", "cover:back"],
+        ),
+        ({"metadata_opf": {"sha256": "c" * 64}}, ["metadata_opf"]),
+    ],
+)
+def test_capture_complete_fails_closed_for_items_serif_cannot_store_yet(
+    key: str, extra: dict[str, Any], missing: list[str]
+) -> None:
+    """A declared cover that was never uploaded (S4 checks it) or an OPF serif cannot
+    store yet (S6) was never stored: capture-complete must not tell the scanner it may
+    delete it."""
+    _register(key)
+
+    response = _capture_complete(key, _manifest({}, **extra))
+
+    assert response.status_code == 409, response.content
+    error = response.json()["error"]
+    assert error["code"] == "incomplete"
+    assert error["details"]["missing"] == missing
+    assert error["details"]["mismatched"] == []
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert job.state == ScanJob.State.OPEN
+    assert job.capture_manifest_sha256 == ""
+
+
+@pytest.mark.django_db
+def test_capture_complete_fails_closed_for_events_serif_has_not_stored(key: str) -> None:
+    _register(key)
+
+    response = _capture_complete(key, _manifest({}, sans_last_line_no=3))
+
+    assert response.status_code == 409
+    assert response.json()["error"]["details"]["mismatched"] == ["events"]
+    assert response.json()["error"]["details"]["sans_last_line_no"] == 0
+    assert ScanJob.objects.get(pk=JOB_ID).state == ScanJob.State.OPEN
+
+
+@pytest.mark.django_db(transaction=True)
+def test_capture_complete_after_success_revalidates_a_changed_manifest(
+    key: str, member: Client
+) -> None:
+    """Success is bound to the verified manifest: an identical retry is 200, a changed
+    manifest (an absent page 9, a cover, a later event line) is checked again."""
+    _register(key)
+    pages = {1: _add_page(member, JOB_ID, 1, b"one"), 2: _add_page(member, JOB_ID, 2, b"two")}
+    assert _capture_complete(key, _manifest(pages)).status_code == 200
+    job = ScanJob.objects.get(pk=JOB_ID)
+    digest = job.capture_manifest_sha256
+    assert len(digest) == 64
+
+    with_page_9 = _capture_complete(key, _manifest({**pages, 9: "9" * 64}))
+    assert with_page_9.status_code == 409, with_page_9.content
+    assert with_page_9.json()["error"]["code"] == "incomplete"
+    assert with_page_9.json()["error"]["details"]["missing"] == ["page:9"]
+
+    changed_page = _capture_complete(key, _manifest({1: pages[1], 2: "f" * 64}))
+    assert changed_page.status_code == 409
+    assert changed_page.json()["error"]["details"]["mismatched"] == ["page:2"]
+
+    with_cover = _capture_complete(
+        key, _manifest(pages, covers=[{"position": "front", "sha256": "a" * 64}])
+    )
+    assert with_cover.status_code == 409
+    assert with_cover.json()["error"]["details"]["missing"] == ["cover:front"]
+
+    later_events = _capture_complete(key, _manifest(pages, sans_last_line_no=4))
+    assert later_events.status_code == 409
+    assert later_events.json()["error"]["details"]["mismatched"] == ["events"]
+
+    # The job is untouched by the refused attempts, and an identical retry (pages in
+    # any order, another finished_at) still succeeds.
+    job.refresh_from_db()
+    assert job.state == ScanJob.State.CAPTURED
+    assert job.capture_manifest_sha256 == digest
+    retry = _manifest(pages, finished_at="2026-11-17T15:41:00Z")
+    retry["pages"].reverse()
+    repeat = _capture_complete(key, retry)
+    assert repeat.status_code == 200, repeat.content
+    assert repeat.json()["verified"] is True
+
+    # A subset of what serif holds is a different manifest, but it verifies.
+    subset = _capture_complete(key, _manifest({1: pages[1]}))
+    assert subset.status_code == 200
+    job.refresh_from_db()
+    assert job.capture_manifest_sha256 == digest
+
+
+@pytest.mark.django_db(transaction=True)
+def test_identical_retry_after_a_replacement_still_verifies(
+    key: str, member: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a rescan replaced page 1 on a complete job, the scanner's lost-response
+    retry of the manifest serif verified is still 200; any other manifest is checked
+    against what serif holds now."""
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    book = Book.objects.create(title="Retry After Rescan")
+    key, pages = _captured_job_with_book(key, member, book)
+    assert (
+        member.post(f"/scan/jobs/{JOB_ID}/finish/", data={"allow_raw_pages": "true"}).status_code
+        == 202
+    )
+    page = ScanPage.objects.get(scan_job_id=JOB_ID)
+    assert member.post(f"/scan/pages/{page.id}/rescan/", data={"reason": "x"}).status_code == 201
+    assert _put_scan_page(member, page.id, _png_for(b"sharper")).status_code == 201
+
+    assert _capture_complete(key, _manifest(pages)).status_code == 200
+    stale = _capture_complete(key, _manifest(pages, finished_at=None, sans_last_line_no=0))
+    assert stale.status_code == 200  # finished_at is not part of the manifest identity
+    other = _capture_complete(key, _manifest({**pages, 2: "2" * 64}))
+    assert other.status_code == 409
+
+
+@pytest.mark.django_db
 def test_capture_complete_on_cancelled_job_is_job_state(key: str) -> None:
     _register(key)
     assert _abort(key).status_code == 200
