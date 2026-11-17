@@ -66,6 +66,16 @@ def test_shared_candidate_accept_and_batch_emit_human_review_events(enabled: Any
     assert set(events.values_list("user_id", flat=True)) == {reviewer.user_id}
     assert set(events.values_list("kind", flat=True)) == {ContributionKind.REVIEW_RESOLVED}
     assert set(events.values_list("state", flat=True)) == {ContributionEvent.State.PENDING}
+    for event in events.select_related("review_task"):
+        source = event.review_task
+        assert source is not None
+        assert source.decided_at is not None
+        assert event.outcome == {
+            "decision": ReviewTask.Decision.ACCEPT_CANDIDATE,
+            "decided_at": source.decided_at.isoformat(),
+            "book_id": source.resolved_book_id,
+        }
+        assert not event.own_upload
     repeated = client.post(
         "/reviews/batch-accept/", {"task_ids": [batched.pk]}, content_type="application/json"
     )
