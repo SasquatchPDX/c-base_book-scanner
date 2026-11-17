@@ -93,6 +93,7 @@ class Settings(BaseSettings):
     metadata_rate_limit_max_wait_seconds: float = 60.0
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    identification_work_isbn_bonus: float = 0.3
     ocr_service_url: str = "http://localhost:8020"
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
@@ -290,6 +291,7 @@ BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value
 BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts

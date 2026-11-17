@@ -125,6 +125,8 @@ AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+# Bound for short OPF evidence values (publisher, date) copied into job evidence.
+MAX_EPUB_TEXT_FIELD = 255
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -803,6 +805,9 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        # Publisher and date are evidence for the publisher bonus and later review (#37).
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
         subjects = identification.normalize_subjects(
             [
                 "".join(element.itertext())
@@ -822,6 +827,8 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "description": description,
             "subjects": subjects,
             "identifier": identifier,
+            "publisher": publisher[:MAX_EPUB_TEXT_FIELD] if publisher else None,
+            "date": raw_date[:MAX_EPUB_TEXT_FIELD] if raw_date else None,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
 import re
@@ -20,6 +21,7 @@ from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
 from rapidfuzz.utils import default_process
 
+from .languages import normalize_language, normalize_languages
 from .rate_limit import throttle_provider
 
 logger = structlog.get_logger(__name__)
@@ -43,6 +45,18 @@ OPEN_LIBRARY_SEARCH_FIELDS = ",".join(
         "cover_i",
         "cover_edition_key",
         "subject",
+        # Work-level lists spanning every edition: comparison-only evidence (#37).
+        "isbn",
+        "publisher",
+        # The single edition that best matches the query: its ISBN/publisher/language
+        # describe one concrete edition, unlike the work-level lists above.
+        "editions",
+        "editions.key",
+        "editions.title",
+        "editions.language",
+        "editions.publisher",
+        "editions.publish_date",
+        "editions.isbn",
     )
 )
 DEFAULT_USER_AGENT = (
@@ -60,6 +74,41 @@ REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
 AUTHOR_GIVEN_NAME_MIN_RATIO = 85.0
+# A file ISBN equal to the candidate's own (edition) ISBN is near-proof (+0.95). One that
+# only appears in the work's list of *other* editions proves the work, not the edition,
+# so it earns a smaller bonus that cannot auto-accept a candidate on its own.
+WORK_ISBN_MATCH_SCORE = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS",
+    0.3,
+)
+# Minimum rapidfuzz token_set_ratio for two publisher names (noise words removed).
+PUBLISHER_MATCH_MIN_RATIO = 90.0
+_PUBLISHER_NOISE_TOKENS = frozenset(
+    {
+        "ag",
+        "and",
+        "book",
+        "books",
+        "brand",
+        "co",
+        "company",
+        "corp",
+        "gmbh",
+        "group",
+        "inc",
+        "limited",
+        "llc",
+        "ltd",
+        "media",
+        "press",
+        "publisher",
+        "publishers",
+        "publishing",
+        "the",
+        "verlag",
+    }
+)
 
 
 class MetadataProvider(Protocol):
@@ -111,6 +160,11 @@ class IdentificationCandidate:
     score: float
     raw: dict[str, Any]
     subjects: list[str] = field(default_factory=list)
+    # Comparison-only evidence, never stored as Book data or Identifiers: every
+    # normalised language, publisher and ISBN-13 the provider knows for the *work*.
+    languages: tuple[str, ...] = ()
+    publishers: tuple[str, ...] = ()
+    work_isbns: tuple[str, ...] = ()
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -286,7 +340,9 @@ def build_identification_input(
         author_hints=author_hints,
         isbns=isbns,
         folder_hints=[h for h in folder_hints if h],
-        language=normalize_text(extracted_metadata.get("language")),
+        # Normalised (ISO 639-1, else 639-3) so "en" and "eng" compare equal; "UND" and
+        # unknown codes become None ("no signal"), never a mismatch.
+        language=normalize_language(_first_str(extracted_metadata.get("language"))),
         publisher=normalize_text(extracted_metadata.get("publisher")),
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
@@ -562,12 +618,46 @@ def _normalize_candidate(
             if isbn10 is not None:
                 isbn10 = _normalize_identifier(isbn10)
 
-    publisher = None
-    raw_publisher = payload.get("publisher") or payload.get("publishers")
-    if isinstance(raw_publisher, list) and raw_publisher:
-        publisher = normalize_text(str(raw_publisher[0]))
-    elif isinstance(raw_publisher, str):
-        publisher = normalize_text(raw_publisher)
+    # A search hit describes a *work*; ``editions`` adds the one edition that best
+    # matches the query. Edition values describe something concrete, work lists do not.
+    edition = _best_edition(payload)
+    if isbn10 is None and isbn13 is None and edition:
+        for value in _as_str_list(edition.get("isbn")):
+            normalized = _normalize_identifier(value)
+            if normalized is None:
+                continue
+            if len(normalized) == 13 and isbn13 is None:
+                isbn13 = normalized
+            elif len(normalized) == 10 and isbn10 is None:
+                isbn10 = normalized
+    work_isbns = (
+        _isbn13_set(payload.get("isbn"))
+        | _isbn13_set(payload.get("isbn_10"))
+        | _isbn13_set(payload.get("isbn_13"))
+        | _isbn13_set(edition.get("isbn"))
+    )
+
+    # Edition publisher: search ``editions`` doc, edition record ``publishers``, or a
+    # plain-string ``publisher`` (single-edition shape, e.g. Hardcover). The search
+    # ``publisher`` *list* spans all editions, so its first entry is arbitrary (#37);
+    # it is used for comparison only.
+    raw_publisher = payload.get("publisher")
+    edition_publishers = (
+        _as_str_list(edition.get("publisher"))
+        or _as_str_list(payload.get("publishers"))
+        or (_as_str_list(raw_publisher) if isinstance(raw_publisher, str) else [])
+    )
+    publisher = next(
+        (normalize_text(value) for value in edition_publishers if normalize_text(value)),
+        None,
+    )
+    publishers = tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in edition_publishers + _as_str_list(raw_publisher)
+            if value.strip()
+        )
+    )
 
     publication_year = None
     raw_publish = payload.get("first_publish_year")
@@ -580,14 +670,14 @@ def _normalize_candidate(
     elif isinstance(raw_publish, str) and raw_publish.isdigit():
         publication_year = int(raw_publish)
 
-    language: str | None = None
-    raw_language = payload.get("language")
-    if isinstance(raw_language, str):
-        language = normalize_text(raw_language)
-    elif isinstance(raw_language, list) and raw_language:
-        first_language = raw_language[0]
-        if isinstance(first_language, str):
-            language = normalize_text(first_language)
+    # Languages, edition first: search edition doc ["eng"] or edition record
+    # [{"key": "/languages/eng"}] (#36), then the work's list ["und", "eng", "fre"].
+    edition_language_values = _as_language_values(edition.get("language")) or (
+        _as_language_values(payload.get("languages"))
+    )
+    work_language_values = _as_language_values(payload.get("language"))
+    languages = tuple(normalize_languages(edition_language_values + work_language_values))
+    language = _pick_language(edition_language_values, work_language_values, signals.language)
 
     candidate = IdentificationCandidate(
         provider_id=provider_id,
@@ -612,6 +702,9 @@ def _normalize_candidate(
             + _as_str_list(payload.get("subjects"))
             + _as_str_list(payload.get("categories"))
         ),
+        languages=languages,
+        publishers=publishers,
+        work_isbns=tuple(sorted(work_isbns)),
     )
     return _apply_scoring(signals, candidate)
 
@@ -622,6 +715,84 @@ def _as_str_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, str)]
     return []
+
+
+def _first_str(value: Any) -> str | None:
+    """A string, or the first non-blank string of a list (OPF may repeat dc:language)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return next((item for item in value if isinstance(item, str) and item.strip()), None)
+    return None
+
+
+def _best_edition(payload: dict[str, Any]) -> dict[str, Any]:
+    """The best-matching edition Open Library returns for ``fields=editions``."""
+    editions = payload.get("editions")
+    docs = editions.get("docs") if isinstance(editions, dict) else None
+    if isinstance(docs, list) and docs and isinstance(docs[0], dict):
+        return docs[0]
+    return {}
+
+
+def _isbn13_set(values: Any) -> set[str]:
+    result: set[str] = set()
+    for value in _as_str_list(values):
+        normalized = _normalize_identifier(value)
+        if normalized is None:
+            continue
+        result.add(_isbn10_to_isbn13(normalized) if len(normalized) == 10 else normalized)
+    return result
+
+
+def _as_language_values(value: Any) -> list[str]:
+    """Raw language codes from a string, a list, or edition-record ``{"key": ...}`` dicts."""
+    values = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in values:
+        if isinstance(item, dict):
+            item = item.get("key")
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip().rsplit("/", 1)[-1])
+    return result
+
+
+def _pick_language(
+    edition_values: list[str],
+    work_values: list[str],
+    signal_language: str | None,
+) -> str | None:
+    """The language stored on the candidate, kept in the provider's own code form.
+
+    The edition's language wins; otherwise the work's entry for the file's language (a
+    work listed as ["und", "eng", "fre"] is not French because "fre" came first), then
+    the first entry that carries a language signal.
+    """
+    usable_edition = [value for value in edition_values if normalize_language(value)]
+    if usable_edition:
+        return normalize_text(usable_edition[0])
+    usable_work = [value for value in work_values if normalize_language(value)]
+    if signal_language:
+        for value in usable_work:
+            if normalize_language(value) == signal_language:
+                return normalize_text(value)
+    return normalize_text(usable_work[0]) if usable_work else None
+
+
+def _publisher_tokens(value: str) -> str:
+    return " ".join(sorted(set(default_process(value).split()) - _PUBLISHER_NOISE_TOKENS))
+
+
+def _publisher_match(signal: str | None, candidates: tuple[str, ...]) -> bool:
+    """Fuzzy publisher equality ("ACE BOOKS" ~ "Ace", "Gollancz Ltd." ~ "Gollancz")."""
+    left = _publisher_tokens(signal) if signal else ""
+    if not left:
+        return False
+    for candidate in candidates:
+        right = _publisher_tokens(candidate)
+        if right and token_set_ratio(left, right) >= PUBLISHER_MATCH_MIN_RATIO:
+            return True
+    return False
 
 
 def _title_match_score(left: str, right: str) -> float:
@@ -719,11 +890,12 @@ def _apply_scoring(
     score = 0.0
 
     if signals.isbns:
-        isbn_matches = {
-            value for value in signals.isbns if value in {candidate.isbn10, candidate.isbn13}
-        }
-        if isbn_matches:
+        signal_isbns = _isbn13_set(signals.isbns)
+        edition_isbns = _isbn13_set([v for v in (candidate.isbn10, candidate.isbn13) if v])
+        if signal_isbns & edition_isbns:
             score += 0.95
+        elif signal_isbns & set(candidate.work_isbns):
+            score += WORK_ISBN_MATCH_SCORE
 
     title_scores = [
         _title_match_score(title_hint, candidate.title) for title_hint in signals.title_hints
@@ -734,10 +906,18 @@ def _apply_scoring(
     author_score = _author_match_score(signals.author_hints, candidate.authors)
     score += 0.3 * author_score
 
-    if signals.language and candidate.language and signals.language == candidate.language:
-        score += 0.05
+    if signals.language:
+        candidate_languages = set(candidate.languages)
+        candidate_language = normalize_language(candidate.language)
+        if candidate_language:
+            candidate_languages.add(candidate_language)
+        if signals.language in candidate_languages:
+            score += 0.05
 
-    if signals.publisher and candidate.publisher and signals.publisher == candidate.publisher:
+    if _publisher_match(
+        signals.publisher,
+        candidate.publishers or ((candidate.publisher,) if candidate.publisher else ()),
+    ):
         score += 0.05
 
     if signals.description and candidate.description:
@@ -745,23 +925,7 @@ def _apply_scoring(
         if normalized_signal and normalized_signal in normalize_text(candidate.description):
             score += 0.05
 
-    normalized_candidate = IdentificationCandidate(
-        provider_id=candidate.provider_id,
-        provider_ref=candidate.provider_ref,
-        title=candidate.title,
-        authors=candidate.authors,
-        isbn10=candidate.isbn10,
-        isbn13=candidate.isbn13,
-        language=candidate.language,
-        description=candidate.description,
-        publisher=candidate.publisher,
-        edition=candidate.edition,
-        publication_year=candidate.publication_year,
-        score=min(score, 1.0),
-        raw=candidate.raw,
-        subjects=candidate.subjects,
-    )
-    return normalized_candidate
+    return dataclasses.replace(candidate, score=min(score, 1.0))
 
 
 def best_candidate(

@@ -34,6 +34,7 @@ dependencies = [
   "rarfile>=4.2,<5",
   "pypdfium2>=4.30,<5",
   "uvicorn>=0.35,<1",
+  "pycountry>=24.6,<27",
 ]
 
 [project.scripts]
