@@ -688,6 +688,10 @@ def test_unsupported_format_is_rejected() -> None:
     ("filename", "expected_format"),
     [
         ("book.mobi", "mobi"),
+        ("book.azw", "azw"),
+        ("book.AZW3", "azw3"),
+        ("book.prc", "prc"),
+        ("book.rtf", "rtf"),
         ("book.txt", "txt"),
         ("book.html", "html"),
         ("book.htm", "html"),
@@ -707,8 +711,16 @@ def test_extended_formats_are_detected(filename: str, expected_format: str) -> N
 def test_extended_format_signatures_are_validated(tmp_path: Path) -> None:
     mobi = bytearray(68)
     mobi[60:68] = b"BOOKMOBI"
+    palmdoc = bytearray(68)
+    palmdoc[60:68] = b"TEXtREAd"
     fixtures = {
         "book.mobi": (bytes(mobi), "mobi"),
+        "book.azw": (bytes(mobi), "azw"),
+        "book.azw3": (bytes(mobi), "azw3"),
+        "book.prc": (bytes(mobi), "prc"),
+        "palmdoc.prc": (bytes(palmdoc), "prc"),
+        "book.rtf": (b"{\\rtf1\\ansi Hello}", "rtf"),
+        "bom.rtf": (b"\xef\xbb\xbf{\\rtf1 Hello}", "rtf"),
         "book.txt": ("A café story".encode(), "txt"),
         "book.html": (b"<!doctype html><html><title>Book</title></html>", "html"),
         "book.fb2": (b"<FictionBook><description/></FictionBook>", "fb2"),
@@ -730,6 +742,10 @@ def test_extended_format_signatures_are_validated(tmp_path: Path) -> None:
     ("filename", "detected_format"),
     [
         ("fake.mobi", "mobi"),
+        ("fake.azw", "azw"),
+        ("fake.azw3", "azw3"),
+        ("fake.prc", "prc"),
+        ("fake.rtf", "rtf"),
         ("fake.html", "html"),
         ("fake.fb2", "fb2"),
         ("fake.djvu", "djvu"),
@@ -849,6 +865,48 @@ def test_txt_upload_uses_normal_ingestion_and_external_verification(
     assert job.state == ImportJob.State.COMPLETE
     assert job.file_variant is not None
     assert job.file_variant.format == FileVariant.VariantFormat.TXT
+
+
+def test_plain_palmdoc_is_only_accepted_as_prc(tmp_path: Path) -> None:
+    palmdoc = bytearray(68)
+    palmdoc[60:68] = b"TEXtREAd"
+    path = tmp_path / "book.azw3"
+    path.write_bytes(bytes(palmdoc))
+    with pytest.raises(intake.ValidationError):
+        intake.validate_container_signature(str(path), "azw3")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_azw3_upload_registers_file_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_storage(tmp_path)
+    # Auto-accept needs provider authors (master's no_provider_authors block).
+    _force_stub_provider(monkeypatch, candidate_title="Kindle Story", authors=["Jane Doe"])
+    profile = get_or_create_profile("azw3-upload-user")
+    client = Client()
+    client.force_login(profile.user)
+    payload = bytearray(256)
+    payload[60:68] = b"BOOKMOBI"
+
+    response = client.post(
+        "/imports/upload/",
+        {
+            "file": SimpleUploadedFile(
+                "Kindle Story.azw3",
+                bytes(payload),
+                content_type="application/octet-stream",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.file_variant is not None
+    assert job.file_variant.format == FileVariant.VariantFormat.AZW3
+    assert job.file_variant.mime_type == "application/x-mobi8-ebook"
 
 
 @pytest.mark.django_db(transaction=True)

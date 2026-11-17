@@ -32,6 +32,19 @@ test("a member completes digital intake, review, search, download, and conversio
     await member.getByRole("link", { name: "Resolve metadata" }).click();
     await member.getByRole("link", { name: title }).click();
     await expect(member.locator(".candidate-list")).toContainText("Ada Digital");
+
+    // The reviewer can read the actual file in the collapsed-by-default reader panel.
+    const reader = member.locator("[data-review-reader]");
+    await expect(reader.locator("[data-reader-body]")).toBeHidden();
+    await reader.getByRole("button", { name: "Read the book" }).click();
+    await expect(reader.getByRole("tab", { name: /EPUB/ })).toHaveAttribute("aria-selected", "true");
+    await expect(reader.locator("iframe")).toHaveAttribute("sandbox", "");
+    await expect(reader.frameLocator("iframe").locator("body")).toContainText(
+      "Browser Digital Library",
+    );
+    await reader.getByRole("button", { name: "Close" }).click();
+    await expect(reader.locator("[data-reader-body]")).toBeHidden();
+
     await member.getByRole("button", { name: "Accept" }).click();
 
     await member.goto(`/library/books/?view=html&q=${encodeURIComponent(title)}`);

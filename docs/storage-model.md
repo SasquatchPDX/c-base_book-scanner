@@ -44,6 +44,18 @@ mounted NFS/Samba shares to the filesystem backend. The reserved `default` and
 `APP_DATA_DIR/scan-artifacts`; other locations use their configured base path.
 Unknown backend values fail closed. Object storage is not implemented.
 
+## Read-only locations (index in place)
+
+A `StorageLocation` with `read_only=True` resolves to `ReadOnlyFilesystemStorage`:
+reads (`open`, `stream`, `hash`, `exists`, `stat`) work, while `store`, `copy`,
+`move`, `delete` and `generate_destination` raise `ReadOnlyStorageError`. Sources in
+`index` transfer mode reference files through such a location; their FileVariants
+carry `source_mtime_ns` and `reference_state` for drift detection
+(`core.referenced_files`). `storage_registry.writable_location_for()` maps a
+read-only location to the `default` archive, so conversions, covers and OCR output
+derived from referenced files are written there. Book deletion skips files on
+read-only locations (records only).
+
 Duplicate intake verifies the existing variant on its declared backend before
 removing a MOVE source. A matching identifier on another backend cannot authorize
 deletion; COPY always retains its source.
