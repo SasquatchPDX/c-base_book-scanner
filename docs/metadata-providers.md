@@ -71,11 +71,56 @@ candidate was or was not auto-accepted. The rule runs inside `resolve_candidates
 so it applies equally to upload/incoming/network intake, review re-searches and
 scan-job identification.
 
+The rule only raises a score; it does not bypass the other auto-accept checks. A
+promoted candidate goes through intake's author checks (see "Author checks before
+auto-accept" below) like any other candidate at the threshold. If its provider
+record names no real authors, or its authors conflict with the file's embedded
+authors, the import still goes to review with `auto_accept_blocked` set. Its
+`_auto_accept_rule` record then says `applied: true`, and the import evidence says
+why the accept was blocked anyway.
+
+Author names are compared per name, not by exact string. Case, punctuation,
+spacing, and "Last, First" order are ignored, so "H P Lovecraft" equals
+"H. P. Lovecraft". A name variant counts as a partial match
+(`AUTHOR_VARIANT_MATCH_SCORE`, 0.9) when the surname is the same and the given
+names line up in order. Given names line up when they are equal, when one is the
+other's initial, or when they are close spellings, so a missing middle name or
+initial is allowed ("Iain M. Banks" vs "Iain Banks"). A shared surname alone is
+not a match ("Frank Herbert" vs "Brian Herbert").
+
 Title similarity is the mean of rapidfuzz `token_set_ratio` and `token_sort_ratio`
 over punctuation-normalized titles. `token_set_ratio` alone gives full marks when one
 title's words are a subset of the other's ("Foundation" vs "Foundation and Earth"),
 so the sort ratio is blended in to make unmatched words cost score. Only titles with
 the same words reach a full title score.
+
+### Author checks before auto-accept
+
+A score at or above the auto-accept threshold is necessary but not sufficient. An
+exact ISBN match alone reaches it, and an ISBN says nothing about who wrote the book,
+so intake (`intake.decide_auto_accept`) also checks the top candidate's authors:
+
+- **No provider authors** (`no_provider_authors`): the candidate names no authors,
+  or only placeholders such as "Unknown" or "Multiple Authors". The import goes to
+  review instead of creating, or attaching to, a Book whose authors nobody checked.
+  The file's embedded authors are never written onto the Book automatically, also
+  not when an existing Book matched by ISBN has no authors yet.
+- **Author conflict** (`author_conflict`): both sides name authors and none of the
+  candidate's authors is the same person as any of the file's embedded authors,
+  using the name matching above. A bare surname on one side ("Tolkien") agrees with
+  a full name that ends in it. Missing file authors are not a conflict.
+
+Either case sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
+`REVIEW` state (none is shown as a `MATCH`), and records in the import's evidence:
+`auto_accept_blocked` (the reason above), `auto_accept_block_details` (provider,
+score, candidate and file authors) and `suggested_authors` (the file's embedded
+authors without placeholder creators such as "Microsoft Office User", "Owner" or
+"Administrator"). The review page explains the reason and pre-fills the suggested
+authors. They are applied only when a reviewer accepts a candidate that has no
+authors of its own, and only to a Book without authors; provider authors always win.
+
+For Open Library ISBN lookups, an edition record without `authors` falls back to the
+authors of its first work record (`works[0]`), where Open Library usually keeps them.
 
 ## Provider options identified
 
@@ -91,6 +136,43 @@ the same words reach a full title score.
 - Query style: ISBN/title/author lookup and broader coverage in some domains.
 - Fit: useful for fallback/confirmatory evidence where Open Library misses coverage.
 - Notes: operational terms and quotas need environment-specific validation before go-live.
+
+### Hardcover.app (optional, opt-in)
+
+- Provider: `ebook_server.core.hardcover_provider.HardcoverMetadataProvider`
+  (`provider_id = "hardcover"`).
+- Access: free personal API token from <https://hardcover.app/account/api>. A token
+  limited to a read-only catalog scope (`read:catalog`, or `read:catalog:search` plus
+  `read:catalog:data`) is sufficient; do not use an `all`-scope token.
+- Enable: add the provider to `BOOK_SCANNER_METADATA_PROVIDERS` **and** set
+  `BOOK_SCANNER_HARDCOVER_API_TOKEN`. Listed without a token, the provider is skipped
+  with a single `metadata_provider_unavailable` warning. Optional
+  `BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS` (default 10).
+- Transport: `POST https://api.hardcover.app/v1/graphql` with
+  `Authorization: Bearer <token>` and a JSON GraphQL body. The token is never logged or
+  included in error messages.
+- Queries (fields taken from the official `schema.graphql` in
+  `hardcoverapp/hardcover-docs`):
+  - ISBN: `editions(where: {isbn_13 | isbn_10 _eq})` with edition title, subtitle,
+    ISBNs, release year, publisher, language (`code3`, falling back to `code2`), cover
+    image, and the parent book's description and authors
+    (`contributions` filtered to `contributor_role.slug = "author"`).
+  - Title/author: `search(query_type: "Book")` returns ranked `ids`; a second
+    `books(where: {id: {_in: ids}})` query fetches typed fields. The untyped
+    `search.results` JSON is not parsed. Work-level search candidates carry no ISBN,
+    publisher or language, because those belong to a specific edition.
+- Limits (official docs): free plan 60 requests/minute, burst 10, 5,000/day; queries
+  time out after 30 s (search after 2 s); responses carry `Retry-After` on 429. A title
+  search costs two requests. Every outbound request uses the shared per-provider
+  limiter, including retries; the default rate is one request per second.
+- Failures: HTTP 401/403/408/429/5xx, GraphQL `errors`, non-JSON, unexpected shapes and
+  responses over 1 MiB are provider failures (`metadata_provider_failed`), not "no
+  results". A 429 is retried once only if `Retry-After` is at most 5 seconds.
+- Candidates go through the same scoring and review thresholds as Open Library; a
+  Hardcover hit is never accepted on weaker evidence than any other provider.
+- Terms: the Hardcover API is in beta and may change; tokens may be reset. The data
+  must not be used to train publicly available or commercial LLMs. Cover images are
+  user-uploaded; the provider only records their URL.
 
 ### WorldCat/other catalogs (later)
 
@@ -109,3 +191,39 @@ For each hit store:
 - provenance timestamp
 
 Weak matches must route to review workflow instead of auto-linking.
+
+## Subject / genre evidence
+
+Subject tags are captured as evidence only; they do not affect candidate scoring and
+are not yet written to `Book.categories` / `Book.genres`.
+
+- Embedded: EPUB `dc:subject` and CBZ `ComicInfo.xml` `Genre` (comma-separated) land
+  in `ImportJob.evidence["subjects"]` (and therefore the review task's embedded
+  metadata).
+- Providers: `MetadataCandidate.subjects` holds tags from the provider record
+  (Open Library search `subject`, edition `subjects`, Google Books-style
+  `categories`). Open Library search requests `subject` explicitly via `fields`,
+  because the default search field set omits it.
+- Tags are trimmed, de-duplicated case-insensitively, limited to 25 per source and
+  128 characters each (`Category.name` / `Genre.name` length), and otherwise kept as
+  free text. Reviewers see candidate subjects on the review page.
+
+Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
+whether review gates it) is an open owner decision tracked in issue #50.
+
+## Publication year
+
+Providers report a publication *year*, never a reliable day: Open Library's
+`first_publish_year` (the work's first publication, not necessarily the edition on
+file, and sometimes simply wrong) or Hardcover's `release_year`. It is stored in
+`Book.publication_year`. `Book.publication_date` is kept only for a genuinely known
+full date (for example entered in the admin) and is otherwise empty, so the book
+page shows "2003" instead of a fabricated "Jan. 1, 2003".
+
+Migration `0020_book_publication_year` copies the year of every existing
+`publication_date` into `publication_year` and clears dates on 1 January, because
+every automated writer stored a year that way; other dates are kept. The book API
+(`GET /library/books/<id>/`) gains `publication_year` (from the year field, or the
+year of a full date) next to `publication_date`, which is now `null` for year-only
+books. Clients that read the year from `publication_date` must switch to
+`publication_year`.

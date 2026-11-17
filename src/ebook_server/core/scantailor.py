@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import struct
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from math import hypot
+from math import ceil, hypot
 from pathlib import Path
 from typing import Any, Final
 
@@ -17,14 +20,16 @@ from django.conf import settings as django_settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
 from .models import (
     ProcessingJob,
+    ScanJob,
     ScanPage,
+    ScanPageVersion,
     ScanTailorStageState,
     StorageLocation,
 )
@@ -50,7 +55,9 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     "deskew": "projection-v1",
     "select_content": "projection-v1",
     "margins": "padding-v1",
-    "dewarping": "opencv-v1",
+    # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
+    # v3: auto mode derives the quad from the text lines.
+    "dewarping": "opencv-v3",
     "output": "opencv-v1",
 }
 
@@ -218,8 +225,6 @@ def get_or_create_stage_state(
     page_id: str,
     stage: str,
 ) -> ScanTailorStageState:
-    from .models import ScanJob  # local import to avoid cycle at module import time
-
     scan_job = ScanJob.objects.get(id=scan_job_id)
     scan_page = ScanPage.objects.get(id=page_id)
     predecessor_name = previous_stage(stage)
@@ -257,26 +262,142 @@ def get_or_create_stage_state(
         defaults=defaults,
     )
 
-    if state.input_stage_state_id != (predecessor.id if predecessor else None):
-        state.input_stage_state = predecessor
-    if predecessor is None and active_version is not None:
-        state.input_scan_page_version = active_version
-        state.input_storage_identifier = active_version.storage_identifier
-    if not state.algorithm:
-        state.algorithm = _default_algorithm(stage)
-    if not state.algorithm_version:
-        state.algorithm_version = _default_algorithm_version(stage)
-
-    state.save(
-        update_fields=[
-            "input_stage_state",
-            "input_scan_page_version",
-            "input_storage_identifier",
-            "algorithm",
-            "algorithm_version",
-        ],
+    changed = _apply_stage_state_defaults(
+        state,
+        predecessor=predecessor,
+        active_version=active_version,
     )
+    if changed:
+        # Only write when something actually changed: workspace loads call this for
+        # every page/stage and must not turn into thousands of no-op UPDATEs (#51).
+        state.save(update_fields=[*changed, "updated_at"])
     return state
+
+
+_STAGE_STATE_DEFAULT_FIELDS: Final[tuple[str, ...]] = (
+    "input_stage_state",
+    "input_scan_page_version",
+    "input_storage_identifier",
+    "algorithm",
+    "algorithm_version",
+)
+
+
+def _apply_stage_state_defaults(
+    state: ScanTailorStageState,
+    *,
+    predecessor: ScanTailorStageState | None,
+    active_version: ScanPageVersion | None,
+) -> list[str]:
+    """Bring ``state``'s input links/algorithm defaults up to date; return changed fields."""
+    changed: list[str] = []
+    predecessor_id = predecessor.id if predecessor is not None else None
+    if state.input_stage_state_id != predecessor_id:
+        state.input_stage_state = predecessor
+        changed.append("input_stage_state")
+    if predecessor is None and active_version is not None:
+        if state.input_scan_page_version_id != active_version.id:
+            state.input_scan_page_version = active_version
+            changed.append("input_scan_page_version")
+        if state.input_storage_identifier != active_version.storage_identifier:
+            state.input_storage_identifier = active_version.storage_identifier
+            changed.append("input_storage_identifier")
+    if not state.algorithm:
+        state.algorithm = _default_algorithm(state.stage)
+        changed.append("algorithm")
+    if not state.algorithm_version:
+        state.algorithm_version = _default_algorithm_version(state.stage)
+        changed.append("algorithm_version")
+    return changed
+
+
+@transaction.atomic
+def ensure_stage_states_for_pages(
+    scan_job: ScanJob,
+    pages: Sequence[ScanPage],
+    active_versions: dict[Any, ScanPageVersion | None],
+) -> dict[Any, dict[str, ScanTailorStageState]]:
+    """Bulk equivalent of ``get_or_create_stage_state`` for every stage of ``pages``.
+
+    Uses a bounded number of queries independent of the page count: one read of the
+    job's existing states, plus (only when rows are missing) one insert and one
+    re-read per stage. Rows whose input links are already correct are not written.
+    Rows that do need relinking (e.g. after a rescan) go through the locked
+    single-row path, which is rare.
+
+    ``active_versions`` maps page id -> active ScanPageVersion (callers usually have
+    the versions prefetched). Returns page id -> {stage: state}.
+    """
+    page_ids = [page.id for page in pages]
+    by_page: dict[Any, dict[str, ScanTailorStageState]] = {page_id: {} for page_id in page_ids}
+    if not page_ids:
+        return by_page
+
+    def _load(stage: str | None = None) -> None:
+        query = ScanTailorStageState.objects.filter(scan_job=scan_job, scan_page_id__in=page_ids)
+        if stage is not None:
+            query = query.filter(stage=stage)
+        for existing in query:
+            by_page[existing.scan_page_id][existing.stage] = existing
+
+    _load()
+    for stage in stage_order():
+        predecessor_name = previous_stage(stage)
+        missing: list[ScanTailorStageState] = []
+        for page in pages:
+            if stage in by_page[page.id]:
+                continue
+            predecessor = by_page[page.id].get(predecessor_name) if predecessor_name else None
+            active_version = active_versions.get(page.id)
+            first_input = predecessor is None and active_version is not None
+            missing.append(
+                ScanTailorStageState(
+                    scan_job=scan_job,
+                    scan_page=page,
+                    stage=stage,
+                    algorithm=_default_algorithm(stage),
+                    algorithm_version=_default_algorithm_version(stage),
+                    input_stage_state=predecessor,
+                    input_scan_page_version=active_version if first_input else None,
+                    input_storage_identifier=(
+                        active_version.storage_identifier
+                        if first_input and active_version is not None
+                        else ""
+                    ),
+                ),
+            )
+        if missing:
+            # ignore_conflicts: a concurrent request may have created some rows.
+            ScanTailorStageState.objects.bulk_create(missing, ignore_conflicts=True)
+            _load(stage)
+
+    for page in pages:
+        page_states = by_page[page.id]
+        for stage in stage_order():
+            state = page_states.get(stage)
+            if state is None:
+                continue
+            predecessor_name = previous_stage(stage)
+            predecessor = page_states.get(predecessor_name) if predecessor_name else None
+            probe = ScanTailorStageState(
+                stage=state.stage,
+                input_stage_state_id=state.input_stage_state_id,
+                input_scan_page_version_id=state.input_scan_page_version_id,
+                input_storage_identifier=state.input_storage_identifier,
+                algorithm=state.algorithm,
+                algorithm_version=state.algorithm_version,
+            )
+            if _apply_stage_state_defaults(
+                probe,
+                predecessor=predecessor,
+                active_version=active_versions.get(page.id),
+            ):
+                page_states[stage] = get_or_create_stage_state(
+                    scan_job_id=str(scan_job.id),
+                    page_id=str(page.id),
+                    stage=stage,
+                )
+    return by_page
 
 
 def invalidate_downstream_states(
@@ -293,8 +414,9 @@ def invalidate_downstream_states(
         query |= Q(scan_job=page.scan_job, scan_page=page, stage=stage)
     for state in ScanTailorStageState.objects.filter(query):
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def mark_state_stale(
@@ -306,8 +428,9 @@ def mark_state_stale(
     states = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     for state in states:
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -401,17 +524,16 @@ def _load_image(path: Path) -> Image.Image:
             image = _normalise_image(oriented)
             if image is opened:
                 image = opened.copy()
-    except (OSError, UnidentifiedImageError, ValueError, SyntaxError) as exc:
+    except (
+        OSError,
+        UnidentifiedImageError,
+        ValueError,
+        SyntaxError,
+        Image.DecompressionBombError,
+    ) as exc:
         raise ImageLoadError(f"cannot read image {path.name}: {exc}") from exc
     image.info["dpi"] = dpi or (DEFAULT_DPI, DEFAULT_DPI)
     return image
-
-
-def _as_image_if_available(path: Path) -> tuple[Image.Image | None, bool]:
-    try:
-        return _load_image(path), True
-    except ImageLoadError:
-        return None, False
 
 
 def _dpi_of(image: Image.Image) -> tuple[int, int]:
@@ -447,11 +569,173 @@ def _save_preview(source: Image.Image, preview_path: Path) -> None:
         preview_image.save(preview_path, format="PNG")
 
 
-def _passthrough(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
-    """Copy a stage input through unchanged (re-encoded as normalised PNG)."""
-    image = _load_image(source_path)
-    _save_png(image, output_path, _dpi_of(image))
+_ORIENTATION_TAG: Final[int] = int(ExifTags.Base.Orientation)
+_TRANSPOSED_ORIENTATIONS: Final[frozenset[int]] = frozenset({5, 6, 7, 8})
+
+
+def _exif_orientation(image: Image.Image) -> int:
+    try:
+        value = image.getexif().get(_ORIENTATION_TAG, 1)
+    except (OSError, ValueError, SyntaxError):
+        return 1
+    return value if isinstance(value, int) else 1
+
+
+def _orientation_from_exif_bytes(data: bytes) -> int:
+    exif = Image.Exif()
+    try:
+        exif.load(data)
+        value = exif.get(_ORIENTATION_TAG, 1)
+    except (OSError, ValueError, SyntaxError, struct.error):
+        return 1
+    return value if isinstance(value, int) else 1
+
+
+_PNG_SIGNATURE: Final[bytes] = b"\x89PNG\r\n\x1a\n"
+# Upper bounds for the chunk walk; real pages have a few hundred IDAT chunks at most.
+_PNG_MAX_CHUNKS: Final[int] = 100_000
+_PNG_MAX_EXIF_BYTES: Final[int] = 1 << 20
+# Exactly the chunks ``_save_png`` writes for an 8-bit L/RGB image (pHYs carries DPI).
+# Anything else (gAMA, cHRM, sRGB, iCCP, eXIf, sBIT, tRNS, text, ...) either changes
+# rendering/metadata or is dropped by a re-encode, so it disqualifies a byte copy.
+_PNG_PASSTHROUGH_CHUNKS: Final[frozenset[bytes]] = frozenset({b"IHDR", b"pHYs", b"IDAT", b"IEND"})
+
+
+@dataclass(frozen=True)
+class _PngLayout:
+    width: int
+    height: int
+    bit_depth: int
+    colour_type: int
+    interlace: int
+    chunk_types: frozenset[bytes]
+    phys: tuple[int, int, int] | None
+    exif: bytes | None
+
+
+def _read_png_layout(path: Path) -> _PngLayout | None:
+    """Walk the PNG chunk headers of ``path`` without decompressing any image data.
+
+    Only the IHDR, pHYs and eXIf payloads are read; every other chunk is skipped by
+    seeking. Returns None for anything that is not a structurally sane PNG.
+    """
+    ihdr: tuple[int, int, int, int, int] | None = None
+    phys: tuple[int, int, int] | None = None
+    exif: bytes | None = None
+    seen: set[bytes] = set()
+    try:
+        with path.open("rb") as handle:
+            if handle.read(len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+                return None
+            file_size = os.fstat(handle.fileno()).st_size
+            for _ in range(_PNG_MAX_CHUNKS):
+                head = handle.read(8)
+                if len(head) != 8:
+                    return None
+                length, chunk_type = struct.unpack(">I4s", head)
+                if handle.tell() + length + 4 > file_size:
+                    return None
+                if not seen and chunk_type != b"IHDR":
+                    return None
+                if chunk_type == b"IHDR":
+                    if seen or length != 13:
+                        return None
+                    width, height, bit_depth, colour_type, _, _, interlace = struct.unpack(
+                        ">IIBBBBB", handle.read(13)
+                    )
+                    ihdr = (width, height, bit_depth, colour_type, interlace)
+                    handle.seek(4, os.SEEK_CUR)
+                elif chunk_type == b"pHYs" and length == 9:
+                    phys = struct.unpack(">IIB", handle.read(9))
+                    handle.seek(4, os.SEEK_CUR)
+                elif chunk_type == b"eXIf" and length <= _PNG_MAX_EXIF_BYTES:
+                    exif = handle.read(length)
+                    handle.seek(4, os.SEEK_CUR)
+                else:
+                    handle.seek(length + 4, os.SEEK_CUR)
+                seen.add(chunk_type)
+                if chunk_type == b"IEND":
+                    break
+            else:
+                return None
+    except (OSError, struct.error):
+        return None
+    if ihdr is None or b"IDAT" not in seen or ihdr[0] == 0 or ihdr[1] == 0:
+        return None
+    width, height, bit_depth, colour_type, interlace = ihdr
+    return _PngLayout(
+        width=width,
+        height=height,
+        bit_depth=bit_depth,
+        colour_type=colour_type,
+        interlace=interlace,
+        chunk_types=frozenset(seen),
+        phys=phys,
+        exif=exif,
+    )
+
+
+def _phys_matches_encoder(phys: tuple[int, int, int] | None) -> bool:
+    """True when pHYs holds exactly what ``_save_png`` writes for the DPI it implies."""
+    if phys is None:
+        return False
+    x_ppm, y_ppm, unit = phys
+    if unit != 1:
+        return False
+    dpi = _sanitize_dpi((x_ppm * 0.0254, y_ppm * 0.0254))
+    if dpi is None:
+        return False
+    return (int(dpi[0] / 0.0254 + 0.5), int(dpi[1] / 0.0254 + 0.5)) == (x_ppm, y_ppm)
+
+
+def _is_normalised_png(path: Path) -> bool:
+    """True when re-encoding ``path`` via ``_load_image``/``_save_png`` would change nothing.
+
+    That is a non-interlaced 8-bit greyscale or RGB PNG (IHDR bit depth 8, colour
+    type 0 or 2) whose only chunks are the ones ``_save_png`` itself writes (IHDR,
+    a pHYs with an in-range DPI, IDAT, IEND): exactly what every stage writes. Such
+    a file can be byte-copied as an unchanged stage output instead of being decoded
+    and re-encoded (#54). 16-bit, 1/2/4-bit, palette, alpha and interlaced files,
+    and files with colour-management, EXIF, transparency or text chunks, are not
+    eligible and take the normalising re-encode. Only chunk headers are read; no
+    image data is decompressed.
+    """
+    layout = _read_png_layout(path)
+    return (
+        layout is not None
+        and layout.bit_depth == 8
+        and layout.colour_type in {0, 2}
+        and layout.interlace == 0
+        and layout.chunk_types <= _PNG_PASSTHROUGH_CHUNKS
+        and _phys_matches_encoder(layout.phys)
+    )
+
+
+def _write_unchanged(
+    image: Image.Image,
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+) -> None:
+    """Persist ``image`` (the decoded, unmodified stage input) as this stage's output.
+
+    When the input file already is a normalised PNG its bytes are copied verbatim,
+    skipping the full-resolution PNG re-encode; the stage still gets its own output
+    artifact (identical bytes, so identical SHA-256) and preview. Anything else
+    (raw TIFF/JPEG uploads, 16-bit, palette, interlaced, alpha, EXIF/ICC/gamma
+    chunks, ...) is normalised by a re-encode as before.
+    """
+    if _is_normalised_png(source_path):
+        shutil.copyfile(source_path, output_path)
+    else:
+        _save_png(image, output_path, _dpi_of(image))
     _save_preview(image, preview_path)
+
+
+def _passthrough(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
+    """Copy a stage input through unchanged (normalised PNG; byte copy when possible)."""
+    image = _load_image(source_path)
+    _write_unchanged(image, source_path, output_path, preview_path)
     return {"algorithm": "copy"}
 
 
@@ -466,17 +750,43 @@ def _record_image_dimensions(
 ) -> dict[str, Any]:
     """Record current input/output sizes; always overwrite so they never go stale."""
     recorded = dict(parameters)
-    source, source_loaded = _as_image_if_available(source_path)
-    if source is not None and source_loaded:
-        recorded["input_width"] = source.width
-        recorded["input_height"] = source.height
-        source.close()
-    output, output_loaded = _as_image_if_available(output_path)
-    if output is not None and output_loaded:
-        recorded["output_width"] = output.width
-        recorded["output_height"] = output.height
-        output.close()
+    source_size = _oriented_size(source_path)
+    if source_size is not None:
+        recorded["input_width"], recorded["input_height"] = source_size
+    output_size = _oriented_size(output_path)
+    if output_size is not None:
+        recorded["output_width"], recorded["output_height"] = output_size
     return recorded
+
+
+def _oriented_size(path: Path) -> tuple[int, int] | None:
+    """Size ``_load_image`` would report, honouring EXIF orientation, without decoding.
+
+    For a PNG the size comes from IHDR and the orientation from its eXIf chunk (if
+    any), so nothing is decompressed; Pillow's ``PngImageFile.getexif()`` would
+    fully decode the image when there is no eXIf chunk. A PNG with an iTXt chunk may
+    carry an XMP orientation, so it goes through Pillow, like every other format
+    (whose EXIF Pillow reads from the header).
+    """
+    layout = _read_png_layout(path)
+    if layout is not None and b"iTXt" not in layout.chunk_types:
+        if (
+            Image.MAX_IMAGE_PIXELS is not None
+            and layout.width * layout.height > 2 * Image.MAX_IMAGE_PIXELS
+        ):
+            return None
+        orientation = _orientation_from_exif_bytes(layout.exif) if layout.exif else 1
+        if orientation in _TRANSPOSED_ORIENTATIONS:
+            return layout.height, layout.width
+        return layout.width, layout.height
+    try:
+        with Image.open(path) as opened:
+            width, height = opened.size
+            if _exif_orientation(opened) in _TRANSPOSED_ORIENTATIONS:
+                return height, width
+            return width, height
+    except (OSError, UnidentifiedImageError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return None
 
 
 def _run_copy(
@@ -600,8 +910,7 @@ def _run_page_split(
 
     dpi = _dpi_of(source)
     if source.width <= source.height:
-        _save_png(source, output_path, dpi)
-        _save_preview(source, preview_path)
+        _write_unchanged(source, source_path, output_path, preview_path)
         return {
             "resolved_split_mode": "single",
             "source_width": source.width,
@@ -789,7 +1098,7 @@ def _run_deskew(
         mode = "auto"
 
     if abs(angle) < 1e-9:
-        output = source
+        _write_unchanged(source, source_path, output_path, preview_path)
     else:
         output = source.rotate(
             angle,
@@ -797,8 +1106,8 @@ def _run_deskew(
             expand=True,
             fillcolor=_paper_fill(source),
         )
-    _save_png(output, output_path, _dpi_of(source))
-    _save_preview(output, preview_path)
+        _save_png(output, output_path, _dpi_of(source))
+        _save_preview(output, preview_path)
 
     return _as_recorded_parameters(
         parameters,
@@ -1164,9 +1473,257 @@ def _coerce_dewarp_points(
     return values
 
 
-def _auto_dewarp_points(
+# Text-line based auto detection (see _detect_text_line_quad).
+DEWARP_DETECTION_MAX_SIDE: Final[int] = 1200
+DEWARP_MIN_TEXT_LINES: Final[int] = 3
+# The left/right edge fits need more rows than the top/bottom lines: with only a
+# few row ends a robust fit can drop all but two points and report zero scatter,
+# letting noise (or ragged text) pass as an aligned edge.
+DEWARP_MIN_SIDE_ROWS: Final[int] = 6
+# A text line is "long" (usable for the left/right edges) relative to the longest one.
+DEWARP_LONG_LINE_RATIO: Final[float] = 0.6
+# Reject detections implying more than this tilt of any quad edge.
+DEWARP_MAX_EDGE_SLOPE: Final[float] = 0.27  # ~15 degrees
+
+
+def _robust_line_fit(
+    along: Sequence[float] | Any,
+    across: Sequence[float] | Any,
+) -> tuple[float, float, float] | None:
+    """Fit ``across = slope * along + intercept``, iteratively dropping outliers.
+
+    Returns ``(slope, intercept, spread)`` where ``spread`` is the robust (MAD)
+    standard deviation of all points around the fit, used to judge reliability.
+    """
+    if np is None:
+        return None
+    a = np.asarray(along, dtype=np.float64)
+    b = np.asarray(across, dtype=np.float64)
+    if a.size < 2 or float(np.ptp(a)) == 0.0:
+        return None
+    keep = np.ones(a.size, dtype=bool)
+    slope, intercept = 0.0, float(np.median(b))
+    for _ in range(4):
+        slope, intercept = (float(v) for v in np.polyfit(a[keep], b[keep], 1))
+        residual = np.abs(b - (slope * a + intercept))
+        # 2.5 robust standard deviations (MAD), never tighter than one pixel.
+        limit = max(1.0, 2.5 * 1.4826 * float(np.median(residual[keep])))
+        new_keep = residual <= limit
+        if int(new_keep.sum()) < 2 or bool(np.array_equal(new_keep, keep)):
+            break
+        keep = new_keep
+    spread = 1.4826 * float(np.median(np.abs(b - (slope * a + intercept))))
+    return slope, intercept, spread
+
+
+def _text_rows(
+    lines: list[tuple[float, float, float, float, float, float]],
+    line_height: float,
+) -> list[tuple[float, float, float, float]]:
+    """Group line blobs at the same height (e.g. across columns) into rows.
+
+    Returns ``(left_x, left_y, right_x, right_y)`` per row: the outermost ends.
+    """
+    rows: list[list[tuple[float, float, float, float, float, float]]] = []
+    for line in sorted(lines, key=lambda item: (item[1] + item[3]) / 2):
+        center = (line[1] + line[3]) / 2
+        if rows:
+            last = rows[-1]
+            last_center = sum((item[1] + item[3]) / 2 for item in last) / len(last)
+            if abs(center - last_center) <= 0.6 * line_height:
+                last.append(line)
+                continue
+        rows.append([line])
+    result: list[tuple[float, float, float, float]] = []
+    for row in rows:
+        leftmost = min(row, key=lambda item: item[0])
+        rightmost = max(row, key=lambda item: item[2])
+        result.append((leftmost[0], leftmost[1], rightmost[2], rightmost[3]))
+    return result
+
+
+def _detect_text_line_quad(image: Image.Image) -> Quad | None:
+    """Derive the dewarp quad from the topmost/bottommost text lines and the text edges.
+
+    Characters are merged into line blobs with a horizontal closing whose width
+    follows the measured glyph height. The top and bottom long lines give the
+    upper/lower quad edges (their fitted direction, not just their bounding box);
+    robust fits through the outer left/right ends of each text row give the side
+    edges (a ragged side is replaced by the mirror of the aligned one). The quad
+    corners are the intersections of those four lines. This straightens keystone
+    and tilt only; it cannot follow curved (spine-bowed) lines. Returns None when
+    the page has too few text lines or the result is implausible.
+    """
+    if cv2 is None or np is None:
+        return None
+    gray = np.array(image.convert("L"))
+    full_height, full_width = gray.shape
+    scale = min(1.0, DEWARP_DETECTION_MAX_SIDE / max(full_width, full_height))
+    if scale < 1.0:
+        gray = cv2.resize(
+            gray,
+            (max(1, round(full_width * scale)), max(1, round(full_height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    height, width = gray.shape
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, ink = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    count, _, glyph_stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    glyph_heights = glyph_stats[1:, cv2.CC_STAT_HEIGHT][
+        (glyph_stats[1:, cv2.CC_STAT_AREA] >= 4)
+        & (glyph_stats[1:, cv2.CC_STAT_HEIGHT] <= 0.06 * height)
+    ]
+    if count < 2 or glyph_heights.size < 10:
+        return None
+    # Word gaps are well under ~1.5 glyph heights; column gutters are wider.
+    kernel_width = int(min(max(9.0, 3.0 * float(np.median(glyph_heights))), width / 10))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, kernel_width), 1))
+    merged = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+    # Each line: (left_x, left_y, right_x, right_y, slope, intercept) with y = slope*x + b.
+    lines: list[tuple[float, float, float, float, float, float]] = []
+    line_heights: list[int] = []
+    for index in range(1, count):
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        line_width = int(stats[index, cv2.CC_STAT_WIDTH])
+        line_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if (
+            line_width < 0.2 * width
+            or line_height < 2
+            or line_height > 0.06 * height
+            or line_width < 4 * line_height
+        ):
+            continue
+        ys, xs = np.nonzero(labels[y : y + line_height, x : x + line_width] == index)
+        fit = _robust_line_fit(xs + x, ys + y)
+        if fit is None:
+            continue
+        slope, intercept, _ = fit
+        line_heights.append(line_height)
+        left_x, right_x = float(x), float(x + line_width - 1)
+        lines.append(
+            (
+                left_x,
+                slope * left_x + intercept,
+                right_x,
+                slope * right_x + intercept,
+                slope,
+                intercept,
+            )
+        )
+    if len(lines) < DEWARP_MIN_TEXT_LINES:
+        return None
+    longest = max(line[2] - line[0] for line in lines)
+    long_lines = [line for line in lines if line[2] - line[0] >= DEWARP_LONG_LINE_RATIO * longest]
+    if len(long_lines) < DEWARP_MIN_TEXT_LINES:
+        return None
+    long_lines.sort(key=lambda line: (line[1] + line[3]) / 2)
+    top, bottom = long_lines[0], long_lines[-1]
+
+    # Side edges (x = slope * y + intercept) through the outer ends of each row, so
+    # multi-column pages use the outer column edges rather than a mixture.
+    rows = _text_rows(lines, float(np.median(line_heights)))
+    widest = max(row[2] - row[0] for row in rows)
+    rows = [row for row in rows if row[2] - row[0] >= DEWARP_LONG_LINE_RATIO * widest]
+    if len(rows) < DEWARP_MIN_SIDE_ROWS:
+        return None
+    left_fit = _robust_line_fit([row[1] for row in rows], [row[0] for row in rows])
+    right_fit = _robust_line_fit([row[3] for row in rows], [row[2] for row in rows])
+    if left_fit is None or right_fit is None:
+        return None
+    # Justified/aligned text gives side ends within a pixel or two of a line;
+    # ragged text (e.g. ragged-right) scatters them and the fit is meaningless.
+    max_spread = max(2.0, 0.006 * width)
+    left_ok, right_ok = left_fit[2] <= max_spread, right_fit[2] <= max_spread
+    if not left_ok and not right_ok:
+        return None
+    left_slope, right_slope = left_fit[0], right_fit[0]
+    if not right_ok:
+        # Assume symmetric keystone (camera centred on the page): mirror the left
+        # edge and place the right edge at the outermost line end.
+        right_slope = -left_slope
+    if not left_ok:
+        left_slope = -right_slope
+    left_intercept = left_fit[1] if left_ok else min(row[0] - left_slope * row[1] for row in rows)
+    right_intercept = (
+        right_fit[1] if right_ok else max(row[2] - right_slope * row[3] for row in rows)
+    )
+    left_edge = (left_slope, left_intercept)
+    right_edge = (right_slope, right_intercept)
+    if any(
+        abs(slope) > DEWARP_MAX_EDGE_SLOPE for slope in (top[4], bottom[4], left_slope, right_slope)
+    ):
+        return None
+
+    def intersect(
+        line: tuple[float, float, float, float, float, float],
+        edge: tuple[float, float],
+    ) -> tuple[float, float]:
+        line_slope, line_intercept = line[4], line[5]
+        edge_slope, edge_intercept = edge
+        y = (line_slope * edge_intercept + line_intercept) / (1.0 - line_slope * edge_slope)
+        return edge_slope * y + edge_intercept, y
+
+    corners = [
+        intersect(top, left_edge),
+        intersect(top, right_edge),
+        intersect(bottom, right_edge),
+        intersect(bottom, left_edge),
+    ]
+    scaled = [(px / scale, py / scale) for px, py in corners]
+    slack_x, slack_y = 0.1 * full_width, 0.1 * full_height
+    if any(
+        not (-slack_x <= px <= full_width + slack_x and -slack_y <= py <= full_height + slack_y)
+        for px, py in scaled
+    ):
+        return None
+    contour = np.array(scaled, dtype=np.float32)
+    if not cv2.isContourConvex(contour):
+        return None
+    if cv2.contourArea(contour) < 0.05 * full_width * full_height:
+        return None
+    points = [(round(px), round(py)) for px, py in scaled]
+    return (points[0], points[1], points[2], points[3])
+
+
+def _dewarp_correction_is_negligible(quad: Quad, image_size: tuple[int, int]) -> bool:
+    """True when ``quad`` is already an upright rectangle to within a few pixels."""
+    top_left, top_right, bottom_right, bottom_left = quad
+    tolerance = max(2.0, 0.003 * max(image_size))
+    width_top = hypot(top_right[0] - top_left[0], top_right[1] - top_left[1])
+    width_bottom = hypot(bottom_right[0] - bottom_left[0], bottom_right[1] - bottom_left[1])
+    height_left = hypot(bottom_left[0] - top_left[0], bottom_left[1] - top_left[1])
+    height_right = hypot(bottom_right[0] - top_right[0], bottom_right[1] - top_right[1])
+    deviations = (
+        abs(top_left[1] - top_right[1]),
+        abs(bottom_left[1] - bottom_right[1]),
+        abs(top_left[0] - bottom_left[0]),
+        abs(top_right[0] - bottom_right[0]),
+        abs(width_top - width_bottom),
+        abs(height_left - height_right),
+    )
+    return max(deviations) <= tolerance
+
+
+def _auto_dewarp_points(image: Image.Image) -> tuple[Quad, str] | None:
+    """Auto-detect the dewarp quad: text lines first, then a page-outline contour."""
+    text_quad = _detect_text_line_quad(image)
+    if text_quad is not None:
+        return text_quad, "text_lines"
+    outline_quad = _detect_page_outline_quad(image)
+    if outline_quad is not None:
+        return outline_quad, "page_outline"
+    return None
+
+
+def _detect_page_outline_quad(
     image: Image.Image,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+    """Find one large near-rectangular contour (a sheet photographed on a contrasting
+    background). Rarely matches an ordinary scanned text page."""
     if cv2 is None or np is None:
         return None
     grayscale = np.array(image.convert("L"))
@@ -1223,6 +1780,186 @@ def _estimate_target_dimensions(
     return width, height
 
 
+# How far (as a multiple of the input's own width/height) the dewarped canvas may
+# extend beyond the rectified quad on each side. A quad that would need more than
+# this is treated as degenerate and not rendered (see DewarpGeometry.rejection).
+DEWARP_MAX_CANVAS_OVERHANG: Final[float] = 1.0
+# The dewarped canvas may hold at most this multiple of the input's pixel count.
+# Real keystone/tilt corrections stay well below it; anything larger comes from a
+# near-degenerate quad and would only allocate a huge, mostly empty image.
+DEWARP_MAX_CANVAS_AREA_RATIO: Final[float] = 2.0
+# Projective weights at or below this (relative to the largest one) mean an input
+# corner lies at or beyond the vanishing line: it would map to infinity or mirror.
+DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO: Final[float] = 1e-3
+
+
+@dataclass(frozen=True)
+class DewarpGeometry:
+    """Perspective transform from the input onto an output canvas holding all of it.
+
+    ``rejection`` is empty when the transform may be rendered. Otherwise it names
+    why not (the quad is near-degenerate) and the canvas dimensions are only the
+    clamped, bounded values -- callers must not render such a geometry.
+    """
+
+    matrix: Any
+    canvas_width: int
+    canvas_height: int
+    quad_width: int
+    quad_height: int
+    offset_x: int
+    offset_y: int
+    clipped: bool
+    rejection: str = ""
+
+
+def _ceil_tolerant(value: float, tolerance: float = 1e-3) -> int:
+    return int(ceil(value - tolerance))
+
+
+def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGeometry:
+    """Map ``quad`` to an upright rectangle without discarding the rest of the image.
+
+    The quad only defines the correction (which four points should become a
+    rectangle). The output canvas is sized to the bounding box of the whole
+    transformed input, so content outside the quad -- page numbers, a line that
+    runs past a corner point, the margins added by the Margins stage -- is kept.
+
+    Near-degenerate quads are rejected (``rejection`` is set) when an input corner
+    lies at or beyond the vanishing line, when the transformed input would extend
+    more than ``DEWARP_MAX_CANVAS_OVERHANG`` input sizes past the quad, or when the
+    canvas would exceed ``DEWARP_MAX_CANVAS_AREA_RATIO`` times the input area. The
+    returned canvas dimensions are always bounded, so even a caller that ignored
+    the rejection could not allocate an unbounded image.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("dewarping requires OpenCV and NumPy")
+    quad_width, quad_height = _estimate_target_dimensions(quad)
+    source_matrix = np.array(quad, dtype=np.float64)
+    # Corner distances are preserved (no "-1"), so an already-upright quad is a pure
+    # translation and the output equals the input.
+    destination_matrix = np.array(
+        [
+            [0, 0],
+            [quad_width, 0],
+            [quad_width, quad_height],
+            [0, quad_height],
+        ],
+        dtype=np.float64,
+    )
+    transform = cv2.getPerspectiveTransform(
+        source_matrix.astype(np.float32),
+        destination_matrix.astype(np.float32),
+    ).astype(np.float64)
+
+    width, height = image_size
+    corners = np.array(
+        [[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]],
+        dtype=np.float64,
+    ).T
+    projected = transform @ corners
+    weights = projected[2]
+    overhang_x = DEWARP_MAX_CANVAS_OVERHANG * width
+    overhang_y = DEWARP_MAX_CANVAS_OVERHANG * height
+    limit_left, limit_right = -overhang_x, quad_width + overhang_x
+    limit_top, limit_bottom = -overhang_y, quad_height + overhang_y
+
+    rejection = ""
+    clipped = False
+    max_weight = float(np.max(np.abs(weights))) if np.all(np.isfinite(weights)) else 0.0
+    if (
+        max_weight <= 0.0
+        or not np.all(np.isfinite(projected))
+        or not np.all(weights > DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO * max_weight)
+    ):
+        # A corner lies at/beyond the vanishing line: the image has no finite (or
+        # unmirrored) bounds.
+        left, right, top, bottom = limit_left, limit_right, limit_top, limit_bottom
+        clipped = True
+        rejection = "degenerate_quad_beyond_vanishing_line"
+    else:
+        xs = projected[0] / weights
+        ys = projected[1] / weights
+        left, right = float(min(xs.min(), 0.0)), float(max(xs.max(), quad_width))
+        top, bottom = float(min(ys.min(), 0.0)), float(max(ys.max(), quad_height))
+    if left < limit_left or right > limit_right or top < limit_top or bottom > limit_bottom:
+        clipped = True
+        rejection = rejection or "extreme_quad_canvas_clipped"
+    left, right = max(left, limit_left), min(right, limit_right)
+    top, bottom = max(top, limit_top), min(bottom, limit_bottom)
+
+    # Round up, but tolerate the solver's float noise (520.0001 must not add a pixel).
+    offset_x = _ceil_tolerant(-left)
+    offset_y = _ceil_tolerant(-top)
+    canvas_width = max(1, _ceil_tolerant(right) + offset_x)
+    canvas_height = max(1, _ceil_tolerant(bottom) + offset_y)
+    max_area = DEWARP_MAX_CANVAS_AREA_RATIO * max(1, width) * max(1, height)
+    if canvas_width * canvas_height > max_area:
+        rejection = rejection or "extreme_quad_canvas_too_large"
+        # Keep the reported dimensions within the area budget as well.
+        shrink = (max_area / (canvas_width * canvas_height)) ** 0.5
+        canvas_width = max(1, int(canvas_width * shrink))
+        canvas_height = max(1, int(canvas_height * shrink))
+    translate = np.array(
+        [[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]],
+        dtype=np.float64,
+    )
+    return DewarpGeometry(
+        matrix=translate @ transform,
+        canvas_width=canvas_width,
+        canvas_height=canvas_height,
+        quad_width=quad_width,
+        quad_height=quad_height,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        clipped=clipped,
+        rejection=rejection,
+    )
+
+
+# Every parameter the dewarping stage reports. Each run sets all of them (``None``
+# when not applicable): results are merged into the stored parameters, and a
+# passthrough must not leave a previous run's warp geometry looking current.
+DEWARP_RESULT_KEYS: Final[tuple[str, ...]] = (
+    "dewarp_source_points",
+    "dewarp_width",
+    "dewarp_height",
+    "dewarp_canvas_width",
+    "dewarp_canvas_height",
+    "dewarp_quad_offset",
+    "dewarp_canvas_clipped",
+    "dewarp_detection",
+    "dewarp_correction",
+    "dewarp_warning",
+    "dewarp_error",
+)
+
+
+def _dewarp_result(applied: str, **fields: Any) -> dict[str, Any]:
+    """Full dewarping result: every known key, cleared unless given in ``fields``.
+
+    ``dewarp_applied`` records what actually ran: ``"perspective"`` when the page
+    was warped, ``"passthrough"`` when the input was copied through unchanged
+    (bypass, nothing detected, no correction needed, a rejected quad, an error).
+    ``algorithm`` follows it, so a passthrough never claims a warp ran.
+    """
+    result: dict[str, Any] = dict.fromkeys(DEWARP_RESULT_KEYS)
+    result.update(fields)
+    result["dewarp_applied"] = applied
+    result["algorithm"] = "copy" if applied == "passthrough" else "projective_dewarp"
+    return result
+
+
+def _dewarp_passthrough(
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+    **fields: Any,
+) -> dict[str, Any]:
+    _copy_fallback(source_path, output_path, preview_path)
+    return _dewarp_result("passthrough", **fields)
+
+
 def _run_perspective_dewarp(
     state: ScanTailorStageState,
     source_path: Path,
@@ -1235,64 +1972,79 @@ def _run_perspective_dewarp(
         mode = "auto"
 
     if mode == "bypass":
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "bypass",
-        }
+        return _dewarp_passthrough(source_path, output_path, preview_path, dewarp_mode="bypass")
 
     source = _load_image(source_path)
 
     if cv2 is None or np is None:
         if mode == "manual":
             resolved_points = _coerce_dewarp_points(parameters.get("dewarp_points"), source.size)
-            fallback_payload = _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "manual",
-            }
+            fields: dict[str, Any] = {"dewarp_mode": "manual"}
             if resolved_points is not None:
-                fallback_payload["dewarp_source_points"] = _ordered_quad_points(resolved_points)
-                fallback_payload["dewarp_warning"] = "missing_library_fallback"
-            return fallback_payload
-        if mode == "bypass":
-            return _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "bypass",
-            }
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "missing_library_fallback",
-        }
+                fields["dewarp_source_points"] = _ordered_quad_points(resolved_points)
+                fields["dewarp_warning"] = "missing_library_fallback"
+            return _dewarp_passthrough(source_path, output_path, preview_path, **fields)
+        return _dewarp_passthrough(
+            source_path, output_path, preview_path, dewarp_mode="missing_library_fallback"
+        )
 
     manual_points = _coerce_dewarp_points(
         parameters.get("dewarp_points"),
         source.size,
     )
 
-    source_quad: Quad | None
+    source_quad: Quad
+    detection = "manual"
+    recorded_mode = "manual" if mode == "manual" else "auto"
     if mode == "manual" and manual_points is not None:
         source_quad = _ordered_quad_points(manual_points)
     else:
-        source_quad = _auto_dewarp_points(source)
-        if source_quad is None:
-            return _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "auto_fallback",
-            }
+        detected = _auto_dewarp_points(source)
+        if detected is None:
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode="auto_fallback",
+                dewarp_detection="none",
+                dewarp_warning="auto_detection_found_no_text_lines_or_page_outline",
+            )
+        source_quad, detection = detected
+        if _dewarp_correction_is_negligible(source_quad, source.size):
+            # Already upright: don't resample (and soften) the page for nothing.
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode="auto",
+                dewarp_detection=detection,
+                dewarp_source_points=source_quad,
+                dewarp_correction="none_needed",
+                dewarp_warning="",
+            )
 
     try:
-        width, height = _estimate_target_dimensions(source_quad)
+        geometry = _dewarp_output_geometry(source_quad, source.size)
+        if geometry.rejection:
+            # Near-degenerate quad: rendering would allocate a huge canvas of mostly
+            # extrapolated (or mirrored) pixels. Keep the page as it is instead.
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode=recorded_mode,
+                dewarp_detection=detection,
+                dewarp_source_points=source_quad,
+                dewarp_canvas_clipped=geometry.clipped,
+                dewarp_correction="rejected_degenerate_quad",
+                dewarp_warning=geometry.rejection,
+            )
         src = np.array(source.convert("RGB"))
         paper = _paper_fill(source.convert("RGB"))
-        source_matrix = np.array(source_quad, dtype=np.float32)
-        destination_matrix = np.array(
-            [
-                [0, 0],
-                [width - 1, 0],
-                [width - 1, height - 1],
-                [0, height - 1],
-            ],
-            dtype=np.float32,
-        )
-        transform = cv2.getPerspectiveTransform(source_matrix, destination_matrix)
         warped = cv2.warpPerspective(
             src,
-            transform,
-            (width, height),
+            geometry.matrix,
+            (geometry.canvas_width, geometry.canvas_height),
             flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=paper,
@@ -1300,18 +2052,30 @@ def _run_perspective_dewarp(
         output = Image.fromarray(warped)
         _save_png(output, output_path, _dpi_of(source))
         _save_preview(output, preview_path)
-        recorded_mode = "manual" if mode == "manual" else "auto"
-        return {
-            "dewarp_mode": recorded_mode,
-            "dewarp_source_points": source_quad,
-            "dewarp_width": width,
-            "dewarp_height": height,
-        }
+        return _dewarp_result(
+            "perspective",
+            dewarp_mode=recorded_mode,
+            dewarp_source_points=source_quad,
+            dewarp_width=geometry.quad_width,
+            dewarp_height=geometry.quad_height,
+            dewarp_canvas_width=geometry.canvas_width,
+            dewarp_canvas_height=geometry.canvas_height,
+            dewarp_quad_offset=[geometry.offset_x, geometry.offset_y],
+            dewarp_canvas_clipped=geometry.clipped,
+            dewarp_detection=detection,
+            dewarp_correction="applied",
+            dewarp_warning="",
+        )
     except Exception as exc:  # pragma: no cover - geometry failures
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "processing_error_fallback",
-            "dewarp_error": str(exc),
-        }
+        return _dewarp_passthrough(
+            source_path,
+            output_path,
+            preview_path,
+            dewarp_mode="processing_error_fallback",
+            dewarp_source_points=source_quad,
+            dewarp_detection=detection,
+            dewarp_error=str(exc),
+        )
 
 
 def _run_dewarping(
@@ -1730,6 +2494,7 @@ def request_stage_job(
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
+    state.invalidated_reason = ""
     if not state.algorithm:
         state.algorithm = _default_algorithm(state.stage)
     if not state.algorithm_version:
@@ -1741,6 +2506,7 @@ def request_stage_job(
             "algorithm",
             "algorithm_version",
             "last_error",
+            "invalidated_reason",
             "updated_at",
         ],
     )
@@ -1886,8 +2652,12 @@ def process_stage_job(job_id: str) -> None:
             state.status = ScanTailorStageState.StageStatus.SUCCESS
             state.finished_at = timezone.now()
             state.last_error = ""
+            # Provenance: record the version of the implementation that actually ran,
+            # not whatever version was current when this state row was first created.
+            state.algorithm_version = _default_algorithm_version(state.stage)
             state.save(
                 update_fields=[
+                    "algorithm_version",
                     "output_storage_location",
                     "preview_storage_location",
                     "output_storage_identifier",

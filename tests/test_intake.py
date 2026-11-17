@@ -43,6 +43,7 @@ def _build_epub(
     title: str = "Sample EPUB",
     *,
     cover_payload: bytes | None = None,
+    creator: str = "Jane Doe",
 ) -> None:
     with ZipFile(path, "w") as archive:
         archive.writestr(
@@ -71,7 +72,7 @@ def _build_epub(
                 '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
                 f'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
                 f"<dc:title>{title}</dc:title>"
-                f"<dc:creator>Jane Doe</dc:creator>"
+                f"<dc:creator>{creator}</dc:creator>"
                 f"{cover_metadata}"
                 "</metadata>"
                 f"{cover_manifest}"
@@ -273,6 +274,67 @@ def test_exact_title_and_author_without_isbn_auto_accepts_with_evidence(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("upload_name", "creator", "provider_authors", "blocked_reason"),
+    [
+        # Placeholder authors on both sides agree, so the rule promotes the candidate,
+        # but the provider record names nobody real (#42 / #92 guard).
+        ("unknown.epub", "Unknown", ["Unknown"], intake.BLOCK_NO_PROVIDER_AUTHORS),
+        # The filename's author matches the provider strongly enough for the rule, but
+        # the file's embedded author is someone else.
+        (
+            "John Roe - Borderline Match.epub",
+            "Jane Doe",
+            ["John Roe"],
+            intake.BLOCK_AUTHOR_CONFLICT,
+        ),
+    ],
+)
+def test_strong_match_promotion_still_goes_through_author_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    upload_name: str,
+    creator: str,
+    provider_authors: list[str],
+    blocked_reason: str,
+) -> None:
+    # The exact-title + strong-author rule (#9) only raises a score; intake's author
+    # checks still run on the promoted candidate and route it to review.
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=provider_authors,
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("strong-match-guard-user")
+    client = Client()
+    client.force_login(profile.user)
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "guarded.epub"
+    _build_epub(epub_path, "Borderline Match", creator=creator)
+    response = client.post(
+        "/imports/upload/",
+        {"file": SimpleUploadedFile(upload_name, epub_path.read_bytes())},
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    evidence = candidate.raw_payload["_auto_accept_rule"]
+    assert evidence["applied"] is True
+    assert float(candidate.score) == pytest.approx(0.86)
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == blocked_reason
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("auto_accept_threshold", [0.8, 0.86])
 def test_import_status_exposes_each_processing_phase(
     tmp_path: Path,
@@ -379,7 +441,7 @@ def test_pdf_upload_registers_file_variant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_stub_provider(monkeypatch, candidate_title="book", authors=["Unknown"])
+    _force_stub_provider(monkeypatch, candidate_title="book", authors=["Jane Doe"])
     _configure_storage(tmp_path)
     profile = get_or_create_profile("pdf-user")
     client = Client()
@@ -414,7 +476,7 @@ def test_pdf_upload_renders_first_page_cover_with_pdfium(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_data = tmp_path / "pdf-cover-app-data"
-    _force_stub_provider(monkeypatch, candidate_title="Rendered PDF")
+    _force_stub_provider(monkeypatch, candidate_title="Rendered PDF", authors=["Jane Doe"])
     profile = get_or_create_profile("pdf-cover-user")
     client = Client()
     client.force_login(profile.user)
@@ -450,7 +512,7 @@ def test_cbz_upload_uses_first_page_as_cover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_data = tmp_path / "cbz-cover-app-data"
-    _force_stub_provider(monkeypatch, candidate_title="Covered Comic")
+    _force_stub_provider(monkeypatch, candidate_title="Covered Comic", authors=["Jane Doe"])
     profile = get_or_create_profile("cbz-cover-user")
     client = Client()
     client.force_login(profile.user)
@@ -517,7 +579,7 @@ def test_duplicate_upload_reuses_existing_physical_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_stub_provider(monkeypatch, candidate_title="first", authors=["Unknown"])
+    _force_stub_provider(monkeypatch, candidate_title="first", authors=["Jane Doe"])
     _configure_storage(tmp_path)
     profile = get_or_create_profile("dup-user")
     client = Client()
@@ -766,7 +828,7 @@ def test_txt_upload_uses_normal_ingestion_and_external_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure_storage(tmp_path)
-    _force_stub_provider(monkeypatch, candidate_title="Plain Story")
+    _force_stub_provider(monkeypatch, candidate_title="Plain Story", authors=["Jane Doe"])
     profile = get_or_create_profile("txt-upload-user")
     client = Client()
     client.force_login(profile.user)

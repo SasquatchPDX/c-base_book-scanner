@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import io
 import json
+import struct
+import zlib
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
 from typing import cast
 
+import cv2
 import numpy as np
 import pytest
 from asgiref.sync import async_to_sync
 from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile
 
 from ebook_server.core import scantailor, views
 from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
@@ -354,8 +357,48 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
 
     latest = client.get(_stages_url(str(job.id), str(page.id))).json()["stages"]
     status_by_stage = {entry["stage"]: entry["status"] for entry in latest}
+    by_stage = {entry["stage"]: entry for entry in latest}
     for stage_name in ("deskew", "select_content", "margins", "dewarping", "output"):
         assert status_by_stage[stage_name] == ScanTailorStageState.StageStatus.INVALIDATED
+        # Routine invalidation is not an error (#53).
+        assert by_stage[stage_name]["last_error"] == ""
+        assert by_stage[stage_name]["invalidated_reason"] == "page_split updated"
+
+    # Re-running a stage clears its invalidation note.
+    rerun = client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {}}),
+        content_type="application/json",
+    )
+    assert rerun.status_code == 202
+    deskew = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
+    assert deskew.invalidated_reason == ""
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failed_stage_that_is_invalidated_clears_stale_error() -> None:
+    client, job = _create_scan_job("scan-user-invalidation-failed")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"invalidate-failed",
+        filename="scan.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+    ScanTailorStageState.objects.filter(scan_page=page, stage="output").update(
+        status=ScanTailorStageState.StageStatus.FAILED,
+        last_error="cannot read image",
+    )
+    scantailor.invalidate_downstream_states(
+        page, from_stage="dewarping", reason="dewarping updated"
+    )
+    output = ScanTailorStageState.objects.get(scan_page=page, stage="output")
+    assert output.status == ScanTailorStageState.StageStatus.INVALIDATED
+    assert output.last_error == ""
+    assert output.invalidated_reason == "dewarping updated"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1440,3 +1483,823 @@ def test_content_box_on_dark_surroundings_finds_text_not_frame() -> None:
     assert right < 950
     assert top > 150
     assert bottom < 1250
+
+
+def _page_with_number_outside_quad() -> Image.Image:
+    """Text block plus a page number and corner marks that lie outside the text quad."""
+    page = Image.new("L", (600, 800), 240)
+    draw = ImageDraw.Draw(page)
+    for y in range(80, 680, 30):
+        draw.rectangle((80, y, 520, y + 10), fill=20)
+    draw.rectangle((285, 740, 315, 770), fill=20)  # page number below the text block
+    for x, y in ((5, 5), (580, 5), (580, 780), (5, 780)):
+        draw.rectangle((x, y, x + 14, y + 14), fill=20)  # corner marks at the very edge
+    return page
+
+
+def _project(matrix: np.ndarray, x: float, y: float) -> tuple[int, int]:
+    px, py, pw = matrix @ np.array([x, y, 1.0])
+    return int(round(px / pw)), int(round(py / pw))
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        # axis-aligned quad hugging the text block
+        [[80, 80], [520, 80], [520, 680], [80, 680]],
+        # keystoned quad (top edge narrower than bottom)
+        [[110, 80], [490, 80], [520, 680], [80, 680]],
+    ],
+)
+def test_dewarp_keeps_content_outside_the_quad(points: list[list[int]], tmp_path: Path) -> None:
+    source = _save(_page_with_number_outside_quad(), tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(
+        _state({"dewarp_mode": "manual", "dewarp_points": points}),
+        source,
+        output,
+        tmp_path / "prev.png",
+    )
+    assert result["dewarp_mode"] == "manual"
+    assert result["dewarp_canvas_clipped"] is False
+
+    quad = scantailor._ordered_quad_points([(int(x), int(y)) for x, y in points])
+    geometry = scantailor._dewarp_output_geometry(quad, (600, 800))
+    warped = np.asarray(Image.open(output).convert("L"))
+    assert warped.shape == (geometry.canvas_height, geometry.canvas_width)
+    assert geometry.canvas_width >= 590 and geometry.canvas_height >= 790
+    # the page number and every corner mark survive, at their transformed positions
+    for x, y in ((300, 755), (12, 12), (587, 12), (587, 787), (12, 787)):
+        tx, ty = _project(geometry.matrix, x, y)
+        assert 0 <= tx < warped.shape[1] and 0 <= ty < warped.shape[0]
+        assert warped[ty, tx] < 100, (x, y, tx, ty)
+    # and the quad itself still becomes an upright rectangle at the recorded offset
+    ox, oy = result["dewarp_quad_offset"]
+    expected = [
+        (0, 0),
+        (geometry.quad_width, 0),
+        (geometry.quad_width, geometry.quad_height),
+        (0, geometry.quad_height),
+    ]
+    for (x, y), (ex, ey) in zip(quad, expected, strict=True):
+        tx, ty = _project(geometry.matrix, x, y)
+        assert abs(tx - (ex + ox)) <= 1 and abs(ty - (ey + oy)) <= 1
+
+
+def test_axis_aligned_dewarp_quad_is_near_identity(tmp_path: Path) -> None:
+    page = _page_with_number_outside_quad()
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    points = [[80, 80], [520, 80], [520, 680], [80, 680]]
+    scantailor._run_perspective_dewarp(
+        _state({"dewarp_mode": "manual", "dewarp_points": points}),
+        source,
+        output,
+        tmp_path / "prev.png",
+    )
+    warped = Image.open(output).convert("L")
+    # an already-upright quad crops nothing and changes nothing
+    assert warped.size == page.size
+    difference = np.abs(np.asarray(warped, dtype=np.int16) - np.asarray(page, dtype=np.int16))
+    assert float(difference.mean()) < 0.5
+
+
+def test_degenerate_dewarp_quad_canvas_is_bounded() -> None:
+    # a sliver-thin quad would project the rest of the page towards infinity
+    quad = scantailor._ordered_quad_points([(100, 100), (500, 100), (300, 104), (290, 104)])
+    geometry = scantailor._dewarp_output_geometry(quad, (600, 800))
+    assert geometry.clipped is True
+    assert geometry.rejection
+    assert geometry.canvas_width <= geometry.quad_width + 2 * 600 + 2
+    assert geometry.canvas_height <= geometry.quad_height + 2 * 800 + 2
+    assert (
+        geometry.canvas_width * geometry.canvas_height
+        <= scantailor.DEWARP_MAX_CANVAS_AREA_RATIO * 600 * 800
+    )
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        # review finding: one corner pulled to the page centre on a full-size scan
+        [[0, 0], [2480, 3508], [4960, 7016], [0, 7016]],
+        # a sliver quad on a full-size scan
+        [[100, 100], [4800, 100], [2600, 140], [2500, 140]],
+    ],
+)
+def test_near_degenerate_quad_on_full_size_scan_is_rejected_with_bounded_canvas(
+    points: list[list[int]],
+) -> None:
+    # Only the geometry is computed: no real 300+ MP canvas is allocated here.
+    size = (4960, 7016)
+    quad = scantailor._ordered_quad_points([(x, y) for x, y in points])
+    geometry = scantailor._dewarp_output_geometry(quad, size)
+    assert geometry.rejection
+    assert (
+        geometry.canvas_width * geometry.canvas_height
+        <= scantailor.DEWARP_MAX_CANVAS_AREA_RATIO * size[0] * size[1]
+    )
+
+
+def test_ordinary_keystone_is_not_rejected() -> None:
+    size = (4960, 7016)
+    quad = scantailor._ordered_quad_points([(600, 500), (4360, 500), (4700, 6600), (260, 6600)])
+    geometry = scantailor._dewarp_output_geometry(quad, size)
+    assert geometry.rejection == ""
+    assert geometry.clipped is False
+
+
+def test_degenerate_manual_quad_falls_back_to_passthrough(tmp_path: Path) -> None:
+    page = _page_with_number_outside_quad()
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(
+        _state(
+            {"dewarp_mode": "manual", "dewarp_points": [[0, 0], [300, 400], [600, 800], [0, 800]]}
+        ),
+        source,
+        output,
+        tmp_path / "prev.png",
+    )
+    assert result["dewarp_mode"] == "manual"
+    assert result["dewarp_applied"] == "passthrough"
+    assert result["algorithm"] == "copy"
+    assert result["dewarp_correction"] == "rejected_degenerate_quad"
+    assert result["dewarp_warning"]
+    assert result["dewarp_source_points"]
+    for key in ("dewarp_canvas_width", "dewarp_canvas_height", "dewarp_quad_offset"):
+        assert key in result and result[key] is None
+    # the page is copied through untouched
+    assert np.array_equal(np.asarray(Image.open(output).convert("L")), np.asarray(page))
+
+
+def test_applied_dewarp_records_perspective_provenance(tmp_path: Path) -> None:
+    source = _save(_page_with_number_outside_quad(), tmp_path / "in.png")
+    result = scantailor._run_perspective_dewarp(
+        _state(
+            {
+                "dewarp_mode": "manual",
+                "dewarp_points": [[110, 80], [490, 80], [520, 680], [80, 680]],
+            }
+        ),
+        source,
+        tmp_path / "out.png",
+        tmp_path / "prev.png",
+    )
+    assert result["dewarp_applied"] == "perspective"
+    assert result["algorithm"] == "projective_dewarp"
+    assert result["dewarp_correction"] == "applied"
+    assert result["dewarp_error"] is None
+
+
+def test_oversized_image_is_an_image_load_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _save(Image.new("L", (600, 800), 200), tmp_path / "in.png")
+    # Pillow raises DecompressionBombError above 2x MAX_IMAGE_PIXELS.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    with pytest.raises(scantailor.ImageLoadError):
+        scantailor._load_image(source)
+    # The replacement dimension path observes the same limit without decoding.
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_passthrough_clears_stale_warp_geometry() -> None:
+    client, job = _create_scan_job("scan-user-dewarp-stale")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_trapezoid_bytes(),
+        filename="dewarp-stale.png",
+        content_type="image/png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    url = _stage_url(str(job.id), str(page.id), "dewarping")
+    points = [[18, 14], [392, 28], [412, 286], [10, 270]]
+    manual = json.dumps({"parameters": {"dewarp_mode": "manual", "dewarp_points": points}})
+    assert client.post(url, data=manual, content_type="application/json").status_code == 202
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="dewarping")
+    assert state.parameters["dewarp_applied"] == "perspective"
+    assert state.parameters["dewarp_canvas_width"]
+
+    bypass = json.dumps({"parameters": {"dewarp_mode": "bypass"}})
+    assert client.post(url, data=bypass, content_type="application/json").status_code == 202
+    state.refresh_from_db()
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.parameters["dewarp_applied"] == "passthrough"
+    assert state.parameters["algorithm"] == "copy"
+    for key in (
+        "dewarp_width",
+        "dewarp_height",
+        "dewarp_canvas_width",
+        "dewarp_canvas_height",
+        "dewarp_quad_offset",
+        "dewarp_canvas_clipped",
+        "dewarp_correction",
+    ):
+        assert state.parameters[key] is None, key
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stage_run_records_current_algorithm_version() -> None:
+    client, job = _create_scan_job("scan-user-dewarp-version")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_trapezoid_bytes(),
+        filename="dewarp-version.png",
+        content_type="image/png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    url = _stage_url(str(job.id), str(page.id), "dewarping")
+    points = [[18, 14], [392, 28], [412, 286], [10, 270]]
+    payload = json.dumps({"parameters": {"dewarp_mode": "manual", "dewarp_points": points}})
+    assert client.post(url, data=payload, content_type="application/json").status_code == 202
+    # a row created by an older release still carries the old implementation version
+    ScanTailorStageState.objects.filter(scan_page=page, stage="dewarping").update(
+        algorithm_version="opencv-v1"
+    )
+    assert client.post(url, data=payload, content_type="application/json").status_code == 202
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="dewarping")
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.algorithm_version == scantailor.DEFAULT_STAGE_ALGORITHM_VERSION["dewarping"]
+    assert state.algorithm_version != "opencv-v1"
+
+
+def _keystoned(image: Image.Image, inset: float) -> Image.Image:
+    """Simulate a camera tilted towards the page top: the top edge is narrower."""
+    width, height = image.size
+    source = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    target = np.array(
+        [[inset, 0], [width - inset, 0], [width, height], [0, height]], dtype=np.float32
+    )
+    matrix = cv2.getPerspectiveTransform(source, target)
+    warped = cv2.warpPerspective(np.asarray(image), matrix, (width, height), borderValue=235)
+    return Image.fromarray(warped)
+
+
+@pytest.mark.parametrize("size", [(900, 1200), (1800, 2400)])
+def test_auto_dewarp_detects_text_lines_and_straightens_keystone(
+    size: tuple[int, int], tmp_path: Path
+) -> None:
+    width, height = size
+    page = _keystoned(_text_page(width, height), inset=width * 0.07)
+    detected = scantailor._auto_dewarp_points(page)
+    assert detected is not None
+    quad, method = detected
+    assert method == "text_lines"
+    assert not scantailor._dewarp_correction_is_negligible(quad, page.size)
+    top_left, top_right, bottom_right, bottom_left = quad
+    # the text block's top is narrower than its bottom, as simulated
+    assert (top_right[0] - top_left[0]) < (bottom_right[0] - bottom_left[0]) - 0.05 * width
+
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(_state(), source, output, tmp_path / "p.png")
+    assert result["dewarp_mode"] == "auto"
+    assert result["dewarp_detection"] == "text_lines"
+    assert result["dewarp_correction"] == "applied"
+    assert result["dewarp_warning"] == ""
+
+    corrected = Image.open(output)
+    redetected = scantailor._detect_text_line_quad(corrected)
+    assert redetected is not None
+    assert scantailor._dewarp_correction_is_negligible(redetected, corrected.size)
+
+
+def test_auto_dewarp_leaves_an_upright_text_page_untouched(tmp_path: Path) -> None:
+    page = _text_page()
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(_state(), source, output, tmp_path / "p.png")
+    assert result["dewarp_mode"] == "auto"
+    assert result["dewarp_detection"] == "text_lines"
+    assert result["dewarp_correction"] == "none_needed"
+    assert np.array_equal(np.asarray(Image.open(output).convert("L")), np.asarray(page))
+
+
+def test_auto_dewarp_on_blank_page_reports_that_nothing_was_found(tmp_path: Path) -> None:
+    source = _save(Image.new("L", (900, 1200), 235), tmp_path / "in.png")
+    result = scantailor._run_perspective_dewarp(
+        _state(), source, tmp_path / "out.png", tmp_path / "p.png"
+    )
+    assert result["dewarp_mode"] == "auto_fallback"
+    assert result["dewarp_detection"] == "none"
+    assert result["dewarp_warning"]
+
+
+def test_auto_dewarp_still_finds_a_photographed_sheet_outline() -> None:
+    sheet = Image.open(io.BytesIO(_trapezoid_bytes()))
+    detected = scantailor._auto_dewarp_points(sheet)
+    assert detected is not None
+    assert detected[1] == "page_outline"
+
+
+def _column_page(columns: int, *, ragged: bool, seed: int = 3) -> Image.Image:
+    rng = np.random.default_rng(seed)
+    width, height = 1200, 1600
+    page = Image.new("L", (width, height), 235)
+    draw = ImageDraw.Draw(page)
+    column_width = (width * 0.76 - (columns - 1) * 40) / columns
+    for column in range(columns):
+        start = width * 0.12 + column * (column_width + 40)
+        for y in range(200, 1400, 28):
+            end = (
+                start
+                + column_width
+                - (int(rng.integers(0, int(column_width * 0.4))) if ragged else 0)
+            )
+            x = start
+            while x < end - 20:
+                word = int(rng.integers(20, 70))
+                draw.rectangle((x, y, min(x + word, end), y + 9), fill=30)
+                x += word + 14
+    return page
+
+
+@pytest.mark.parametrize(("columns", "ragged"), [(2, False), (1, True)])
+def test_text_line_detection_handles_columns_and_ragged_right(columns: int, ragged: bool) -> None:
+    upright = _column_page(columns, ragged=ragged)
+    quad = scantailor._detect_text_line_quad(upright)
+    assert quad is not None
+    # an upright page needs no correction: ragged ends must not invent a keystone
+    assert scantailor._dewarp_correction_is_negligible(quad, upright.size)
+    # the quad spans the outer text edges, not one column
+    assert quad[0][0] < 160 and quad[1][0] > 1000
+
+    tilted = _keystoned(upright, inset=80)
+    quad = scantailor._detect_text_line_quad(tilted)
+    assert quad is not None
+    geometry = scantailor._dewarp_output_geometry(quad, tilted.size)
+    corrected = Image.fromarray(
+        cv2.warpPerspective(
+            np.asarray(tilted),
+            geometry.matrix,
+            (geometry.canvas_width, geometry.canvas_height),
+            borderValue=235,
+        )
+    )
+    redetected = scantailor._detect_text_line_quad(corrected)
+    assert redetected is not None
+    assert scantailor._dewarp_correction_is_negligible(redetected, corrected.size)
+
+
+def test_text_line_detection_needs_enough_rows_for_side_edges() -> None:
+    # Five long lines are enough for top/bottom but too few to trust side fits:
+    # a handful of row ends can fit a line exactly by chance.
+    page = Image.new("L", (900, 1200), 235)
+    draw = ImageDraw.Draw(page)
+    rng = np.random.default_rng(7)
+    for row, y in enumerate(range(300, 300 + 5 * 40, 40)):
+        start = 120 + int(rng.integers(0, 30))
+        end = 780 - int(rng.integers(0, 30)) - row * 3
+        x = start
+        while x < end - 20:
+            word = int(rng.integers(20, 60))
+            draw.rectangle((x, y, min(x + word, end), y + 9), fill=30)
+            x += word + 12
+    assert len(range(300, 300 + 5 * 40, 40)) < scantailor.DEWARP_MIN_SIDE_ROWS
+    assert scantailor._detect_text_line_quad(page) is None
+
+
+def test_text_line_detection_rejects_too_few_lines() -> None:
+    page = Image.new("L", (900, 1200), 235)
+    draw = ImageDraw.Draw(page)
+    for x in range(100, 800, 60):
+        draw.rectangle((x, 500, x + 40, 510), fill=30)
+    assert scantailor._detect_text_line_quad(page) is None
+
+
+def _thumbnail_size(client: Client, page_id: str) -> tuple[tuple[int, int], str]:
+    response = client.get(f"/scan/pages/{page_id}/image/")
+    assert response.status_code == 200
+    assert response["Content-Type"] == "image/jpeg"
+    streaming = cast(StreamingHttpResponse, response)
+    body = b"".join(cast(Iterable[bytes], streaming.streaming_content))
+    with Image.open(io.BytesIO(body)) as thumb:
+        return thumb.size, response["ETag"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_page_thumbnail_follows_latest_completed_stage() -> None:
+    """#58: the overview thumbnail shows the latest completed stage, not the raw scan."""
+    client, job = _create_scan_job("scan-user-thumbnail-stage")
+    portrait = io.BytesIO()
+    _text_page(300, 400).save(portrait, format="PNG")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=portrait.getvalue(),
+        filename="portrait.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+
+    raw_size, raw_etag = _thumbnail_size(client, str(page.id))
+    assert raw_size == (300, 400)
+
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 90}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+
+    # Deskew rotated the page by 90 degrees: the thumbnail now shows landscape.
+    stage_size, stage_etag = _thumbnail_size(client, str(page.id))
+    assert stage_size == (400, 300)
+    assert stage_etag != raw_etag
+    revalidated = client.get(f"/scan/pages/{page.id}/image/", HTTP_IF_NONE_MATCH=stage_etag)
+    assert revalidated.status_code == 304
+    assert "max-age=0" in revalidated["Cache-Control"]
+
+    # A stale (invalidated) stage is never shown; fall back to the last good one.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.INVALIDATED,
+    )
+    fallback_size, fallback_etag = _thumbnail_size(client, str(page.id))
+    assert fallback_size == (300, 400)
+    assert fallback_etag not in {raw_etag, stage_etag}
+
+    # Downstream success after an upstream that is not complete does not count either.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.SUCCESS,
+    )
+    ScanTailorStageState.objects.filter(scan_page=page, stage="page_split").update(
+        status=ScanTailorStageState.StageStatus.QUEUED,
+    )
+    assert _thumbnail_size(client, str(page.id))[1] == raw_etag
+
+
+def test_passthrough_byte_copies_normalised_png(tmp_path: Path) -> None:
+    """#54: an unchanged normalised PNG is copied, not decoded and re-encoded."""
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(200, 200))
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+
+    assert scantailor._passthrough(source, output, preview) == {"algorithm": "copy"}
+
+    assert output.read_bytes() == source.read_bytes()
+    assert scantailor._compute_sha256(output) == scantailor._compute_sha256(source)
+    with Image.open(preview) as rendered:
+        assert rendered.format == "PNG"
+
+
+@pytest.mark.parametrize(
+    ("image", "save_kwargs"),
+    [
+        (Image.new("L", (40, 60), 200), {"format": "TIFF"}),
+        (Image.new("RGBA", (40, 60), (200, 200, 200, 128)), {"format": "PNG"}),
+        (Image.new("I;16", (40, 60), 40000), {"format": "PNG"}),
+    ],
+)
+def test_passthrough_still_normalises_other_inputs(
+    image: Image.Image,
+    save_kwargs: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    source = _save(image, tmp_path / "in.bin", **save_kwargs)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    assert output.read_bytes() != source.read_bytes()
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.mode in {"L", "RGB"}
+        assert written.size == (40, 60)
+
+
+def test_exif_rotated_input_is_normalised_and_sized_like_load_image(tmp_path: Path) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 CW on display
+    source = _save(Image.new("RGB", (80, 50), (250, 250, 250)), tmp_path / "in.jpg", exif=exif)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    loaded = scantailor._load_image(source)
+    assert loaded.size == (50, 80)
+    assert scantailor._oriented_size(source) == loaded.size
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.size == (50, 80)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (50, 80)
+    assert (recorded["output_width"], recorded["output_height"]) == (50, 80)
+
+
+def test_zero_angle_deskew_keeps_identical_pixels_by_copy(tmp_path: Path) -> None:
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(300, 300))
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+    result = scantailor._run_deskew(_state({"manual_angle": 0}), source, output, preview)
+
+    assert result["angle"] == 0
+    assert output.read_bytes() == source.read_bytes()
+    assert preview.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_noop_stage_still_persists_own_output_artifact_with_provenance() -> None:
+    client, job = _create_scan_job("scan-user-noop-stage")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_text_heavy_bytes(),
+        filename="noop.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 0}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+
+    split = ScanTailorStageState.objects.get(scan_page=page, stage="page_split")
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+    # The no-op stage has its own artifact (and preview) with full provenance ...
+    assert deskew.output_storage_identifier
+    assert deskew.output_storage_identifier != split.output_storage_identifier
+    assert deskew.preview_storage_identifier
+    assert deskew.input_stage_state_id == split.id
+    assert deskew.algorithm and deskew.algorithm_version
+    # ... byte-identical to its input, so the hashes match.
+    assert deskew.output_sha256 == split.output_sha256
+    assert deskew.output_size_bytes == split.output_size_bytes
+    assert deskew.parameters["output_width"] == deskew.parameters["input_width"]
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _raw_png(
+    width: int,
+    height: int,
+    bit_depth: int,
+    colour_type: int,
+    row: bytes,
+    *,
+    interlace: int = 0,
+    extra: Iterable[tuple[bytes, bytes]] = (),
+) -> bytes:
+    """Hand-built PNG (``row`` repeated for every scanline, filter type 0)."""
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, colour_type, 0, 0, interlace)
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + b"".join(_png_chunk(kind, data) for kind, data in extra)
+        + _png_chunk(b"pHYs", struct.pack(">IIB", 11811, 11811, 1))
+        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _with_chunk_after_ihdr(png: bytes, chunk_type: bytes, data: bytes) -> bytes:
+    ihdr_end = 8 + 8 + 13 + 4
+    return png[:ihdr_end] + _png_chunk(chunk_type, data) + png[ihdr_end:]
+
+
+def _encoder_png(path: Path, mode: str = "L") -> Path:
+    colour: int | tuple[int, int, int] = 200 if mode == "L" else (200, 190, 180)
+    scantailor._save_png(Image.new(mode, (40, 60), colour), path, (300, 300))
+    return path
+
+
+@pytest.mark.parametrize("mode", ["L", "RGB"])
+def test_png_written_by_stage_encoder_is_passthrough_eligible(mode: str, tmp_path: Path) -> None:
+    source = _encoder_png(tmp_path / "in.png", mode)
+    layout = scantailor._read_png_layout(source)
+    assert layout is not None
+    assert layout.chunk_types <= scantailor._PNG_PASSTHROUGH_CHUNKS
+    assert scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() == source.read_bytes()
+
+
+def _not_normalised_cases() -> dict[str, tuple[bytes, tuple[int, int]]]:
+    encoded = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(encoded, format="PNG", dpi=(300, 300))
+    plain = encoded.getvalue()
+    palette = io.BytesIO()
+    Image.new("P", (40, 60), 3).save(palette, format="PNG", dpi=(300, 300))
+    no_phys = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(no_phys, format="PNG")
+    exif = Image.Exif()
+    exif[0x0112] = 1
+    return {
+        # scanimage --format=png --depth 16: 48-bit RGB, which Pillow opens as "RGB"
+        "rgb16": (_raw_png(4, 3, 16, 2, b"\x80\x00\x40\x00\x20\x00" * 4), (4, 3)),
+        # 2/4-bit greyscale, which Pillow opens as "L"
+        "gray2": (_raw_png(8, 3, 2, 0, b"\x1b\xe4"), (8, 3)),
+        "gray4": (_raw_png(4, 3, 4, 0, b"\x0f\xf0"), (4, 3)),
+        "palette": (palette.getvalue(), (40, 60)),
+        # Adam7 data of a 1x1 image is a single pass-1 pixel
+        "interlaced": (_raw_png(1, 1, 8, 0, b"\x80", interlace=1), (1, 1)),
+        "gAMA": (_with_chunk_after_ihdr(plain, b"gAMA", struct.pack(">I", 45455)), (40, 60)),
+        "iCCP": (
+            _with_chunk_after_ihdr(plain, b"iCCP", b"fake\x00\x00" + zlib.compress(b"x" * 64)),
+            (40, 60),
+        ),
+        "sRGB": (_with_chunk_after_ihdr(plain, b"sRGB", b"\x00"), (40, 60)),
+        "eXIf": (_with_chunk_after_ihdr(plain, b"eXIf", exif.tobytes()), (40, 60)),
+        "tEXt": (_with_chunk_after_ihdr(plain, b"tEXt", b"Comment\x00hello"), (40, 60)),
+        "no-pHYs": (no_phys.getvalue(), (40, 60)),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["rgb16", "gray2", "gray4", "palette", "interlaced", "gAMA", "iCCP", "sRGB", "eXIf", "tEXt"]
+    + ["no-pHYs"],
+)
+def test_non_normalised_png_is_reencoded_not_copied(case: str, tmp_path: Path) -> None:
+    """#54 review: bit depth/colour type/interlace/ancillary chunks come from IHDR, not mode."""
+    payload, size = _not_normalised_cases()[case]
+    source = tmp_path / "in.png"
+    source.write_bytes(payload)
+    assert not scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() != payload
+    layout = scantailor._read_png_layout(output)
+    assert layout is not None
+    assert (layout.bit_depth, layout.interlace) == (8, 0)
+    assert layout.colour_type in {0, 2}
+    assert (layout.width, layout.height) == size
+    assert scantailor._oriented_size(source) == size
+
+
+def _forbid_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _no_decode(self: object) -> None:
+        raise AssertionError("pixel data was decoded")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", _no_decode)
+    monkeypatch.setattr(Image.Image, "load", _no_decode)
+
+
+def test_png_passthrough_checks_and_sizes_do_not_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _encoder_png(tmp_path / "in.png", "RGB")
+    output = tmp_path / "out.png"
+    output.write_bytes(source.read_bytes())
+    _forbid_decode(monkeypatch)
+
+    assert scantailor._is_normalised_png(source)
+    assert scantailor._oriented_size(source) == (40, 60)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (40, 60)
+    assert (recorded["output_width"], recorded["output_height"]) == (40, 60)
+
+
+def test_png_exif_orientation_is_sized_from_chunk_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    plain = io.BytesIO()
+    Image.new("L", (80, 50), 200).save(plain, format="PNG", dpi=(300, 300))
+    source = tmp_path / "in.png"
+    source.write_bytes(_with_chunk_after_ihdr(plain.getvalue(), b"eXIf", exif.tobytes()))
+    expected = scantailor._load_image(source).size
+    assert expected == (50, 80)
+
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) == expected
+    assert not scantailor._is_normalised_png(source)
+
+
+def _workspace_queries(client: Client, job_id: str) -> list[str]:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as captured:
+        response = client.get(f"/scan/jobs/{job_id}/workspace/")
+    assert response.status_code == 200
+    return [query["sql"] for query in captured.captured_queries]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_workspace_query_count_does_not_grow_with_page_count() -> None:
+    """Regression for #51: the workspace issued several queries per page *and* stage."""
+    client, job = _create_scan_job("scan-user-workspace-queries")
+    for sequence in (1, 2):
+        _upload_scan_page(
+            client,
+            str(job.id),
+            sequence=sequence,
+            side="single",
+            payload=f"page-{sequence}".encode(),
+            filename=f"p{sequence}.png",
+        )
+    _workspace_queries(client, str(job.id))  # first load creates the stage rows
+    small = _workspace_queries(client, str(job.id))
+
+    for sequence in range(3, 9):
+        _upload_scan_page(
+            client,
+            str(job.id),
+            sequence=sequence,
+            side="single",
+            payload=f"page-{sequence}".encode(),
+            filename=f"p{sequence}.png",
+        )
+    first_large = _workspace_queries(client, str(job.id))
+    large = _workspace_queries(client, str(job.id))
+
+    assert len(large) == len(small)
+    # Creating the missing rows costs a bounded number of extra queries, not O(pages).
+    assert len(first_large) <= len(small) + 2 * len(scantailor.stage_order()) + 2
+    # A steady-state load must not write anything.
+    assert not [sql for sql in large if sql.lstrip().upper().startswith(("UPDATE", "INSERT"))]
+    assert ScanTailorStageState.objects.filter(scan_job=job).count() == 8 * len(
+        scantailor.stage_order()
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_workspace_bulk_stage_creation_links_inputs_like_single_path() -> None:
+    client, job = _create_scan_job("scan-user-workspace-links")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"links",
+        filename="links.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    response = client.get(f"/scan/jobs/{job.id}/workspace/")
+    assert response.status_code == 200
+    stages = response.json()["pages"][0]["stages"]
+    assert [stage["stage"] for stage in stages] == list(scantailor.stage_order())
+
+    states = {state.stage: state for state in ScanTailorStageState.objects.filter(scan_page=page)}
+    active = page.active_version()
+    assert active is not None
+    assert states["page_split"].input_stage_state_id is None
+    assert states["page_split"].input_scan_page_version_id == active.id
+    assert states["page_split"].input_storage_identifier == active.storage_identifier
+    for stage in scantailor.stage_order()[1:]:
+        predecessor = scantailor.previous_stage(stage)
+        assert predecessor is not None
+        assert states[stage].input_stage_state_id == states[predecessor].id
+        assert states[stage].algorithm == scantailor.DEFAULT_STAGE_ALGORITHM[stage]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_get_or_create_stage_state_skips_noop_save() -> None:
+    client, job = _create_scan_job("scan-user-noop-save")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"noop",
+        filename="noop.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    first = scantailor.get_or_create_stage_state(
+        scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+    )
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as captured:
+        again = scantailor.get_or_create_stage_state(
+            scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+        )
+    assert again.id == first.id
+    assert not [
+        query
+        for query in captured.captured_queries
+        if query["sql"].lstrip().upper().startswith("UPDATE")
+    ]

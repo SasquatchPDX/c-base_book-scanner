@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import shutil
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, cast
 from urllib.parse import unquote
 from zipfile import ZipFile, ZipInfo, is_zipfile
@@ -26,6 +27,7 @@ from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.db import models as django_models
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
 
@@ -34,6 +36,7 @@ from ebook_server.storage import (
     StorageBackend,
     cap_filename,
     ensure_path_storage_ready,
+    min_free_bytes,
 )
 
 from . import identification
@@ -47,6 +50,7 @@ from .models import (
     ReviewTask,
     SourceLocation,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import backend_for_location
 
@@ -126,6 +130,80 @@ MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+# Formats whose metadata is read through Calibre's ``ebook-meta`` instead of a Python
+# parser. Only ``mobi`` is an accepted intake format today; the other Kindle-family
+# names are listed so they pick this path up as soon as detect_format accepts them.
+EBOOK_META_FORMATS = frozenset({"mobi", "azw", "azw3", "prc"})
+EBOOK_META_BINARY = "ebook-meta"
+EBOOK_META_TIMEOUT_SECONDS = 30.0
+DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
+
+# ImportJob.evidence keys written when a candidate scores high enough to be accepted
+# automatically but is routed to review anyway (shown on the review page).
+AUTO_ACCEPT_BLOCKED_KEY = "auto_accept_blocked"
+AUTO_ACCEPT_BLOCK_DETAILS_KEY = "auto_accept_block_details"
+# Authors from the file's own metadata, offered to the reviewer; never applied
+# to a Book without a person confirming them.
+SUGGESTED_AUTHORS_KEY = "suggested_authors"
+# The provider record names no authors (e.g. an edition without them): accepting it
+# would create, or attach to, a Book whose authors nobody verified.
+BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
+# The provider's authors and the file's embedded authors name different people.
+BLOCK_AUTHOR_CONFLICT = "author_conflict"
+
+
+@dataclass(frozen=True)
+class AutoAcceptDecision:
+    """Outcome of the auto-accept check: the candidate to accept, or why not."""
+
+    candidate: identification.IdentificationCandidate | None
+    blocked_reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def _block_details(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "score": float(candidate.score),
+        "candidate_authors": list(candidate.authors),
+        "file_authors": list(file_authors),
+    }
+
+
+def decide_auto_accept(
+    candidates: list[identification.IdentificationCandidate],
+    file_authors: list[str],
+) -> AutoAcceptDecision:
+    """Pick the candidate to accept without review, or record why there is none.
+
+    A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
+    candidate must also name at least one real author, and its authors must not
+    contradict the file's own embedded authors. A high score from an ISBN match alone
+    is no evidence about authorship.
+    """
+    top = candidates[0] if candidates else None
+    if top is None or top.score < AUTO_ACCEPT_SCORE:
+        return AutoAcceptDecision(candidate=None)
+    provider_authors = [
+        name for name in top.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
+            details=_block_details(top, file_authors),
+        )
+    if identification.authors_conflict(provider_authors, file_authors):
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_AUTHOR_CONFLICT,
+            details=_block_details(top, file_authors),
+        )
+    return AutoAcceptDecision(candidate=top)
 
 
 def normalize_filename(raw: str) -> str:
@@ -437,11 +515,64 @@ def _already_handled(source_location: SourceLocation, path: Path, normalized: st
     return False
 
 
+@dataclass
+class ByteBudget:
+    """Archive bytes that may still be queued before the free-space reserve is reached."""
+
+    remaining: int
+    exhausted: bool = False
+
+    def take(self, size: int) -> bool:
+        if size > self.remaining:
+            self.exhausted = True
+            return False
+        self.remaining -= size
+        return True
+
+
+# Jobs whose source file has not been archived yet; their size is still owed to
+# the archive volume.
+PENDING_ARCHIVE_STATES = (
+    ImportJob.State.DISCOVERED,
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+
+def archive_space_budget() -> ByteBudget | None:
+    """Bytes that new imports may add to the archive before hitting the reserve.
+
+    Free space on the archive volume, minus ``BOOK_SCANNER_STORAGE_MIN_FREE_BYTES``,
+    minus the (approximate) size of imports already queued but not yet archived.
+    ``None`` when the check is disabled or free space cannot be determined.
+    """
+    reserve = min_free_bytes()
+    if reserve <= 0:
+        return None
+    free = _default_storage().free_bytes()
+    if free is None:
+        return None
+    pending = ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES).aggregate(
+        total=django_models.Sum(Coalesce("source_size", "size_bytes")),
+    )["total"]
+    return ByteBudget(remaining=max(free - reserve - int(pending or 0), 0))
+
+
 def discover_source_jobs_for_location(
     source_location: SourceLocation,
     *,
     uploader: Any | None = None,
+    byte_budget: ByteBudget | None = None,
 ) -> list[ImportJob]:
+    """Create DISCOVERED jobs for new files.
+
+    With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
+    would not fit, so a bulk import cannot queue more than the archive can hold.
+    """
     jobs: list[ImportJob] = []
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
@@ -463,6 +594,18 @@ def discover_source_jobs_for_location(
         ).exists()
         if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
+        if byte_budget is not None:
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            if not byte_budget.take(size):
+                logger.warning(
+                    "intake_space_budget_exhausted",
+                    source_location_id=source_location.pk,
+                    queued=len(jobs),
+                )
+                break
         try:
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
@@ -537,6 +680,12 @@ def extract_metadata(
             return _extract_fb2_metadata(file_path, original_filename=original_filename)
         if detected_format == "cbz":
             return _extract_cbz_metadata(file_path, original_filename=original_filename)
+        if detected_format in EBOOK_META_FORMATS:
+            return _extract_ebook_meta_metadata(
+                file_path,
+                detected_format,
+                original_filename=original_filename,
+            )
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
@@ -668,11 +817,78 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
     return {
         "title": value("Title") or fallback["title"],
         "authors": authors,
+        "subjects": identification.normalize_subjects((value("Genre") or "").split(",")),
         "language": value("LanguageISO"),
         "description": value("Summary"),
         "publisher": value("Publisher"),
         "raw_metadata": {"comic_info": True},
         "container_type": "cbz",
+    }
+
+
+def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
+    """Return the OPF document Calibre's ``ebook-meta`` writes for ``file_path``.
+
+    ``None`` means "no usable metadata" (tool missing, failed, timed out, or wrote
+    nothing within the size cap); the caller then falls back to filename signals.
+    The command goes through the conversion runner, which kills the whole process
+    group on timeout so a hung Calibre helper cannot outlive the job.
+    """
+    # Imported here: conversion imports this module at load time.
+    from .conversion import ConversionError, _run_conversion_command
+
+    binary = shutil.which(EBOOK_META_BINARY)
+    if binary is None:
+        logger.warning("ebook_meta_unavailable", binary=EBOOK_META_BINARY)
+        return None
+    with TemporaryDirectory(prefix="ebook-meta-") as workdir:
+        opf_path = Path(workdir) / "metadata.opf"
+        try:
+            result = _run_conversion_command(
+                [binary, str(Path(file_path).resolve()), "--to-opf", str(opf_path)],
+                timeout=EBOOK_META_TIMEOUT_SECONDS,
+            )
+        except (OSError, ConversionError) as exc:
+            logger.warning("ebook_meta_failed", error_type=type(exc).__name__)
+            return None
+        if result.returncode != 0:
+            logger.warning("ebook_meta_failed", returncode=result.returncode)
+            return None
+        try:
+            if opf_path.stat().st_size > MAX_FORMAT_METADATA_BYTES:
+                logger.warning("ebook_meta_output_too_large")
+                return None
+            payload = opf_path.read_bytes()
+        except OSError:
+            return None
+    return payload or None
+
+
+def _extract_ebook_meta_metadata(
+    file_path: str,
+    detected_format: str,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    """MOBI and other Kindle-family metadata, read via ``ebook-meta --to-opf``."""
+    fallback: dict[str, Any] = {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {},
+        "container_type": detected_format,
+    }
+    payload = _run_ebook_meta_to_opf(file_path)
+    if payload is None:
+        return fallback
+    try:
+        fields = parse_opf_metadata(payload)
+    except (ET.ParseError, DefusedXmlException) as exc:
+        logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
+        return fallback
+    return {
+        **fields,
+        "title": fields["title"] or fallback["title"],
+        "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
+        "container_type": detected_format,
     }
 
 
@@ -735,6 +951,12 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        subjects = identification.normalize_subjects(
+            [
+                "".join(element.itertext())
+                for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}subject")
+            ]
+        )
         identifier = _pick_epub_identifier(
             [
                 (element.attrib, "".join(element.itertext()).strip())
@@ -746,6 +968,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "authors": [author] if author else [],
             "language": language,
             "description": description,
+            "subjects": subjects,
             "identifier": identifier,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
@@ -772,6 +995,59 @@ def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
         if identification.normalize_isbns(text):
             return text
     return texts[0][1]
+
+
+def _opf_creator_is_author(element: Any) -> bool:
+    """True unless the dc:creator carries a non-author ``opf:role`` (editor, translator...)."""
+    role = next(
+        (str(value) for key, value in element.attrib.items() if _xml_local_name(key) == "role"),
+        "",
+    )
+    return not role or role.strip().lower() == "aut"
+
+
+def parse_opf_metadata(payload: bytes) -> dict[str, Any]:
+    """Parse the Dublin-Core fields of a standalone OPF package document.
+
+    Shared by every OPF this module reads outside an EPUB container: the document
+    ``ebook-meta --to-opf`` writes for Kindle-family files and a Calibre
+    ``metadata.opf`` sidecar. Parsing goes through defusedxml, so a document with
+    entity declarations raises ``DefusedXmlException``; malformed XML raises
+    ``ParseError``. Callers decide how to degrade.
+    """
+    root = ET.fromstring(payload)
+
+    def texts(name: str) -> list[str]:
+        values = []
+        for element in root.iterfind(f".//{DC_NAMESPACE}{name}"):
+            value = " ".join("".join(element.itertext()).split())
+            if value:
+                values.append(value)
+        return values
+
+    def first(name: str) -> str | None:
+        values = texts(name)
+        return values[0] if values else None
+
+    authors: list[str] = []
+    for element in root.iterfind(f".//{DC_NAMESPACE}creator"):
+        name = " ".join("".join(element.itertext()).split())
+        if name and name not in authors and _opf_creator_is_author(element):
+            authors.append(name)
+    return {
+        "title": first("title"),
+        "authors": authors,
+        "language": first("language"),
+        "description": first("description"),
+        "publisher": first("publisher"),
+        "subjects": identification.normalize_subjects(texts("subject")),
+        "identifier": _pick_epub_identifier(
+            [
+                (element.attrib, "".join(element.itertext()).strip())
+                for element in root.iterfind(f".//{DC_NAMESPACE}identifier")
+            ],
+        ),
+    }
 
 
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
@@ -811,12 +1087,15 @@ def _find_text_any(root: ET.Element, expression: str) -> str | None:
 def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
+    *,
+    allow_match: bool = True,
 ) -> None:
+    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
     # Ensure idempotence if jobs are retried.
     MetadataCandidate.objects.filter(import_job=job).delete()
     for candidate in candidates:
         state = MetadataCandidate.CandidateState.REVIEW
-        if candidate.score >= AUTO_ACCEPT_SCORE:
+        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             import_job=job,
@@ -828,6 +1107,7 @@ def _save_metadata_candidates(
             isbn13=_fit(MetadataCandidate, "isbn13", candidate.isbn13),
             score=Decimal(str(candidate.score)),
             raw_payload=candidate.raw,
+            subjects=candidate.subjects,
             language=_fit(MetadataCandidate, "language", candidate.language),
             publisher=_fit(MetadataCandidate, "publisher", candidate.publisher),
             description=candidate.description or "",
@@ -909,6 +1189,16 @@ def _create_review_task(
     return existing
 
 
+def variant_source_type_for_job(job: ImportJob) -> str:
+    """FileVariant provenance for an import: upload, incoming folder, or network source."""
+    mapping: dict[str, str] = {
+        ImportJob.SourceType.UPLOAD: FileVariant.SourceType.UPLOAD,
+        ImportJob.SourceType.INCOMING_FOLDER: FileVariant.SourceType.INCOMING_FOLDER,
+        ImportJob.SourceType.NETWORK_SOURCE: FileVariant.SourceType.NETWORK_SOURCE,
+    }
+    return mapping.get(str(job.source_type), FileVariant.SourceType.UPLOAD)
+
+
 def _create_or_reuse_file_variant(
     job: ImportJob,
     book: Book,
@@ -917,7 +1207,7 @@ def _create_or_reuse_file_variant(
     source_type: str = "",
 ) -> FileVariant:
     if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+        source_type = variant_source_type_for_job(job)
     duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
     if duplicate_variant is not None:
         return duplicate_variant
@@ -928,6 +1218,7 @@ def _create_or_reuse_file_variant(
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
             storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+            storage.ensure_free_space(Path(job.source_path).stat().st_size)
             storage.store(job.source_path, storage_id)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
@@ -956,11 +1247,11 @@ def _create_or_reuse_file_variant(
     )
 
 
-def _try_extract_front_cover(variant: FileVariant) -> None:
+def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None) -> None:
     from . import covers
 
     try:
-        cover = covers.extract_front_cover(variant)
+        cover = covers.extract_front_cover(variant, import_job=job)
     except Exception as exc:  # cover generation is optional; preserve successful intake
         logger.warning(
             "cover_extraction_failed",
@@ -999,11 +1290,7 @@ def _provision_book_from_manual_metadata(
         description=description or "",
         edition=_fit(Book, "edition", edition),
     )
-    if publication_year:
-        try:
-            book.publication_date = date(publication_year, 1, 1)
-        except ValueError:
-            pass
+    book.publication_year = clean_publication_year(publication_year)
     for raw_author in authors or []:
         author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
@@ -1030,19 +1317,18 @@ def resolve_import_with_review_data(
     job: ImportJob,
     review_task: ReviewTask,
     book: Book,
-    source_type: str,
+    source_type: str = "",
     selected_candidate: MetadataCandidate | None = None,
     reviewer: Any | None = None,
     decision: str = "",
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
 ) -> FileVariant:
-    if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+    """Resolve a reviewed import; ``source_type`` defaults to the job's origin."""
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant)
+    _try_extract_front_cover(variant, job)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -1143,11 +1429,9 @@ def _provision_book_from_metadata(
             book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
-        if candidate.publication_year:
-            try:
-                book.publication_date = date(candidate.publication_year, 1, 1)
-            except ValueError:
-                pass
+        year = clean_publication_year(candidate.publication_year)
+        if year is not None:
+            book.publication_year = year
         book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book
@@ -1160,6 +1444,8 @@ def _provision_book_from_metadata(
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
     storage_location = _default_storage_location()
     destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    # Checked per file, so a bulk import already queued still stops before the disk fills.
+    storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):
         storage.copy(job.source_path, destination)
     else:
@@ -1255,7 +1541,7 @@ def process_import_job(job_id: str) -> None:
                     job.sha256,
                 ),
             )
-            _try_extract_front_cover(duplicate_variant)
+            _try_extract_front_cover(duplicate_variant, job)
             return
 
         metadata = extract_metadata(
@@ -1281,10 +1567,29 @@ def process_import_job(job_id: str) -> None:
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
         job.save(update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
-        _save_metadata_candidates(job, candidates)
+        file_authors = identification.evidence_author_names(metadata)
+        decision = decide_auto_accept(candidates, file_authors)
+        if decision.blocked_reason is not None:
+            metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
+            metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
+            metadata[SUGGESTED_AUTHORS_KEY] = file_authors
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_blocked",
+                import_job_id=str(job.id),
+                reason=decision.blocked_reason,
+                provider_id=decision.details.get("provider_id"),
+                score=decision.details.get("score"),
+            )
+        _save_metadata_candidates(
+            job,
+            candidates,
+            allow_match=decision.blocked_reason is None,
+        )
 
-        top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+        top_candidate = decision.candidate
+        if top_candidate is None:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
@@ -1345,12 +1650,12 @@ def process_import_job(job_id: str) -> None:
             storage_identifier=destination,
             size_bytes=job.size_bytes,
             sha256=job.sha256,
-            source_type=FileVariant.SourceType.UPLOAD,
+            source_type=variant_source_type_for_job(job),
             uploader=job.uploader,
             imported_at=timezone.now(),
             processing_state=FileVariant.ProcessingState.COMPLETE,
         )
-        _try_extract_front_cover(variant)
+        _try_extract_front_cover(variant, job)
 
         job.book = book
         job.file_variant = variant

@@ -9,6 +9,7 @@ from typing import ClassVar, Final
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.timezone import now
 
@@ -111,6 +112,20 @@ class StorageLocation(models.Model):
         return self.identifier
 
 
+MAX_PUBLICATION_YEAR = 9999
+
+
+def clean_publication_year(value: object) -> int | None:
+    """Return a plausible publication year (1-9999) or ``None``."""
+    if isinstance(value, bool):
+        return None
+    try:
+        year = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    return year if 1 <= year <= MAX_PUBLICATION_YEAR else None
+
+
 class SourceLocation(models.Model):
     """Configured input source for ingestion workflows."""
 
@@ -150,12 +165,31 @@ class Book(models.Model):
     title = models.CharField(max_length=255)
     subtitle = models.CharField(max_length=512, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
-    publication_date = models.DateField(null=True, blank=True)
+    # Providers only give a (first-)publication *year*; storing it as 1 January would
+    # fabricate day precision (#38). ``publication_date`` holds a genuinely known full
+    # date only (for example entered by an admin) and is empty otherwise.
+    publication_year = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(MAX_PUBLICATION_YEAR)],
+    )
+    publication_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Full publication date, only when the exact day is known.",
+    )
     edition = models.CharField(max_length=128, blank=True)
     language = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def published_year(self) -> int | None:
+        """The publication year, whichever precision is stored."""
+        if self.publication_year is not None:
+            return self.publication_year
+        return self.publication_date.year if self.publication_date else None
 
     authors: models.ManyToManyField[Author, Author] = models.ManyToManyField(
         "Author",
@@ -282,6 +316,8 @@ class FileVariant(models.Model):
 
     class SourceType(models.TextChoices):
         UPLOAD = "upload", "Upload"
+        INCOMING_FOLDER = "incoming_folder", "Incoming folder"
+        NETWORK_SOURCE = "network_source", "Network source"
         SCAN = "scan", "Scan"
         CONVERTED = "converted", "Converted"
         OCR = "ocr", "OCR"
@@ -622,7 +658,10 @@ class ScanTailorStageState(models.Model):
     )
     preview_storage_identifier = models.CharField(max_length=512, blank=True)
     worker_job_id = models.CharField(max_length=64, blank=True)
+    # Only genuine processing failures (status FAILED) go in last_error. Routine
+    # bookkeeping such as "upstream stage changed" goes in invalidated_reason.
     last_error = models.TextField(blank=True)
+    invalidated_reason = models.TextField(blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -814,6 +853,9 @@ class MetadataCandidate(models.Model):
     isbn13 = models.CharField(max_length=16, blank=True)
     score = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     raw_payload = models.JSONField(default=dict, blank=True)
+    # Provider-reported subject/genre/category tags: evidence only, not yet mapped to
+    # Book.categories / Book.genres (see #50 for the open taxonomy decision).
+    subjects = models.JSONField(default=list, blank=True)
     language = models.CharField(max_length=32, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
     description = models.TextField(blank=True)

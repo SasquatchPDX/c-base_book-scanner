@@ -86,10 +86,15 @@ and configured retry intervals. Slow work must not use the no-Redis development
 fallback in a deployed environment; production configuration validation requires
 Redis.
 
-Production web processes should serve `ebook_server.asgi:application` through an
-ASGI server so ScanTailor live event streams do not tie up WSGI threads. The
-repository includes Uvicorn; reverse-proxy requirements are documented in the
-operations guide.
+`runserver` is for local development only, and serves `/static/` itself only
+when `BOOK_SCANNER_DEBUG=true`. Production web processes should serve
+`ebook_server.asgi:application` through an ASGI server so ScanTailor live event
+streams do not tie up WSGI threads. The repository includes Uvicorn, which does
+**not** serve static files: run `uv run python manage.py collectstatic --noinput`
+and let the reverse proxy serve the result. The operations guide covers the
+static-file step, reverse-proxy requirements, example `systemd` units
+(`deploy/systemd/`), and the settings needed for a plain-HTTP test/lab install
+(`BOOK_SCANNER_ENVIRONMENT=development`, `ALLOWED_HOSTS`, CSRF trusted origins).
 
 ## Main workflows
 
@@ -126,8 +131,8 @@ the worker queue in production.
 
 See [docs/operations.md](docs/operations.md) for production configuration,
 LDAP modes, network mounts, worker operation, consistency verification, and
-security boundaries. Nginx streaming-proxy, Prometheus alert/scrape, and
-provisioned Grafana examples live in `deploy/`. Architecture and protocol
+security boundaries. Nginx streaming-proxy, systemd service, Prometheus
+alert/scrape, and provisioned Grafana examples live in `deploy/`. Architecture and protocol
 documents live in `docs/`, while the sprint specifications remain the
 authoritative feature requirements.
 

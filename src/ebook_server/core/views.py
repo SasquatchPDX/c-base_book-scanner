@@ -43,7 +43,14 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from ebook_server.jobs import enqueue
-from ebook_server.storage import LocalFilesystemStorage, check_storage_root, probe_storage_writable
+from ebook_server.storage import (
+    LocalFilesystemStorage,
+    StorageBackend,
+    check_storage_root,
+    free_bytes,
+    min_free_bytes,
+    probe_storage_writable,
+)
 
 from . import (
     book_deletion,
@@ -73,6 +80,7 @@ from .models import (
     ScanTailorStageState,
     ScanTodo,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -174,17 +182,34 @@ def _serialize_scan_todo(todo: ScanTodo) -> dict[str, Any]:
     }
 
 
-def _serialize_scan_page(page: ScanPage) -> dict[str, Any]:
-    active_version = page.active_version()
+def _prefetched_active_version(versions: list[ScanPageVersion]) -> ScanPageVersion | None:
+    """``ScanPage.active_version()`` computed from an already-loaded version list."""
+    active = [version for version in versions if version.is_active]
+    return max(active, key=lambda version: version.version) if active else None
+
+
+def _serialize_scan_page(
+    page: ScanPage,
+    *,
+    versions: list[ScanPageVersion] | None = None,
+    open_todo_count: int | None = None,
+) -> dict[str, Any]:
+    """Serialize a page; pass ``versions``/``open_todo_count`` to avoid per-page queries."""
+    if versions is None:
+        active_version = page.active_version()
+        ordered_versions = list(page.versions.order_by("-version"))
+    else:
+        active_version = _prefetched_active_version(versions)
+        ordered_versions = sorted(versions, key=lambda version: version.version, reverse=True)
+    if open_todo_count is None:
+        open_todo_count = page.todos.filter(state=ScanTodo.State.OPEN).count()
     return {
         "id": str(page.id),
         "logical_sequence_number": page.logical_sequence_number,
         "side": page.side,
-        "open_rescan_todos": page.todos.filter(state=ScanTodo.State.OPEN).count(),
+        "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
-        "available_versions": [
-            _serialize_scan_page_version(v) for v in page.versions.order_by("-version")
-        ],
+        "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],
         "created_at": page.created_at.isoformat(),
         "updated_at": page.updated_at.isoformat(),
     }
@@ -211,6 +236,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_size_bytes": state.output_size_bytes,
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
+        "invalidated_reason": state.invalidated_reason,
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -776,28 +802,90 @@ def _store_scan_page(
 SCAN_THUMBNAIL_MAX_EDGE: Final[int] = 1600
 
 
-def _scan_thumbnail_cache_path(version: ScanPageVersion) -> Path:
+@dataclass(frozen=True)
+class _ThumbnailSource:
+    """The artifact a page thumbnail is rendered from, plus its cache identity."""
+
+    storage: StorageBackend
+    identifier: str
+    cache_key: str
+
+
+def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None:
+    """Last stage of the page's unbroken run of successful stages that has an artifact.
+
+    Walks ``stage_order()`` from the first stage and stops at the first stage that
+    is not SUCCESS, so an output whose upstream was edited/invalidated or is
+    re-running is never shown as current (#58).
+    """
+    states = {
+        state.stage: state
+        for state in ScanTailorStageState.objects.filter(
+            scan_job_id=page.scan_job_id,
+            scan_page=page,
+        ).select_related("preview_storage_location", "output_storage_location")
+    }
+    latest: ScanTailorStageState | None = None
+    for stage_name in scantailor.stage_order():
+        state = states.get(stage_name)
+        if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
+            break
+        if state.preview_storage_identifier or state.output_storage_identifier:
+            latest = state
+    return latest
+
+
+def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
+    """Thumbnail source: latest completed stage output, else the raw active version."""
+    state = _latest_completed_stage_state(page)
+    if state is not None:
+        if state.preview_storage_identifier:
+            identifier = state.preview_storage_identifier
+            location = state.preview_storage_location
+        else:
+            identifier = state.output_storage_identifier
+            location = state.output_storage_location
+        return _ThumbnailSource(
+            storage=(
+                backend_for_location(location) if location is not None else _default_scan_storage()
+            ),
+            identifier=identifier,
+            cache_key=(
+                f"stage-{state.id}-{state.stage}-r{state.revision}-{state.output_sha256[:16]}"
+            ),
+        )
+    version = page.active_version()
+    if version is None:
+        return None
+    return _ThumbnailSource(
+        storage=(
+            backend_for_location(version.storage_location)
+            if version.storage_location_id is not None
+            else _default_scan_storage()
+        ),
+        identifier=version.storage_identifier,
+        cache_key=f"{version.id}-{version.checksum_sha256[:32]}",
+    )
+
+
+def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
     return (
         Path(django_settings.APP_DATA_DIR)
         / SCANNING_STORAGE_ROOT
         / "thumbnails"
-        / f"{version.id}-{version.checksum_sha256[:32]}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
+        / f"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
     )
 
 
-def _render_scan_thumbnail(version: ScanPageVersion, cache_path: Path) -> None:
-    """Generate a downscaled, browser-displayable JPEG for a page version."""
+def _render_scan_thumbnail(source_artifact: _ThumbnailSource, cache_path: Path) -> None:
+    """Generate a downscaled, browser-displayable JPEG for a page artifact."""
     from PIL import Image, ImageOps
 
-    storage = (
-        backend_for_location(version.storage_location)
-        if version.storage_location_id is not None
-        else _default_scan_storage()
-    )
+    storage = source_artifact.storage
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
     try:
-        with storage.open(version.storage_identifier) as stream, Image.open(stream) as source:
+        with storage.open(source_artifact.identifier) as stream, Image.open(stream) as source:
             image = ImageOps.exif_transpose(source) or source
             if image.mode in {"I;16", "I;16L", "I;16B", "I"}:
                 image = image.convert("I").point(lambda value: value * (1 / 256)).convert("L")
@@ -868,7 +956,17 @@ def _check_storage() -> DependencyResult:
             storage_root.mkdir(parents=True, exist_ok=True)
         check_storage_root(root=storage_root)
         probe_storage_writable(storage_root)
-        return DependencyResult(name="storage", status="ok", details={"root": str(storage_root)})
+        details: dict[str, Any] = {"root": str(storage_root)}
+        available = free_bytes(storage_root)
+        reserve = min_free_bytes()
+        if available is not None:
+            details["free_bytes"] = available
+            details["min_free_bytes"] = reserve
+        if available is not None and reserve > 0 and available < reserve:
+            # Imports refuse to archive below the reserve; the app itself still serves.
+            details["warning"] = "free space below BOOK_SCANNER_STORAGE_MIN_FREE_BYTES"
+            return DependencyResult(name="storage", status="degraded", details=details)
+        return DependencyResult(name="storage", status="ok", details=details)
     except Exception as exc:  # pragma: no cover
         return DependencyResult(name="storage", status="down", details={"error": str(exc)})
 
@@ -1017,7 +1115,6 @@ def _resolve_review_source(
             job=import_job,
             review_task=task,
             book=book,
-            source_type=cast(str, FileVariant.SourceType.UPLOAD),
             selected_candidate=selected_candidate,
             reviewer=reviewer,
             decision=decision,
@@ -1068,6 +1165,7 @@ def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
         "publisher": candidate.publisher,
         "publication_year": candidate.publication_year,
         "description": candidate.description,
+        "subjects": candidate.subjects,
         "state": candidate.state,
     }
 
@@ -1085,6 +1183,45 @@ def _review_action_response(
     return JsonResponse(payload)
 
 
+def _parse_author_list(raw_authors: Any) -> list[str]:
+    """Authors from a comma-separated form value or a JSON list."""
+    if isinstance(raw_authors, str):
+        return [entry.strip() for entry in raw_authors.split(",") if entry.strip()]
+    if isinstance(raw_authors, list):
+        return [str(name).strip() for name in raw_authors if str(name).strip()]
+    return []
+
+
+_AUTO_ACCEPT_BLOCK_MESSAGES = {
+    "no_provider_authors": (
+        "The best match scored high enough to be accepted automatically, but the "
+        "metadata provider lists no authors for it. Confirm or edit the suggested "
+        "authors from the file before accepting it."
+    ),
+    "author_conflict": (
+        "The best match scored high enough to be accepted automatically, but its "
+        "authors differ from the authors in the file's own metadata."
+    ),
+}
+
+
+def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
+    """Why an otherwise auto-accepted import was routed to review, for the review page."""
+    evidence = task.embedded_metadata if isinstance(task.embedded_metadata, dict) else {}
+    reason = evidence.get(intake.AUTO_ACCEPT_BLOCKED_KEY)
+    if not isinstance(reason, str) or not reason:
+        return None
+    details = evidence.get(intake.AUTO_ACCEPT_BLOCK_DETAILS_KEY)
+    return {
+        "reason": reason,
+        "message": _AUTO_ACCEPT_BLOCK_MESSAGES.get(
+            reason, "The best match was not accepted automatically."
+        ),
+        "details": details if isinstance(details, dict) else {},
+        "suggested_authors": _parse_author_list(evidence.get(intake.SUGGESTED_AUTHORS_KEY)),
+    }
+
+
 def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     from . import identification
 
@@ -1095,13 +1232,7 @@ def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     if not title:
         raise ValueError("title required")
 
-    raw_authors = payload.get("authors", [])
-    if isinstance(raw_authors, str):
-        authors = [entry.strip() for entry in raw_authors.split(",") if entry.strip()]
-    elif isinstance(raw_authors, list):
-        authors = [str(name).strip() for name in raw_authors if str(name).strip()]
-    else:
-        authors = []
+    authors = _parse_author_list(payload.get("authors", []))
 
     publication_year: int | None = None
     raw_year = payload.get("publication_year")
@@ -1230,6 +1361,8 @@ def _serialize_book(
         "edition": book.edition,
         "language": book.language,
         "description": book.description,
+        # Year-only data (the usual case) leaves publication_date null (#38).
+        "publication_year": book.published_year,
         "publication_date": book.publication_date.isoformat() if book.publication_date else None,
         "authors": [author.full_name for author in book.authors.all()],
         "categories": [category.name for category in book.categories.all()],
@@ -1868,6 +2001,48 @@ def _serialize_workspace_page(page: ScanPage) -> dict[str, Any]:
     return payload
 
 
+def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
+    """Serialize every page of ``job`` for the workspace with a bounded query count.
+
+    The per-page helpers above issue several queries per page and per stage, which
+    made the workspace for a realistic (hundreds of pages) book time out (#51).
+    """
+    page_list = list(
+        job.pages.annotate(
+            open_todo_count=Count("todos", filter=Q(todos__state=ScanTodo.State.OPEN)),
+        )
+        .prefetch_related("versions")
+        .order_by("logical_sequence_number", "side"),
+    )
+    versions_by_page = {page.id: list(page.versions.all()) for page in page_list}
+    states_by_page = scantailor.ensure_stage_states_for_pages(
+        job,
+        page_list,
+        {
+            page_id: _prefetched_active_version(versions)
+            for page_id, versions in versions_by_page.items()
+        },
+    )
+    serialized: list[dict[str, Any]] = []
+    for page in page_list:
+        versions = versions_by_page[page.id]
+        payload = _serialize_scan_page(
+            page,
+            versions=versions,
+            open_todo_count=getattr(page, "open_todo_count", 0),
+        )
+        if _prefetched_active_version(versions) is not None:
+            payload["thumbnail"] = _scan_page_thumbnail_url(page)
+        page_states = states_by_page.get(page.id, {})
+        payload["stages"] = [
+            _serialize_stage_state(page_states[stage])
+            for stage in scantailor.stage_order()
+            if stage in page_states
+        ]
+        serialized.append(payload)
+    return serialized
+
+
 def _scan_workspace_page_payload(job: ScanJob, page: ScanPage) -> dict[str, Any]:
     _ensure_workspace_stage_states(job, page)
     return _serialize_workspace_page(page)
@@ -2033,21 +2208,11 @@ def scan_job_workspace(
         return HttpResponseBadRequest("invalid job id")
 
     try:
-        job = (
-            ScanJob.objects.select_related("book", "operator")
-            .prefetch_related(
-                "pages",
-                "pages__versions",
-            )
-            .get(pk=job_id)
-        )
+        job = ScanJob.objects.select_related("book", "operator").get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
-    pages = []
-    for page in job.pages.all().order_by("logical_sequence_number", "side"):
-        _ensure_workspace_stage_states(job, page)
-        pages.append(_serialize_workspace_page(page))
+    pages = _serialize_workspace_pages(job)
     payload = {
         "job_id": str(job.id),
         "state": job.state,
@@ -2993,19 +3158,21 @@ def scan_page_thumbnail(
         page = ScanPage.objects.get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    version = page.active_version()
-    if version is None:
+    source = _scan_thumbnail_source(page)
+    if source is None:
         return HttpResponseNotFound("no page version")
 
-    etag = f'"{version.checksum_sha256[:32]}-{version.id}-{SCAN_THUMBNAIL_MAX_EDGE}"'
-    headers = {"ETag": etag, "Cache-Control": "private, max-age=3600"}
+    etag = f'"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}"'
+    # The thumbnail URL is stable while its content follows stage processing, so
+    # browsers must revalidate (cheap: ETag -> 304) instead of caching for an hour.
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
     if request.headers.get("If-None-Match") == etag:
         return HttpResponse(status=304, headers=headers)
 
-    cache_path = _scan_thumbnail_cache_path(version)
+    cache_path = _scan_thumbnail_cache_path(source)
     if not cache_path.exists():
         try:
-            _render_scan_thumbnail(version, cache_path)
+            _render_scan_thumbnail(source, cache_path)
         except (FileNotFoundError, StorageConfigurationError):
             return HttpResponseNotFound("artifact missing")
         except Exception:  # undecodable image data
@@ -3351,6 +3518,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     payload["candidates"] = [
         _serialize_candidate(candidate) for candidate in _review_candidates(task)
     ]
+    auto_accept_block = _auto_accept_block(task)
+    payload["auto_accept_block"] = auto_accept_block
     if _wants_html(request):
         return render(
             request,
@@ -3358,6 +3527,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
             {
                 "task": task,
                 "payload": payload,
+                "auto_accept_block": auto_accept_block,
                 "candidates": _review_candidates(task),
                 "books": Book.objects.order_by("title")[:250],
             },
@@ -3443,13 +3613,7 @@ def review_accept_candidate(
                 description=candidate.description or "",
                 edition=candidate_edition or "",
             )
-            if candidate.publication_year:
-                try:
-                    from datetime import date
-
-                    book.publication_date = date(candidate.publication_year, 1, 1)
-                except ValueError:
-                    pass
+            book.publication_year = clean_publication_year(candidate.publication_year)
             for author_name in candidate.authors:
                 if not isinstance(author_name, str):
                     continue
@@ -3472,6 +3636,27 @@ def review_accept_candidate(
                 )
             book.save()
 
+        # A candidate without authors (the provider record names none) can be accepted
+        # with authors the reviewer confirmed, e.g. the file's suggested authors. They
+        # only fill a Book that has no authors yet; provider authors always win.
+        candidate_has_authors = any(
+            isinstance(name, str) and name.strip() for name in candidate.authors
+        )
+        reviewer_authors = (
+            [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
+        )
+        decision_payload: dict[str, Any] | None = None
+        if reviewer_authors and not book.authors.exists():
+            for author_name in reviewer_authors:
+                author, _ = Author.objects.get_or_create(
+                    full_name=intake._fit(Author, "full_name", author_name),
+                )
+                book.authors.add(author)
+            decision_payload = {
+                **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
+                "reviewer_authors": reviewer_authors,
+            }
+
         variant = _resolve_review_source(
             task=task,
             book=book,
@@ -3479,6 +3664,7 @@ def review_accept_candidate(
             reviewer=profile.user,
             decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
             decision_notes=f"Accepted candidate {candidate.id}",
+            decision_payload=decision_payload,
         )
         return _review_action_response(
             request,
