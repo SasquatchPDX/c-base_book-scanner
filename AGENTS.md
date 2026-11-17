@@ -290,9 +290,10 @@ Scanner integration is job-based.
 A `ScanJob` must have persistent identity and state shared by the scanner and ScanTailor-Web.
 
 Job IDs are opaque, immutable strings. A scan job created in the web UI gets a server-generated
-UUID (stored as its canonical string). A scan job registered by a scanner device over
-`/api/scanner/v1/` uses the scanner-assigned ID (`YYYYMMDDTHHMMSSZ[-N]`) as its primary key, as
-specified by the libreflip device API contract
+UUID (stored as its canonical string). A scan job registered by the scanner over
+`/api/scanner/v1/` (`source=scanner`; there is exactly one scanner, authenticated by one API key)
+uses the scanner-assigned ID (`YYYYMMDDTHHMMSSZ[-N]`) as its primary key, as specified by the
+libreflip scanner API contract
 ([libreflip/serif#37](https://github.com/libreflip/serif/pull/37), decision D1). Registering an
 existing ID with different data is rejected (409), never overwritten.
 

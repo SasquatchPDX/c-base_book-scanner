@@ -28,14 +28,13 @@ from ebook_server.core.models import (
     CoverImage,
     ScanCover,
     ScanJob,
-    ScannerDevice,
     ScanPage,
     ScanPageVersion,
     ScanUploadSource,
     StorageLocation,
     get_or_create_profile,
 )
-from ebook_server.core.scanner_devices import create_device
+from ebook_server.core.scanner_auth import generate_key, hash_key
 
 JOB_ID = "20261117T143201Z"
 STARTED = "2026-11-17T14:32:01Z"
@@ -49,13 +48,10 @@ def _data_dir(settings: Any, tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def device(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01")
-
-
-@pytest.fixture
-def key(device: tuple[ScannerDevice, str]) -> str:
-    _, api_key = device
+def key(db: None, settings: Any) -> str:
+    """The scanner key (#125: one scanner, one key hash in settings), job registered."""
+    api_key = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(api_key)
     response = Client().put(
         f"/api/scanner/v1/jobs/{JOB_ID}",
         data=json.dumps({"scan_started_at": STARTED}),
@@ -354,12 +350,23 @@ def test_bad_ids_are_refused_before_the_body_is_read(
 
 
 @pytest.mark.django_db
-def test_another_devices_job_is_404(key: str) -> None:
-    _, other_key = create_device("libreflip-02")
-    image = _jpeg(b"other")
-    response = _put_page(other_key, 0, image)
-    assert response.status_code == 404
+def test_a_web_created_job_is_404(key: str) -> None:
+    web_job_id = "20261117T150000Z"
+    ScanJob.objects.create(id=web_job_id, source=ScanJob.Source.WEB)
+    image = _jpeg(b"web")
+
+    page = _put_page(key, 0, image, job_id=web_job_id)
+    cover = Client().put(
+        f"/api/scanner/v1/jobs/{web_job_id}/covers/front",
+        data=_multipart({"sha256": _sha(image)}, image),
+        content_type=CONTENT_TYPE,
+        headers=_auth(key),
+    )
+
+    assert page.status_code == 404
+    assert cover.status_code == 404
     assert not ScanPageVersion.objects.exists()
+    assert not ScanCover.objects.exists()
 
 
 @pytest.mark.django_db

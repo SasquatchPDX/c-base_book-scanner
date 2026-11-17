@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _package_version
 from pathlib import Path
@@ -36,6 +37,7 @@ DEFAULT_METADATA_USER_AGENT = (
     "(+https://github.com/SasquatchPDX/c-base_book-scanner; self-hosted hackerspace library)"
 )
 DEV_SECRET_KEY = "dev-only-secret-change-me-before-production-0123456789abcdef"
+SCANNER_KEY_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Settings(BaseSettings):
@@ -166,11 +168,13 @@ class Settings(BaseSettings):
     # project's own scanner) or ``spread`` (one photo holds two facing pages).
     scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
     scan_spread_scanner_ids: list[str] = []
-    # Scanner device API v1 (/api/scanner/v1/, libreflip contract §7.2). The public base
-    # URL builds portal links handed to the scanner; it is required (https://) in
-    # production. Device keys are records (manage.py scanner_device), not settings.
+    # Scanner device API v1 (/api/scanner/v1/, libreflip contract §7.2, #125). There is
+    # one scanner with one key; this is the key's SHA-256 as lowercase hex (generate it
+    # with manage.py generate_scanner_key). Empty disables the API (every request 503).
+    # The public base URL builds portal links handed to the scanner; production requires
+    # it (https://) only while the scanner API is enabled.
+    scanner_api_key_sha256: str = ""
     public_base_url: str = ""
-    scanner_api_enabled: bool = True
     scanner_max_image_bytes: int = 50 * 1024 * 1024
     scanner_max_opf_bytes: int = 1024 * 1024
 
@@ -182,6 +186,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_scanner_api(self) -> Settings:
         errors: list[str] = []
+        self.scanner_api_key_sha256 = self.scanner_api_key_sha256.strip().lower()
+        if self.scanner_api_key_sha256 and not SCANNER_KEY_SHA256_PATTERN.match(
+            self.scanner_api_key_sha256
+        ):
+            errors.append("scanner_api_key_sha256 must be 64 hex characters (a SHA-256)")
         if self.scanner_max_image_bytes <= 0:
             errors.append("scanner_max_image_bytes must be positive")
         if self.scanner_max_opf_bytes <= 0:
@@ -201,9 +210,16 @@ class Settings(BaseSettings):
         if self.environment != "production":
             return self
         errors: list[str] = []
+        # The scanner API is opt-in: deployments without a scanner key need no public
+        # base URL. Once a key is configured, portal links must be https://.
         public_base_url = urlparse(self.public_base_url.strip())
-        if public_base_url.scheme != "https" or not public_base_url.hostname:
-            errors.append("public_base_url must be set to an https:// URL")
+        if (self.scanner_api_key_sha256 or self.public_base_url.strip()) and (
+            public_base_url.scheme != "https" or not public_base_url.hostname
+        ):
+            errors.append(
+                "public_base_url must be set to an https:// URL when the scanner API is"
+                " enabled (scanner_api_key_sha256 is set)"
+            )
         if self.secret_key.get_secret_value() == DEV_SECRET_KEY:
             errors.append("secret_key must be changed")
         if not self.allowed_hosts or "*" in self.allowed_hosts:
@@ -274,8 +290,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
-    # Device keys are refused outside /api/scanner/v1/ before any session is loaded.
-    "ebook_server.core.middleware.ScannerDeviceKeyMiddleware",
+    # The scanner key is refused outside /api/scanner/v1/ before any session is loaded.
+    "ebook_server.core.middleware.ScannerKeyMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -437,7 +453,7 @@ BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 BOOK_SCANNER_PUBLIC_BASE_URL = (
     settings.public_base_url.strip().rstrip("/") + "/" if settings.public_base_url.strip() else ""
 )
-BOOK_SCANNER_SCANNER_API_ENABLED = settings.scanner_api_enabled
+BOOK_SCANNER_SCANNER_API_KEY_SHA256 = settings.scanner_api_key_sha256
 BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES = settings.scanner_max_image_bytes
 BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = settings.scanner_max_opf_bytes
 
