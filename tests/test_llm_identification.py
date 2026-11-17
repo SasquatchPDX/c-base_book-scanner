@@ -299,6 +299,152 @@ def test_http_client_rejects_invalid_model_output(response: dict[str, Any]) -> N
         client.complete(llm.build_evidence_bundle(relative_path="a.pdf", filename="a.pdf"))
 
 
+_OK_ANSWER = _chat_response(json.dumps({"title_hints": ["Nmap"], "confidence": "low"}))
+
+
+def _bundle() -> llm.LLMEvidenceBundle:
+    return llm.build_evidence_bundle(relative_path="Books/Nmap.pdf", filename="Nmap.pdf")
+
+
+@pytest.mark.parametrize(
+    "variable", ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "all_proxy"]
+)
+def test_http_client_ignores_ambient_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch, variable: str
+) -> None:
+    """An ambient proxy must never see the prompt (it may be an external host)."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    # A closed local port: if the env proxy were honoured, the request would go there and
+    # fail instead of reaching the mocked LLM server.
+    monkeypatch.setenv(variable, "http://127.0.0.1:9")
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_OK_ANSWER)
+
+    client = llm.HttpxLLMClient(
+        "http://10.20.30.40:8000", model="m", transport=httpx.MockTransport(handler)
+    )
+    assert client._client._mounts == {}
+    assert client.complete(_bundle()).output.title_hints == ["Nmap"]
+    assert [str(request.url) for request in seen] == ["http://10.20.30.40:8000/v1/chat/completions"]
+
+
+def test_http_client_connects_to_the_address_it_validated_on_every_request() -> None:
+    """DNS is re-checked per request and the connection goes to that checked address."""
+    answers = {"ai.lan": ["10.0.0.7"]}
+    resolved: list[str] = []
+
+    def resolver(host: str) -> list[str]:
+        resolved.append(host)
+        return answers[host]
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_OK_ANSWER)
+
+    client = llm.HttpxLLMClient(
+        "http://ai.lan:8000", model="m", transport=httpx.MockTransport(handler), resolver=resolver
+    )
+    client.complete(_bundle())
+    assert str(seen[0].url) == "http://10.0.0.7:8000/v1/chat/completions"
+    assert seen[0].headers["Host"] == "ai.lan:8000"
+
+    # The name now points somewhere public (DNS rebinding): nothing is sent.
+    answers["ai.lan"] = ["10.0.0.7", "93.184.216.34"]
+    with pytest.raises(llm.LLMClientError) as excinfo:
+        client.complete(_bundle())
+    assert excinfo.value.transient is False
+    assert len(seen) == 1
+    assert resolved.count("ai.lan") >= 3  # construction check plus one per request
+
+    # A name that stops resolving is a transient connection failure, not a public send.
+    answers["ai.lan"] = []
+    with pytest.raises(llm.LLMClientError) as excinfo:
+        client.complete(_bundle())
+    assert excinfo.value.transient is True
+    assert len(seen) == 1
+
+
+def test_http_client_keeps_tls_server_name_when_pinning_https() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_OK_ANSWER)
+
+    client = llm.HttpxLLMClient(
+        "https://ai.lan",
+        model="m",
+        transport=httpx.MockTransport(handler),
+        resolver=lambda host: ["fd00::12"],
+    )
+    client.complete(_bundle())
+    assert seen[0].url.host == "fd00::12"
+    assert seen[0].headers["Host"] == "ai.lan"
+    assert seen[0].extensions["sni_hostname"] == "ai.lan"
+
+
+class _CountingStream(httpx.SyncByteStream):
+    def __init__(self, total: int, chunk: int = 16 * 1024) -> None:
+        self.total = total
+        self.chunk = chunk
+        self.delivered = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        while self.delivered < self.total:
+            self.delivered += self.chunk
+            yield b" " * self.chunk
+
+
+def test_http_client_stops_reading_an_oversized_response_at_the_cap() -> None:
+    stream = _CountingStream(total=1024 * 1024)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, stream=stream)  # no Content-Length: chunked
+
+    client = llm.HttpxLLMClient(
+        "http://127.0.0.1:1", model="m", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(llm.LLMOutputInvalid, match="too large"):
+        client.complete(_bundle())
+    assert stream.delivered <= llm.MAX_RESPONSE_ENVELOPE_BYTES + stream.chunk
+    assert stream.delivered < stream.total
+    assert requests[0].headers["Accept-Encoding"] == "identity"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Length": str(llm.MAX_RESPONSE_ENVELOPE_BYTES + 1)},
+        {"Content-Encoding": "gzip"},
+    ],
+)
+def test_http_client_rejects_declared_oversize_or_compressed_body_unread(
+    headers: dict[str, str],
+) -> None:
+    stream = _CountingStream(total=1024)
+
+    client = llm.HttpxLLMClient(
+        "http://127.0.0.1:1",
+        model="m",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, headers=headers, stream=stream)
+        ),
+    )
+    with pytest.raises(llm.LLMOutputInvalid):
+        client.complete(_bundle())
+    assert stream.delivered == 0
+
+
 # --- auto-accept block and trigger policy -------------------------------------------------
 
 

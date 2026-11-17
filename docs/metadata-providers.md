@@ -364,7 +364,13 @@ displayed suggestion; no tools are offered; nothing is accepted or written to a
 Book), untrusted evidence is wrapped in `<untrusted_evidence>` with those delimiters
 stripped from the evidence itself, and the service URL must be loopback, RFC 1918 or
 ULA, or a host listed in `BOOK_SCANNER_LLM_ALLOWED_HOSTS`; otherwise the client
-refuses to start and `manage.py check --deploy` reports `ebook_server.E101`. Logs
+refuses to start and `manage.py check --deploy` reports `ebook_server.E101`. The
+HTTP client ignores ambient proxy settings (`HTTP(S)_PROXY`, `ALL_PROXY`; httpx
+`trust_env=False`), re-resolves the host on every request, refuses the request if any
+address is no longer local (unless the host is allowlisted), and connects to the
+address it just checked with the configured name kept in the `Host` header and the
+TLS server name. Responses are requested uncompressed and read as a stream; reading
+stops at 256 KiB. Logs
 carry job id, model, prompt template version, input size and hash, duration, schema
 validity, grounded/ungrounded hint counts and outcome, never the prompt, the
 response or the text sample.

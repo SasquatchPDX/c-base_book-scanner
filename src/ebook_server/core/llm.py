@@ -7,7 +7,10 @@ evidence before anything uses it; it never scores, accepts or creates anything.
 
 Inference stays local. The service URL must resolve to a loopback, RFC 1918 or ULA
 address, or a host an operator listed in ``BOOK_SCANNER_LLM_ALLOWED_HOSTS``. There is
-no hosted-API code path.
+no hosted-API code path. The HTTP client ignores ambient proxy settings, re-resolves the
+host on every request and connects to the address it just validated (with the original
+``Host`` header and TLS server name), so a DNS change after start-up cannot redirect the
+request. Responses are read as a stream under a byte cap, uncompressed.
 
 Book content (the bundle, the prompt and the raw response) is never logged.
 """
@@ -44,6 +47,8 @@ MAX_FAILED_CANDIDATES = 5
 MAX_EVIDENCE_FIELD_CHARS = 500
 DEFAULT_TEXT_SAMPLE_CHARS = 4000
 MAX_RESPONSE_BYTES = 64 * 1024
+# The whole HTTP body (JSON envelope around the answer) is capped while streaming.
+MAX_RESPONSE_ENVELOPE_BYTES = MAX_RESPONSE_BYTES * 4
 EVIDENCE_OPEN = "<untrusted_evidence>"
 EVIDENCE_CLOSE = "</untrusted_evidence>"
 _DELIMITER_RE = re.compile(r"<\s*/?\s*untrusted_evidence\s*>", re.IGNORECASE)
@@ -537,6 +542,104 @@ def local_service_url_problem(
     )
 
 
+def pinned_local_address(
+    host: str,
+    *,
+    allowed_hosts: Iterable[str] = (),
+    resolver: Resolver | None = None,
+) -> str:
+    """Resolve ``host`` now and return the address a request must connect to.
+
+    Literal IPs must be loopback, RFC 1918 or ULA. Hostnames are resolved on every call;
+    every address must be local unless the host is operator-allowlisted. Raises
+    ``LLMConfigurationError`` for a non-local answer and ``OSError`` when the host does
+    not resolve.
+    """
+    bare = host.strip("[]").lower()
+    try:
+        ipaddress.ip_address(bare.split("%", 1)[0])
+    except ValueError:
+        pass
+    else:
+        if _is_private_address(bare):
+            return bare
+        raise LLMConfigurationError(f"LLM host {bare} is not a loopback, RFC 1918 or ULA address")
+    addresses = (resolver or _default_resolver)(bare)
+    if not addresses:
+        raise OSError(f"LLM host {bare} did not resolve")
+    allowed = {entry.strip().lower() for entry in allowed_hosts if entry.strip()}
+    if bare not in allowed and not all(_is_private_address(a) for a in addresses):
+        raise LLMConfigurationError(f"LLM host {bare} now resolves to a non-local address")
+    return addresses[0]
+
+
+class LocalPinnedTransport(httpx.BaseTransport):
+    """Connects each request to the address validated for it, not one resolved later.
+
+    The URL host is replaced by the address :func:`pinned_local_address` just checked;
+    the ``Host`` header keeps the configured name and, for https, the TLS server name
+    (SNI and certificate check) does too.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.BaseTransport,
+        *,
+        allowed_hosts: Iterable[str] = (),
+        resolver: Resolver | None = None,
+    ) -> None:
+        self._inner = inner
+        self._allowed_hosts = tuple(allowed_hosts)
+        self._resolver = resolver
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        try:
+            address = pinned_local_address(
+                host, allowed_hosts=self._allowed_hosts, resolver=self._resolver
+            )
+        except LLMConfigurationError as exc:
+            raise LLMClientError(str(exc), transient=False) from None
+        except OSError:
+            raise httpx.ConnectError("LLM host did not resolve", request=request) from None
+        if address != host:
+            request.headers.setdefault("Host", request.url.netloc.decode("ascii"))
+            request.url = request.url.copy_with(host=address)
+            if request.url.scheme == "https":
+                request.extensions = {**request.extensions, "sni_hostname": host}
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def read_capped_body(response: httpx.Response, limit: int) -> bytes:
+    """Read a streamed response body, aborting as soon as it passes ``limit`` bytes.
+
+    Compressed bodies are refused (the request asks for ``identity``), so the byte count
+    is also the decoded size and a small compressed payload cannot expand in memory.
+    """
+    encoding = response.headers.get("Content-Encoding", "").strip().lower()
+    if encoding not in {"", "identity"}:
+        raise LLMOutputInvalid("llm_output_invalid: compressed response refused")
+    declared = response.headers.get("Content-Length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise LLMOutputInvalid("llm_output_invalid: response too large")
+    if response.is_stream_consumed:
+        # Only in-memory responses (tests' MockTransport) arrive already buffered.
+        if len(response.content) > limit:
+            raise LLMOutputInvalid("llm_output_invalid: response too large")
+        return response.content
+    chunks: list[bytes] = []
+    received = 0
+    for chunk in response.iter_raw():
+        received += len(chunk)
+        if received > limit:
+            raise LLMOutputInvalid("llm_output_invalid: response too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def llm_enabled() -> bool:
     return bool(getattr(django_settings, "BOOK_SCANNER_LLM_ENABLED", False))
 
@@ -627,9 +730,10 @@ class HttpxLLMClient:
     ) -> None:
         self.base_url = (base_url or _setting("BOOK_SCANNER_LLM_SERVICE_URL", "")).rstrip("/")
         self.base_url = self.base_url.removesuffix("/v1")
+        allowed_hosts = list(_setting("BOOK_SCANNER_LLM_ALLOWED_HOSTS", []))
         problem = local_service_url_problem(
             self.base_url,
-            allowed_hosts=_setting("BOOK_SCANNER_LLM_ALLOWED_HOSTS", []),
+            allowed_hosts=allowed_hosts,
             resolver=resolver,
         )
         if problem is not None:
@@ -643,11 +747,18 @@ class HttpxLLMClient:
         api_key = str(_setting("BOOK_SCANNER_LLM_API_KEY", ""))
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        # trust_env=False: HTTP(S)_PROXY / ALL_PROXY / NO_PROXY and .netrc are ignored, so
+        # book text cannot be routed through an ambient (possibly external) proxy.
         self._client = httpx.Client(
             timeout=self.timeout_seconds,
             headers=headers,
-            transport=transport,
+            transport=LocalPinnedTransport(
+                transport or httpx.HTTPTransport(),
+                allowed_hosts=allowed_hosts,
+                resolver=resolver,
+            ),
             follow_redirects=False,
+            trust_env=False,
         )
 
     def request_payload(self, bundle: LLMEvidenceBundle) -> dict[str, Any]:
@@ -670,14 +781,15 @@ class HttpxLLMClient:
     def complete(self, bundle: LLMEvidenceBundle) -> LLMCompletion:
         started = time.monotonic()
         try:
-            response = self._client.post(
+            with self._client.stream(
+                "POST",
                 f"{self.base_url}{self.endpoint}",
                 json=self.request_payload(bundle),
-            )
-            response.raise_for_status()
-            if len(response.content) > MAX_RESPONSE_BYTES * 4:
-                raise LLMOutputInvalid("llm_output_invalid: response too large")
-            raw = response.json()
+                headers={"Accept-Encoding": "identity"},
+            ) as response:
+                response.raise_for_status()
+                body = read_capped_body(response, MAX_RESPONSE_ENVELOPE_BYTES)
+            raw = json.loads(body)
         except httpx.HTTPError as exc:
             # str(exc) names the URL and status only, never the request body.
             raise LLMClientError(

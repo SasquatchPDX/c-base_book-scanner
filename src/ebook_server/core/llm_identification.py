@@ -193,12 +193,12 @@ def request_llm_identification(
         raise LLMIdentificationError(f"unknown trigger: {trigger}")
 
     with transaction.atomic():
+        # Lock only the review task row: ``import_job`` is nullable, so the join is an
+        # outer join and PostgreSQL refuses FOR UPDATE on its nullable side.
         task = (
-            ReviewTask.objects.select_for_update()
+            ReviewTask.objects.select_for_update(of=("self",))
             .select_related("import_job")
-            .get(
-                pk=review_task.pk,
-            )
+            .get(pk=review_task.pk)
         )
         for active in ProcessingJob.objects.filter(
             job_type=ProcessingJob.JobType.LLM_IDENTIFICATION,
