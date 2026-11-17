@@ -81,6 +81,15 @@ class PersistentStateCollector:
         yield collection
 
         yield _group_count_metrics(
+            name="ebook_server_referenced_file_variants",
+            documentation="Indexed-in-place file variants by reference (drift) state.",
+            rows=FileVariant.objects.filter(storage_location__read_only=True)
+            .values("reference_state")
+            .annotate(total=Count("id")),
+            label_names=("reference_state",),
+        )
+
+        yield _group_count_metrics(
             name="ebook_server_processing_jobs",
             documentation="Current processing job count by type and state.",
             rows=ProcessingJob.objects.values("job_type", "state").annotate(total=Count("id")),

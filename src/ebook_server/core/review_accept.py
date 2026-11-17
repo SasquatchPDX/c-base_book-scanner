@@ -14,11 +14,12 @@ from typing import Any, cast
 from django.db import transaction
 from django.utils import timezone
 
-from . import intake, metadata_search
+from . import genres, intake, metadata_search
 from .models import (
     Author,
     Book,
     FileVariant,
+    Genre,
     Identifier,
     MetadataCandidate,
     ReviewTask,
@@ -80,6 +81,35 @@ def resolve_review_source(
     return None
 
 
+def apply_review_genres(
+    *,
+    book: Book,
+    task: ReviewTask,
+    reviewer_genres: list[Genre] | None,
+    provider_subjects: list[Any] | None,
+    reviewer: Any = None,
+) -> dict[str, Any]:
+    """Attach genres on a review decision; returns decision-payload additions.
+
+    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
+    """
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    if reviewer_genres is not None:
+        genres.assign_reviewer(
+            book,
+            reviewer_genres,
+            suggestion=genres.suggest(provider_subjects, embedded),
+            user=reviewer,
+        )
+        return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
+    added = genres.assign_automatic(
+        book,
+        provider_subjects=provider_subjects,
+        embedded_subjects=embedded,
+    )
+    return {"automatic_genres": [genre.name for genre in added]} if added else {}
+
+
 def book_for_candidate(candidate: MetadataCandidate) -> Book:
     """The library Book a candidate describes: by ISBN, then title+author, else new."""
     book: Book | None = None
@@ -139,6 +169,7 @@ def accept_candidate(
     candidate: MetadataCandidate,
     reviewer: Any,
     reviewer_authors: list[str] | None = None,
+    reviewer_genres: list[Genre] | None = None,
     decision_notes: str = "",
     extra_payload: dict[str, Any] | None = None,
 ) -> tuple[Book, FileVariant | None]:
@@ -146,7 +177,9 @@ def accept_candidate(
 
     A candidate without authors can be accepted with authors the reviewer
     confirmed; they only fill a Book that has no authors yet (provider authors
-    always win). ``extra_payload`` is merged into the task's decision payload.
+    always win). Genres follow the review page's rules (:func:`apply_review_genres`):
+    an explicit ``reviewer_genres`` choice, else automatic genres from the
+    candidate's subjects. ``extra_payload`` is merged into the task's decision payload.
     """
     book = book_for_candidate(candidate)
     candidate_has_authors = any(
@@ -161,6 +194,15 @@ def accept_candidate(
             )
             book.authors.add(author)
         payload_additions["reviewer_authors"] = authors
+    payload_additions.update(
+        apply_review_genres(
+            book=book,
+            task=task,
+            reviewer_genres=reviewer_genres,
+            provider_subjects=candidate.subjects,
+            reviewer=reviewer,
+        )
+    )
     decision_payload: dict[str, Any] | None = None
     if payload_additions:
         decision_payload = {

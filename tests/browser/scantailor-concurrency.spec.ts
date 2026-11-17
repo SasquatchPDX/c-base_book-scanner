@@ -40,7 +40,9 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
     );
     await page.getByRole("button", { name: "Save and run" }).click();
     await expect((await queued).status()).toBe(202);
-    await expect(stageRow.locator("[data-stage-status]")).toHaveText("success", {
+    // New jobs are single-page captures, so Page Split completes as "no split" (#55).
+    const expected = stage === "page_split" ? "skipped · single page" : "success";
+    await expect(stageRow.locator("[data-stage-status]")).toHaveText(expected, {
       timeout: 30_000,
     });
   }
@@ -93,8 +95,9 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
 
     const firstControls = firstEditor.locator("[data-stage-controls]");
     const secondControls = secondEditor.locator("[data-stage-controls]");
-    await expect(firstControls.getByLabel("Mode")).toHaveValue("auto");
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("auto");
+    // The upload already completed Page Split as a single-page passthrough (#55).
+    await expect(firstControls.getByLabel("Mode")).toHaveValue("none");
+    await expect(secondControls.getByLabel("Mode")).toHaveValue("none");
 
     await firstControls.getByLabel("Mode").selectOption("single");
     const saved = firstEditor.waitForResponse(
