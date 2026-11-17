@@ -112,6 +112,8 @@ def test_combining_pdf_parts_creates_derived_variant_with_provenance(tmp_path: P
         assert combined.part_index is None
         assert combined.source_type == FileVariant.SourceType.GENERATED
         assert combined.source_variant_id == parts[0].id
+        book.refresh_from_db()
+        assert combined.storage_identifier.startswith(f"{book.archive_folder}/")
         assert combined.converter_tool == "pypdf"
         assert combined.converter_version.startswith("pypdf ")
         assert str(combined.job_id) == payload["job_id"]
@@ -441,3 +443,49 @@ def test_combined_work_includes_a_part_identical_to_another_books_file(
         ]
         other_variant.refresh_from_db()
         assert other_variant.book.file_variants.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_indexed_parts_combine_into_writable_book_folder(tmp_path: Path) -> None:
+    with override_settings(APP_DATA_DIR=tmp_path):
+        book, parts = _part_book(
+            tmp_path,
+            [
+                ("ch01.txt", b"First chapter.", "Chapter 1"),
+                ("ch02.txt", b"Second chapter.", "Chapter 2"),
+            ],
+        )
+        share = tmp_path / "read-only-share"
+        reference = StorageLocation.objects.create(
+            identifier="referenced-parts",
+            backend=StorageLocation.BackendType.LOCAL,
+            base_path=str(share),
+            read_only=True,
+        )
+        original_bytes = {}
+        for part in parts:
+            original = tmp_path / "library-artifacts" / part.storage_identifier
+            referenced = share / part.storage_identifier
+            referenced.parent.mkdir(parents=True, exist_ok=True)
+            referenced.write_bytes(original.read_bytes())
+            original_bytes[referenced] = referenced.read_bytes()
+            part.storage_location = reference
+            part.save(update_fields=["storage_location"])
+
+        response = _client().post(
+            f"/library/books/{book.id}/combine-parts/",
+            data=json.dumps({"target_format": "txt"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202, response.content
+        payload = response.json()
+        assert payload["state"] == ProcessingJob.JobState.SUCCESS, payload
+        combined = FileVariant.objects.get(pk=payload["output_variant_id"])
+        book.refresh_from_db()
+        assert not combined.storage_location.read_only
+        assert combined.storage_location.identifier == "default"
+        assert combined.storage_identifier.startswith(f"{book.archive_folder}/")
+        assert combined.source_variant_id == parts[0].pk
+        assert combined.converter_options["part_variant_ids"] == [part.pk for part in parts]
+        assert {path: path.read_bytes() for path in original_bytes} == original_bytes
+        assert {path for path in share.rglob("*") if path.is_file()} == set(original_bytes)
