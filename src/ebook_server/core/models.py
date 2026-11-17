@@ -12,6 +12,8 @@ from typing import Any, ClassVar, Final
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
@@ -519,6 +521,100 @@ class Identifier(models.Model):
 
     def __str__(self) -> str:
         return f"{self.kind}:{self.value}"
+
+
+class BookSearchDocument(models.Model):
+    """Denormalised, rebuildable search/browse row for one Book (#28).
+
+    Never a source of truth: `ebook_server.core.search` rewrites it from the
+    Book, its authors, identifiers, genres, categories and COMPLETE variants,
+    and `manage.py rebuild_search_index` can recreate every row. Text columns
+    hold accent- and case-folded text, so trigram and keyset queries need no
+    per-row function call. `document` is a PostgreSQL `tsvector`; it stays
+    NULL on other databases, which use the plain `icontains` fallback.
+    """
+
+    book = models.OneToOneField(
+        Book,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name="search_document",
+    )
+    document = SearchVectorField(null=True, blank=True)
+    title_sort = models.CharField(max_length=255, blank=True)
+    author_sort = models.CharField(max_length=255, blank=True)
+    author_text = models.TextField(blank=True)
+    language = models.CharField(max_length=32, blank=True)
+    publication_decade = models.SmallIntegerField(null=True, blank=True)
+    has_cover = models.BooleanField(default=False)
+    book_created_at = models.DateTimeField()
+    # SHA-256 of the weighted full-text input, so drift in text that only reaches
+    # the `tsvector` (description, publisher, identifiers) stays detectable.
+    content_digest = models.CharField(max_length=64, blank=True)
+    indexed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["-book_created_at", "-book"],
+                name="booksearch_created_idx",
+            ),
+            models.Index(fields=["title_sort", "book"], name="booksearch_title_idx"),
+            models.Index(fields=["author_sort", "book"], name="booksearch_author_idx"),
+            models.Index(fields=["language", "book"], name="booksearch_language_idx"),
+            # PostgreSQL only; migration 0034 skips these on other databases.
+            GinIndex(fields=["document"], name="booksearch_document_gin"),
+            GinIndex(
+                fields=["title_sort"],
+                opclasses=["gin_trgm_ops"],
+                name="booksearch_title_trgm",
+            ),
+            GinIndex(
+                fields=["author_text"],
+                opclasses=["gin_trgm_ops"],
+                name="booksearch_author_trgm",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"search document for book {self.book_id}"
+
+
+class BookSearchFacet(models.Model):
+    """One facet value of a Book's search document (#28).
+
+    A narrow `(kind, value, book)` table instead of array columns: it is
+    B-tree indexed on every database, filters are exact equality on a
+    normalised value (no `UPPER(format)` misestimate), and facet counts are a
+    `GROUP BY value`. Genre, category and author facets store the related
+    row's id; format stores the lower-cased format code. Language and
+    publication decade are single-valued, so they are columns of the
+    document instead.
+    """
+
+    class Kind(models.TextChoices):
+        FORMAT = "format", "Format"
+        AUTHOR = "author", "Author"
+        GENRE = "genre", "Genre"
+        CATEGORY = "category", "Category"
+
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name="search_facets")
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    value = models.CharField(max_length=64)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["book", "kind", "value"],
+                name="uniq_booksearchfacet_book_kind_value",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["kind", "value", "book"], name="booksearchfacet_lookup_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.kind}={self.value}"
 
 
 class CoverImage(models.Model):

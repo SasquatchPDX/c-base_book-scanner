@@ -32,9 +32,10 @@
     <label>
       Format<input name="format" value="{{ filters.format }}" placeholder="epub, pdf…">
     </label>
-    <label>Sort<select name="sort"><option value="-created_at">Newest</option><option value="title" {% if filters.sort == 'title' %}selected{% endif %}>Title A–Z</option><option value="-title" {% if filters.sort == '-title' %}selected{% endif %}>Title Z–A</option></select></label>
+    <label>Sort<select name="sort">{% if filters.q %}<option value="relevance" {% if filters.sort == 'relevance' %}selected{% endif %}>Best match</option>{% endif %}<option value="-created_at" {% if filters.sort == '-created_at' %}selected{% endif %}>Newest</option><option value="created_at" {% if filters.sort == 'created_at' %}selected{% endif %}>Oldest</option><option value="title" {% if filters.sort == 'title' %}selected{% endif %}>Title A–Z</option><option value="-title" {% if filters.sort == '-title' %}selected{% endif %}>Title Z–A</option></select></label>
     <button type="submit">Apply filters</button>
   </form>
+  {% if fuzzy %}<p class="muted">No exact matches. Showing books with similar titles or authors.</p>{% endif %}
   <div class="list-stack">
     {% for book in books %}
       <article class="book-row">
@@ -48,11 +49,11 @@
       </article>
 {% empty %}<p class="empty-state">No books match these filters.</p>{% endfor %}
   </div>
-  {% if page_object.paginator.num_pages > 1 %}
+  {% if previous_url or next_url %}
     <nav class="pagination" aria-label="Pagination">
-      {% if page_object.has_previous %}<a href="?view=html&amp;{{ filter_query }}&amp;page={{ page_object.previous_page_number }}">Previous</a>{% endif %}
-      <span>Page {{ page_object.number }} of {{ page_object.paginator.num_pages }}</span>
-      {% if page_object.has_next %}<a href="?view=html&amp;{{ filter_query }}&amp;page={{ page_object.next_page_number }}">Next</a>{% endif %}
+      {% if previous_url %}<a href="{{ previous_url }}" rel="prev">Previous</a>{% endif %}
+      {% if page_number %}<span>Page {{ page_number }}</span>{% endif %}
+      {% if next_url %}<a href="{{ next_url }}" rel="next">Next</a>{% endif %}
     </nav>
   {% endif %}
 {% endblock %}

@@ -246,6 +246,8 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    # Full-text search, trigram lookups and GIN indexes for the library (#28).
+    "django.contrib.postgres",
     "rest_framework",
     "ebook_server.core",
 ]

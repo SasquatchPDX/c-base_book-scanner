@@ -99,6 +99,8 @@ export BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS="0.1"
 export QT_QPA_PLATFORM="offscreen"
 
 cd "${book_scanner_project_root}"
+# TLS 1.3-only, LAN-only scanner front end (deploy/nginx/serif-lan-tls.conf).
+"${book_scanner_project_root}/scripts/test_scanner_tls_proxy.sh"
 if ! command -v pandoc >/dev/null 2>&1; then
   "${book_scanner_project_root}/scripts/install_test_pandoc.sh" "${book_scanner_pandoc_root}"
   export PATH="${book_scanner_pandoc_root}/bin:${PATH}"
