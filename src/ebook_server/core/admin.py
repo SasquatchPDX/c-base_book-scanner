@@ -33,7 +33,6 @@ from .models import (
     ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
-    ScannerDevice,
     ScanPage,
     ScanPageVersion,
     ScanTailorStageState,
@@ -238,56 +237,20 @@ def _queue_reference_check(
         )
 
 
-@admin.register(ScannerDevice)
-class ScannerDeviceAdmin(admin.ModelAdmin[ScannerDevice]):
-    """Read-only device list plus revoke; keys are issued with manage.py scanner_device."""
-
-    list_display = ("scanner_id", "name", "is_active", "created_at", "rotated_at", "last_seen_at")
-    list_filter = ("is_active",)
-    search_fields = ("scanner_id", "name")
-    readonly_fields = (
-        "scanner_id",
-        "name",
-        "is_active",
-        "created_at",
-        "rotated_at",
-        "last_seen_at",
-    )
-    exclude = ("key_sha256",)
-    actions = ("revoke_devices",)
-
-    def has_add_permission(self, request: HttpRequest) -> bool:
-        return False
-
-    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
-        return False
-
-    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
-        return False
-
-    def has_revoke_permission(self, request: HttpRequest) -> bool:
-        return bool(request.user.has_perm("core.change_scannerdevice"))
-
-    @admin.action(description="Revoke selected scanner devices", permissions=["revoke"])
-    def revoke_devices(self, request: HttpRequest, queryset: QuerySet[ScannerDevice]) -> None:
-        updated = queryset.filter(is_active=True).update(is_active=False)
-        self.message_user(request, f"Revoked {updated} scanner device(s).", messages.SUCCESS)
-
-
 @admin.register(ScanJob)
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
     list_display = (
         "id",
         "state",
         "scanner_id",
-        "device",
+        "source",
         "operator",
         "book",
         "scan_started_at",
         "created_at",
         "finished_at",
     )
-    list_filter = ("state",)
+    list_filter = ("state", "source")
     search_fields = ("id", "scanner_id")
 
 

@@ -29,13 +29,12 @@ from ebook_server.core.models import (
     BookSearchDocument,
     FileVariant,
     ScanJob,
-    ScannerDevice,
     ScanPage,
     ScanPageVersion,
     StorageLocation,
     get_or_create_profile,
 )
-from ebook_server.core.scanner_devices import create_device
+from ebook_server.core.scanner_auth import generate_key, hash_key
 from tests.test_scan_jobs import _png_for, _put_scan_page, _upload_scan_page
 
 JOB_ID = "20261117T143201Z"
@@ -57,8 +56,11 @@ def _fresh_search_cache() -> Iterator[None]:
 
 
 @pytest.fixture
-def device(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01")
+def key(db: None, settings: Any) -> str:
+    """The scanner API key, configured as its SHA-256 (#125: one scanner, one key)."""
+    value = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(value)
+    return value
 
 
 @pytest.fixture
@@ -107,7 +109,7 @@ def _sha(data: bytes) -> str:
 def _add_page(client: Client, job_id: str, sequence: int, label: bytes) -> str:
     """Store a page through the session API; returns its SHA-256.
 
-    The device page upload (§6.5) arrives with S4; the lifecycle only needs pages.
+    The scanner page upload (§6.5) arrives with S4; the lifecycle only needs pages.
     """
     image = _png_for(label)
     response = _upload_scan_page(
@@ -157,10 +159,7 @@ def _variant(book: Book, source_type: str, *, scan_job: ScanJob | None = None) -
 
 
 @pytest.mark.django_db(transaction=True)
-def test_get_job_reports_state_inventory_and_portal_url(
-    device: tuple[ScannerDevice, str], member: Client
-) -> None:
-    _, key = device
+def test_get_job_reports_state_inventory_and_portal_url(key: str, member: Client) -> None:
     _register(key)
     sha1 = _add_page(member, JOB_ID, 1, b"one")
     sha2 = _add_page(member, JOB_ID, 2, b"two")
@@ -185,13 +184,9 @@ def test_get_job_reports_state_inventory_and_portal_url(
 
 
 @pytest.mark.django_db
-def test_get_job_is_404_for_other_devices_web_jobs_and_unknown_ids(
-    device: tuple[ScannerDevice, str],
-) -> None:
-    _, key = device
-    _, other_key = create_device("libreflip-02")
-    _register(other_key)
+def test_get_job_is_404_for_web_jobs_and_unknown_ids(key: str) -> None:
     web_job = ScanJob.objects.create(id="20261117T150000Z")
+    assert web_job.source == ScanJob.Source.WEB
 
     assert _status(key).status_code == 404
     assert _status(key, web_job.pk).status_code == 404
@@ -205,10 +200,7 @@ def test_get_job_is_404_for_other_devices_web_jobs_and_unknown_ids(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_capture_complete_verifies_manifest_and_is_idempotent(
-    device: tuple[ScannerDevice, str], member: Client
-) -> None:
-    _, key = device
+def test_capture_complete_verifies_manifest_and_is_idempotent(key: str, member: Client) -> None:
     _register(key)
     pages = {1: _add_page(member, JOB_ID, 1, b"one"), 2: _add_page(member, JOB_ID, 2, b"two")}
 
@@ -236,8 +228,7 @@ def test_capture_complete_verifies_manifest_and_is_idempotent(
 
 
 @pytest.mark.django_db
-def test_capture_complete_from_open_job_with_no_pages(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_capture_complete_from_open_job_with_no_pages(key: str) -> None:
     _register(key)
 
     response = _capture_complete(key, _manifest({}))
@@ -247,10 +238,7 @@ def test_capture_complete_from_open_job_with_no_pages(device: tuple[ScannerDevic
 
 
 @pytest.mark.django_db(transaction=True)
-def test_capture_complete_lists_missing_and_mismatched_items(
-    device: tuple[ScannerDevice, str], member: Client
-) -> None:
-    _, key = device
+def test_capture_complete_lists_missing_and_mismatched_items(key: str, member: Client) -> None:
     _register(key)
     pages = {1: _add_page(member, JOB_ID, 1, b"one"), 2: _add_page(member, JOB_ID, 2, b"two")}
     manifest = _manifest(
@@ -270,8 +258,7 @@ def test_capture_complete_lists_missing_and_mismatched_items(
 
 
 @pytest.mark.django_db
-def test_capture_complete_on_cancelled_job_is_job_state(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_capture_complete_on_cancelled_job_is_job_state(key: str) -> None:
     _register(key)
     assert _abort(key).status_code == 200
 
@@ -300,12 +287,13 @@ def test_capture_complete_on_cancelled_job_is_job_state(device: tuple[ScannerDev
         ({"pages": {}}, "pages"),
         ({"sans_last_line_no": "12"}, "sans_last_line_no"),
         ({"finished_at": "yesterday"}, "finished_at"),
+        # ISO-shaped but not a calendar date: 400, never 500.
+        ({"finished_at": "2026-02-30T15:40:00Z"}, "finished_at"),
     ],
 )
 def test_capture_complete_rejects_malformed_manifests(
-    device: tuple[ScannerDevice, str], body: dict[str, Any], field: str
+    key: str, body: dict[str, Any], field: str
 ) -> None:
-    _, key = device
     _register(key)
 
     response = _capture_complete(key, body)
@@ -317,16 +305,20 @@ def test_capture_complete_rejects_malformed_manifests(
 
 
 @pytest.mark.django_db
-def test_capture_complete_is_404_for_another_devices_job(
-    device: tuple[ScannerDevice, str],
-) -> None:
-    _, key = device
-    _, other_key = create_device("libreflip-02")
-    _register(other_key)
+def test_capture_complete_and_abort_are_404_for_web_jobs_and_unknown_ids(key: str) -> None:
+    """Only ``source=scanner`` jobs are reachable; a web job with a scanner-shaped ID
+    looks exactly like an unknown one."""
+    ScanJob.objects.create(id=JOB_ID)
 
     assert _capture_complete(key, _manifest({})).status_code == 404
     assert _abort(key).status_code == 404
-    assert ScanJob.objects.get(pk=JOB_ID).state == ScanJob.State.OPEN
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert job.state == ScanJob.State.OPEN
+    assert job.source == ScanJob.Source.WEB
+
+    unknown = "20261117T160000Z"
+    assert _capture_complete(key, _manifest({}), unknown).status_code == 404
+    assert _abort(key, unknown).status_code == 404
 
 
 class _FakeCoverSource:
@@ -361,9 +353,8 @@ def fake_extensions() -> Iterator[_FakeCoverSource]:
 
 @pytest.mark.django_db
 def test_registered_sources_extend_status_and_manifest_check(
-    device: tuple[ScannerDevice, str], fake_extensions: _FakeCoverSource
+    key: str, fake_extensions: _FakeCoverSource
 ) -> None:
-    _, key = device
     _register(key)
 
     status = _status(key).json()
@@ -389,11 +380,10 @@ def test_registered_sources_extend_status_and_manifest_check(
 
 @pytest.mark.django_db(transaction=True)
 def test_interrupted_upload_leaves_no_duplicates_and_capture_complete_verifies(
-    device: tuple[ScannerDevice, str], member: Client
+    key: str, member: Client
 ) -> None:
     """A lost response makes the scanner resend a page: still one version, and the
     manifest verifies. (The scanner-side half of §10.3 lives in sans.)"""
-    _, key = device
     _register(key)
     sha = _add_page(member, JOB_ID, 1, b"page-one")
     # The response to the first upload was "lost"; GET jobs/{id} after the restart...
@@ -412,10 +402,7 @@ def test_interrupted_upload_leaves_no_duplicates_and_capture_complete_verifies(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_abort_cancels_idempotently_and_keeps_data(
-    device: tuple[ScannerDevice, str], member: Client
-) -> None:
-    _, key = device
+def test_abort_cancels_idempotently_and_keeps_data(key: str, member: Client) -> None:
     _register(key)
     _add_page(member, JOB_ID, 1, b"one")
 
@@ -433,8 +420,7 @@ def test_abort_cancels_idempotently_and_keeps_data(
 
 
 @pytest.mark.django_db
-def test_abort_is_refused_after_capture_complete(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_abort_is_refused_after_capture_complete(key: str) -> None:
     _register(key)
     assert _capture_complete(key, _manifest({})).status_code == 200
 
@@ -450,9 +436,8 @@ def test_abort_is_refused_after_capture_complete(device: tuple[ScannerDevice, st
 
 @pytest.mark.django_db
 def test_portal_link_redirects_through_login_to_workspace(
-    device: tuple[ScannerDevice, str],
+    key: str,
 ) -> None:
-    _, key = device
     _register(key)
     assert _capture_complete(key, _manifest({})).status_code == 200
     ScanJob.objects.filter(pk=JOB_ID).update(provisional_title="Raw Scan Title")
@@ -479,8 +464,7 @@ def test_portal_link_redirects_through_login_to_workspace(
 
 
 @pytest.mark.django_db
-def test_raw_scans_list_shows_captured_jobs(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_raw_scans_list_shows_captured_jobs(key: str) -> None:
     _register(key)
     _register(key, "20261117T150000Z")  # still capturing: not a raw scan yet
     assert _capture_complete(key, _manifest({})).status_code == 200
@@ -608,10 +592,7 @@ def test_book_with_a_completed_scan_stays_visible_during_a_second_raw_scan(
 # --- finish from captured, re-finish after a replacement (§5) ----------------------------
 
 
-def _captured_job_with_book(
-    device: tuple[ScannerDevice, str], member: Client, book: Book
-) -> tuple[str, dict[int, str]]:
-    _, key = device
+def _captured_job_with_book(key: str, member: Client, book: Book) -> tuple[str, dict[int, str]]:
     _register(key)
     pages = {1: _add_page(member, JOB_ID, 1, b"one")}
     assert _capture_complete(key, _manifest(pages)).status_code == 200
@@ -621,11 +602,11 @@ def _captured_job_with_book(
 
 @pytest.mark.django_db(transaction=True)
 def test_finish_from_captured_requires_processed_output_unless_allowed(
-    device: tuple[ScannerDevice, str], member: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, member: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
     book = Book.objects.create(title="Finished From Captured")
-    _captured_job_with_book(device, member, book)
+    _captured_job_with_book(key, member, book)
 
     refused = member.post(f"/scan/jobs/{JOB_ID}/finish/")
     assert refused.status_code == 400
@@ -641,10 +622,9 @@ def test_finish_from_captured_requires_processed_output_unless_allowed(
 
 @pytest.mark.django_db(transaction=True)
 def test_finish_uses_a_registered_book_linker_before_identification(
-    device: tuple[ScannerDevice, str], member: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, member: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
-    _, key = device
     _register(key)
     _add_page(member, JOB_ID, 1, b"one")
     book = Book.objects.create(title="Linked From OPF")
@@ -669,9 +649,8 @@ def test_finish_uses_a_registered_book_linker_before_identification(
 
 @pytest.mark.django_db(transaction=True)
 def test_finish_without_a_linked_book_keeps_scan_identification(
-    device: tuple[ScannerDevice, str], member: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, member: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, key = device
     _register(key)
     assert _capture_complete(key, _manifest({})).status_code == 200
     calls: list[str] = []
@@ -698,11 +677,11 @@ def test_finish_without_a_linked_book_keeps_scan_identification(
 
 @pytest.mark.django_db(transaction=True)
 def test_replacement_on_complete_job_returns_to_captured_until_refinished(
-    device: tuple[ScannerDevice, str], member: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, member: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
     book = Book.objects.create(title="Rescanned After Finish")
-    key, _ = _captured_job_with_book(device, member, book)
+    key, _ = _captured_job_with_book(key, member, book)
     assert (
         member.post(f"/scan/jobs/{JOB_ID}/finish/", data={"allow_raw_pages": "true"}).status_code
         == 202
@@ -748,10 +727,7 @@ def test_replacement_on_complete_job_returns_to_captured_until_refinished(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_captured_job_accepts_processing_but_not_new_pages(
-    device: tuple[ScannerDevice, str], member: Client
-) -> None:
-    _, key = device
+def test_captured_job_accepts_processing_but_not_new_pages(key: str, member: Client) -> None:
     _register(key)
     _add_page(member, JOB_ID, 1, b"one")
     assert _capture_complete(key, _manifest({})).status_code == 200

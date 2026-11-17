@@ -775,30 +775,6 @@ class FileVariant(models.Model):
         return f"{self.book_id}:{self.format}:{self.original_filename}"
 
 
-class ScannerDevice(models.Model):
-    """A physical scanner (libreflip ``sans``) that talks to ``/api/scanner/v1/``.
-
-    A device authenticates with its own API key, never with a member's session. Only the
-    SHA-256 of the key is stored: the key is 32 random bytes, so it needs no slow hash.
-    Keys are issued, rotated and revoked with ``manage.py scanner_device`` (see
-    ``core.scanner_devices``), and they authorise nothing outside the device API.
-    """
-
-    scanner_id = models.SlugField(max_length=64, unique=True)
-    name = models.CharField(max_length=255, blank=True)
-    key_sha256 = models.CharField(max_length=64, unique=True, editable=False)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    rotated_at = models.DateTimeField(null=True, blank=True)
-    last_seen_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ("scanner_id",)
-
-    def __str__(self) -> str:
-        return self.scanner_id
-
-
 class ScanJob(models.Model):
     """Persistent scan job for physical book capture."""
 
@@ -819,6 +795,12 @@ class ScanJob(models.Model):
         SINGLE_PAGE = "single_page", "One page per image"
         SPREAD = "spread", "Two facing pages per image"
 
+    class Source(models.TextChoices):
+        """Who created the job: the scanner over ``/api/scanner/v1/`` or the web UI."""
+
+        SCANNER = "scanner", "Scanner API"
+        WEB = "web", "Web"
+
     # An opaque, immutable string (#126, libreflip contract §4.1/D1): the scanner-assigned
     # ID (YYYYMMDDTHHMMSSZ[-N]) for jobs registered over /api/scanner/v1/, a canonical
     # UUID string for jobs created in the web UI. See core.scan_job_ids.
@@ -830,14 +812,9 @@ class ScanJob(models.Model):
     )
     state = models.CharField(max_length=16, choices=State.choices, default=State.OPEN)
     scanner_id = models.CharField(max_length=64, blank=True)
-    # The scanner device that registered the job; NULL for web-created jobs.
-    device = models.ForeignKey(
-        ScannerDevice,
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="scan_jobs",
-    )
+    # ``scanner`` for jobs registered over /api/scanner/v1/ (#126); only those are
+    # visible to the scanner API. Everything else (web UI, session API) is ``web``.
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.WEB)
     # When the scanner started the job (§6.3); part of the registration identity.
     scan_started_at = models.DateTimeField(null=True, blank=True)
     capture_layout = models.CharField(

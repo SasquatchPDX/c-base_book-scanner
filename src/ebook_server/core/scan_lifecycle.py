@@ -181,7 +181,7 @@ def unregister_raw_scan_annotator(annotator: RawScanAnnotator) -> None:
 def raw_scan_jobs() -> QuerySet[ScanJob]:
     return (
         ScanJob.objects.filter(state=State.CAPTURED)
-        .select_related("book", "device")
+        .select_related("book")
         .annotate(
             page_total=Count("pages", distinct=True),
             open_rescan_total=Count(

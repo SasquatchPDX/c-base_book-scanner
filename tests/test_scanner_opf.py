@@ -29,10 +29,9 @@ from ebook_server.core.models import (
     ReviewTask,
     ScanJob,
     ScanJobOpf,
-    ScannerDevice,
     get_or_create_profile,
 )
-from ebook_server.core.scanner_devices import create_device
+from ebook_server.core.scanner_auth import generate_key, hash_key
 from tests.test_raw_scan_lifecycle import (
     JOB_ID,
     _add_page,
@@ -117,8 +116,11 @@ def providers(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]
 
 
 @pytest.fixture
-def device(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01")
+def key(db: None, settings: Any) -> str:
+    """The scanner API key, configured as its SHA-256 (one scanner, one key)."""
+    value = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(value)
+    return value
 
 
 @pytest.fixture
@@ -139,8 +141,7 @@ def _finish(client: Client) -> Any:
 
 
 @pytest.mark.django_db
-def test_upload_is_versioned_and_idempotent(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_upload_is_versioned_and_idempotent(key: str) -> None:
     _register(key)
     first = _opf()
 
@@ -188,10 +189,7 @@ def test_upload_is_versioned_and_idempotent(device: tuple[ScannerDevice, str]) -
     ],
     ids=["not-xml", "no-metadata", "not-package", "xxe", "billion-laughs"],
 )
-def test_malformed_or_hostile_opf_is_rejected(
-    device: tuple[ScannerDevice, str], payload: bytes, code: str
-) -> None:
-    _, key = device
+def test_malformed_or_hostile_opf_is_rejected(key: str, payload: bytes, code: str) -> None:
     _register(key)
     response = _put_opf(key, payload)
     assert response.status_code == 422, response.content
@@ -201,10 +199,7 @@ def test_malformed_or_hostile_opf_is_rejected(
 
 
 @pytest.mark.django_db
-def test_checksum_size_state_and_ownership(
-    device: tuple[ScannerDevice, str], settings: Any
-) -> None:
-    _, key = device
+def test_checksum_size_state_and_ownership(key: str, settings: Any) -> None:
     _register(key)
     mismatch = _put_opf(key, _opf(), sha="0" * 64)
     assert mismatch.status_code == 422
@@ -224,8 +219,8 @@ def test_checksum_size_state_and_ownership(
     )
     assert missing.status_code == 400
 
-    _, other_key = create_device("libreflip-02")
-    assert _put_opf(other_key, _opf()).status_code == 404
+    web_job = ScanJob.objects.create(id="20261117T150000Z", source=ScanJob.Source.WEB)
+    assert _put_opf(key, _opf(), job_id=web_job.pk).status_code == 404
 
     ScanJob.objects.filter(pk=JOB_ID).update(state=ScanJob.State.CANCELLED)
     cancelled = _put_opf(key, _opf())
@@ -234,8 +229,7 @@ def test_checksum_size_state_and_ownership(
 
 
 @pytest.mark.django_db
-def test_capture_complete_checks_the_opf_checksum(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_capture_complete_checks_the_opf_checksum(key: str) -> None:
     _register(key)
     payload = _opf()
     missing = _capture_complete(key, _manifest({}, metadata_opf={"sha256": _sha(payload)}))
@@ -252,10 +246,7 @@ def test_capture_complete_checks_the_opf_checksum(device: tuple[ScannerDevice, s
 
 
 @pytest.mark.django_db
-def test_raw_scan_shows_opf_on_job_page_and_raw_scans(
-    device: tuple[ScannerDevice, str], admin_client: Client
-) -> None:
-    _, key = device
+def test_raw_scan_shows_opf_on_job_page_and_raw_scans(key: str, admin_client: Client) -> None:
     _register(key)
     assert _put_opf(key, _opf(language="ger")).status_code == 201
     assert _capture_complete(key, _manifest({})).status_code == 200
@@ -276,8 +267,7 @@ def test_raw_scan_shows_opf_on_job_page_and_raw_scans(
 
 
 @pytest.mark.django_db
-def test_app_generated_opf_is_stored_but_not_used(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_app_generated_opf_is_stored_but_not_used(key: str) -> None:
     _register(key)
     _put_opf(key, _opf())
     generated = _opf(
@@ -303,10 +293,9 @@ def _prepare_finish(key: str, member: Client, payload: bytes | None) -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_finish_links_the_one_book_with_the_isbn(
-    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, admin_client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
-    _, key = device
     existing = Book.objects.create(title="The Physical Book")
     Identifier.objects.create(book=existing, kind="isbn13", value=ISBN, normalized_value=ISBN)
     _prepare_finish(key, admin_client, _opf())
@@ -327,10 +316,9 @@ def test_finish_links_the_one_book_with_the_isbn(
 
 @pytest.mark.django_db(transaction=True)
 def test_finish_creates_a_book_from_the_opf(
-    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, admin_client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
-    _, key = device
     _prepare_finish(key, admin_client, _opf())
 
     response = _finish(admin_client)
@@ -366,12 +354,11 @@ def test_finish_creates_a_book_from_the_opf(
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("payload", [None, _opf(title=None)], ids=["no-opf", "no-title"])
 def test_finish_without_opf_title_runs_scan_identification(
-    device: tuple[ScannerDevice, str],
+    key: str,
     admin_client: Client,
     monkeypatch: pytest.MonkeyPatch,
     payload: bytes | None,
 ) -> None:
-    _, key = device
     _prepare_finish(key, admin_client, payload)
     calls: list[str] = []
 
@@ -394,9 +381,8 @@ def test_finish_without_opf_title_runs_scan_identification(
 
 @pytest.mark.django_db(transaction=True)
 def test_isbn_less_duplicate_routes_to_review_and_can_create_a_book(
-    device: tuple[ScannerDevice, str], admin_client: Client
+    key: str, admin_client: Client
 ) -> None:
-    _, key = device
     existing = Book.objects.create(title="The Physical Book")
     existing.authors.add(Author.objects.create(full_name="Ada Scanner"))
     _prepare_finish(key, admin_client, _opf(isbn=None))
@@ -427,10 +413,7 @@ def test_isbn_less_duplicate_routes_to_review_and_can_create_a_book(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_isbn_on_several_books_routes_to_review(
-    device: tuple[ScannerDevice, str], admin_client: Client
-) -> None:
-    _, key = device
+def test_isbn_on_several_books_routes_to_review(key: str, admin_client: Client) -> None:
     for title in ("Copy A", "Copy B"):
         book = Book.objects.create(title=title)
         Identifier.objects.create(book=book, kind="isbn13", value=ISBN, normalized_value=ISBN)
@@ -446,10 +429,9 @@ def test_isbn_on_several_books_routes_to_review(
 
 @pytest.mark.django_db(transaction=True)
 def test_opf_after_linking_updates_scanner_fields_but_not_hand_edits(
-    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+    key: str, admin_client: Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
-    _, key = device
     _prepare_finish(key, admin_client, _opf())
     assert _finish(admin_client).status_code == 202
     book = Book.objects.get()
@@ -497,7 +479,7 @@ def test_opf_after_linking_updates_scanner_fields_but_not_hand_edits(
 
 @pytest.mark.django_db(transaction=True)
 def test_provider_confirmation_keeps_scanner_metadata(
-    device: tuple[ScannerDevice, str],
+    key: str,
     admin_client: Client,
     monkeypatch: pytest.MonkeyPatch,
     providers: list[dict[str, Any]],
@@ -511,7 +493,6 @@ def test_provider_confirmation_keeps_scanner_metadata(
             "isbn": [ISBN],
         }
     )
-    _, key = device
     _prepare_finish(key, admin_client, _opf())
     assert _finish(admin_client).status_code == 202
 
@@ -524,7 +505,7 @@ def test_provider_confirmation_keeps_scanner_metadata(
 
 @pytest.mark.django_db(transaction=True)
 def test_provider_contradiction_opens_review_with_scanner_preselected(
-    device: tuple[ScannerDevice, str],
+    key: str,
     admin_client: Client,
     monkeypatch: pytest.MonkeyPatch,
     providers: list[dict[str, Any]],
@@ -538,7 +519,6 @@ def test_provider_contradiction_opens_review_with_scanner_preselected(
             "isbn": [ISBN],
         }
     )
-    _, key = device
     _prepare_finish(key, admin_client, _opf())
     assert _finish(admin_client).status_code == 202
 

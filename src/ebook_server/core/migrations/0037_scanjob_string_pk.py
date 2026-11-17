@@ -17,7 +17,8 @@ Steps, in order:
 3. ``RunPython``: rewrite ``scan_job_id`` values inside JSON fields into the same
    canonical form. The application has always written ``str(job.id)``, so this is
    normally a no-op; it guards against any non-canonical value.
-4. New fields ``ScanJob.device`` and ``ScanJob.scan_started_at``.
+4. New fields ``ScanJob.source`` (``web`` for every existing job) and
+   ``ScanJob.scan_started_at``.
 
 Reversal works while every job ID is still a UUID. Once a scanner-assigned ID such as
 ``20261117T143201Z`` exists, reversing stops with ``IrreversibleError`` instead of
@@ -27,7 +28,6 @@ losing jobs.
 import uuid
 from typing import Any
 
-import django.db.models.deletion
 from django.db import migrations, models
 from django.db.migrations.exceptions import IrreversibleError
 from django.db.models.functions import Cast
@@ -105,7 +105,7 @@ def restore_uuid_ids(apps: Any, schema_editor: Any) -> None:
         blocking = [row[0] for row in cursor.fetchall() if _canonical_uuid(row[0]) is None]
     if blocking:
         raise IrreversibleError(
-            f"core.0038 cannot be reversed: {len(blocking)} scan job(s) have scanner-assigned "
+            f"core.0037 cannot be reversed: {len(blocking)} scan job(s) have scanner-assigned "
             f"IDs that are not UUIDs (for example {sorted(blocking)[0]!r})."
         )
     if connection.features.has_native_uuid_field:
@@ -169,7 +169,7 @@ def canonicalize_json_references(apps: Any, schema_editor: Any) -> None:
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0037_scanner_device"),
+        ("core", "0036_book_search_document"),
     ]
 
     operations = [
@@ -189,13 +189,11 @@ class Migration(migrations.Migration):
         migrations.RunPython(canonicalize_json_references, migrations.RunPython.noop),
         migrations.AddField(
             model_name="scanjob",
-            name="device",
-            field=models.ForeignKey(
-                blank=True,
-                null=True,
-                on_delete=django.db.models.deletion.PROTECT,
-                related_name="scan_jobs",
-                to="core.scannerdevice",
+            name="source",
+            field=models.CharField(
+                choices=[("scanner", "Scanner API"), ("web", "Web")],
+                default="web",
+                max_length=16,
             ),
         ),
         migrations.AddField(
