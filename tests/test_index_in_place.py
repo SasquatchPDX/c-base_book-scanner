@@ -26,6 +26,7 @@ from ebook_server.core.models import (
     Book,
     FileVariant,
     ImportJob,
+    ProcessingJob,
     ReviewTask,
     SourceLocation,
     StorageLocation,
@@ -521,3 +522,217 @@ def test_reference_fields_only_for_read_only_locations(tmp_path: Path) -> None:
     fields = referenced_files.reference_fields_for_job(job)
     assert fields["source_mtime_ns"] == 123
     assert isinstance(fields["reference_checked_at"], datetime)
+
+
+# --- Readiness: an unmounted share is an outage, never mass drift -------------------
+
+
+def _indexed_variants(tmp_path: Path, count: int = 3) -> tuple[list[FileVariant], Path]:
+    """Index ``count`` files from one share; returns their variants and the share root."""
+    location, book = _index_source(tmp_path)
+    variants = [FileVariant.objects.get(pk=_import(location, book).file_variant_id)]
+    root = Path(location.root_path)
+    for number in range(1, count):
+        extra = root / f"Extra {number}.txt"
+        extra.write_text(f"{BOOK_TEXT}extra {number}\n", encoding="utf-8")
+        variants.append(FileVariant.objects.get(pk=_import(location, extra).file_variant_id))
+    return variants, root
+
+
+def _unmount(root: Path) -> None:
+    """Simulate an unmounted share: the mount point directory exists but is empty."""
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink()
+    assert root.is_dir() and not any(root.iterdir())
+
+
+def _all_ok(variants: list[FileVariant]) -> bool:
+    return all(
+        FileVariant.objects.get(pk=v.pk).reference_state == FileVariant.ReferenceState.OK
+        for v in variants
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_empty_mount_point_is_outage_not_mass_missing(
+    tmp_path: Path, app_storage: Path, matched: None
+) -> None:
+    del matched, app_storage
+    variants, root = _indexed_variants(tmp_path)
+    _unmount(root)
+
+    report = referenced_files.check_referenced_files()
+
+    assert report.checked == len(variants)
+    assert not report.missing and not report.changed
+    assert len(report.errors) == len(variants)
+    assert report.unavailable_locations == [variants[0].storage_location.identifier]
+    assert _all_ok(variants)
+    # A download during the outage is refused but does not flag the variant either.
+    assert _download(variants[0])[0] == 409
+    assert _all_ok(variants)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_missing_sentinel_is_outage_even_when_mount_point_has_files(
+    tmp_path: Path, app_storage: Path, matched: None
+) -> None:
+    del matched, app_storage
+    variants, root = _indexed_variants(tmp_path, count=2)
+    share = variants[0].storage_location
+    share.sentinel_file = ".ebook-index-sentinel"
+    share.save()
+    (root / ".ebook-index-sentinel").write_text("", encoding="utf-8")
+    for variant in variants:  # the files really are gone ...
+        (root / variant.storage_identifier).unlink()
+    assert referenced_files.check_referenced_files().missing == [v.pk for v in variants]
+
+    FileVariant.objects.filter(pk__in=[v.pk for v in variants]).update(
+        reference_state=FileVariant.ReferenceState.OK,
+    )
+    (root / ".ebook-index-sentinel").unlink()  # ... but now the share itself is gone
+    (root / "leftover-on-local-disk").write_text("x", encoding="utf-8")
+
+    report = referenced_files.check_referenced_files()
+
+    assert not report.missing and report.unavailable_locations == [share.identifier]
+    assert _all_ok(variants)
+    stderr = StringIO()
+    with pytest.raises(CommandError):
+        call_command("check_referenced_files", stdout=StringIO(), stderr=stderr)
+    assert f"UNAVAILABLE storage_location:{share.identifier}" in stderr.getvalue()
+    assert _all_ok(variants)
+
+
+@pytest.mark.django_db
+def test_invalid_sentinel_name_counts_as_unavailable(tmp_path: Path) -> None:
+    (tmp_path / "file").write_text("x", encoding="utf-8")
+    location = StorageLocation.objects.create(
+        identifier="ro-share",
+        base_path=str(tmp_path),
+        read_only=True,
+        sentinel_file="../outside",
+    )
+    backend = LocalFilesystemStorage(str(tmp_path))
+    assert referenced_files.location_unavailable_reason(location, backend) is not None
+    location.sentinel_file = ""
+    assert referenced_files.location_unavailable_reason(location, backend) is None
+
+
+# --- Scoping and the queued job ------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_check_scoped_to_selected_variants(
+    tmp_path: Path, app_storage: Path, matched: None
+) -> None:
+    del matched, app_storage
+    variants, root = _indexed_variants(tmp_path)
+    for variant in variants:
+        (root / variant.storage_identifier).unlink()
+
+    report = referenced_files.check_referenced_files(variant_ids=[variants[1].pk])
+
+    assert report.checked == 1 and report.missing == [variants[1].pk]
+    states = {v.pk: FileVariant.objects.get(pk=v.pk).reference_state for v in variants}
+    assert states == {
+        variants[0].pk: FileVariant.ReferenceState.OK,
+        variants[1].pk: FileVariant.ReferenceState.MISSING,
+        variants[2].pk: FileVariant.ReferenceState.OK,
+    }
+
+
+class _RecordingQueue:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, tuple[object, ...]]] = []
+
+    def enqueue(self, func: object, *args: object, **kwargs: object) -> None:
+        del kwargs
+        self.calls.append((func, args))
+
+
+def _admin_client() -> Client:
+    from django.contrib.auth import get_user_model
+
+    user = get_user_model().objects.create_superuser(
+        username=f"admin-{uuid.uuid4().hex[:8]}", password="unused", email=""
+    )
+    client = Client()
+    client.force_login(user)
+    return client
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_action_queues_scoped_job_without_hashing_inline(
+    tmp_path: Path, app_storage: Path, matched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del matched, app_storage
+    variants, root = _indexed_variants(tmp_path)
+    for variant in variants:  # touched: a check would have to re-hash every file
+        path = root / variant.storage_identifier
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 9_000_000_000))
+    queue = _RecordingQueue()
+    monkeypatch.setattr(referenced_files, "get_queue", lambda: queue)
+
+    def no_inline_io(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the admin request must not stat or hash referenced files")
+
+    monkeypatch.setattr(LocalFilesystemStorage, "hash", no_inline_io)
+    monkeypatch.setattr(referenced_files, "check_referenced_files", no_inline_io)
+
+    selected = [variants[0].pk, variants[2].pk]
+    response = _admin_client().post(
+        "/admin/core/filevariant/",
+        {"action": "recheck_referenced_files", "_selected_action": selected},
+        follow=True,
+    )
+
+    assert response.status_code == 200
+    job = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.REFERENCE_CHECK)
+    assert job.state == ProcessingJob.JobState.QUEUED
+    assert job.details["variant_ids"] == sorted(selected)
+    assert queue.calls == [(referenced_files.process_reference_check_job, (str(job.job_id),))]
+    assert str(job.job_id) in response.content.decode()
+    monkeypatch.undo()
+
+    # The worker runs the recorded scope and stores the report on the job.
+    referenced_files.process_reference_check_job(str(job.job_id))
+    job.refresh_from_db()
+    assert job.state == ProcessingJob.JobState.SUCCESS
+    assert job.details["report"]["checked"] == 2
+    assert job.details["report"]["ok"] == 2
+    assert job.details["attempt_count"] == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_location_admin_action_and_cli_run_queued_without_worker(
+    tmp_path: Path, app_storage: Path, matched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del matched, app_storage
+    variants, root = _indexed_variants(tmp_path, count=2)
+    share = variants[0].storage_location
+    monkeypatch.setattr(referenced_files, "get_queue", lambda: None)
+
+    response = _admin_client().post(
+        "/admin/core/storagelocation/",
+        {"action": "recheck_location_references", "_selected_action": [share.pk]},
+        follow=True,
+    )
+
+    assert response.status_code == 200
+    assert "--run-queued" in response.content.decode()
+    job = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.REFERENCE_CHECK)
+    assert job.state == ProcessingJob.JobState.QUEUED  # nothing ran in the request
+    assert job.details["storage_location_ids"] == [share.pk]
+
+    _unmount(root)
+    with pytest.raises(CommandError):
+        call_command("check_referenced_files", "--run-queued", stdout=StringIO())
+    job.refresh_from_db()
+    assert job.state == ProcessingJob.JobState.FAILED
+    assert "storage unavailable" in job.details["error"]
+    assert _all_ok(variants)

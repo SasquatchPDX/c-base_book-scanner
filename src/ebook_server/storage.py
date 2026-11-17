@@ -323,6 +323,17 @@ class LocalFilesystemStorage:
         shutil.move(src, dest, copy_function=shutil.copyfile)
         return destination
 
+    def link(self, source: str, destination: str) -> str:
+        """Give an existing artifact a second name (hard link) inside this storage.
+
+        Instant and byte-identical; raises ``OSError`` where hard links are unsupported
+        or the destination exists. Never overwrites.
+        """
+        src = self.resolve_location(source)
+        dest = self._prepare_destination(destination)
+        os.link(src, dest)
+        return destination
+
     def delete(self, location: str) -> None:
         target = self.resolve_location(location)
         target.unlink(missing_ok=True)
@@ -422,6 +433,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
 
     def move(self, source: str, destination: str) -> str:
         raise self._refuse("move")
+
+    def link(self, source: str, destination: str) -> str:
+        raise self._refuse("link")
 
     def delete(self, location: str) -> None:
         raise self._refuse("delete")

@@ -115,6 +115,17 @@ class StorageLocation(models.Model):
             "default archive location instead."
         ),
     )
+    sentinel_file = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "Read-only locations: a file name, relative to the base path, that must exist "
+            "for the share to count as mounted (for example .ebook-index-sentinel). While "
+            "it is absent, drift checks report a storage outage and flag nothing. Left "
+            "empty, an empty base directory (a bare mount point) counts as unmounted."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -205,6 +216,17 @@ class SourceLocation(models.Model):
         help_text=(
             'Captured folder/file values that are not names, e.g. ["Unknown", "Misc"]. '
             "Compared case-insensitively; an ignored value yields no hint."
+        ),
+    )
+    # Opt-in (#39): generic same-name pairs ("notes.txt"/"notes.pdf") are not one book
+    # in every collection.
+    group_sibling_formats = models.BooleanField(
+        default=False,
+        help_text=(
+            "Treat files in the same folder with the same name and different extensions "
+            "(e.g. 'Dune.epub', 'Dune.mobi') as formats of one book: once one is linked "
+            "to a book, the others are offered that book as a strong candidate. They are "
+            "still looked up externally, and conflicting evidence goes to review."
         ),
     )
     created_at = models.DateTimeField(auto_now_add=True)
@@ -852,6 +874,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        REFERENCE_CHECK = "reference_check", "Referenced file check"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"

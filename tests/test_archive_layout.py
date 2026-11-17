@@ -355,3 +355,27 @@ def test_derived_files_keep_legacy_namespace_under_job_layout(  # type: ignore[n
         legacy_filename="abc-front.jpg",
     )
     assert destination == f"books/{book.pk}/covers/abc-front.jpg"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pending_move_survives_a_rolled_back_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive: LocalFilesystemStorage
+) -> None:
+    monkeypatch.setattr(identification, "resolve_candidates", lambda _signals: [])
+    job = _source_job(tmp_path, "draft.txt", "Pending text.")
+    intake.process_import_job(str(job.id))
+    job.refresh_from_db()
+    pending = job.storage_identifier
+    book = _book("Draft", "Writer")
+
+    class Boom(RuntimeError):
+        pass
+
+    with pytest.raises(Boom), transaction.atomic():
+        archive_layout.place_pending_original(job, book, archive)
+        raise Boom
+
+    # The recorded _unsorted path still resolves; only an extra link was added.
+    assert archive.resolve_location(pending).read_text() == "Pending text."
+    job.refresh_from_db()
+    assert job.storage_identifier == pending
