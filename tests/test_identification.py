@@ -4,10 +4,15 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from ebook_server.core.identification import (
+    AUTHOR_VARIANT_MATCH_SCORE,
     AUTO_ACCEPT_SCORE,
     IdentificationCandidate,
     IdentificationInput,
+    _author_match_score,
+    _author_name_similarity,
     _title_match_score,
     build_identification_input,
     parse_filename_signals,
@@ -176,6 +181,57 @@ def test_conflicting_metadata_keeps_filename_signal() -> None:
 
     assert payload.title_hints[0] == "Wrong Title"
     assert payload.title_hints[1] == "The%20War%20of%20The%20Worlds"
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("H P Lovecraft", "H. P. Lovecraft"),
+        ("HP Lovecraft", "H. P. Lovecraft"),
+        ("Banks, Iain", "Iain Banks"),
+        ("Ursula K. Le Guin", "Ursula K. LeGuin"),
+        ("ANDY WEIR", "Andy Weir"),
+    ],
+)
+def test_author_name_similarity_treats_formatting_variants_as_equal(left: str, right: str) -> None:
+    assert _author_name_similarity(left, right) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("Iain M. Banks", "Iain Banks"),
+        ("J. R. R. Tolkien", "John Ronald Reuel Tolkien"),
+        ("Gebrüder Grimm", "Brüder Grimm"),
+    ],
+)
+def test_author_name_similarity_gives_partial_score_to_name_variants(left: str, right: str) -> None:
+    # Regression for #18: these scored 0 with exact string comparison.
+    assert _author_name_similarity(left, right) == AUTHOR_VARIANT_MATCH_SCORE
+    assert _author_name_similarity(right, left) == AUTHOR_VARIANT_MATCH_SCORE
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("Frank Herbert", "Brian Herbert"),
+        ("Christopher Tolkien", "J. R. R. Tolkien"),
+        ("Jane Smith", "John Smith"),
+        ("Herbert", "Frank Herbert"),
+        ("Neal Stephenson", "Neal Asher"),
+        ("Snow Crash", "Neal Stephenson"),
+    ],
+)
+def test_author_name_similarity_rejects_different_people(left: str, right: str) -> None:
+    assert _author_name_similarity(left, right) == 0.0
+
+
+def test_author_match_score_uses_best_variant_per_hint() -> None:
+    assert _author_match_score(["Iain M. Banks"], ["Iain Banks"]) == AUTHOR_VARIANT_MATCH_SCORE
+    assert _author_match_score(["Andy Weir"], ["Someone Else", "Andy Weir"]) == 1.0
+    # Unmatched hints still dilute the score, as before.
+    assert _author_match_score(["Andy Weir", "The Martian"], ["Andy Weir"]) == 0.5
+    assert _author_match_score([], ["Andy Weir"]) == 0.0
 
 
 def test_title_match_score_does_not_give_full_marks_to_subset_titles() -> None:
