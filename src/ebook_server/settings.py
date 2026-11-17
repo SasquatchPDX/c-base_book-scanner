@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    identification_work_isbn_bonus: float = 0.3
     review_queue_page_size: int = 50
     review_batch_min_score: float = 0.75
     review_batch_ambiguity_margin: float = 0.05
@@ -330,6 +331,7 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
 BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
 BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin

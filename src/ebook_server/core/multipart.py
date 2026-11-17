@@ -1319,7 +1319,7 @@ def identify_split_part(job_id: str) -> None:
     )
     candidates, outcomes = identification.resolve_candidates_with_report(signals)
     file_authors = identification.evidence_author_names(metadata)
-    decision = intake.decide_auto_accept(candidates, file_authors)
+    decision = intake.decide_auto_accept(candidates, file_authors, file_evidence=signals)
     with transaction.atomic():
         job = ImportJob.objects.select_for_update().get(pk=job_id)
         if (
