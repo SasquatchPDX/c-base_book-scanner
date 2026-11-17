@@ -248,6 +248,9 @@ SIDECAR_METADATA_NAME = "metadata.opf"
 SIDECAR_FILE_NAMES = frozenset({*SIDECAR_COVER_NAMES, SIDECAR_METADATA_NAME})
 # Evidence key that holds sidecar values next to (never over) embedded metadata.
 SIDECAR_EVIDENCE_KEY = "sidecar_metadata"
+# Marker the application puts in the metadata.opf it generates itself (same name as
+# #119's book_opf.GENERATED_META_NAME); such a file is never read as a sidecar.
+GENERATED_OPF_META_NAME = "ebook-server:generated"
 SIDECAR_METADATA_FIELDS = (
     "title",
     "authors",
@@ -260,6 +263,11 @@ SIDECAR_METADATA_FIELDS = (
 # Below this title similarity an embedded and a sidecar title name different books.
 SIDECAR_TITLE_CONFLICT_SCORE = 0.5
 PLACEHOLDER_METADATA_VALUES = frozenset({"unknown", "unknown author", "unknown title"})
+# Extractor provenance of ``metadata["title"]`` (see ``extract_metadata``).
+TITLE_SOURCE_KEY = "title_source"
+TITLE_SOURCE_EMBEDDED = "embedded"
+TITLE_SOURCE_FILENAME = "filename"
+TITLE_SOURCE_SIDECAR = "sidecar"
 
 # ImportJob.evidence keys written when a candidate scores high enough to be accepted
 # automatically but is routed to review anyway (shown on the review page).
@@ -718,12 +726,22 @@ def read_sidecar_metadata(job: ImportJob) -> dict[str, Any] | None:
         )
         return None
     try:
-        fields = parse_opf_metadata(_read_bounded_regular_file(path, MAX_FORMAT_METADATA_BYTES))
+        payload = _read_bounded_regular_file(path, MAX_FORMAT_METADATA_BYTES)
+        generated = opf_is_app_generated(payload)
+        fields = {} if generated else parse_opf_metadata(payload)
     except (OSError, ET.ParseError, DefusedXmlException, ValueError) as exc:
         logger.warning(
             "sidecar_metadata_rejected",
             import_job_id=str(job.id),
             error_type=type(exc).__name__,
+        )
+        return None
+    if generated:
+        # Our own derived output (written for the library, #119), not external evidence.
+        logger.info(
+            "sidecar_metadata_ignored",
+            import_job_id=str(job.id),
+            reason="generated_by_ebook_server",
         )
         return None
     return {key: value for key, value in fields.items() if value} or None
@@ -737,12 +755,18 @@ def _is_placeholder(value: Any) -> bool:
     return not value.strip() or value.strip().casefold() in PLACEHOLDER_METADATA_VALUES
 
 
-def _embedded_title(metadata: dict[str, Any], original_filename: str) -> str | None:
-    """The extractor's title, unless it is only the filename-stem fallback."""
+def _embedded_title(metadata: dict[str, Any]) -> str | None:
+    """The title the file itself embeds, or ``None`` for a filename fallback.
+
+    Uses the extractor's explicit ``title_source`` provenance. A real embedded title
+    that happens to equal the filename stem (``Midworld.epub`` titled "Midworld") is
+    still embedded evidence. Metadata without provenance is treated as embedded, so a
+    contradicting sidecar goes to review instead of overwriting it.
+    """
     title = metadata.get("title")
     if not isinstance(title, str) or _is_placeholder(title):
         return None
-    if title == Path(original_filename).stem:
+    if metadata.get(TITLE_SOURCE_KEY) == TITLE_SOURCE_FILENAME:
         return None
     return title
 
@@ -756,19 +780,14 @@ def _metadata_isbns(metadata: dict[str, Any]) -> set[str]:
     return isbns
 
 
-def _sidecar_conflicts(
-    metadata: dict[str, Any],
-    sidecar: dict[str, Any],
-    *,
-    original_filename: str,
-) -> list[str]:
+def _sidecar_conflicts(metadata: dict[str, Any], sidecar: dict[str, Any]) -> list[str]:
     """Fields where the sidecar contradicts the file's own embedded metadata."""
     conflicts: list[str] = []
     embedded_isbns = _metadata_isbns(metadata)
     sidecar_isbns = _metadata_isbns(sidecar)
     if embedded_isbns and sidecar_isbns and not embedded_isbns & sidecar_isbns:
         conflicts.append("isbn")
-    embedded_title = _embedded_title(metadata, original_filename)
+    embedded_title = _embedded_title(metadata)
     sidecar_title = sidecar.get("title")
     if (
         embedded_title
@@ -795,22 +814,22 @@ def _sidecar_conflicts(
 def apply_sidecar_metadata(
     metadata: dict[str, Any],
     sidecar: dict[str, Any] | None,
-    *,
-    original_filename: str,
 ) -> dict[str, Any]:
     """Merge sidecar fields into ``metadata`` without overwriting embedded values.
 
     The sidecar is recorded under ``SIDECAR_EVIDENCE_KEY`` with the fields it filled
     (provenance) and any conflicts. Only gaps are filled: a field the format extractor
-    left empty, a placeholder, or the filename-stem title fallback. A sidecar ISBN is
-    added as ``isbn`` when the file has none, so the embedded ``identifier`` survives.
+    left empty, a placeholder, or a title whose ``title_source`` says it is only the
+    filename stem (an embedded title equal to the stem is still embedded). A sidecar
+    ISBN is added as ``isbn`` when the file has none, so the embedded ``identifier``
+    survives.
     When the sidecar contradicts embedded ISBN, title, or authors, nothing is merged;
     the caller then routes the import to review instead of auto-accepting it.
     """
     if not sidecar:
         return metadata
     merged = dict(metadata)
-    conflicts = _sidecar_conflicts(metadata, sidecar, original_filename=original_filename)
+    conflicts = _sidecar_conflicts(metadata, sidecar)
     applied: list[str] = []
     if not conflicts:
         for key in SIDECAR_METADATA_FIELDS:
@@ -823,8 +842,9 @@ def apply_sidecar_metadata(
                     applied.append("isbn")
                 continue
             if key == "title":
-                if _embedded_title(metadata, original_filename) is None:
+                if _embedded_title(metadata) is None:
                     merged["title"] = value
+                    merged[TITLE_SOURCE_KEY] = TITLE_SOURCE_SIDECAR
                     applied.append(key)
                 continue
             if _is_placeholder(metadata.get(key)):
@@ -1235,6 +1255,39 @@ def extract_metadata(
     *,
     original_filename: str,
 ) -> dict[str, Any]:
+    """Embedded metadata of ``file_path`` with explicit title provenance.
+
+    Every result carries ``title_source``: ``"embedded"`` when the title came from
+    the file's own metadata, ``"filename"`` when the file had none and the filename
+    stem stands in for it. Consumers must use this field rather than comparing the
+    title with the filename, because a real embedded title often equals the stem.
+    """
+    metadata = _extract_format_metadata(
+        file_path,
+        detected_format,
+        original_filename=original_filename,
+    )
+    return _with_title_provenance(metadata, original_filename)
+
+
+def _with_title_provenance(metadata: dict[str, Any], original_filename: str) -> dict[str, Any]:
+    title = metadata.get("title")
+    if isinstance(title, str) and title.strip():
+        metadata["title"] = str(title)
+        metadata[TITLE_SOURCE_KEY] = TITLE_SOURCE_EMBEDDED
+    else:
+        metadata["title"] = Path(original_filename).stem
+        metadata[TITLE_SOURCE_KEY] = TITLE_SOURCE_FILENAME
+    return metadata
+
+
+def _extract_format_metadata(
+    file_path: str,
+    detected_format: str,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    """Per-format extraction; ``title`` is ``None`` when the file embeds none."""
     try:
         if detected_format == "pdf":
             return _extract_pdf_metadata(file_path, original_filename=original_filename)
@@ -1257,15 +1310,15 @@ def extract_metadata(
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
-        return {"title": Path(original_filename).stem}
-    return {"title": Path(original_filename).stem}
+        return {"title": None}
+    return {"title": None}
 
 
 def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     payload = _read_metadata_sample(Path(file_path))
     _text, encoding = _decode_text_sample(payload)
     return {
-        "title": Path(original_filename).stem,
+        "title": None,
         "raw_metadata": {"encoding": encoding},
         "container_type": "txt",
     }
@@ -1290,7 +1343,7 @@ def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[st
         title = soup.title.get_text(" ", strip=True) or None
     author = meta_content("author", "dc.creator", "dcterms.creator")
     return {
-        "title": title or Path(original_filename).stem,
+        "title": title,
         "authors": [author] if author else [],
         "language": meta_content("language", "dc.language"),
         "description": meta_content("description", "og:description", "dc.description"),
@@ -1349,7 +1402,7 @@ def _extract_fb2_metadata(file_path: str, *, original_filename: str) -> dict[str
             elif local_name == "title-info":
                 break
     return {
-        "title": title or Path(original_filename).stem,
+        "title": title,
         "authors": authors,
         "language": language,
         "description": description,
@@ -1359,8 +1412,8 @@ def _extract_fb2_metadata(file_path: str, *, original_filename: str) -> dict[str
 
 
 def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
-    fallback = {
-        "title": Path(original_filename).stem,
+    fallback: dict[str, Any] = {
+        "title": None,
         "raw_metadata": {},
         "container_type": "cbz",
     }
@@ -1383,7 +1436,7 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
 
     authors = [author.strip() for author in (value("Writer") or "").split(",") if author.strip()]
     return {
-        "title": value("Title") or fallback["title"],
+        "title": value("Title"),
         "authors": authors,
         "subjects": identification.normalize_subjects((value("Genre") or "").split(",")),
         "language": value("LanguageISO"),
@@ -1440,7 +1493,7 @@ def _extract_ebook_meta_metadata(
 ) -> dict[str, Any]:
     """MOBI and other Kindle-family metadata, read via ``ebook-meta --to-opf``."""
     fallback: dict[str, Any] = {
-        "title": Path(original_filename).stem,
+        "title": None,
         "raw_metadata": {},
         "container_type": detected_format,
     }
@@ -1454,7 +1507,7 @@ def _extract_ebook_meta_metadata(
         return fallback
     return {
         **fields,
-        "title": fields["title"] or fallback["title"],
+        "title": fields["title"],
         "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
         "container_type": detected_format,
     }
@@ -1472,7 +1525,7 @@ def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str
     author = metadata.get("/Author") if hasattr(metadata, "get") else None
     isbn = metadata.get("/ISBN") if hasattr(metadata, "get") else None
     return {
-        "title": title or Path(original_filename).stem,
+        "title": title,
         "publisher": metadata.get("/Publisher") if hasattr(metadata, "get") else None,
         "language": metadata.get("/Lang") if hasattr(metadata, "get") else None,
         "authors": [author] if author else [],
@@ -1491,7 +1544,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             )
         except KeyError:
             return {
-                "title": Path(original_filename).stem,
+                "title": None,
                 "raw_metadata": {},
                 "container_type": "epub",
             }
@@ -1500,13 +1553,13 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         opf_path = rootfile.attrib.get("full-path") if rootfile is not None else None
         if not opf_path:
             return {
-                "title": Path(original_filename).stem,
+                "title": None,
                 "raw_metadata": {},
                 "container_type": "epub",
             }
         if not isinstance(opf_path, str):
             return {
-                "title": Path(original_filename).stem,
+                "title": None,
                 "raw_metadata": {},
                 "container_type": "epub",
             }
@@ -1532,7 +1585,7 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             ],
         )
         return {
-            "title": title or Path(original_filename).stem,
+            "title": title,
             "authors": [author] if author else [],
             "language": language,
             "description": description,
@@ -1572,6 +1625,24 @@ def _opf_creator_is_author(element: Any) -> bool:
         "",
     )
     return not role or role.strip().lower() == "aut"
+
+
+def opf_is_app_generated(payload: bytes) -> bool:
+    """True when an OPF carries ``<meta name="ebook-server:generated" content="true"/>``.
+
+    That marker is what this application writes into the ``metadata.opf`` it generates
+    for a book folder (#119); such a file is our own output, never sidecar evidence.
+    Parsed with defusedxml like every OPF here, so hostile or malformed documents raise
+    ``DefusedXmlException`` / ``ParseError`` for the caller to handle.
+    """
+    root = ET.fromstring(payload)
+    for node in root.iter():
+        tag = node.tag if isinstance(node.tag, str) else ""
+        if tag.rsplit("}", 1)[-1] != "meta":
+            continue
+        if node.attrib.get("name") == GENERATED_OPF_META_NAME:
+            return str(node.attrib.get("content", "")).strip().lower() == "true"
+    return False
 
 
 def parse_opf_metadata(payload: bytes) -> dict[str, Any]:
@@ -2829,11 +2900,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             detected_format,
             original_filename=job.original_filename,
         )
-        metadata = apply_sidecar_metadata(
-            metadata,
-            read_sidecar_metadata(job),
-            original_filename=job.original_filename,
-        )
+        metadata = apply_sidecar_metadata(metadata, read_sidecar_metadata(job))
         if job.source_location is not None:
             path_hints = source_layout.hints_for_source_file(job.source_location, job.source_path)
             if path_hints is not None:

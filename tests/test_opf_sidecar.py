@@ -160,6 +160,8 @@ def test_single_book_folder_fills_gaps_from_sidecar_with_provenance(
 
     assert isinstance(job.evidence, dict)
     assert job.evidence["title"] == "Phylogenesis"
+    # The txt has no embedded title: the stem fallback was replaced by the sidecar.
+    assert job.evidence[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_SIDECAR
     assert job.evidence["authors"] == ["Alan Dean Foster"]  # translator role excluded
     assert job.evidence["isbn"] == PHYLOGENESIS_ISBN
     assert job.evidence["publisher"] == "Del Rey"
@@ -365,11 +367,7 @@ def test_apply_sidecar_metadata_never_overwrites_embedded_values() -> None:
         "identifier": PHYLOGENESIS_ISBN,
     }
 
-    merged = intake.apply_sidecar_metadata(
-        embedded,
-        sidecar,
-        original_filename="Phylogenesis.epub",
-    )
+    merged = intake.apply_sidecar_metadata(embedded, sidecar)
 
     assert merged["title"] == embedded["title"]
     assert merged["authors"] == ["Alan Dean Foster"]
@@ -381,3 +379,121 @@ def test_apply_sidecar_metadata_never_overwrites_embedded_values() -> None:
     assert evidence["applied_fields"] == ["language", "isbn"]
     assert evidence["fields"]["publisher"] == "Del Rey"
     assert "sidecar_metadata" not in embedded  # input left untouched
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_sidecar_cannot_replace_embedded_title_equal_to_filename_stem(
+    tmp_path: Path,
+    provider: StubProvider,
+) -> None:
+    """PR #95 review probe: Midworld.epub embeds "Midworld"; a stale OPF says Phylogenesis.
+
+    The embedded title equals the filename stem, but it is still the file's own
+    dc:title. It must survive, the stale sidecar ISBN must not reach verification,
+    and the contradiction must be recorded and sent to review, even though the
+    authors agree.
+    """
+    root = tmp_path / "library"
+    book_dir = root / "Alan Dean Foster" / "Midworld"
+    book_dir.mkdir(parents=True)
+    (book_dir / "metadata.opf").write_text(CALIBRE_OPF, encoding="utf-8")
+    _write_epub(book_dir / "Midworld.epub", title="Midworld", author="Alan Dean Foster")
+
+    (job,) = _import_all(root, tmp_path)
+
+    assert isinstance(job.evidence, dict)
+    assert job.evidence["title"] == "Midworld"
+    assert job.evidence[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_EMBEDDED
+    assert job.evidence["authors"] == ["Alan Dean Foster"]
+    assert "isbn" not in job.evidence
+    sidecar = _sidecar_evidence(job)
+    assert sidecar["conflicts"] == ["title"]
+    assert sidecar["applied_fields"] == []
+    assert sidecar["fields"]["title"] == "Phylogenesis"
+    assert provider.isbn_queries == []  # PHYLOGENESIS_ISBN never verified
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book is None
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+def test_extractor_records_title_provenance(tmp_path: Path) -> None:
+    embedded = tmp_path / "Midworld.epub"
+    _write_epub(embedded, title="Midworld", author="Alan Dean Foster")
+    plain = tmp_path / "Midworld.txt"
+    plain.write_text("No metadata here.", encoding="utf-8")
+
+    from_epub = intake.extract_metadata(str(embedded), "epub", original_filename=embedded.name)
+    from_txt = intake.extract_metadata(str(plain), "txt", original_filename=plain.name)
+
+    assert from_epub["title"] == "Midworld"
+    assert from_epub[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_EMBEDDED
+    assert from_txt["title"] == "Midworld"
+    assert from_txt[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
+
+
+@pytest.mark.parametrize(
+    ("title_source", "expected_conflicts", "expected_title"),
+    [
+        (intake.TITLE_SOURCE_EMBEDDED, ["title"], "Midworld"),
+        (intake.TITLE_SOURCE_FILENAME, [], "Phylogenesis"),
+    ],
+)
+def test_apply_sidecar_metadata_uses_title_source_not_filename_comparison(
+    title_source: str,
+    expected_conflicts: list[str],
+    expected_title: str,
+) -> None:
+    metadata: dict[str, Any] = {
+        "title": "Midworld",
+        intake.TITLE_SOURCE_KEY: title_source,
+        "authors": ["Alan Dean Foster"],
+    }
+    sidecar = {
+        "title": "Phylogenesis",
+        "authors": ["Alan Dean Foster"],
+        "identifier": PHYLOGENESIS_ISBN,
+    }
+
+    merged = intake.apply_sidecar_metadata(metadata, sidecar)
+
+    assert merged[intake.SIDECAR_EVIDENCE_KEY]["conflicts"] == expected_conflicts
+    assert merged["title"] == expected_title
+    assert ("isbn" in merged) is not expected_conflicts
+
+
+GENERATED_OPF = CALIBRE_OPF.replace(
+    "  </metadata>",
+    '    <meta name="calibre:title_sort" content="Phylogenesis"/>\n'
+    '    <meta name="ebook-server:generated" content="true"/>\n'
+    '    <meta name="ebook-server:book_id" content="42"/>\n'
+    "  </metadata>",
+)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_app_generated_metadata_opf_is_not_sidecar_evidence(
+    tmp_path: Path,
+    provider: StubProvider,
+) -> None:
+    """A metadata.opf carrying our own generated marker (#119) is treated as absent."""
+    root = tmp_path / "generated"
+    book_dir = root / "Alan Dean Foster" / "Phylogenesis (786)"
+    book_dir.mkdir(parents=True)
+    (book_dir / "metadata.opf").write_text(GENERATED_OPF, encoding="utf-8")
+    (book_dir / "Phylogenesis - Alan Dean Foster.txt").write_text("text", encoding="utf-8")
+
+    (job,) = _import_all(root, tmp_path)
+
+    assert isinstance(job.evidence, dict)
+    assert intake.SIDECAR_EVIDENCE_KEY not in job.evidence
+    assert "isbn" not in job.evidence
+    assert job.evidence[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
+    assert provider.isbn_queries == []
+
+
+def test_generated_marker_detection() -> None:
+    assert intake.opf_is_app_generated(GENERATED_OPF.encode("utf-8"))
+    assert not intake.opf_is_app_generated(CALIBRE_OPF.encode("utf-8"))
+    assert not intake.opf_is_app_generated(
+        GENERATED_OPF.replace('content="true"', 'content="false"').encode("utf-8")
+    )
