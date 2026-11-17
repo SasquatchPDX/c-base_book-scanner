@@ -114,10 +114,19 @@ class Command(BaseCommand):
                             f"source {row['source_location_id']} error: {row['error']}"
                         )
                         continue
-                    self.stdout.write(
+                    line = (
                         f"{row['source_type']} => {row['path']} (source "
                         f"#{row['source_location_id']})"
                     )
+                    if "path_layout" in row:
+                        hints = row["path_layout"]
+                        line += (
+                            " [layout: no match]"
+                            if hints is None
+                            else f" [layout: author={hints['authors']!r} "
+                            f"title={hints['title']!r} series={hints['series']!r}]"
+                        )
+                    self.stdout.write(line)
             return
 
         user_model = get_user_model()
