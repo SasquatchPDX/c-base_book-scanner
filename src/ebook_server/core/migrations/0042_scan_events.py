@@ -4,13 +4,9 @@ import django.db.models.deletion
 from django.db import migrations, models
 
 
-# ScanPage.recognized_page_number and status, which the ``page`` event projects into,
-# are added by 0039_scanner_page_and_cover_upload (#128) with the same definitions.
-
-
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0039_scanner_page_and_cover_upload"),
+        ("core", "0041_scanjob_string_pk"),
     ]
 
     operations = [
@@ -58,6 +54,16 @@ class Migration(migrations.Migration):
             model_name="scanjob",
             name="scan_jsonl_job_rendered_through",
             field=models.BigIntegerField(blank=True, editable=False, null=True),
+        ),
+        migrations.AddField(
+            model_name="scanpage",
+            name="recognized_page_number",
+            field=models.CharField(blank=True, max_length=64, null=True),
+        ),
+        migrations.AddField(
+            model_name="scanpage",
+            name="status",
+            field=models.CharField(blank=True, max_length=32),
         ),
         migrations.CreateModel(
             name="ScanEvent",

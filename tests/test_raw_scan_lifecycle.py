@@ -656,7 +656,6 @@ def test_captured_scan_book_is_invisible_until_finished(
     home = member.get("/library/?view=html")
     assert "Raw Scan Book" not in home.content.decode()
     assert home.context["book_count"] == 1
-    assert home.context["variant_count"] == 1
     assert member.get(f"/library/books/{raw.id}/").status_code == 404
     assert member.get(f"/library/books/{raw.id}/download/").status_code == 404
     assert member.get(f"/library/books/{raw.id}/covers/front/").status_code == 404

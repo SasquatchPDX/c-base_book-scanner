@@ -300,6 +300,9 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# Stronger title evidence (e.g. the embedded title) names another book than the
+# candidate, whose title matches only a weaker hint such as the filename.
+BLOCK_TITLE_EVIDENCE_CONFLICT = identification.TITLE_EVIDENCE_CONFLICT
 # The candidate was found only through search terms a local LLM proposed (#26). An LLM
 # guess is the weakest evidence the system has, so such candidates always need a person.
 BLOCK_LLM_DERIVED = "llm_derived"
@@ -349,7 +352,7 @@ def _block_reason(
     file_authors: list[str],
     file_evidence: identification.IdentificationInput,
 ) -> tuple[str | None, list[str]]:
-    """Why ``candidate`` may not be accepted automatically (LLM, author, edition checks).
+    """Why ``candidate`` may not be accepted automatically (LLM, author, edition, title).
 
     Returns the block reason (``None`` when it may be accepted) and the edition
     conflicts found, which are reported even when an author check blocks first.
@@ -360,6 +363,8 @@ def _block_reason(
     reason = _author_block_reason(candidate, file_authors)
     if reason is None and conflicts:
         reason = BLOCK_EDITION_CONFLICT
+    if reason is None and identification.title_evidence_conflict(file_evidence, candidate):
+        reason = BLOCK_TITLE_EVIDENCE_CONFLICT
     return reason, conflicts
 
 
@@ -402,6 +407,11 @@ def decide_auto_accept(
     ``file_evidence`` (the normalised file signals: ISBNs, language, publisher) is
     checked with ``identification.edition_conflicts``, so a file ISBN must be one of the
     edition's own ISBNs and the file's language/publisher must not contradict it.
+    Finally its title must not be contradicted by stronger title evidence in
+    ``file_evidence``: a candidate matching only the filename title while the embedded
+    title names another book is held for review, whether its score came from the #9
+    strong-match rule or from ordinary bonuses such as language
+    (``identification.title_evidence_conflict``).
 
     Candidates within ``AUTO_ACCEPT_TIE_MARGIN`` of the best score count as tied (two
     providers often both score an ISBN match at 1.0, and their order is only the
@@ -431,6 +441,11 @@ def decide_auto_accept(
                 **details,
                 "edition_conflicts": top_conflicts,
                 **identification.edition_evidence(top, file_evidence),
+            }
+        if top_reason == BLOCK_TITLE_EVIDENCE_CONFLICT:
+            details = {
+                **details,
+                **(identification.title_evidence_conflict(file_evidence, top) or {}),
             }
         return AutoAcceptDecision(
             candidate=None,
@@ -1407,14 +1422,34 @@ def compute_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+UPLOAD_STAGING_PREFIX = "upload-"
+UPLOAD_STAGING_SUFFIX = ".tmp"
+# NamedTemporaryFile's random part: lower-case letters, digits and "_".
+_UPLOAD_STAGING_NAME = re.compile(
+    re.escape(UPLOAD_STAGING_PREFIX) + r"[a-z0-9_]+" + re.escape(UPLOAD_STAGING_SUFFIX)
+)
+
+
+def is_upload_staging_path(file_path: str, original_filename: str) -> bool:
+    """True only when ``file_path`` is a temporary name ``write_upload_to_staging`` made.
+
+    A source-folder import reads the member's real file, whose name is the original
+    filename, so it is never a staging artifact even if it looks like one.
+    """
+    name = Path(file_path).name
+    if name == Path(original_filename).name:
+        return False
+    return _UPLOAD_STAGING_NAME.fullmatch(name) is not None
+
+
 def write_upload_to_staging(uploaded_file: Any, staging_root: Path) -> tuple[str, int]:
     ensure_path_storage_ready(staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         delete=False,
         dir=staging_root,
-        prefix="upload-",
-        suffix=".tmp",
+        prefix=UPLOAD_STAGING_PREFIX,
+        suffix=UPLOAD_STAGING_SUFFIX,
     ) as upload_temp:
         total = 0
         for chunk in uploaded_file.chunks():
@@ -1673,6 +1708,11 @@ def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
     return payload or None
 
 
+def _name_key(value: str) -> str:
+    """Letters and digits only, lower-cased: "upload-ab c123" equals "upload-ab_c123"."""
+    return re.sub(r"[\W_]+", "", value).casefold()
+
+
 def _extract_ebook_meta_metadata(
     file_path: str,
     detected_format: str,
@@ -1693,9 +1733,23 @@ def _extract_ebook_meta_metadata(
     except (ET.ParseError, DefusedXmlException) as exc:
         logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
         return fallback
+    title = fields["title"]
+    if (
+        isinstance(title, str)
+        and is_upload_staging_path(file_path, original_filename)
+        and _name_key(title) == _name_key(Path(file_path).stem)
+    ):
+        # Calibre reports the file's own name when the book has no title (with "_"
+        # turned into spaces). For an upload that is the staging name (e.g.
+        # "upload-ab_c123"), not embedded evidence: leave the title to the
+        # original-filename fallback instead of ranking it as embedded. Only a proven
+        # staging name qualifies: a real embedded title that happens to equal an
+        # ordinary source file's stem ("Midworld.mobi" titled "Midworld") stays
+        # embedded evidence.
+        title = None
     return {
         **fields,
-        "title": fields["title"],
+        "title": title,
         "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
         "container_type": detected_format,
     }
@@ -2416,8 +2470,9 @@ def _resolve_import(
 # * the file is still looked up externally, and its candidates are stored;
 # * the Book is scored with the provider scorer plus ``SIBLING_FORMAT_BONUS`` and must
 #   reach the auto-accept threshold;
-# * embedded ISBNs that conflict with the Book's ISBNs, or a confident provider match for
-#   a different book, send the file to review instead;
+# * embedded ISBNs that conflict with the Book's ISBNs, embedded authors or stronger
+#   title evidence (``identification.title_evidence_conflict``) that contradict the
+#   Book, or a confident provider match for a different book, send the file to review;
 # * a review task a reviewer has CLAIMED is never resolved automatically.
 
 SIBLING_EVIDENCE_KEY = "format_sibling_of"
@@ -2577,6 +2632,10 @@ def _assess_sibling_book(
         reason, accepted = "conflicting_isbn", False
     elif identification.authors_conflict(book_candidate.authors, file_authors):
         reason, accepted = BLOCK_AUTHOR_CONFLICT, False
+    elif identification.title_evidence_conflict(signals, book_candidate):
+        # Same shared title guard as ``decide_auto_accept``: a sibling's file name must
+        # not carry a file whose embedded title names another book into its Book.
+        reason, accepted = BLOCK_TITLE_EVIDENCE_CONFLICT, False
     elif (
         top_candidate is not None
         and top_candidate.score >= AUTO_ACCEPT_SCORE

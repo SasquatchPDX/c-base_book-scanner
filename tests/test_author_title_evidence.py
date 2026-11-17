@@ -14,6 +14,7 @@ reviewer probes on PR #96 and PR #81:
 
 from __future__ import annotations
 
+import dataclasses
 import io
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from zipfile import ZipFile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import Client, override_settings
 from pypdf import PdfWriter
 
@@ -33,6 +35,7 @@ from ebook_server.core.identification import (
     EVIDENCE_FILENAME,
     EVIDENCE_LAYOUT,
     PATH_LAYOUT_EVIDENCE_KEY,
+    STRONG_MATCH_EVIDENCE_KEY,
     AuthorEvidence,
     IdentificationCandidate,
     IdentificationInput,
@@ -42,13 +45,17 @@ from ebook_server.core.identification import (
     is_edition_phrase,
     missing_coauthors,
     parse_filename_signals,
+    resolve_candidates,
     same_book,
     strongest_title_evidence,
 )
 from ebook_server.core.models import (
+    Book,
+    FileVariant,
     ImportJob,
     MetadataCandidate,
     ReviewTask,
+    SourceLocation,
     StorageLocation,
     get_or_create_profile,
 )
@@ -262,6 +269,7 @@ def _catalogue_provider(
     books: list[tuple[str, list[str]]],
     *,
     any_title: bool = False,
+    extra_fields: dict[str, Any] | None = None,
 ) -> list[str | None]:
     """A provider that answers like a catalogue: only books whose title was queried.
 
@@ -285,7 +293,12 @@ def _catalogue_provider(
             queries.append(title)
             wanted = " ".join((title or "").lower().split())
             return [
-                {"title": book_title, "author_name": authors, "key": f"/works/{index}"}
+                {
+                    "title": book_title,
+                    "author_name": authors,
+                    "key": f"/works/{index}",
+                    **(extra_fields or {}),
+                }
                 for index, (book_title, authors) in enumerate(books)
                 if any_title or " ".join(book_title.lower().split()) == wanted
             ]
@@ -397,13 +410,17 @@ def test_edition_filename_upload_creates_book_with_correct_title_and_author(
     author: str,
 ) -> None:
     queries = _catalogue_provider(monkeypatch, [(title, [author])])
-    # Title + author alone score 0.85; accept at that score so a Book is created.
-    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.85)
 
     job = _upload(tmp_path, monkeypatch, filename, _blank_pdf_bytes(), "application/pdf")
 
     assert queries[0] == title
     assert author not in queries
+    # Title + author alone score 0.85; the #9 rule promotes the exact match.
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is True
+    assert rule["title_hint"] == title
+    assert rule["author_hint"] == author
     assert job.state == ImportJob.State.COMPLETE
     assert job.book is not None
     assert job.book.title == title
@@ -432,8 +449,13 @@ def test_good_omens_provider_missing_a_coauthor_is_not_auto_accepted(
     )
 
     candidate = MetadataCandidate.objects.get(import_job=job)
-    # Title 0.55 + half of the author weight: only one of two coauthors is covered.
+    # Title 0.55 + half of the author weight: only one of two coauthors is covered,
+    # and the #9 strong-match rule refuses to promote a candidate missing a coauthor.
     assert float(candidate.score) == pytest.approx(0.70)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert "missing_coauthor" in rule["blocked_by"]
+    assert rule["missing_coauthors"] == ["Neil Gaiman"]
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
@@ -446,7 +468,6 @@ def test_good_omens_provider_naming_both_coauthors_gets_full_author_credit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _catalogue_provider(monkeypatch, [("Good Omens", ["Neil Gaiman", "Terry Pratchett"])])
-    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.85)
 
     job = _upload(
         tmp_path,
@@ -456,6 +477,11 @@ def test_good_omens_provider_naming_both_coauthors_gets_full_author_credit(
         "application/epub+zip",
     )
 
+    # Exact title + every coauthor covered: the #9 rule promotes 0.85 to auto-accept.
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is True
+    assert rule["base_score"] == pytest.approx(0.85)
     assert job.state == ImportJob.State.COMPLETE
     assert job.book is not None
     assert job.book.title == "Good Omens"
@@ -480,10 +506,263 @@ def test_embedded_title_contradicting_filename_title_is_not_imported_as_filename
 
     candidate = MetadataCandidate.objects.get(import_job=job)
     assert candidate.title == "Dune"
+    # "Dune" only matches the filename guess; the embedded title disagrees, so the
+    # #9 strong-match rule must not promote the 0.85 title + author score.
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert "stronger_title_evidence_disagrees" in rule["blocked_by"]
+    assert rule["title_source"] == "filename"
+    assert rule["strongest_title_source"] == "embedded"
+    assert float(candidate.score) == pytest.approx(0.85)
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.get(import_job=job).inferred_title == "The Dragon in the Sea"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedded_title_conflict_blocks_auto_accept_already_above_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81 review on ee563ba: the same probe with the common "en" language on file and
+    # provider. Title 0.55 + author 0.3 + language 0.05 reaches the threshold without
+    # the strong-match rule, so the shared auto-accept decision must block it itself.
+    _catalogue_provider(
+        monkeypatch,
+        [("Dune", ["Frank Herbert"])],
+        any_title=True,
+        extra_fields={"language": ["en"]},
+    )
+
+    job = _upload(
+        tmp_path,
+        monkeypatch,
+        "Dune - Frank Herbert.epub",
+        _epub_bytes(
+            "The Dragon in the Sea",
+            ["Frank Herbert"],
+            extra_metadata="<dc:language>en</dc:language>",
+        ),
+        "application/epub+zip",
+    )
+
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    assert candidate.title == "Dune"
+    assert float(candidate.score) >= intake.AUTO_ACCEPT_SCORE
+    # The rule never ran: the raw score was already high enough.
+    assert STRONG_MATCH_EVIDENCE_KEY not in candidate.raw_payload
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert not Book.objects.exists()
+    assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    details = job.evidence[intake.AUTO_ACCEPT_BLOCK_DETAILS_KEY]
+    assert details["candidate_title"] == "Dune"
+    assert details["title_source"] == "filename"
+    assert details["strongest_title_source"] == "embedded"
+    assert details["strongest_titles"] == ["The Dragon in the Sea"]
+    task = ReviewTask.objects.get(import_job=job)
+    assert task.inferred_title == "The Dragon in the Sea"
+    client = Client()
+    client.force_login(get_or_create_profile("evidence-uploader").user)
+    html = client.get(f"/reviews/{task.id}/?view=html").content.decode()
+    assert 'data-block-reason="stronger_title_evidence_disagrees"' in html
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedded_title_agreeing_with_match_still_auto_accepts_above_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _catalogue_provider(
+        monkeypatch, [("Dune", ["Frank Herbert"])], extra_fields={"language": ["en"]}
+    )
+
+    job = _upload(
+        tmp_path,
+        monkeypatch,
+        "Dune - Frank Herbert.epub",
+        _epub_bytes("Dune", ["Frank Herbert"], extra_metadata="<dc:language>en</dc:language>"),
+        "application/epub+zip",
+    )
+
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None
+    assert job.book.title == "Dune"
+    assert intake.AUTO_ACCEPT_BLOCKED_KEY not in job.evidence
+
+
+def test_decision_blocks_stronger_title_conflict_for_any_score() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Dune - Frank Herbert.epub",
+        original_filename="Dune - Frank Herbert.epub",
+        extracted_metadata={"title": "The Dragon in the Sea", "authors": ["Frank Herbert"]},
+    )
+    dune = dataclasses.replace(_candidate("Dune", ["Frank Herbert"]), score=1.0)
+    decision = intake.decide_auto_accept([dune], ["Frank Herbert"], file_evidence=signals)
+    assert decision.candidate is None
+    assert decision.blocked_reason == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    dragon = dataclasses.replace(_candidate("The Dragon in the Sea", ["Frank Herbert"]), score=1.0)
+    accepted = intake.decide_auto_accept([dragon], ["Frank Herbert"], file_evidence=signals)
+    assert accepted.candidate is dragon
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sibling_format_link_respects_stronger_title_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81 verification: with group_sibling_formats (#39), "Dune - Frank Herbert.txt" is
+    # imported as Dune; then "Dune - Frank Herbert.epub" embedding "The Dragon in the
+    # Sea" arrives. decide_auto_accept blocks the provider's Dune, and the sibling
+    # assessment must apply the same shared title guard instead of linking it to Dune.
+    _catalogue_provider(
+        monkeypatch,
+        [("Dune", ["Frank Herbert"])],
+        any_title=True,
+        extra_fields={"language": ["en"]},
+    )
+    StorageLocation.objects.get_or_create(
+        identifier="default",
+        defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
+    )
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+    folder = tmp_path / "share" / "Herbert"
+    folder.mkdir(parents=True)
+    location = SourceLocation.objects.create(
+        name="member",
+        root_path=str(tmp_path / "share"),
+        transfer_mode=SourceLocation.TransferMode.COPY,
+        group_sibling_formats=True,
+    )
+
+    (folder / "Dune - Frank Herbert.txt").write_text("A beginning is the time.")
+    call_command("ingest_sources", "--source-id", str(location.id))
+    first = ImportJob.objects.select_related("book").get(source_location=location)
+    assert first.state == ImportJob.State.COMPLETE
+    assert first.book is not None
+    assert first.book.title == "Dune"
+
+    (folder / "Dune - Frank Herbert.epub").write_bytes(
+        _epub_bytes(
+            "The Dragon in the Sea",
+            ["Frank Herbert"],
+            extra_metadata="<dc:language>en</dc:language>",
+        )
+    )
+    call_command("ingest_sources", "--source-id", str(location.id))
+    second = ImportJob.objects.exclude(pk=first.pk).get(source_location=location)
+
+    # The provider's Dune reached the threshold and the shared guard blocked it.
+    assert second.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    # The sibling's Dune Book is refused for the same reason, and a person decides.
+    sibling = second.evidence[intake.SIBLING_EVIDENCE_KEY]
+    assert sibling["import_job"] == str(first.id)
+    assert sibling["book_id"] == first.book_id
+    assert sibling["accepted"] is False
+    assert sibling["reason"] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    assert second.state == ImportJob.State.LOW_CONFIDENCE
+    assert second.book_id is None
+    assert Book.objects.count() == 1
+    assert not FileVariant.objects.filter(book=first.book, format="epub").exists()
+    task = ReviewTask.objects.get(import_job=second)
+    assert task.state == ReviewTask.State.OPEN
+    assert task.inferred_title == "The Dragon in the Sea"
+
+
+# --- unit: the #9 strong-match rule on typed evidence -----------------------------------
+
+
+def _rule(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    filename: str,
+    metadata: dict[str, Any],
+    candidate: tuple[str, list[str]],
+) -> dict[str, Any]:
+    _catalogue_provider(monkeypatch, [candidate], any_title=True)
+    signals = build_identification_input(
+        source_path=f"/incoming/{filename}",
+        original_filename=filename,
+        extracted_metadata=metadata,
+    )
+    top = resolve_candidates(signals)[0]
+    rule: dict[str, Any] = top.raw[STRONG_MATCH_EVIDENCE_KEY]
+    return rule
+
+
+def test_rule_promotes_when_embedded_title_is_a_subtitle_form_of_the_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Snow Crash - Neal Stephenson.epub",
+        metadata={"title": "Snow Crash: A Novel", "authors": ["Neal Stephenson"]},
+        candidate=("Snow Crash", ["Neal Stephenson"]),
+    )
+
+    assert rule["applied"] is True
+    assert rule["title_source"] == "filename"
+    assert rule["strongest_title_source"] == "embedded"
+
+
+def test_rule_blocks_filename_title_contradicted_by_embedded_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Dune - Frank Herbert.epub",
+        metadata={"title": "The Dragon in the Sea", "authors": ["Frank Herbert"]},
+        candidate=("Dune", ["Frank Herbert"]),
+    )
+
+    assert rule["applied"] is False
+    assert rule["blocked_by"] == ["stronger_title_evidence_disagrees"]
+
+
+def test_rule_blocks_candidate_missing_an_embedded_coauthor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Good Omens - Terry Pratchett.epub",
+        metadata={"title": "Good Omens", "authors": ["Terry Pratchett", "Neil Gaiman"]},
+        candidate=("Good Omens", ["Terry Pratchett"]),
+    )
+
+    assert rule["applied"] is False
+    assert "missing_coauthor" in rule["blocked_by"]
+    assert rule["author_score"] == pytest.approx(0.5)
+
+
+def test_rule_blocks_candidate_contradicting_embedded_author(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81's first review probe: filename "Dune - Frank Herbert", embedded Brian Herbert.
+    rule = _rule(
+        monkeypatch,
+        filename="Dune - Frank Herbert.txt",
+        metadata={"title": "Dune", "authors": ["Brian Herbert"]},
+        candidate=("Dune", ["Frank Herbert"]),
+    )
+
+    assert rule["applied"] is False
+    assert "author_evidence_conflict" in rule["blocked_by"]
+
+
+def test_rule_still_promotes_filename_only_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Stephen King - Pet Sematary.txt",
+        metadata={"title": "Stephen King - Pet Sematary"},  # extractor stem fallback
+        candidate=("Pet Sematary", ["Stephen King"]),
+    )
+
+    assert rule["applied"] is True
+    assert rule["title_hint"] == "Pet Sematary"
+    assert rule["author_hint"] == "Stephen King"
 
 
 @pytest.mark.django_db

@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0040_scan_events"),
+        ("core", "0044_scanner_page_and_cover_upload"),
     ]
 
     operations = [

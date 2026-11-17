@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
 import shutil
+import tempfile
 import unicodedata
 import uuid
 from collections.abc import Iterator
@@ -226,6 +228,9 @@ class StorageBackend(Protocol):
     def store(self, source: str, destination: str) -> str:
         """Copy a source path into storage and return canonical storage id."""
 
+    def store_atomic(self, source: str, destination: str) -> str:
+        """Like ``store``, but readers never see a partial file (temp file + rename)."""
+
     def copy(self, source: str, destination: str) -> str:
         """Copy an existing storage artifact."""
 
@@ -311,6 +316,9 @@ class StorageBackend(Protocol):
     def discard_staged(self, staged: str) -> None:
         """Remove a staged file that will not be committed; a missing one is fine."""
 
+    def write_atomic(self, location: str, data: bytes) -> str:
+        """Create or replace a small artifact so readers never see a partial file."""
+
     def stat(self, location: str) -> tuple[int, int]:
         """Return ``(size_bytes, mtime_ns)`` for an artifact."""
 
@@ -372,6 +380,27 @@ class LocalFilesystemStorage:
         self._copy_file(source_path, destination_path)
         return destination
 
+    def store_atomic(self, source: str, destination: str) -> str:
+        """Copy ``source`` to ``destination`` so readers see the old file or the whole new one.
+
+        The bytes are copied into a hidden temp file beside the destination, flushed to
+        disk, and then renamed over the destination (``os.replace``, atomic on one
+        filesystem). A copy that fails part way leaves the destination untouched and
+        removes the temp file. Use it for fixed, shared names such as content-addressed
+        cache files; ``store`` writes in place.
+        """
+        dest = self._prepare_destination(destination)
+        src = self._resolve_source(source)
+        staged = dest.with_name(f".{uuid.uuid4().hex}.partial")
+        try:
+            self._copy_file(src, staged)
+            with staged.open("rb+") as handle:
+                os.fsync(handle.fileno())
+            os.replace(staged, dest)
+        finally:
+            staged.unlink(missing_ok=True)
+        return destination
+
     def copy(self, source: str, destination: str) -> str:
         src = self._resolve_source(source)
         dest = self._prepare_destination(destination)
@@ -394,6 +423,30 @@ class LocalFilesystemStorage:
         dest = self._prepare_destination(destination)
         os.link(src, dest)
         return destination
+
+    def write_atomic(self, location: str, data: bytes) -> str:
+        """Create or replace ``location`` with ``data`` atomically.
+
+        The bytes go to a hidden temporary file in the destination folder, are flushed
+        to disk, and the temporary file is then renamed over the destination
+        (``os.replace``, atomic on POSIX filesystems and on NFS/SMB within one folder).
+        A reader sees either the old file or the new one, never a partial write. Meant
+        for small derived files the application regenerates (``metadata.opf``).
+        """
+        dest = self._prepare_destination(location)
+        self.ensure_free_space(len(data))
+        fd, temp_name = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, dest)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+            raise
+        return location
 
     def delete(self, location: str) -> None:
         target = self.resolve_location(location)
@@ -589,6 +642,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
     def store(self, source: str, destination: str) -> str:
         raise self._refuse("store")
 
+    def store_atomic(self, source: str, destination: str) -> str:
+        raise self._refuse("store")
+
     def copy(self, source: str, destination: str) -> str:
         raise self._refuse("copy")
 
@@ -597,6 +653,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
 
     def link(self, source: str, destination: str) -> str:
         raise self._refuse("link")
+
+    def write_atomic(self, location: str, data: bytes) -> str:
+        raise self._refuse("write")
 
     def delete(self, location: str) -> None:
         raise self._refuse("delete")

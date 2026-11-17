@@ -20,7 +20,17 @@ from rq import get_current_job
 from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import contributions, conversion, intake, ocr, scan_covers, scan_events, scan_lifecycle
+from . import (
+    archive_layout,
+    contributions,
+    conversion,
+    intake,
+    ocr,
+    scan_covers,
+    scan_events,
+    scan_lifecycle,
+    scan_logs,
+)
 from .models import (
     FileVariant,
     ProcessingJob,
@@ -403,12 +413,18 @@ def create_cleaned_variant_for_scan_job(
         pdf_path.unlink(missing_ok=True)
         return existing
 
-    destination = file_storage.generate_destination(
-        f"books/{job.book_id}/cleaned",
-        f"{uuid.uuid4()}-{safe_name}.pdf",
-    )
+    # Into the book's archive folder on the attached storage (<Author>/<Title>/ by
+    # default), next to its other formats, cover and uploaded scanner logs.
+    assert job.book is not None
     try:
-        file_storage.store(str(pdf_path), destination)
+        destination = archive_layout.publish_derived(
+            file_storage,
+            job.book,
+            str(pdf_path),
+            f"{archive_layout.book_file_stem(job.book)}.pdf",
+            legacy_namespace=f"books/{job.book_id}/cleaned",
+            legacy_filename=f"{uuid.uuid4()}-{safe_name}.pdf",
+        )
     finally:
         pdf_path.unlink(missing_ok=True)
 
@@ -668,6 +684,8 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
                 request_name="cleaned",
                 allow_raw_pages=bool(details.get("allow_raw_pages", False)),
             )
+
+        scan_logs.place_scan_logs_in_book_folder(scan_job)
 
         ocr_job: ProcessingJob | None = None
         if bool(details.get("auto_ocr", False)):

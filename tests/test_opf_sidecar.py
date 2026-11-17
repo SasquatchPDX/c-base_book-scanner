@@ -195,7 +195,10 @@ def test_flat_multi_book_folder_ignores_stray_sidecar(
     (root / "Dune - Frank Herbert.txt").write_text("Dune text.", encoding="utf-8")
     (root / "Neuromancer - William Gibson.txt").write_text("Gibson text.", encoding="utf-8")
 
-    jobs = _import_all(root, tmp_path)
+    # The stub echoes the queried title and author, so the #9 exact-title + strong-author
+    # rule would accept "Dune - Frank Herbert" on its own; this test is about the sidecar.
+    with override_settings(BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED=False):
+        jobs = _import_all(root, tmp_path)
 
     assert len(jobs) == 2
     for job in jobs:

@@ -198,8 +198,8 @@ def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
     """Job status and received inventory (§6.4).
 
     The item sections come from :mod:`.scan_manifest`: ``pages``, ``covers`` (S4) and,
-    once its store registers a source, ``metadata_opf`` (S6). ``events``
-    carries the stored-event high-water mark (``0`` until S5 stores events).
+    once its store registers a source, ``metadata_opf`` (S6). ``events`` carries the
+    stored-event high-water mark (S5, registered at app start).
     """
     payload: dict[str, Any] = {
         "job_id": job.pk,
