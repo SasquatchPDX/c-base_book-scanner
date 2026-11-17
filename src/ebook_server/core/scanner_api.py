@@ -28,8 +28,8 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from . import scan_events
-from .models import ScanJob
+from . import scan_events, scan_lifecycle, scan_manifest
+from .models import ScanJob, ScanTodo
 from .scan_job_ids import is_device_job_id
 from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
 
@@ -194,32 +194,27 @@ def portal_url(request: HttpRequest, job_id: str) -> str:
 
 
 def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
-    """Job status as in §6.4, limited to what exists so far.
+    """Job status and received inventory (§6.4).
 
-    Covers and ``metadata_opf`` are added by the tickets that store them.
+    The item sections come from :mod:`.scan_manifest`: ``pages`` and, once their stores
+    register a source, ``covers`` (S4) and ``metadata_opf`` (S6). ``events`` carries the
+    stored-event high-water mark (S5, registered at app start).
     """
-    pages = []
-    for page in job.pages.order_by("logical_sequence_number", "side"):
-        active = page.versions.filter(is_active=True).first()
-        if active is None:
-            continue
-        pages.append(
-            {
-                "sequence_number": page.logical_sequence_number,
-                "sha256": active.checksum_sha256,
-                "version": active.version,
-            }
-        )
-    return {
+    payload: dict[str, Any] = {
         "job_id": job.pk,
         "state": job.state,
         "portal_url": portal_url(request, job.pk),
         "scan_started_at": iso_utc(job.scan_started_at) if job.scan_started_at else None,
         "capture_layout": job.capture_layout,
-        "events": {"sans_last_line_no": scan_events.sans_high_water_mark(job)},
-        "pages": pages,
-        "open_rescans": job.todos.filter(state__in=["open", "claimed"], todo_type="rescan").count(),
     }
+    payload.update(scan_manifest.status_sections(job))
+    payload["open_rescans"] = job.todos.filter(
+        state__in=[ScanTodo.State.OPEN, ScanTodo.State.CLAIMED],
+        todo_type=ScanTodo.TodoType.RESCAN,
+    ).count()
+    if job.refinish_needed:
+        payload["note"] = scan_lifecycle.REFINISH_NOTE
+    return payload
 
 
 def _parse_registration(request: HttpRequest) -> tuple[dict[str, Any] | None, JsonResponse | None]:
@@ -277,6 +272,10 @@ def _conflict(job_id: str) -> JsonResponse:
     )
 
 
+def _not_found() -> JsonResponse:
+    return error_response(404, "not_found", "No such job.")
+
+
 def scanner_job(job_id: str, *, lock: bool = False) -> ScanJob | None:
     """The job if the scanner registered it (``source=scanner``), else ``None``.
 
@@ -288,8 +287,24 @@ def scanner_job(job_id: str, *, lock: bool = False) -> ScanJob | None:
     return jobs.filter(pk=job_id, source=ScanJob.Source.SCANNER).first()
 
 
-@scanner_api_view(["PUT"])
+def _job_state_error(job: ScanJob, message: str) -> JsonResponse:
+    return error_response(409, "job_state", message, {"state": job.state})
+
+
+@scanner_api_view(["GET", "PUT"])
 def job(request: HttpRequest, job_id: str) -> JsonResponse:
+    """``GET``: job status (§6.4). ``PUT``: register a job (§6.3)."""
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    if request.method == "GET":
+        current = scanner_job(job_id)
+        if current is None:
+            return _not_found()
+        return JsonResponse(job_status_payload(request, current))
+    return _register_job(request, job_id)
+
+
+def _register_job(request: HttpRequest, job_id: str) -> JsonResponse:
     """Register a job (§6.3): 201 created, 200 identical repeat, 409 conflict.
 
     Repeating the registration with the same ``scan_started_at`` (and
@@ -297,8 +312,6 @@ def job(request: HttpRequest, job_id: str) -> JsonResponse:
     scanner job, or an existing web-created job with that ID, is
     ``409 job_id_conflict``; nothing is overwritten.
     """
-    if not is_device_job_id(job_id):
-        return _invalid_job_id(job_id)
     registration, problem = _parse_registration(request)
     if problem is not None:
         return problem
@@ -328,6 +341,109 @@ def job(request: HttpRequest, job_id: str) -> JsonResponse:
             # A concurrent first registration won the insert; re-read it.
             continue
     return _conflict(job_id)
+
+
+# --- capture-complete (§6.9) and abort (§6.10) ------------------------------------------
+
+# A manifest lists every page; 4 MiB holds tens of thousands of entries.
+MAX_MANIFEST_BYTES: Final = 4 * 1024 * 1024
+
+
+def _json_object(request: HttpRequest, limit: int) -> tuple[dict[str, Any], JsonResponse | None]:
+    if len(request.body) > limit:
+        return {}, error_response(413, "payload_too_large", "The request body is too large.")
+    try:
+        payload = json.loads(request.body or b"null")
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        return {}, error_response(400, "invalid_json", "The body must be a JSON object.")
+    return payload, None
+
+
+def _invalid_request(field_name: str, message: str) -> JsonResponse:
+    return error_response(400, "invalid_request", message, {"field": field_name})
+
+
+def _capture_verified(request: HttpRequest, job: ScanJob) -> JsonResponse:
+    return JsonResponse(
+        {"verified": True, "state": job.state, "portal_url": portal_url(request, job.pk)}
+    )
+
+
+@scanner_api_view(["POST"])
+def capture_complete(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Verify the scanner's full manifest and move the job to ``captured`` (§6.9).
+
+    ``200`` when every listed item is held with exactly that active checksum and the
+    event high-water marks agree. Once the job got past ``captured``, repeating the
+    manifest that was verified answers ``200`` again; any other manifest is checked
+    against what serif holds now, like a first request (but the state is unchanged).
+    ``409 incomplete`` lists ``missing`` and ``mismatched`` item keys (a declared item
+    serif cannot store yet is ``missing``); ``409 job_state`` for a cancelled (or
+    paused) job.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    payload, problem = _json_object(request, MAX_MANIFEST_BYTES)
+    if problem is not None:
+        return problem
+    raw_finished = payload.get("finished_at")
+    finished_at = None
+    if raw_finished is not None:
+        finished_at = _parse_timestamp(raw_finished)
+        if finished_at is None:
+            return _invalid_request(
+                "finished_at", "finished_at must be an ISO 8601 timestamp with a time zone."
+            )
+    with transaction.atomic():
+        current = scanner_job(job_id, lock=True)
+        if current is None:
+            return _not_found()
+        already_captured = current.state in scan_lifecycle.CAPTURE_VERIFIED_STATES
+        if not already_captured and current.state not in scan_lifecycle.CAPTURE_COMPLETE_FROM:
+            return _job_state_error(
+                current, f"capture-complete is not allowed for a {current.state} job."
+            )
+        try:
+            check = scan_manifest.check_manifest(current, payload)
+        except scan_manifest.ManifestError as exc:
+            return _invalid_request(exc.field, str(exc))
+        if already_captured and current.capture_manifest_sha256 == check.digest:
+            # An identical retry of the verified manifest (its response was lost).
+            return _capture_verified(request, current)
+        if not check.verified:
+            return error_response(
+                409,
+                "incomplete",
+                "Some items are missing or differ; upload them and call again.",
+                {
+                    "missing": check.missing,
+                    "mismatched": check.mismatched,
+                    "sans_last_line_no": check.sans_last_line_no,
+                },
+            )
+        if not already_captured:
+            scan_lifecycle.mark_captured(
+                current,
+                finished_at=finished_at.astimezone(UTC) if finished_at else None,
+                manifest_sha256=check.digest,
+            )
+    return _capture_verified(request, current)
+
+
+@scanner_api_view(["POST"])
+def abort(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Abort Book (§6.10): ``cancelled``, idempotent, uploaded data kept."""
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    if scanner_job(job_id) is None:
+        return _not_found()
+    try:
+        aborted = scan_lifecycle.abort(job_id)
+    except scan_lifecycle.LifecycleError as exc:
+        return error_response(409, "job_state", str(exc), {"state": exc.state})
+    return JsonResponse(job_status_payload(request, aborted))
 
 
 # --- events (§6.7) ----------------------------------------------------------------------

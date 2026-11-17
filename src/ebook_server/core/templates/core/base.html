@@ -18,6 +18,7 @@
         <a href="{% url 'imports-upload' %}">Upload</a>
         <a href="{% url 'review-queue' %}?view=html">Reviews</a>
         <a href="{% url 'scan-jobs' %}?view=html">Scanning</a>
+        <a href="{% url 'scan-raw-scans' %}?view=html">Raw scans</a>
         {% if contributions_enabled and request.user.is_authenticated %}<a href="{% url 'my-contributions' %}?view=html">My contributions</a>{% endif %}
         {% if contributions_admin_link %}<a href="{% url 'contributions-admin' %}?view=html">Recognition admin</a>{% endif %}
         {% if request.user.is_staff %}<a href="{% url 'intake-progress' %}?view=html">Intake</a><a href="/admin/">Admin</a>{% endif %}

@@ -27,6 +27,7 @@ from ebook_server.core.models import (
     FileVariant,
     Genre,
     GenreAlias,
+    ScanJob,
     StorageLocation,
     get_or_create_profile,
 )
@@ -339,6 +340,47 @@ def test_rescan_invalidation_in_autocommit_removes_the_last_format() -> None:
     facets = client.get("/library/books/", {"facets": "format"}).json()["facets"]["format"]
     assert facets == []
     assert search.verify_search_index(sample=100).ok
+
+
+@pytest.mark.django_db(transaction=True)
+def test_raw_scan_books_are_never_indexed_or_found() -> None:
+    """#127: a book that exists only through an unfinished scan is not in the index."""
+    library = _book("Atlas of Rivers", formats=("epub",))
+    raw = _book("Atlas of Mountains")
+    job = ScanJob.objects.create(state=ScanJob.State.CAPTURED, book=raw)
+    location = StorageLocation.objects.get(identifier="default")
+    FileVariant.objects.create(
+        book=raw,
+        format="pdf",
+        mime_type="application/pdf",
+        original_filename="cleaned.pdf",
+        storage_location=location,
+        storage_identifier="pg/raw-scan-cleaned.pdf",
+        size_bytes=1,
+        sha256="f" * 64,
+        source_type=FileVariant.SourceType.CLEANED,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+        converter_options={"scan_job_id": str(job.pk)},
+    )
+    client = _client()
+
+    assert not BookSearchDocument.objects.filter(book=raw).exists()
+    assert isinstance(search.get_search_backend(), search.PostgresSearchBackend)
+    assert _ids(client.get("/library/books/", {"q": "atlas"}).json()) == [library.pk]
+    assert _ids(client.get("/library/books/", {"format": "pdf"}).json()) == []
+    assert _ids(client.get("/library/books/").json()) == [library.pk]
+    search.rebuild_search_index()
+    assert not BookSearchDocument.objects.filter(book=raw).exists()
+    assert search.verify_search_index(sample=100).ok
+
+    job.state = ScanJob.State.COMPLETE
+    job.save()
+    cache.clear()
+
+    assert sorted(_ids(client.get("/library/books/", {"q": "atlas"}).json())) == sorted(
+        [library.pk, raw.pk]
+    )
+    assert _ids(client.get("/library/books/", {"format": "pdf"}).json()) == [raw.pk]
 
 
 @pytest.mark.django_db(transaction=True)

@@ -893,6 +893,9 @@ class ScanJob(models.Model):
         OPEN = "open", "Open"
         CAPTURING = "capturing", "Capturing"
         PAUSED = "paused", "Paused"
+        # A raw scan (#127, contract §5/D6): capture verified by checksum, awaiting
+        # ScanTailor-Web processing and an explicit finish. Never in the library.
+        CAPTURED = "captured", "Raw scan"
         FINALIZING = "finalizing", "Finalizing"
         COMPLETE = "complete", "Complete"
         CANCELLED = "cancelled", "Cancelled"
@@ -977,6 +980,16 @@ class ScanJob(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
+    # capture-complete (§6.9): when serif verified the manifest, and the scanner's own
+    # Finish Book time from that request.
+    captured_at = models.DateTimeField(null=True, blank=True)
+    capture_finished_at = models.DateTimeField(null=True, blank=True)
+    # SHA-256 of the manifest capture-complete verified (items and event high-water
+    # mark): an identical retry answers 200 again, any other manifest is re-checked.
+    capture_manifest_sha256 = models.CharField(max_length=64, blank=True, default="")
+    # A replacement page arrived after the job was complete (§5): the job is back in
+    # `captured` and its existing library variants stay until the next finish.
+    refinish_needed = models.BooleanField(default=False)
 
     class Meta:
         indexes = [
