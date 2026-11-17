@@ -318,6 +318,15 @@ phases (COMPLETE, LOW_CONFIDENCE, FAILED) releases the lease. The lease lasts
 `BOOK_SCANNER_INGEST_LEASE_SECONDS`; the default `0` means the RQ job timeout
 plus five minutes. A job whose lease expired is never taken over by another
 delivery. `recover_stale_jobs` handles it, see below.
+`--preview` lists every importable file and every skipped file, followed by a
+per-source summary such as `importable=108 skipped=3 (.chm=2, .lit=1)`. Skipped
+files are unsupported formats (`SKIPPED (unsupported format: .chm) => <path>`) and
+audio files (see "Audio files and audiobooks" below); the per-extension counts cover
+both. With `--json`, rows carry `"status": "importable"` or `"status": "skipped"`;
+skipped rows add `"skipped": "unsupported"` or `"skipped": "audio"`, `extension` and
+`reason`, and each source ends with a
+`{"source_location_id", "summary": {"importable", "skipped", "skipped_audio",
+"skipped_by_extension"}}` row.
 
 ### Audio files and audiobooks
 
@@ -606,7 +615,16 @@ hash downloaded bytes while staging them on disk and remove partial temporary
 files after download failures. Changed results receive separate storage paths
 even when the service repeats a filename, preserving prior outputs.
 
-Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
+Digital intake accepts EPUB, MOBI, AZW, AZW3, PRC, RTF, PDF, TXT, HTML, FB2,
+DjVu, CBZ, and CBR. AZW/AZW3/PRC must carry a PalmDB `BOOKMOBI` header (PRC may
+also be plain PalmDOC `TEXtREAd`); RTF must start with `{\rtf`. AZW/AZW3/PRC
+metadata is read with Calibre's `ebook-meta` like MOBI; RTF metadata currently falls
+back to filename/folder signals before external verification. These four formats
+are stored and downloadable as uploaded, but no conversion route is offered from them
+until one is binary-verified (see `docs/conversion-matrix.md`).
+Files in any other format (for example CHM, LIT, LRF, PDB, DOC/DOCX, ZIP/RAR) are
+not imported: source discovery logs a `source_files_skipped_unsupported` warning
+with per-extension counts, and `--preview` lists them (see above).
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text
 encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP readers
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page

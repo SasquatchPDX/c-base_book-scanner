@@ -111,11 +111,10 @@ class Command(BaseCommand):
             return
 
         if preview:
-            payload = []
+            payload: list[dict[str, Any]] = []
             for location in locations:
                 try:
-                    for row in intake.preview_source_jobs(location):
-                        payload.append(row)
+                    source_preview = intake.preview_source_location(location)
                 except IntakeError as exc:
                     payload.append(
                         {
@@ -123,6 +122,22 @@ class Command(BaseCommand):
                             "error": str(exc),
                         },
                     )
+                    continue
+                payload.extend(
+                    {**row, "status": "skipped" if "skipped" in row else "importable"}
+                    for row in source_preview.rows
+                )
+                payload.append(
+                    {
+                        "source_location_id": str(location.id),
+                        "summary": {
+                            "importable": len(source_preview.jobs),
+                            "skipped": len(source_preview.skipped),
+                            "skipped_audio": source_preview.skipped_audio,
+                            "skipped_by_extension": source_preview.skipped_by_extension,
+                        },
+                    },
+                )
             if output_json:
                 self.stdout.write(json.dumps(payload, indent=2))
             else:
@@ -133,11 +148,30 @@ class Command(BaseCommand):
                             f"source {row['source_location_id']} error: {row['error']}"
                         )
                         continue
+                    if "summary" in row:
+                        summary = row["summary"]
+                        by_extension = ", ".join(
+                            f"{extension}={count}"
+                            for extension, count in summary["skipped_by_extension"].items()
+                        )
+                        self.stdout.write(
+                            f"source #{row['source_location_id']}: "
+                            f"importable={summary['importable']} "
+                            f"skipped={summary['skipped']}"
+                            + (f" ({by_extension})" if by_extension else "")
+                        )
+                        continue
                     if row.get("skipped") == "audio":
                         audio_rows += 1
                         self.stdout.write(
                             f"skipped [{row['reason']}] => {row['path']} (source "
                             f"#{row['source_location_id']})"
+                        )
+                        continue
+                    if row.get("skipped") == "unsupported":
+                        self.stdout.write(
+                            f"SKIPPED ({row['reason']}: {row['extension']}) => {row['path']} "
+                            f"(source #{row['source_location_id']})"
                         )
                         continue
                     line = (
