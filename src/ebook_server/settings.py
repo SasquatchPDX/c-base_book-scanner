@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
+    ingest_batch_size: int = 100
+    ingest_max_per_hour: int = 0
+    # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
+    ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
     multipart_detection: bool = True
     redis_url: str | None = None
@@ -89,6 +93,9 @@ class Settings(BaseSettings):
     # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
     hardcover_api_token: SecretStr = SecretStr("")
     hardcover_timeout_seconds: float = 10.0
+    # Google Books (opt-in): also add
+    # "ebook_server.core.metadata_providers.GoogleBooksMetadataProvider" to metadata_providers.
+    google_books_api_key: SecretStr = SecretStr("")
     # Client-side request pacing per metadata provider_id (requests/second; <= 0 disables).
     # Providers not listed use metadata_rate_limit_default. Shared across worker processes
     # through Redis when redis_url is set, otherwise enforced per process.
@@ -119,6 +126,10 @@ class Settings(BaseSettings):
     csrf_trusted_origins: list[str] = []
     scantailor_event_stream_interval_seconds: float = 1.0
     scantailor_event_stream_max_events: int = 45
+    # How scanners deliver pages (#55): ``single_page`` (one page per image, the
+    # project's own scanner) or ``spread`` (one photo holds two facing pages).
+    scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
+    scan_spread_scanner_ids: list[str] = []
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -249,6 +260,15 @@ LOGIN_REDIRECT_URL = "/library/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 APP_DATA_DIR = Path(settings.storage_root)
+# The one attached storage: a writable network share mounted on the VM. It holds the
+# archive (copied/moved/uploaded originals plus every derived artifact: conversions,
+# covers, OCR output), scan artifacts and upload staging. The VM disk keeps only the
+# database, Redis and caches. Files indexed in place are read from their own
+# read-only StorageLocation and are never copied here.
+# The archive root is APP_DATA_DIR / BOOK_SCANNER_ARCHIVE_DIRNAME. It is deliberately
+# not separately configurable: keeping it under the storage root keeps it behind the
+# mount/sentinel check, and renaming it would orphan every archived artifact.
+BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
@@ -261,6 +281,9 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
+BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
+BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
 BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
@@ -295,6 +318,7 @@ BOOK_SCANNER_AUDIOBOOK_SERVICE_URL = settings.audiobook_service_url
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
 BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
+BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_value()
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
@@ -312,6 +336,8 @@ BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds
 SCANTAILOR_EVENT_STREAM_MAX_EVENTS = settings.scantailor_event_stream_max_events
+BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
+BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds
