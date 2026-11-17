@@ -34,7 +34,7 @@ from django.utils import timezone
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import archive_layout, book_opf
+from . import archive_layout, book_opf, scan_logs
 from .models import (
     Book,
     CoverImage,
@@ -152,7 +152,7 @@ def _target_name(kind: str, record: Any, book: Book) -> str:
     if kind == "cover":
         return f"cover{suffix or '.jpg'}"
     if kind == "scan_log":
-        return "scan.log"
+        return scan_logs.scan_log_filename(record.sha256)
     stem = archive_layout.book_file_stem(book)
     if record.source_type == FileVariant.SourceType.OCR:
         stem = f"{stem} (OCR)"

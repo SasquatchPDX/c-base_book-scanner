@@ -15,6 +15,7 @@ from django.db import transaction
 from django.db.models.signals import pre_save
 from django.utils import timezone
 
+from ebook_server import jobs
 from ebook_server.core import archive_reorganize, book_opf
 from ebook_server.core.archive_reorganize import request_reorganize
 from ebook_server.core.book_deletion import delete_book_safely
@@ -452,7 +453,7 @@ def test_deleting_attached_author_genre_or_category_regenerates(
     assert fields["subjects"] == ["Romance", "Classics"]
 
     queued: list[int] = []
-    real_enqueue = book_opf.jobs.enqueue
+    real_enqueue = jobs.enqueue
 
     def recording_enqueue(func: Any, book_id: int) -> Any:
         queued.append(book_id)

@@ -1,0 +1,32 @@
+<section class="action-panel llm-suggestion" data-llm-panel="true">
+  <h2>AI suggestion (unverified)</h2>
+  {% with suggestion=llm_panel.suggestion %}
+    {% if suggestion %}
+      <p class="muted">From the local AI server ({{ suggestion.model|default:"unknown model" }}{% if suggestion.model_version %} · {{ suggestion.model_version }}{% endif %}), {{ suggestion.get_trigger_display|lower }}. It only proposes search terms; it has not checked anything. Confirm against the file before accepting a candidate.</p>
+      <p><span class="status status-{% if suggestion.outcome == 'hints_used' %}success{% elif suggestion.outcome == 'no_new_candidates' %}queued{% else %}failed{% endif %}" data-llm-outcome="{{ suggestion.outcome }}">{{ suggestion.get_outcome_display }}</span></p>
+      {% if llm_panel.title_hints or llm_panel.author_hints %}
+        <dl class="metadata">
+          {% if llm_panel.title_hints %}<div><dt>Title hints</dt><dd>{% for hint in llm_panel.title_hints %}{{ hint.value }}{% if not hint.grounded %} <span class="muted" data-ungrounded="true">(not found in the file's evidence)</span>{% endif %}{% if not forloop.last %}; {% endif %}{% endfor %}</dd></div>{% endif %}
+          {% if llm_panel.author_hints %}<div><dt>Author hints</dt><dd>{% for hint in llm_panel.author_hints %}{{ hint.value }}{% if not hint.grounded %} <span class="muted" data-ungrounded="true">(not found in the file's evidence)</span>{% endif %}{% if not forloop.last %}; {% endif %}{% endfor %}</dd></div>{% endif %}
+          {% if llm_panel.isbn_hints_kept %}<div><dt>ISBN (seen in the file)</dt><dd>{{ llm_panel.isbn_hints_kept|join:", " }}</dd></div>{% endif %}
+          {% if llm_panel.isbn_hints_dropped %}<div><dt>ISBN discarded</dt><dd class="muted">{{ llm_panel.isbn_hints_dropped|length }} ISBN suggestion(s) did not appear in the file and were not used</dd></div>{% endif %}
+          {% if llm_panel.output.language %}<div><dt>Language</dt><dd>{{ llm_panel.output.language }}</dd></div>{% endif %}
+          {% if llm_panel.output.publication_year %}<div><dt>Year</dt><dd>{{ llm_panel.output.publication_year }}</dd></div>{% endif %}
+          {% if llm_panel.output.is_single_book is False %}<div><dt>Whole book?</dt><dd>Looks like a chapter or part of a larger book</dd></div>{% endif %}
+          {% if llm_panel.output.confidence %}<div><dt>Model's own confidence</dt><dd>{{ llm_panel.output.confidence }} (not a match score)</dd></div>{% endif %}
+        </dl>
+      {% endif %}
+      {% if llm_panel.output.rationale %}<p class="muted">Rationale (unverified): {{ llm_panel.output.rationale }}</p>{% endif %}
+      {% if llm_panel.first_title %}
+        <form method="post" action="{% url 'review-edit-search-terms' task.id %}">{% csrf_token %}<input type="hidden" name="inferred_title" value="{{ llm_panel.first_title }}"><input type="hidden" name="inferred_authors" value="{{ llm_panel.authors_text }}"><button class="secondary" type="submit">Use as search terms</button></form>
+      {% endif %}
+    {% else %}
+      <p class="muted">No AI suggestion yet. The local AI server can propose search terms for files with weak names; it never accepts anything by itself.</p>
+    {% endif %}
+  {% endwith %}
+  {% if llm_panel.active_job %}
+    <p><a href="{% url 'llm-identification-job-status' llm_panel.active_job.job_id %}"><span class="status status-{{ llm_panel.active_job.state }}">{{ llm_panel.active_job.get_state_display }}</span> AI request in progress</a></p>
+  {% elif llm_panel.enabled %}
+    <form method="post" action="{% url 'review-ask-llm' task.id %}">{% csrf_token %}<button class="secondary" type="submit">Ask the AI server</button></form>
+  {% endif %}
+</section>

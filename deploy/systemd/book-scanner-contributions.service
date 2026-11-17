@@ -1,0 +1,18 @@
+# Daily contribution settlement (#27, docs/contributions.md). Started by
+# book-scanner-contributions.timer; a no-op while
+# BOOK_SCANNER_CONTRIBUTIONS_ENABLED=false. --enqueue hands the run to an RQ
+# worker (falls back to running here when no queue is configured).
+[Unit]
+Description=Book Scanner contribution settlement
+Wants=network-online.target
+After=network-online.target postgresql.service redis-server.service
+
+[Service]
+Type=oneshot
+User=book-scanner
+Group=book-scanner
+WorkingDirectory=/opt/book-scanner
+ExecStart=/opt/book-scanner/.venv/bin/python manage.py settle_contributions --enqueue
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

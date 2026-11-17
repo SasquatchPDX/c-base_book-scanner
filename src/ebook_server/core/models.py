@@ -12,6 +12,8 @@ from typing import Any, ClassVar, Final
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
@@ -546,6 +548,100 @@ class Identifier(models.Model):
         return f"{self.kind}:{self.value}"
 
 
+class BookSearchDocument(models.Model):
+    """Denormalised, rebuildable search/browse row for one Book (#28).
+
+    Never a source of truth: `ebook_server.core.search` rewrites it from the
+    Book, its authors, identifiers, genres, categories and COMPLETE variants,
+    and `manage.py rebuild_search_index` can recreate every row. Text columns
+    hold accent- and case-folded text, so trigram and keyset queries need no
+    per-row function call. `document` is a PostgreSQL `tsvector`; it stays
+    NULL on other databases, which use the plain `icontains` fallback.
+    """
+
+    book = models.OneToOneField(
+        Book,
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name="search_document",
+    )
+    document = SearchVectorField(null=True, blank=True)
+    title_sort = models.CharField(max_length=255, blank=True)
+    author_sort = models.CharField(max_length=255, blank=True)
+    author_text = models.TextField(blank=True)
+    language = models.CharField(max_length=32, blank=True)
+    publication_decade = models.SmallIntegerField(null=True, blank=True)
+    has_cover = models.BooleanField(default=False)
+    book_created_at = models.DateTimeField()
+    # SHA-256 of the weighted full-text input, so drift in text that only reaches
+    # the `tsvector` (description, publisher, identifiers) stays detectable.
+    content_digest = models.CharField(max_length=64, blank=True)
+    indexed_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["-book_created_at", "-book"],
+                name="booksearch_created_idx",
+            ),
+            models.Index(fields=["title_sort", "book"], name="booksearch_title_idx"),
+            models.Index(fields=["author_sort", "book"], name="booksearch_author_idx"),
+            models.Index(fields=["language", "book"], name="booksearch_language_idx"),
+            # PostgreSQL only; migration 0034 skips these on other databases.
+            GinIndex(fields=["document"], name="booksearch_document_gin"),
+            GinIndex(
+                fields=["title_sort"],
+                opclasses=["gin_trgm_ops"],
+                name="booksearch_title_trgm",
+            ),
+            GinIndex(
+                fields=["author_text"],
+                opclasses=["gin_trgm_ops"],
+                name="booksearch_author_trgm",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"search document for book {self.book_id}"
+
+
+class BookSearchFacet(models.Model):
+    """One facet value of a Book's search document (#28).
+
+    A narrow `(kind, value, book)` table instead of array columns: it is
+    B-tree indexed on every database, filters are exact equality on a
+    normalised value (no `UPPER(format)` misestimate), and facet counts are a
+    `GROUP BY value`. Genre, category and author facets store the related
+    row's id; format stores the lower-cased format code. Language and
+    publication decade are single-valued, so they are columns of the
+    document instead.
+    """
+
+    class Kind(models.TextChoices):
+        FORMAT = "format", "Format"
+        AUTHOR = "author", "Author"
+        GENRE = "genre", "Genre"
+        CATEGORY = "category", "Category"
+
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name="search_facets")
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    value = models.CharField(max_length=64)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["book", "kind", "value"],
+                name="uniq_booksearchfacet_book_kind_value",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["kind", "value", "book"], name="booksearchfacet_lookup_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.kind}={self.value}"
+
+
 class CoverImage(models.Model):
     """Stored front/back cover image per book."""
 
@@ -768,7 +864,7 @@ class ScanJob(models.Model):
 
 
 class ScanLog(models.Model):
-    """A scanner log (libreflip ``scan.log``) uploaded for a scan job (#7).
+    """A scanner log file uploaded for a scan job (#7), stored as ``scan-upload-<sha8>.log``.
 
     The upload request only stages the bytes and records the log as ``queued``; a
     worker (``ProcessingJob`` of type ``scan_log``) validates, hashes and stores it.
@@ -1094,6 +1190,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        LLM_IDENTIFICATION = "llm_identification", "LLM identification assist"
         COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
         SCAN_LOG = "scan_log", "Scanner log"
@@ -1641,6 +1738,87 @@ class ReviewTask(models.Model):
         return f"{source_id}:{self.task_type}:{self.state}"
 
 
+class LLMSuggestion(models.Model):
+    """Validated, structured output of one local-LLM identification request (#26).
+
+    Evidence only, never truth: the hints were used as provider search terms, and any
+    candidate they found still needs a reviewer. The evidence bundle itself (which may
+    contain book text) is not stored, only its SHA-256.
+    """
+
+    class Trigger(models.TextChoices):
+        AUTO_ZERO_CANDIDATES = "auto_zero_candidates", "Automatic: no candidates"
+        AUTO_LOW_SCORE = "auto_low_score", "Automatic: low score"
+        REVIEWER = "reviewer", "Reviewer request"
+
+    class Outcome(models.TextChoices):
+        HINTS_USED = "hints_used", "Hints found new candidates"
+        NO_NEW_CANDIDATES = "no_new_candidates", "No new candidates"
+        INVALID_OUTPUT = "invalid_output", "Invalid model output"
+        FAILED = "failed", "Failed"
+
+    import_job = models.ForeignKey(
+        ImportJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+        null=True,
+        blank=True,
+    )
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="llm_suggestions",
+    )
+    processing_job = models.ForeignKey(
+        ProcessingJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+    )
+    trigger = models.CharField(max_length=32, choices=Trigger.choices)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="llm_suggestions",
+    )
+    model = models.CharField(max_length=255, blank=True)
+    model_version = models.CharField(max_length=255, blank=True)
+    prompt_template_version = models.CharField(max_length=32, blank=True)
+    input_sha256 = models.CharField(max_length=64, blank=True)
+    output = models.JSONField(default=dict, blank=True)
+    grounding = models.JSONField(default=dict, blank=True)
+    outcome = models.CharField(max_length=32, choices=Outcome.choices)
+    new_candidate_count = models.PositiveIntegerField(default=0)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(import_job__isnull=False, scan_job__isnull=True)
+                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                ),
+                name="llm_suggestion_has_exactly_one_source",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        source_id = self.import_job_id or self.scan_job_id
+        return f"{source_id}:llm:{self.outcome}"
+
+
 def canonical_ldap_uid(uid: str) -> str:
     """Canonical form for a directory uid typed by a user (directories are case-insensitive)."""
     return uid.strip().casefold()
@@ -1682,3 +1860,222 @@ def get_or_create_profile(
         },
     )
     return profile
+
+
+# --- Contribution recognition (#27, docs/contributions.md) ------------------------------
+
+
+class ContributionKind(models.TextChoices):
+    REVIEW_RESOLVED = "review_resolved", "Review resolved"
+    REVIEW_UNIDENTIFIED = "review_unidentified", "Review marked unidentified"
+    SCAN_COMPLETED = "scan_completed", "Scan finished into the library"
+    CLAWBACK = "clawback", "Clawback"
+    ADMIN_ADJUSTMENT = "admin_adjustment", "Admin adjustment"
+
+
+class ContributionEvent(models.Model):
+    """Append-only ledger of contribution outcomes.
+
+    Emitters create PENDING rows next to the state transitions they describe; they do
+    not compute points. Only the settlement job (and the admin void action) moves a row
+    from PENDING to SETTLED or VOIDED and fills ``points``. A reversal found after
+    settlement never edits the row: it adds a negative CLAWBACK row that ``reverses`` it.
+    """
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SETTLED = "settled", "Settled"
+        VOIDED = "voided", "Voided"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="contribution_events",
+    )
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.PENDING)
+    points = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    weight_version = models.PositiveIntegerField(default=0)
+    own_upload = models.BooleanField(default=False)
+    # Idempotency key of the outcome, e.g. "review:<task>:<decided_at>"; one event per
+    # (user, kind, outcome) so retries and reprocessing never double-count.
+    outcome_key = models.CharField(max_length=200)
+    # Snapshot of the outcome when it happened; settlement compares the source rows
+    # against it to find reversals.
+    outcome = models.JSONField(default=dict, blank=True)
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    book = models.ForeignKey(
+        Book,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="contribution_events",
+    )
+    reverses = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reversals",
+    )
+    reason = models.CharField(max_length=255, blank=True)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    occurred_at = models.DateTimeField()
+    settle_after = models.DateTimeField()
+    settled_at = models.DateTimeField(null=True, blank=True)
+    voided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "kind", "outcome_key"],
+                name="uniq_contribution_event_outcome",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["state", "settle_after"]),
+            models.Index(fields=["user", "state", "occurred_at"]),
+            models.Index(fields=["kind", "state", "occurred_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.kind}:{self.state}:{self.points}"
+
+
+class ContributionWeight(models.Model):
+    """Admin-configurable points per outcome kind; every edit is a new version."""
+
+    version = models.PositiveIntegerField()
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    base_points = models.DecimalField(max_digits=7, decimal_places=2)
+    per_unit_points = models.DecimalField(max_digits=7, decimal_places=3, default=0)
+    cap = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    own_upload_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["version", "kind"],
+                name="uniq_contribution_weight_version_kind",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"v{self.version}:{self.kind}:{self.base_points}"
+
+
+class ContributorPreference(models.Model):
+    """Leaderboard consent and display handle; no row means "not on the board"."""
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="contributor_preference",
+    )
+    leaderboard_opt_in = models.BooleanField(default=False)
+    display_handle = models.CharField(max_length=40, blank=True)
+    opted_in_at = models.DateTimeField(null=True, blank=True)
+    excluded_from_leaderboard = models.BooleanField(default=False)
+    excluded_reason = models.CharField(max_length=255, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                Lower("display_handle"),
+                condition=models.Q(leaderboard_opt_in=True) & ~models.Q(display_handle=""),
+                name="uniq_contributor_handle_opted_in",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.display_handle}:{self.leaderboard_opt_in}"
+
+
+class ReviewDecisionCorrection(models.Model):
+    """A later finding that a resolved ReviewTask decision no longer stands."""
+
+    class Source(models.TextChoices):
+        REOPENED = "reopened", "Review reopened"
+        RE_RESOLVED = "re_resolved", "Resolved again"
+        BOOK_DELETED = "book_deleted", "Resolved book deleted"
+        BOOK_MERGED = "book_merged", "Resolved book merged away"
+        SPOT_CHECK = "spot_check", "Spot-check found it wrong"
+        ADMIN = "admin", "Admin flagged it wrong"
+
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.CASCADE,
+        related_name="decision_corrections",
+    )
+    found_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    source = models.CharField(max_length=16, choices=Source.choices)
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["review_task", "created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.review_task_id}:{self.source}"
+
+
+class ContributionMonthlyTotal(models.Model):
+    """Monthly aggregate kept after retention pruning removes the detailed events."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="contribution_monthly_totals",
+    )
+    month = models.DateField()
+    kind = models.CharField(max_length=32, choices=ContributionKind.choices)
+    points = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    event_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "month", "kind"],
+                name="uniq_contribution_monthly_total",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id}:{self.month}:{self.kind}:{self.points}"

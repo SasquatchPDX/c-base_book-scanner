@@ -15,6 +15,10 @@ from .models import (
     Book,
     BookGenre,
     Category,
+    ContributionEvent,
+    ContributionMonthlyTotal,
+    ContributionWeight,
+    ContributorPreference,
     CoverImage,
     FileVariant,
     Genre,
@@ -22,9 +26,11 @@ from .models import (
     Identifier,
     ImportGroup,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
+    ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
     ScanLog,
@@ -249,6 +255,25 @@ class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
         "processing_job",
         "error",
     )
+    actions = ("retry_failed_logs",)
+
+    @admin.action(description="Retry selected failed logs (staged upload kept)")
+    def retry_failed_logs(self, request: HttpRequest, queryset: QuerySet[ScanLog]) -> None:
+        from .scan_logs import ScanLogDispatchError, retry_failed_scan_log
+
+        requeued = 0
+        try:
+            for log in queryset.filter(state=ScanLog.State.FAILED):
+                if retry_failed_scan_log(log):
+                    requeued += 1
+        except ScanLogDispatchError as exc:
+            self.message_user(request, f"Queue unavailable: {exc}", messages.ERROR)
+            return
+        self.message_user(
+            request,
+            f"Queued {requeued} log(s) again; failed logs without a staged upload were skipped.",
+            messages.SUCCESS if requeued else messages.WARNING,
+        )
 
 
 @admin.register(ScanPage)
@@ -575,3 +600,66 @@ class ScanTodoAdmin(admin.ModelAdmin[ScanTodo]):
         "created_at",
     )
     list_filter = ("todo_type", "state")
+
+
+class _ReadOnlyLedgerAdmin(admin.ModelAdmin[Any]):
+    """The contribution ledger is append-only; changes go through /contributions/admin/."""
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+
+@admin.register(ContributionEvent)
+class ContributionEventAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "kind", "state", "points", "occurred_at", "settle_after")
+    list_filter = ("kind", "state")
+    search_fields = ("user__username", "outcome_key", "reason")
+
+
+@admin.register(ContributionWeight)
+class ContributionWeightAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("version", "kind", "base_points", "per_unit_points", "cap")
+
+
+@admin.register(ReviewDecisionCorrection)
+class ReviewDecisionCorrectionAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("review_task", "source", "found_by", "created_at")
+    list_filter = ("source",)
+
+
+@admin.register(ContributorPreference)
+class ContributorPreferenceAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "leaderboard_opt_in", "display_handle", "excluded_from_leaderboard")
+
+
+@admin.register(ContributionMonthlyTotal)
+class ContributionMonthlyTotalAdmin(_ReadOnlyLedgerAdmin):
+    list_display = ("user", "month", "kind", "points", "event_count")
+
+
+@admin.register(LLMSuggestion)
+class LLMSuggestionAdmin(admin.ModelAdmin[LLMSuggestion]):
+    """Read-only: suggestions are evidence written by the LLM job, never edited by hand."""
+
+    list_display = (
+        "created_at",
+        "import_job",
+        "trigger",
+        "outcome",
+        "model",
+        "new_candidate_count",
+    )
+    list_filter = ("trigger", "outcome", "model")
+    readonly_fields = tuple(field.name for field in LLMSuggestion._meta.fields)
+
+    def has_add_permission(self, request: Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: Any, obj: LLMSuggestion | None = None) -> bool:
+        return False

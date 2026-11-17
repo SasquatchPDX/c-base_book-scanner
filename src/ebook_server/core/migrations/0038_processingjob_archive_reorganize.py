@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0034_scan_logs"),
+        ("core", "0037_scan_logs"),
     ]
 
     operations = [
@@ -21,6 +21,7 @@ class Migration(migrations.Migration):
                     ("review_identification", "Review identification"),
                     ("scan_identification", "Scan identification"),
                     ("scan_finalization", "Scan finalization"),
+                    ("llm_identification", "LLM identification assist"),
                     ("combine_parts", "Combine multi-part work"),
                     ("reference_check", "Referenced file check"),
                     ("scan_log", "Scanner log"),

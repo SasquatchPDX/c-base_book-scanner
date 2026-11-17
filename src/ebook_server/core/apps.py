@@ -11,6 +11,11 @@ class CoreConfig(AppConfig):
     verbose_name = "Core"
 
     def ready(self) -> None:
-        from .book_opf import connect_signals
+        from . import (
+            book_opf,
+            checks,  # noqa: F401  (registers system checks)
+            search,
+        )
 
-        connect_signals()
+        search.connect_signals()
+        book_opf.connect_signals()

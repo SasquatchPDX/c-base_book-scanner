@@ -87,3 +87,12 @@ groups:
           summary: Book Scanner review backlog is high
           description: More than 50 review tasks have remained open or claimed for one day.
           runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-review-backlog
+      - alert: BookScannerLLMAssistFailing
+        expr: sum(ebook_server_llm_requests_recent{window="1h",outcome=~"failed|invalid_output"}) / sum(ebook_server_llm_requests_recent{window="1h"}) > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Most LLM identification requests are failing
+          description: More than half of the LLM identification requests in the last hour failed or returned invalid output; the AI server is probably down or its model changed.
+          runbook_url: https://github.com/SasquatchPDX/book_scanner/blob/master/docs/operations.md#book-scanner-llm-assist-failing
