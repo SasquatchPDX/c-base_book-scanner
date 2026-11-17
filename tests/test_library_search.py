@@ -21,14 +21,17 @@ from django.test import Client
 from django.utils import timezone
 
 from ebook_server.core import scan_pipeline, search
+from ebook_server.core.genres import assign_automatic
 from ebook_server.core.models import (
     Author,
     Book,
+    BookGenre,
     BookSearchDocument,
     BookSearchFacet,
     Category,
     FileVariant,
     Genre,
+    GenreAlias,
     Identifier,
     StorageLocation,
     get_or_create_profile,
@@ -427,3 +430,81 @@ def test_rebuild_and_verify_commands() -> None:
     assert _document(books[1]).title_sort == "rebuild 1"
     call_command("verify_search_index", stdout=out)
     assert "Search index is consistent." in out.getvalue()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_scan_invalidation_in_autocommit_drops_the_format() -> None:
+    """Outside a transaction `on_commit` runs at once; it must see the FAILED state."""
+    book = Book.objects.create(title="Rescanned")
+    variant = _variant(book, "pdf")
+    assert _facets(book, "format") == {"pdf"}
+    assert connection.get_autocommit()
+
+    scan_pipeline._invalidate_file_variants_and_descendants({variant.pk})
+
+    assert _facets(book, "format") == set()
+    assert _client().get("/library/books/", {"format": "pdf"}).json()["count"] == 0
+    assert search.verify_search_index(sample=100).ok
+
+
+@pytest.mark.django_db
+def test_verify_detects_drift_in_weighted_full_text_content() -> None:
+    books = [Book.objects.create(title=f"Digest {index}") for index in range(3)]
+    search.rebuild_search_index()
+    assert search.verify_search_index(sample=100).ok
+
+    # A bulk change sends no signal and touches only full-text (weight D) content.
+    Book.objects.filter(pk=books[1].pk).update(description="A brand new blurb")
+    report = search.verify_search_index(sample=100)
+    assert report.drifted_book_ids == [books[1].pk]
+    assert not report.ok
+
+    out = StringIO()
+    call_command("verify_search_index", "--fix", stdout=out)
+    assert "Reindexed 1 book(s)" in out.getvalue()
+    assert search.verify_search_index(sample=100).ok
+
+
+def test_content_digest_covers_every_weighted_column() -> None:
+    base = ("title", "author", "publisher", "description")
+    digests = {search.content_digest(base)}
+    for index in range(len(base)):
+        changed = list(base)
+        changed[index] += " changed"
+        digests.add(search.content_digest(changed))
+    # Moving text from one weight to another changes the digest too.
+    digests.add(search.content_digest(("title author", "", "publisher", "description")))
+    assert len(digests) == len(base) + 2
+
+
+@pytest.mark.django_db
+def test_book_genre_rows_written_directly_keep_the_index_current(
+    django_capture_on_commit_callbacks: OnCommit,
+) -> None:
+    with django_capture_on_commit_callbacks(execute=True):
+        book = Book.objects.create(title="Dune")
+        solarpunk = Genre.objects.create(name="Solarpunk utopias")
+        GenreAlias.objects.create(genre=solarpunk, alias="Solar-Punk")
+    assert _facets(book, "genre") == set()
+
+    # `assign_automatic` writes BookGenre rows directly: no m2m_changed.
+    with django_capture_on_commit_callbacks(execute=True):
+        added = assign_automatic(book, provider_subjects=["SolarPunk"], embedded_subjects=None)
+    assert added == [solarpunk]
+    assert _facets(book, "genre") == {str(solarpunk.pk)}
+    assert search.verify_search_index(sample=100).ok
+
+    client = _client()
+    # A genre alias selects its genre, as master's browse filter does (#50).
+    by_alias = client.get("/library/books/", {"genre": "solar punk"}).json()
+    assert [item["id"] for item in by_alias["items"]] == [book.pk]
+    assert client.get("/library/books/", {"genre": "utopia"}).json()["count"] == 1
+
+    with django_capture_on_commit_callbacks(execute=True):
+        BookGenre.objects.filter(book=book).delete()
+    assert _facets(book, "genre") == set()
+
+    with django_capture_on_commit_callbacks(execute=True):
+        BookGenre.objects.create(book=book, genre=solarpunk)
+    assert _facets(book, "genre") == {str(solarpunk.pk)}
+    assert search.verify_search_index(sample=100).ok

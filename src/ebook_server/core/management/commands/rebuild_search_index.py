@@ -11,7 +11,7 @@ from ebook_server.core import search
 class Command(BaseCommand):
     help = (
         "Rebuild the library search rows (BookSearchDocument/BookSearchFacet) for every "
-        "book. Run once after migration 0023 and nightly; safe to repeat."
+        "book. Run once after migration 0031 and nightly; safe to repeat."
     )
 
     def handle(self, *args: Any, **options: Any) -> None:

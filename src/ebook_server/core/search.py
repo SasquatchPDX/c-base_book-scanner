@@ -12,7 +12,7 @@ Three parts:
   (Meilisearch) could replace PostgreSQL later without touching the views:
   `PostgresSearchBackend` uses full-text search (`simple` configuration over
   accent- and case-folded text), `pg_trgm` substring and fuzzy matching, and
-  the B-tree/GIN indexes of migration 0023. `DatabaseFallbackSearchBackend`
+  the B-tree/GIN indexes of migration 0031. `DatabaseFallbackSearchBackend`
   is the phase 0 `icontains` query over `Book`, used on SQLite (development and
   unit tests) and on PostgreSQL until the index has been built.
 - **Keyset pagination.** Browse sorts (newest, oldest, title A-Z/Z-A) page with
@@ -24,6 +24,8 @@ Query text is never logged.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import threading
 import unicodedata
@@ -41,9 +43,11 @@ from django.db.models import Count, F, Q, QuerySet
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 
+from . import genres
 from .models import (
     Author,
     Book,
+    BookGenre,
     BookSearchDocument,
     BookSearchFacet,
     Category,
@@ -221,7 +225,19 @@ def build_document(source: BookSource) -> _BuiltDocument:
         ),
         fold(source.description[:DESCRIPTION_INDEX_CHARS]),
     )
+    document.content_digest = content_digest(weighted_text)
     return _BuiltDocument(document=document, facets=facets, weighted_text=weighted_text)
+
+
+def content_digest(weighted_text: Sequence[str]) -> str:
+    """SHA-256 of the canonical weighted FTS text of one book.
+
+    The `tsvector` exists only on PostgreSQL and loses the input text, so the
+    digest is what lets `verify_search_index` see drift in the full-text content
+    (a changed description, publisher or identifier) on every database.
+    """
+    canonical = json.dumps(list(weighted_text), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _book_sources(book_ids: Sequence[int]) -> list[BookSource]:
@@ -287,6 +303,7 @@ _DOCUMENT_UPDATE_FIELDS: Final = [
     "publication_decade",
     "has_cover",
     "book_created_at",
+    "content_digest",
     "indexed_at",
 ]
 
@@ -354,13 +371,23 @@ def _sync_facets(book_ids: Sequence[int], wanted: Sequence[BookSearchFacet]) -> 
         BookSearchFacet.objects.bulk_create(missing)
 
 
+# The weighted `tsvector` of one book from its four weighted text columns. Used by
+# the upsert and, to detect vector drift, by `verify_search_index`.
+_VECTOR_SQL: Final = """
+    setweight(to_tsvector('simple', src.a), 'A')
+    || setweight(to_tsvector('simple', src.b), 'B')
+    || setweight(to_tsvector('simple', src.c), 'C')
+    || setweight(to_tsvector('simple', src.d), 'D')
+"""
+
+
 def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
     """Insert or update a batch of rows, weighted `tsvector` included, in one statement.
 
     Computing the vector in the same statement writes each row (and its GIN
     entries) once instead of inserting it and then updating the vector.
     """
-    columns: list[list[Any]] = [[] for _ in range(12)]
+    columns: list[list[Any]] = [[] for _ in range(13)]
     for item in built:
         document = item.document
         values = (
@@ -373,29 +400,26 @@ def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
             document.publication_decade,
             document.has_cover,
             document.book_created_at,
+            document.content_digest,
         )
         for column, value in zip(columns, values, strict=True):
             column.append(value)
     with connection.cursor() as cursor:
         cursor.execute(
-            """
+            f"""
             INSERT INTO core_booksearchdocument (
                 book_id, document, title_sort, author_sort, author_text, language,
-                publication_decade, has_cover, book_created_at, indexed_at
+                publication_decade, has_cover, book_created_at, content_digest, indexed_at
             )
-            SELECT src.book_id,
-                   setweight(to_tsvector('simple', src.a), 'A')
-                || setweight(to_tsvector('simple', src.b), 'B')
-                || setweight(to_tsvector('simple', src.c), 'C')
-                || setweight(to_tsvector('simple', src.d), 'D'),
+            SELECT src.book_id, {_VECTOR_SQL},
                    src.title_sort, src.author_sort, src.author_text, src.language,
-                   src.decade, src.has_cover, src.created_at, now()
+                   src.decade, src.has_cover, src.created_at, src.digest, now()
               FROM unnest(
                    %s::bigint[], %s::text[], %s::text[], %s::text[], %s::text[],
                    %s::text[], %s::text[], %s::text[], %s::text[],
-                   %s::smallint[], %s::boolean[], %s::timestamptz[]
+                   %s::smallint[], %s::boolean[], %s::timestamptz[], %s::text[]
                    ) AS src(book_id, a, b, c, d, title_sort, author_sort, author_text,
-                            language, decade, has_cover, created_at)
+                            language, decade, has_cover, created_at, digest)
             ON CONFLICT (book_id) DO UPDATE SET
                    document = EXCLUDED.document,
                    title_sort = EXCLUDED.title_sort,
@@ -405,6 +429,7 @@ def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
                    publication_decade = EXCLUDED.publication_decade,
                    has_cover = EXCLUDED.has_cover,
                    book_created_at = EXCLUDED.book_created_at,
+                   content_digest = EXCLUDED.content_digest,
                    indexed_at = EXCLUDED.indexed_at
              -- Rewrite (and re-index) only rows whose content changed; `indexed_at`
              -- is therefore the time of the last change.
@@ -412,11 +437,12 @@ def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
                     core_booksearchdocument.author_sort, core_booksearchdocument.author_text,
                     core_booksearchdocument.language,
                     core_booksearchdocument.publication_decade,
-                    core_booksearchdocument.has_cover, core_booksearchdocument.book_created_at)
+                    core_booksearchdocument.has_cover, core_booksearchdocument.book_created_at,
+                    core_booksearchdocument.content_digest)
                    IS DISTINCT FROM
                    (EXCLUDED.document, EXCLUDED.title_sort, EXCLUDED.author_sort,
                     EXCLUDED.author_text, EXCLUDED.language, EXCLUDED.publication_decade,
-                    EXCLUDED.has_cover, EXCLUDED.book_created_at)
+                    EXCLUDED.has_cover, EXCLUDED.book_created_at, EXCLUDED.content_digest)
             """,
             columns,
         )
@@ -464,15 +490,46 @@ def _comparable(document: BookSearchDocument, facets: Iterable[BookSearchFacet])
         document.publication_decade,
         document.has_cover,
         document.book_created_at,
+        document.content_digest,
         sorted((facet.kind, facet.value) for facet in facets),
     )
+
+
+def _vector_drift(built: Sequence[_BuiltDocument]) -> set[int]:
+    """Books whose stored PostgreSQL `tsvector` differs from a freshly computed one.
+
+    Catches a vector written by other means (a manual repair, a changed text
+    search configuration) even when the stored digest still matches.
+    """
+    if connection.vendor != "postgresql" or not built:
+        return set()
+    columns: list[list[Any]] = [[] for _ in range(5)]
+    for item in built:
+        for column, value in zip(
+            columns, (item.document.book_id, *item.weighted_text), strict=True
+        ):
+            column.append(value)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT src.book_id
+              FROM unnest(%s::bigint[], %s::text[], %s::text[], %s::text[], %s::text[])
+                   AS src(book_id, a, b, c, d)
+              JOIN core_booksearchdocument stored ON stored.book_id = src.book_id
+             WHERE stored.document IS DISTINCT FROM ({_VECTOR_SQL})
+            """,
+            columns,
+        )
+        return {row[0] for row in cursor.fetchall()}
 
 
 def verify_search_index(*, sample: int = 500) -> IndexReport:
     """Compare the search rows with their books: missing, orphaned and drifted rows.
 
     Drift is checked on a random sample of `sample` books (all of them when the
-    library is smaller) by rebuilding their rows in memory.
+    library is smaller) by rebuilding their rows in memory and comparing every
+    column, the facets and the digest of the weighted full-text content; on
+    PostgreSQL the stored `tsvector` is also compared with a freshly computed one.
     """
     missing = list(
         Book.objects.filter(search_document__isnull=True)
@@ -487,14 +544,16 @@ def verify_search_index(*, sample: int = 500) -> IndexReport:
     stored_facets: dict[int, list[BookSearchFacet]] = {}
     for facet in BookSearchFacet.objects.filter(book_id__in=sample_ids):
         stored_facets.setdefault(facet.book_id, []).append(facet)
-    drifted = []
-    for source in _book_sources(sample_ids):
-        built = build_document(source)
-        current = stored.get(source.book_id)
-        if current is None or _comparable(
-            current, stored_facets.get(source.book_id, [])
-        ) != _comparable(built.document, built.facets):
-            drifted.append(source.book_id)
+    drifted: set[int] = set()
+    rebuilt = [build_document(source) for source in _book_sources(sample_ids)]
+    for built in rebuilt:
+        book_id = built.document.book_id
+        current = stored.get(book_id)
+        if current is None or _comparable(current, stored_facets.get(book_id, [])) != _comparable(
+            built.document, built.facets
+        ):
+            drifted.add(book_id)
+    drifted |= _vector_drift(rebuilt)
     return IndexReport(
         missing_book_ids=missing,
         orphan_count=orphan_count,
@@ -513,7 +572,7 @@ def search_index_ready() -> bool:
     """Whether every Book has a search row, so the PostgreSQL backend sees them all.
 
     Cached for a few minutes; the fallback answers until `rebuild_search_index`
-    has run once after migration 0023.
+    has run once after migration 0031.
     """
     ready = cache.get(_READY_CACHE_KEY)
     if ready is None:
@@ -539,7 +598,8 @@ def schedule_reindex(book_ids: Iterable[int | None]) -> None:
     """Index these books once the current transaction commits (immediately outside one).
 
     Calls within one transaction coalesce: a book saved, given three authors and
-    two variants in one import is indexed once.
+    two variants in one import is indexed once. Call it *after* the write it
+    reflects: in autocommit mode `on_commit` runs the reindex right away.
     """
     ids = {int(book_id) for book_id in book_ids if book_id}
     if not ids:
@@ -623,7 +683,9 @@ def connect_signals() -> None:
             sender=entity,
             dispatch_uid=f"{uid}-delete-{entity.__name__}",
         )
-    for child in (FileVariant, Identifier, CoverImage):
+    # `BookGenre` is the explicit genre link model (#50): `genres.assign_*` and the
+    # admin inline create, re-source and delete its rows directly, without m2m_changed.
+    for child in (FileVariant, Identifier, CoverImage, BookGenre):
         post_save.connect(
             _on_book_child_changed, sender=child, dispatch_uid=f"{uid}-save-{child.__name__}"
         )
@@ -830,6 +892,21 @@ def _book_ids_with_author(name: str) -> QuerySet[Any]:
     return Book.authors.through.objects.filter(author__full_name__icontains=name).values("book_id")
 
 
+def _genre_filter_ids(text: str) -> QuerySet[Any]:
+    """Ids of the genres a `genre` filter selects (#50), as a lazy subquery.
+
+    A genre name or alias ("sci-fi") selects exactly that genre; anything else is
+    a substring match on genre names, as before.
+    """
+    match = genres.genre_from_filter(text)
+    selected = (
+        Genre.objects.filter(pk=match.pk)
+        if match is not None
+        else Genre.objects.filter(name__icontains=text)
+    )
+    return selected.values_list("pk", flat=True)
+
+
 def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
     """The phase 0 `icontains` filters over `Book` (#28): no joins, no DISTINCT.
 
@@ -858,9 +935,9 @@ def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
         )
     if request.genre:
         books = books.filter(
-            pk__in=Book.genres.through.objects.filter(
-                genre__name__icontains=request.genre,
-            ).values("book_id"),
+            pk__in=BookGenre.objects.filter(genre_id__in=_genre_filter_ids(request.genre)).values(
+                "book_id"
+            ),
         )
     if request.language:
         books = books.filter(language__iexact=request.language)
@@ -1000,16 +1077,23 @@ class PostgresSearchBackend:
             documents = documents.filter(title_sort__contains=fold(request.title))
         if request.author:
             documents = documents.filter(author_text__contains=fold(request.author))
-        for kind, model, text in (
-            (BookSearchFacet.Kind.CATEGORY, Category, request.category),
-            (BookSearchFacet.Kind.GENRE, Genre, request.genre),
-        ):
-            if text:
-                # Taxonomy tables are small; resolve the names to ids first.
-                ids = model.objects.filter(name__icontains=text).values_list("pk", flat=True)
-                documents = documents.filter(
-                    book_id__in=_facet_book_ids(kind, (str(pk) for pk in ids))
+        # Taxonomy tables are small; resolve the names to ids first.
+        if request.category:
+            category_ids = Category.objects.filter(name__icontains=request.category).values_list(
+                "pk", flat=True
+            )
+            documents = documents.filter(
+                book_id__in=_facet_book_ids(
+                    BookSearchFacet.Kind.CATEGORY, (str(pk) for pk in category_ids)
                 )
+            )
+        if request.genre:
+            documents = documents.filter(
+                book_id__in=_facet_book_ids(
+                    BookSearchFacet.Kind.GENRE,
+                    (str(pk) for pk in _genre_filter_ids(request.genre)),
+                )
+            )
         if request.language:
             documents = documents.filter(language=fold(request.language))
         if request.book_format:
