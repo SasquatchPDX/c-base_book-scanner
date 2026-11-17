@@ -56,6 +56,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Evidence key for title/author hints read from the first lines of plain-text books
+# (see core.text_header); written by intake, read when building signals.
+TEXT_HEADER_EVIDENCE_KEY = "text_header"
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -242,6 +245,45 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+def _header_strings(value: Any) -> list[str]:
+    return [item.strip() for item in _as_str_list(value) if item.strip()]
+
+
+def _apply_text_header_hints(
+    header: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge hints read from a plain-text book's first lines (see ``core.text_header``).
+
+    Precedence for authors: explicit header rules (``Author:``, Gutenberg header,
+    ``by ...``, copyright line) replace the filename's "A - B" split guesses; heuristic
+    name-like lines are only appended after the other hints, so they never become the
+    author sent to providers ahead of them. Hints from an admin-configured source such
+    as a folder layout must likewise rank ahead of anything guessed from the text.
+    """
+    title_hints = list(title_hints)
+    author_hints = list(author_hints)
+    header_title = header.get("title")
+    if isinstance(header_title, str) and header_title.strip():
+        header_title = header_title.strip()
+        title_hints.insert(1 if title_hints else 0, header_title)
+        # A filename part the text names as the title is not an author.
+        author_hints = [
+            hint for hint in author_hints if _title_match_score(hint, header_title) < 0.95
+        ]
+    explicit_authors = _header_strings(header.get("authors"))
+    if explicit_authors:
+        return title_hints, explicit_authors
+    author_hints = [
+        hint for hint in author_hints if normalize_text(hint) not in {"unknown", "anonymous"}
+    ]
+    for likely in _header_strings(header.get("likely_authors")):
+        if not any(_author_name_similarity(likely, known) for known in author_hints):
+            author_hints.append(likely)
+    return title_hints, author_hints
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -257,6 +299,9 @@ def build_identification_input(
         title_hints = filename_title_hints
 
     author_hints = filename_author_hints
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    if isinstance(header, dict):
+        title_hints, author_hints = _apply_text_header_hints(header, title_hints, author_hints)
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:

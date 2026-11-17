@@ -51,6 +51,7 @@ from .models import (
     StorageLocation,
 )
 from .storage_registry import backend_for_location
+from .text_header import parse_text_header
 
 logger = structlog.get_logger(__name__)
 
@@ -613,12 +614,18 @@ def extract_metadata(
 
 def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     payload = _read_metadata_sample(Path(file_path))
-    _text, encoding = _decode_text_sample(payload)
-    return {
+    text, encoding = _decode_text_sample(payload)
+    metadata: dict[str, Any] = {
         "title": Path(original_filename).stem,
         "raw_metadata": {"encoding": encoding},
         "container_type": "txt",
     }
+    # Plain text has no metadata container; its first lines often name title/author.
+    # Only the extracted hints and the rules that fired are kept, never the lines.
+    header = parse_text_header(text, Path(original_filename).stem)
+    if header is not None:
+        metadata[identification.TEXT_HEADER_EVIDENCE_KEY] = header
+    return metadata
 
 
 def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
