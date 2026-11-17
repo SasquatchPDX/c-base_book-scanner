@@ -217,28 +217,294 @@ def normalize_text(value: str | None) -> str:
     return " ".join(value.lower().strip().split())
 
 
+# --- Person-name heuristics (#15) -------------------------------------------------------
+# Shared by every signal source that has to tell a person's name apart from a title
+# (filename parsing below, TXT header hints, ...). Keep them in this one place so the word
+# lists cannot drift between callers.
+
+_INITIALS_TOKEN = re.compile(r"^(?:[A-Z]\.?){1,3}$")
+_CAPITALISED_TOKEN = re.compile(r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*\.?$")
+# An inner capital after a lowercase letter, except in "McNab", "MacDonald", "DeWitt",
+# "LeGuin", "VanDyke", "O'Brien"-style surnames.
+_CAMEL_CASE_WORD = re.compile(r"^(?!Mc|Mac|De|Di|Da|La|Le|Van|Von).*[a-z][A-Z]")
+# Lowercase particles inside a name: "Ludwig van Beethoven", "Gabriel de la Cruz".
+_NAME_PARTICLES = frozenset(
+    {"von", "van", "de", "da", "di", "du", "la", "le", "del", "della", "zu", "y", "ter", "ten"},
+)
+# "der"/"den" count as particles only straight after von/van/de ("Johannes van der Waals");
+# anywhere else they are far more likely German title words ("Insel der Freibeuter").
+_COMPOUND_PARTICLES = frozenset({"der", "den"})
+_COMPOUND_PARTICLE_LEADS = frozenset({"von", "van", "de"})
+# Words that (almost) never occur in a person's name but are common in titles.
+_NOT_NAME_WORDS = frozenset(
+    {
+        # English function words
+        *("the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "for", "with", "by"),
+        *("from", "into", "is", "are", "my", "your", "his", "her", "its", "our", "their"),
+        *("this", "that", "not", "no", "than", "as", "about", "after", "before", "over"),
+        *("under", "without", "all", "so", "if", "when", "who", "what", "how", "why"),
+        # German function words
+        *("der", "die", "das", "des", "dem", "den", "ein", "eine", "einer", "und", "oder"),
+        *("im", "am", "auf", "mit", "aus", "zum", "zur", "vom", "ohne"),
+        # placeholders and bibliographic words
+        *("unknown", "anonymous", "various", "unbekannt", "volume", "vol", "book", "band"),
+        *("bd", "part", "teil", "series", "edition", "stories", "tales", "saga"),
+        *("chronicles", "novel", "novella", "roman", "anthology", "collection", "omnibus"),
+        *("guide", "handbook", "introduction", "manual"),
+    },
+)
+_PLACEHOLDER_AUTHORS = frozenset(
+    {"unknown", "anonymous", "anon", "various", "unbekannt", "n/a", "na", "none"},
+)
+_TITLE_ARTICLES = frozenset({"the", "a", "an", "der", "die", "das"})
+_AUTHOR_LIST_SEPARATOR = re.compile(r"\s*(?:&|;|\+|\band\b|\bund\b)\s*", re.IGNORECASE)
+
+
+def looks_like_person_name(value: str) -> bool:
+    """True when ``value`` reads as one person's name in "First [Middle] Last" order.
+
+    Two to five tokens, each capitalised, an initial ("A.", "H.P.", "T"), or a lowercase
+    particle inside the name ("van"); no digits and no title/function words. This is
+    shape-based, so short title-case titles ("Pet Sematary") match too: callers must
+    treat a match as evidence, never as proof.
+    """
+    tokens = value.split()
+    if not 2 <= len(tokens) <= 5 or any(ch.isdigit() for ch in value):
+        return False
+    shouting = value.isupper()  # "HARRY HARRISON": all-caps tokens are fine here
+    has_name_word = False
+    for index, token in enumerate(tokens):
+        if _INITIALS_TOKEN.match(token):
+            continue
+        if not shouting and (token.isupper() or _CAMEL_CASE_WORD.search(token)):
+            return False  # acronyms and product names: "LDAP", "MATLAB", "MathWorks"
+        bare = token.lower().rstrip(".")
+        if token.islower() and 0 < index < len(tokens) - 1:
+            if bare in _NAME_PARTICLES or (
+                bare in _COMPOUND_PARTICLES and tokens[index - 1] in _COMPOUND_PARTICLE_LEADS
+            ):
+                continue
+        if bare in _NOT_NAME_WORDS or not _CAPITALISED_TOKEN.match(token):
+            return False
+        has_name_word = True
+    return has_name_word
+
+
+def invert_last_first_name(value: str) -> str | None:
+    """ "Corey, James S. A." -> "James S. A. Corey" when it reads as a person's name.
+
+    Returns ``None`` for anything else, including the library-sort title form
+    "Hobbit, The" and comma titles such as "Python Development, Second Edit".
+    """
+    if value.count(",") != 1:
+        return None
+    last, first = (part.strip() for part in value.split(","))
+    if not last or not first or first.lower() in _TITLE_ARTICLES:
+        return None
+    # A surname is one or two words plus particles ("Le Guin", "van Vogt", "Carre").
+    surname_words = [t for t in last.split() if t.lower() not in _NAME_PARTICLES]
+    if len(surname_words) > 2:
+        return None
+    candidate = f"{first} {last}"
+    return candidate if looks_like_person_name(candidate) else None
+
+
+def split_author_list(value: str) -> list[str] | None:
+    """ "David Weber & Linda Evans" / "Cory Doctorow;Charles Stross" -> list of names.
+
+    Each part may be "First Last" or "Last, First" (returned as "First Last"). Returns
+    ``None`` unless every part reads as a person's name.
+    """
+    names: list[str] = []
+    for raw_part in _AUTHOR_LIST_SEPARATOR.split(value):
+        part = raw_part.strip()
+        if not part:
+            continue
+        inverted = invert_last_first_name(part)
+        if inverted:
+            names.append(inverted)
+        elif looks_like_person_name(part):
+            names.append(part)
+        else:
+            return None
+    return names or None
+
+
+def is_placeholder_author(value: str) -> bool:
+    """ "Unknown", "Anonymous", ...: an explicit "no author" marker, not a name."""
+    return value.strip().lower().rstrip(".") in _PLACEHOLDER_AUTHORS
+
+
+# Lopsided separators ("Asimov- Foundation", "Foundation -Asimov") split too; a hyphen
+# inside a word ("Mother-Not", "Priest-Kings of Gor") never does.
+_FILENAME_SEPARATOR = re.compile(r"\s+-+\s*|\s*-+\s+|--+")
+# Calibre writes ":" as "_" ("Rabenseelen_ Roman") and the "." of a trailing initial as
+# "_" ("Lovecraft, H.P_").
+_UNDERSCORE_INITIAL = re.compile(r"(?<=\b[A-Za-z])_(?=\s|$)")
+_UNDERSCORE_COLON = re.compile(r"(?<=\w)_(?=\s)")
+# "Title, The" -> "The Title" (library sorting convention).
+_INVERTED_ARTICLE = re.compile(r"^(.+?),\s*(The|A|An|Der|Die|Das)$", re.IGNORECASE)
+_TRAILING_ANNOTATION = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
+_NUMERIC_SEGMENT = re.compile(r"^[\d\s.#]+$")
+_BY_PREFIX = re.compile(r"^by\s+", re.IGNORECASE)
+
+
+def _normalize_filename_stem(stem: str) -> str:
+    value = _UNDERSCORE_INITIAL.sub(".", stem)
+    value = _UNDERSCORE_COLON.sub(":", value)
+    return " ".join(value.replace("_", " ").split())
+
+
+def _title_variants(title: str) -> list[str]:
+    """Cheap, safe normalisations of one title guess, as extra hints (never a replacement)."""
+    variants = [title]
+    stripped = _TRAILING_ANNOTATION.sub("", title).strip()
+    if stripped:
+        variants.append(stripped)
+    for value in list(variants):
+        inverted = _INVERTED_ARTICLE.match(value)
+        if inverted:
+            variants.append(f"{inverted.group(2)} {inverted.group(1)}".strip())
+    main_title = title.split(": ", 1)[0].strip()
+    if main_title:
+        variants.append(main_title)
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def _titles_for(title_segments: list[str]) -> list[str]:
+    """Primary title, then the fuller fallback, for the segments left beside the author.
+
+    "Series 03 - Title" puts the title last; the series/volume prefix is only kept as a
+    fallback, since searching with it attached can make a provider return nothing.
+    """
+    if len(title_segments) == 1:
+        return title_segments
+    named = [s for s in title_segments if not _NUMERIC_SEGMENT.match(s)]
+    primary = named[-1] if named else title_segments[-1]
+    return [primary, " - ".join(title_segments)]
+
+
+def _same_title(left: str, right: str) -> bool:
+    def strip(value: str) -> str:
+        return normalize_text(_TRAILING_ANNOTATION.sub("", value))
+
+    return strip(left) == strip(right)
+
+
+# How strongly one end of a filename split reads as the author.
+_END_NOT_A_NAME = 0
+# A single word could be a bare surname ("Asimov - Foundation"), and "Series 2" could
+# be the series prefix of a name-shaped title ("Ender's Saga 1 - Ender's Game"): neither
+# is a name, but neither rules out the other end being a title.
+_END_UNCERTAIN = 1
+_END_NAME_SHAPED = 2
+_END_LAST_FIRST = 3
+_SINGLE_WORD = re.compile(r"^[^\W\d_][\w'’.\-]*$")
+_SERIES_NUMBER_SUFFIX = re.compile(r"\s(?:\d+|[IVX]+)$")
+_TRAILING_NUMBER = re.compile(r"[\s\d.#]+$")
+
+
+def _author_end(segment: str) -> tuple[int, list[str]]:
+    """Classify one end of a split and return the author name(s) it would provide.
+
+    A plain "A B and C D" list counts as name-shaped, not stronger: "Advanced
+    Mathematics and Mechanics Applications" splits into two name-shaped halves just as
+    well as two authors do.
+    """
+    segment = _TRAILING_ANNOTATION.sub("", segment).strip()  # "Dumas, Alexandre (d.A.)"
+    segment = _BY_PREFIX.sub("", segment)  # "By Cory Doctorow"
+    names = split_author_list(segment)
+    if names:
+        parts = (part.strip() for part in _AUTHOR_LIST_SEPARATOR.split(segment))
+        if any(invert_last_first_name(part) for part in parts if part):
+            return _END_LAST_FIRST, names
+        return _END_NAME_SHAPED, names
+    if _SINGLE_WORD.match(segment) or _SERIES_NUMBER_SUFFIX.search(segment):
+        return _END_UNCERTAIN, []
+    return _END_NOT_A_NAME, []
+
+
+def _ambiguous_author_hint(segment: str) -> str | None:
+    """One end of an ambiguous split, cleaned up for use as a (possible) author hint."""
+    cleaned = _TRAILING_ANNOTATION.sub("", segment).strip()
+    cleaned = _TRAILING_NUMBER.sub("", cleaned).strip()  # "Henning Mankell_2279"
+    if not cleaned or any(ch.isdigit() for ch in cleaned):
+        return None
+    return cleaned
+
+
+def _commits(author_end: int, other_end: int) -> bool:
+    """Whether one end is clearly enough the author to drop the other orientation."""
+    if author_end == _END_LAST_FIRST:
+        return other_end < _END_LAST_FIRST
+    return author_end == _END_NAME_SHAPED and other_end == _END_NOT_A_NAME
+
+
 def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
-    """Return title and author candidates from filename patterns."""
+    """Return title and author candidates from filename patterns.
+
+    "Title - Author" and "Author - Title" are both common, so the two ends of a split
+    filename are compared:
+
+    * "Title - Unknown" / "Unknown - Title": no author; the rest is the title.
+    * Exactly one end in "Last, First" form - or, failing that, one end name-shaped
+      and the other plainly not a name: commit to that orientation. The author hints
+      are that name (each name, for a co-author list) and nothing from the title side.
+    * Otherwise - both ends name-shaped ("Stephen King - Pet Sematary"), neither
+      ("Asimov - Foundation", "tolkien - the hobbit"), or the other end a single word
+      (maybe a bare surname) or a "Series 2" prefix: keep *both* orientations as hints,
+      "Title - Author" first since it is the more common convention. Author scoring
+      takes the best-matching hint, so the wrong orientation costs nothing.
+
+    Only the outermost segments can be an author. For "Series 03 - Title - Author" the
+    series/volume prefix is dropped from the primary title and kept as a fallback hint.
+    Library sort titles ("Title, The") and Calibre's "_" for ":" are also undone.
+    """
     stem = Path(raw_filename).stem
     if not stem:
         return [], []
+    normalized = _normalize_filename_stem(stem)
+    if not normalized:
+        return [], []
 
-    normalized = stem.replace("_", " ")
-    title_hints = [normalized]
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(normalized)]
+    segments = [s for s in segments if s.strip("-")]
+    title_guesses: list[str] = []
     author_hints: list[str] = []
 
-    for sep in [" - ", " -", "- ", "--"]:
-        if sep in normalized:
-            left, right = normalized.split(sep, 1)
-            left = left.strip()
-            right = right.strip()
-            if left and right:
-                title_hints.extend([left, right])
-                author_hints.extend([left, right])
-            break
+    if len(segments) >= 2:
+        first, last = segments[0], segments[-1]
+        if is_placeholder_author(last):
+            title_guesses = _titles_for(segments[:-1])
+        elif is_placeholder_author(first):
+            title_guesses = _titles_for(segments[1:])
+        elif len(segments) == 2 and _same_title(first, last):
+            title_guesses = [first, last]  # "Die Kandidaten - Die Kandidaten"
+        else:
+            last_strength, last_names = _author_end(last)
+            first_strength, first_names = _author_end(first)
+            if _commits(last_strength, first_strength):
+                author_hints = last_names
+                title_guesses = _titles_for(segments[:-1])
+            elif _commits(first_strength, last_strength):
+                author_hints = first_names
+                title_guesses = _titles_for(segments[1:])
+            else:
+                author_last_titles = _titles_for(segments[:-1])
+                author_first_titles = _titles_for(segments[1:])
+                title_guesses = [author_last_titles[0], author_first_titles[0]]
+                title_guesses += author_last_titles[1:] + author_first_titles[1:]
+                for names, end in ((last_names, last), (first_names, first)):
+                    hint = _ambiguous_author_hint(end)
+                    author_hints.extend(names or ([hint] if hint else []))
 
-    return list(dict.fromkeys([x for x in title_hints if x])), list(
-        dict.fromkeys([x for x in author_hints if x]),
+    title_hints: list[str] = []
+    for guess in [*title_guesses, normalized]:
+        title_hints.extend(_title_variants(guess))
+
+    return (
+        list(dict.fromkeys(h for h in title_hints if h)),
+        list(dict.fromkeys(h for h in author_hints if h)),
     )
 
 
@@ -251,7 +517,13 @@ def build_identification_input(
     filename_title_hints, filename_author_hints = parse_filename_signals(original_filename)
 
     metadata_title = extracted_metadata.get("title")
-    if isinstance(metadata_title, str) and normalize_text(metadata_title):
+    # Format extractors with nothing real to say fall back to the raw filename stem as
+    # "title" (see intake.extract_metadata). That is no better than the parsed filename
+    # hints above, so it must not jump ahead of them.
+    is_stem_fallback = isinstance(metadata_title, str) and normalize_text(
+        metadata_title,
+    ) == normalize_text(Path(original_filename).stem)
+    if isinstance(metadata_title, str) and normalize_text(metadata_title) and not is_stem_fallback:
         title_hints = [metadata_title] + filename_title_hints
     else:
         title_hints = filename_title_hints
@@ -700,16 +972,20 @@ def _author_name_similarity(left: str, right: str) -> float:
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:
+    """Best similarity between any author hint and any candidate author.
+
+    Author hints are alternatives, not a list that must all match: an ambiguous
+    "Stephen King - Pet Sematary" filename yields both halves as hints (#15), and only
+    one of them can be the author. Averaging over hints would halve the score of the
+    right candidate merely because the filename did not say which half is which.
+    """
     if not left or not right:
         return 0.0
-    left_names = list(dict.fromkeys(normalize_text(author) for author in left))
-    right_names = list(dict.fromkeys(normalize_text(author) for author in right))
-    if not left_names:
+    left_names = [name for name in dict.fromkeys(normalize_text(a) for a in left) if name]
+    right_names = [name for name in dict.fromkeys(normalize_text(a) for a in right) if name]
+    if not left_names or not right_names:
         return 0.0
-    total = sum(
-        max(_author_name_similarity(name, other) for other in right_names) for name in left_names
-    )
-    return total / len(left_names)
+    return max(_author_name_similarity(name, other) for name in left_names for other in right_names)
 
 
 def _apply_scoring(
