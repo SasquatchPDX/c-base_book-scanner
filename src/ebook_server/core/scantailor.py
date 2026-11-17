@@ -411,8 +411,9 @@ def invalidate_downstream_states(
         query |= Q(scan_job=page.scan_job, scan_page=page, stage=stage)
     for state in ScanTailorStageState.objects.filter(query):
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def mark_state_stale(
@@ -424,8 +425,9 @@ def mark_state_stale(
     states = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     for state in states:
         state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.last_error = reason
-        state.save(update_fields=["status", "last_error", "updated_at"])
+        state.invalidated_reason = reason
+        state.last_error = ""
+        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -519,7 +521,13 @@ def _load_image(path: Path) -> Image.Image:
             image = _normalise_image(oriented)
             if image is opened:
                 image = opened.copy()
-    except (OSError, UnidentifiedImageError, ValueError, SyntaxError) as exc:
+    except (
+        OSError,
+        UnidentifiedImageError,
+        ValueError,
+        SyntaxError,
+        Image.DecompressionBombError,
+    ) as exc:
         raise ImageLoadError(f"cannot read image {path.name}: {exc}") from exc
     image.info["dpi"] = dpi or (DEFAULT_DPI, DEFAULT_DPI)
     return image
@@ -1285,6 +1293,10 @@ def _coerce_dewarp_points(
 # Text-line based auto detection (see _detect_text_line_quad).
 DEWARP_DETECTION_MAX_SIDE: Final[int] = 1200
 DEWARP_MIN_TEXT_LINES: Final[int] = 3
+# The left/right edge fits need more rows than the top/bottom lines: with only a
+# few row ends a robust fit can drop all but two points and report zero scatter,
+# letting noise (or ragged text) pass as an aligned edge.
+DEWARP_MIN_SIDE_ROWS: Final[int] = 6
 # A text line is "long" (usable for the left/right edges) relative to the longest one.
 DEWARP_LONG_LINE_RATIO: Final[float] = 0.6
 # Reject detections implying more than this tilt of any quad edge.
@@ -1433,7 +1445,7 @@ def _detect_text_line_quad(image: Image.Image) -> Quad | None:
     rows = _text_rows(lines, float(np.median(line_heights)))
     widest = max(row[2] - row[0] for row in rows)
     rows = [row for row in rows if row[2] - row[0] >= DEWARP_LONG_LINE_RATIO * widest]
-    if len(rows) < DEWARP_MIN_TEXT_LINES:
+    if len(rows) < DEWARP_MIN_SIDE_ROWS:
         return None
     left_fit = _robust_line_fit([row[1] for row in rows], [row[0] for row in rows])
     right_fit = _robust_line_fit([row[3] for row in rows], [row[2] for row in rows])
@@ -1586,14 +1598,26 @@ def _estimate_target_dimensions(
 
 
 # How far (as a multiple of the input's own width/height) the dewarped canvas may
-# extend beyond the rectified quad on each side. Only an extreme, nearly degenerate
-# quad gets near this; it guards against unbounded canvases (vanishing points).
+# extend beyond the rectified quad on each side. A quad that would need more than
+# this is treated as degenerate and not rendered (see DewarpGeometry.rejection).
 DEWARP_MAX_CANVAS_OVERHANG: Final[float] = 1.0
+# The dewarped canvas may hold at most this multiple of the input's pixel count.
+# Real keystone/tilt corrections stay well below it; anything larger comes from a
+# near-degenerate quad and would only allocate a huge, mostly empty image.
+DEWARP_MAX_CANVAS_AREA_RATIO: Final[float] = 2.0
+# Projective weights at or below this (relative to the largest one) mean an input
+# corner lies at or beyond the vanishing line: it would map to infinity or mirror.
+DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO: Final[float] = 1e-3
 
 
 @dataclass(frozen=True)
 class DewarpGeometry:
-    """Perspective transform from the input onto an output canvas holding all of it."""
+    """Perspective transform from the input onto an output canvas holding all of it.
+
+    ``rejection`` is empty when the transform may be rendered. Otherwise it names
+    why not (the quad is near-degenerate) and the canvas dimensions are only the
+    clamped, bounded values -- callers must not render such a geometry.
+    """
 
     matrix: Any
     canvas_width: int
@@ -1603,6 +1627,7 @@ class DewarpGeometry:
     offset_x: int
     offset_y: int
     clipped: bool
+    rejection: str = ""
 
 
 def _ceil_tolerant(value: float, tolerance: float = 1e-3) -> int:
@@ -1616,6 +1641,13 @@ def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGe
     rectangle). The output canvas is sized to the bounding box of the whole
     transformed input, so content outside the quad -- page numbers, a line that
     runs past a corner point, the margins added by the Margins stage -- is kept.
+
+    Near-degenerate quads are rejected (``rejection`` is set) when an input corner
+    lies at or beyond the vanishing line, when the transformed input would extend
+    more than ``DEWARP_MAX_CANVAS_OVERHANG`` input sizes past the quad, or when the
+    canvas would exceed ``DEWARP_MAX_CANVAS_AREA_RATIO`` times the input area. The
+    returned canvas dimensions are always bounded, so even a caller that ignored
+    the rejection could not allocate an unbounded image.
     """
     if cv2 is None or np is None:
         raise RuntimeError("dewarping requires OpenCV and NumPy")
@@ -1649,18 +1681,27 @@ def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGe
     limit_left, limit_right = -overhang_x, quad_width + overhang_x
     limit_top, limit_bottom = -overhang_y, quad_height + overhang_y
 
+    rejection = ""
     clipped = False
-    if np.all(weights > 1e-9):
+    max_weight = float(np.max(np.abs(weights))) if np.all(np.isfinite(weights)) else 0.0
+    if (
+        max_weight <= 0.0
+        or not np.all(np.isfinite(projected))
+        or not np.all(weights > DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO * max_weight)
+    ):
+        # A corner lies at/beyond the vanishing line: the image has no finite (or
+        # unmirrored) bounds.
+        left, right, top, bottom = limit_left, limit_right, limit_top, limit_bottom
+        clipped = True
+        rejection = "degenerate_quad_beyond_vanishing_line"
+    else:
         xs = projected[0] / weights
         ys = projected[1] / weights
         left, right = float(min(xs.min(), 0.0)), float(max(xs.max(), quad_width))
         top, bottom = float(min(ys.min(), 0.0)), float(max(ys.max(), quad_height))
-    else:
-        # A corner lies beyond the vanishing line: the image has no finite bounds.
-        left, right, top, bottom = limit_left, limit_right, limit_top, limit_bottom
-        clipped = True
     if left < limit_left or right > limit_right or top < limit_top or bottom > limit_bottom:
         clipped = True
+        rejection = rejection or "extreme_quad_canvas_clipped"
     left, right = max(left, limit_left), min(right, limit_right)
     top, bottom = max(top, limit_top), min(bottom, limit_bottom)
 
@@ -1669,6 +1710,13 @@ def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGe
     offset_y = _ceil_tolerant(-top)
     canvas_width = max(1, _ceil_tolerant(right) + offset_x)
     canvas_height = max(1, _ceil_tolerant(bottom) + offset_y)
+    max_area = DEWARP_MAX_CANVAS_AREA_RATIO * max(1, width) * max(1, height)
+    if canvas_width * canvas_height > max_area:
+        rejection = rejection or "extreme_quad_canvas_too_large"
+        # Keep the reported dimensions within the area budget as well.
+        shrink = (max_area / (canvas_width * canvas_height)) ** 0.5
+        canvas_width = max(1, int(canvas_width * shrink))
+        canvas_height = max(1, int(canvas_height * shrink))
     translate = np.array(
         [[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]],
         dtype=np.float64,
@@ -1682,7 +1730,51 @@ def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGe
         offset_x=offset_x,
         offset_y=offset_y,
         clipped=clipped,
+        rejection=rejection,
     )
+
+
+# Every parameter the dewarping stage reports. Each run sets all of them (``None``
+# when not applicable): results are merged into the stored parameters, and a
+# passthrough must not leave a previous run's warp geometry looking current.
+DEWARP_RESULT_KEYS: Final[tuple[str, ...]] = (
+    "dewarp_source_points",
+    "dewarp_width",
+    "dewarp_height",
+    "dewarp_canvas_width",
+    "dewarp_canvas_height",
+    "dewarp_quad_offset",
+    "dewarp_canvas_clipped",
+    "dewarp_detection",
+    "dewarp_correction",
+    "dewarp_warning",
+    "dewarp_error",
+)
+
+
+def _dewarp_result(applied: str, **fields: Any) -> dict[str, Any]:
+    """Full dewarping result: every known key, cleared unless given in ``fields``.
+
+    ``dewarp_applied`` records what actually ran: ``"perspective"`` when the page
+    was warped, ``"passthrough"`` when the input was copied through unchanged
+    (bypass, nothing detected, no correction needed, a rejected quad, an error).
+    ``algorithm`` follows it, so a passthrough never claims a warp ran.
+    """
+    result: dict[str, Any] = dict.fromkeys(DEWARP_RESULT_KEYS)
+    result.update(fields)
+    result["dewarp_applied"] = applied
+    result["algorithm"] = "copy" if applied == "passthrough" else "projective_dewarp"
+    return result
+
+
+def _dewarp_passthrough(
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+    **fields: Any,
+) -> dict[str, Any]:
+    _copy_fallback(source_path, output_path, preview_path)
+    return _dewarp_result("passthrough", **fields)
 
 
 def _run_perspective_dewarp(
@@ -1697,29 +1789,21 @@ def _run_perspective_dewarp(
         mode = "auto"
 
     if mode == "bypass":
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "bypass",
-        }
+        return _dewarp_passthrough(source_path, output_path, preview_path, dewarp_mode="bypass")
 
     source = _load_image(source_path)
 
     if cv2 is None or np is None:
         if mode == "manual":
             resolved_points = _coerce_dewarp_points(parameters.get("dewarp_points"), source.size)
-            fallback_payload = _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "manual",
-            }
+            fields: dict[str, Any] = {"dewarp_mode": "manual"}
             if resolved_points is not None:
-                fallback_payload["dewarp_source_points"] = _ordered_quad_points(resolved_points)
-                fallback_payload["dewarp_warning"] = "missing_library_fallback"
-            return fallback_payload
-        if mode == "bypass":
-            return _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "bypass",
-            }
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "missing_library_fallback",
-        }
+                fields["dewarp_source_points"] = _ordered_quad_points(resolved_points)
+                fields["dewarp_warning"] = "missing_library_fallback"
+            return _dewarp_passthrough(source_path, output_path, preview_path, **fields)
+        return _dewarp_passthrough(
+            source_path, output_path, preview_path, dewarp_mode="missing_library_fallback"
+        )
 
     manual_points = _coerce_dewarp_points(
         parameters.get("dewarp_points"),
@@ -1728,29 +1812,50 @@ def _run_perspective_dewarp(
 
     source_quad: Quad
     detection = "manual"
+    recorded_mode = "manual" if mode == "manual" else "auto"
     if mode == "manual" and manual_points is not None:
         source_quad = _ordered_quad_points(manual_points)
     else:
         detected = _auto_dewarp_points(source)
         if detected is None:
-            return _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "auto_fallback",
-                "dewarp_detection": "none",
-                "dewarp_warning": "auto_detection_found_no_text_lines_or_page_outline",
-            }
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode="auto_fallback",
+                dewarp_detection="none",
+                dewarp_warning="auto_detection_found_no_text_lines_or_page_outline",
+            )
         source_quad, detection = detected
         if _dewarp_correction_is_negligible(source_quad, source.size):
             # Already upright: don't resample (and soften) the page for nothing.
-            return _copy_fallback(source_path, output_path, preview_path) | {
-                "dewarp_mode": "auto",
-                "dewarp_detection": detection,
-                "dewarp_source_points": source_quad,
-                "dewarp_correction": "none_needed",
-                "dewarp_warning": "",
-            }
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode="auto",
+                dewarp_detection=detection,
+                dewarp_source_points=source_quad,
+                dewarp_correction="none_needed",
+                dewarp_warning="",
+            )
 
     try:
         geometry = _dewarp_output_geometry(source_quad, source.size)
+        if geometry.rejection:
+            # Near-degenerate quad: rendering would allocate a huge canvas of mostly
+            # extrapolated (or mirrored) pixels. Keep the page as it is instead.
+            return _dewarp_passthrough(
+                source_path,
+                output_path,
+                preview_path,
+                dewarp_mode=recorded_mode,
+                dewarp_detection=detection,
+                dewarp_source_points=source_quad,
+                dewarp_canvas_clipped=geometry.clipped,
+                dewarp_correction="rejected_degenerate_quad",
+                dewarp_warning=geometry.rejection,
+            )
         src = np.array(source.convert("RGB"))
         paper = _paper_fill(source.convert("RGB"))
         warped = cv2.warpPerspective(
@@ -1764,26 +1869,30 @@ def _run_perspective_dewarp(
         output = Image.fromarray(warped)
         _save_png(output, output_path, _dpi_of(source))
         _save_preview(output, preview_path)
-        recorded_mode = "manual" if mode == "manual" else "auto"
-        recorded: dict[str, Any] = {
-            "dewarp_mode": recorded_mode,
-            "dewarp_source_points": source_quad,
-            "dewarp_width": geometry.quad_width,
-            "dewarp_height": geometry.quad_height,
-            "dewarp_canvas_width": geometry.canvas_width,
-            "dewarp_canvas_height": geometry.canvas_height,
-            "dewarp_quad_offset": [geometry.offset_x, geometry.offset_y],
-            "dewarp_canvas_clipped": geometry.clipped,
-            "dewarp_detection": detection,
-            "dewarp_correction": "applied",
-            "dewarp_warning": "extreme_quad_canvas_clipped" if geometry.clipped else "",
-        }
-        return recorded
+        return _dewarp_result(
+            "perspective",
+            dewarp_mode=recorded_mode,
+            dewarp_source_points=source_quad,
+            dewarp_width=geometry.quad_width,
+            dewarp_height=geometry.quad_height,
+            dewarp_canvas_width=geometry.canvas_width,
+            dewarp_canvas_height=geometry.canvas_height,
+            dewarp_quad_offset=[geometry.offset_x, geometry.offset_y],
+            dewarp_canvas_clipped=geometry.clipped,
+            dewarp_detection=detection,
+            dewarp_correction="applied",
+            dewarp_warning="",
+        )
     except Exception as exc:  # pragma: no cover - geometry failures
-        return _copy_fallback(source_path, output_path, preview_path) | {
-            "dewarp_mode": "processing_error_fallback",
-            "dewarp_error": str(exc),
-        }
+        return _dewarp_passthrough(
+            source_path,
+            output_path,
+            preview_path,
+            dewarp_mode="processing_error_fallback",
+            dewarp_source_points=source_quad,
+            dewarp_detection=detection,
+            dewarp_error=str(exc),
+        )
 
 
 def _run_dewarping(
@@ -2202,6 +2311,7 @@ def request_stage_job(
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
+    state.invalidated_reason = ""
     if not state.algorithm:
         state.algorithm = _default_algorithm(state.stage)
     if not state.algorithm_version:
@@ -2213,6 +2323,7 @@ def request_stage_job(
             "algorithm",
             "algorithm_version",
             "last_error",
+            "invalidated_reason",
             "updated_at",
         ],
     )

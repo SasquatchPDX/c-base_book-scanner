@@ -1,0 +1,17 @@
+# Normalize line endings: the repo stores LF regardless of contributor OS or
+# core.autocrlf, so Windows tooling cannot commit CRLF churn.
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.tif binary
+*.tiff binary
+*.pdf binary
+*.epub binary
+*.zip binary
+
+# Captured real-world listings are kept byte-for-byte as committed.
+tests/fixtures/real_world_samples/*.csv -text
