@@ -226,6 +226,8 @@ def _serialize_scan_page(
         "id": str(page.id),
         "logical_sequence_number": page.logical_sequence_number,
         "side": page.side,
+        "recognized_page_number": page.recognized_page_number,
+        "scanner_status": page.status,
         "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
         "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],

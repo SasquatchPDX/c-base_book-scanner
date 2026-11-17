@@ -33,6 +33,12 @@ EXPECTED_REFERENCES = {
     "LLMSuggestion",
     "ContributionEvent",
 }
+# Foreign keys to ScanJob created by later migrations: they are string keys from the
+# start, so 0038 never converts them, but its discovery (run here on the current models)
+# lists them too.
+ADDED_AFTER_0038 = {
+    "ScanEvent",  # 0039_scan_events (#129)
+}
 
 
 def _migrate(target: list[tuple[str, str]]) -> Any:
@@ -152,7 +158,10 @@ def _assert_references(apps: Any, job_id: Any, expected_pk: Any) -> None:
 
 def test_migration_discovers_every_scan_job_foreign_key() -> None:
     discovered = {table for table, _column in MIGRATION.scan_job_fk_columns(global_apps)}
-    expected = {global_apps.get_model("core", name)._meta.db_table for name in EXPECTED_REFERENCES}
+    expected = {
+        global_apps.get_model("core", name)._meta.db_table
+        for name in EXPECTED_REFERENCES | ADDED_AFTER_0038
+    }
     assert discovered == expected
     current_fks = {
         model.__name__
@@ -160,7 +169,7 @@ def test_migration_discovers_every_scan_job_foreign_key() -> None:
         for field in model._meta.local_concrete_fields
         if field.many_to_one and field.related_model is global_apps.get_model("core", "ScanJob")
     }
-    assert current_fks == EXPECTED_REFERENCES
+    assert current_fks == EXPECTED_REFERENCES | ADDED_AFTER_0038
 
 
 @pytest.mark.django_db(transaction=True)
