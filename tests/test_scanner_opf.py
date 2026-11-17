@@ -108,6 +108,13 @@ class _StubProvider:
 
 
 @pytest.fixture(autouse=True)
+def jobs_run_inline(settings: Any) -> None:
+    """Background jobs run in-process, also in the infrastructure lane (which sets a
+    Redis queue URL); tests that need a held-back worker patch ``get_queue`` themselves."""
+    settings.BOOK_SCANNER_QUEUE_URL = ""
+
+
+@pytest.fixture(autouse=True)
 def providers(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
     """Provider records every lookup returns; empty by default (no network in tests)."""
     records: list[dict[str, Any]] = []
