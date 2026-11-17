@@ -1,0 +1,28 @@
+{% extends "core/base.html" %}
+{% block title %}Authors · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Browse</p>
+      <h1>Authors A–Z</h1>
+    </div>
+  </div>
+  <nav aria-label="Authors by first letter" class="letter-nav">
+    {% for item in letters %}<a href="?view=html&amp;letter={{ item }}"{% if item == letter %} aria-current="true"{% endif %}>{{ item }}</a>{% endfor %}
+  </nav>
+  {% if authors %}
+    <ul class="author-list">
+      {% for author in authors %}
+        <li><a href="{% url 'library-books' %}?view=html&amp;author_id={{ author.id }}">{{ author.name }}</a> <span class="facet-count" aria-label="{{ author.book_count }} book{{ author.book_count|pluralize }}">{{ author.book_count }}</span></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty-state">No authors {% if letter %}from {{ letter }} on{% else %}yet{% endif %}.</p>
+  {% endif %}
+  {% if previous_url or next_url %}
+    <nav class="pagination" aria-label="Pagination">
+      {% if previous_url %}<a href="{{ previous_url }}" rel="prev">Previous</a>{% endif %}
+      {% if next_url %}<a href="{{ next_url }}" rel="next">Next</a>{% endif %}
+    </nav>
+  {% endif %}
+{% endblock %}

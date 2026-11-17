@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     # "author_title" (Author/Title/, Calibre-style), "calibre" (Author/Title (id)/),
     # "job" (the original books/<import job id>/), or a custom template.
     archive_layout: str = "author_title"
+    # Write a Calibre-compatible metadata.opf into each book's archive folder (derived,
+    # regenerated in the background when metadata changes; see core.book_opf).
+    write_book_opf: bool = True
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     ingest_batch_size: int = 100
@@ -63,6 +66,15 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    # Cover thumbnails (#28): a regenerable cache on the application VM. Empty root means
+    # `<storage_root>/cover-thumbnails`. With an accel prefix (for example
+    # `/_protected/cover-thumbnails/`) Django checks permissions and hands the file to
+    # nginx with X-Accel-Redirect; see deploy/nginx/book-scanner.conf.
+    cover_thumbnail_root: str = ""
+    cover_thumbnail_accel_prefix: str = ""
+    # Unreferenced thumbnail files are deleted by `collect_cover_thumbnails` only after
+    # this grace period, so a worker that just saw a shared file can still publish it.
+    cover_thumbnail_gc_grace_seconds: int = 24 * 60 * 60
     multipart_detection: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
@@ -112,6 +124,13 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    # Exact-title + strong-author rule for matches without ISBN confirmation
+    # (docs/metadata-providers.md).
+    identification_strong_match_enabled: bool = True
+    identification_strong_match_min_title: float = 1.0
+    identification_strong_match_min_author: float = 0.9
+    identification_strong_match_tie_margin: float = 0.05
+    identification_strong_match_year_tolerance: int = 2
     # Candidates within this score margin of the best one count as tied for auto-accept.
     identification_tie_margin: float = 0.02
     identification_work_isbn_bonus: float = 0.3
@@ -356,6 +375,9 @@ BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 # Folder layout inside the archive. Changing it applies to newly archived files only;
 # existing files stay where they are until an admin runs a reorganize.
 BOOK_SCANNER_ARCHIVE_LAYOUT = settings.archive_layout
+# A derived, Calibre-compatible metadata.opf in each book folder (book-scoped layouts
+# only; never on read-only, indexed-in-place locations). See core.book_opf.
+BOOK_SCANNER_WRITE_BOOK_OPF = settings.write_book_opf
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
@@ -372,6 +394,9 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_COVER_THUMBNAIL_ROOT = settings.cover_thumbnail_root
+BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX = settings.cover_thumbnail_accel_prefix
+BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS = max(settings.cover_thumbnail_gc_grace_seconds, 0)
 BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
@@ -410,6 +435,17 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED = settings.identification_strong_match_enabled
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE = settings.identification_strong_match_min_title
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR = (
+    settings.identification_strong_match_min_author
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN = (
+    settings.identification_strong_match_tie_margin
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE = (
+    settings.identification_strong_match_year_tolerance
+)
 BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
 BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size

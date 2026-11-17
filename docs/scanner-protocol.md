@@ -15,6 +15,8 @@
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
+- `POST /scan/jobs/{job_id}/logs/` -> upload a scanner log file (202, processed by a worker)
+- `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
 - `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
@@ -104,6 +106,36 @@ book queues bibliographic identification instead (202, `requires_bibliographic_r
 
 A runnable version of this flow is `scripts/scanner_client_example.py`.
 
+## Scanner logs and where scan output is stored
+
+`POST /scan/jobs/{job_id}/logs/` takes a multipart `file` field holding a whole
+scanner log file: plain text, at most 8 MiB. The request only writes the
+bounded upload to scan staging (an empty or oversized upload is refused with 400) and
+records the log with a `scan_log` processing job, which is queued once the request's
+transaction commits; it answers `202` with the log (`state: queued`) and a
+`status_url`. A worker then checks that the content is text, hashes it and stores it.
+It hashes the stored copy again and compares it with the upload before it records the
+log as stored and deletes the staged upload; a copy that does not match is removed, the
+staged upload is kept and the log becomes `failed` (an admin can retry it). The log's
+`state` becomes `stored`, `duplicate` (the same content is already stored for the job;
+`duplicate_of` names that log, and no second file is written) or `failed` (with
+`error`). `GET /scan/jobs/{job_id}/logs/` and the scan job detail (`logs`) report it.
+The client filename is only kept as provenance; the server stores each upload as
+`scan-upload-<first 8 hex digits of its SHA-256>.log`.
+
+Uploaded log files never take the name `scan.jsonl`. In the book folder that name is
+reserved for the scanner event log rendered from the events endpoint (#129, S5), which
+is rewritten as events arrive; `/logs/` uploads are immutable originals.
+
+Everything the library keeps from a scan goes into the book's archive folder on the
+attached storage (`<Author>/<Title>/` under the default `BOOK_SCANNER_ARCHIVE_LAYOUT`):
+the cleaned PDF (`<Title> - <Author>.pdf`), OCR output and conversions derived from it,
+the cover, and uploaded scanner logs (`scan-upload-<sha8>.log`). A log uploaded before the
+job is linked to a book waits in scan storage and is moved into the book folder during
+finalization; the scan-storage copy is deleted only after the archive copy's SHA-256 is
+verified. Raw page captures and ScanTailor stage outputs stay in `scan-artifacts/`,
+keyed by scan job, because the job may still be unidentified and stages are re-run.
+
 ## Storage and resilience
 
 - Scanner sends raw image artifacts; server stores immutable upload.
@@ -155,18 +187,18 @@ see `docs/operations.md`).
   `scan_started_at`, `capture_layout`, `pages`, `open_rescans`). `portal_url` is built
   from `BOOK_SCANNER_PUBLIC_BASE_URL`.
 
-### Upgrade note: migration `0037_scanjob_string_pk`
+### Upgrade note: migration `0041_scanjob_string_pk`
 
 The migration changes `core_scanjob.id` from `uuid` to `varchar(64)`, together with every
 column that references it: `ScanPage`, `ScanTodo`, `ScanTailorStageState`,
-`MetadataSearch`, `MetadataCandidate`, `ReviewTask`, `LLMSuggestion` and
-`ContributionEvent`. Existing IDs keep their value in canonical string form, so links,
+`MetadataSearch`, `MetadataCandidate`, `ReviewTask`, `LLMSuggestion`,
+`ContributionEvent` and `ScanLog`. Existing IDs keep their value in canonical string form, so links,
 storage paths and `scan_job_id` values in JSON details stay valid. The JSON fields are
 `ProcessingJob.details`, `FileVariant.converter_options`, `ScanJob.notes`,
 `ReviewTask.decision_payload` and `ContributionEvent.outcome`. Any non-canonical spelling
 in them is rewritten.
 
-- **PostgreSQL** casts `uuid::varchar` and rewrites all nine tables and every index on
+- **PostgreSQL** casts `uuid::varchar` and rewrites all ten tables and every index on
   the changed columns (primary key, foreign-key indexes, the composite and unique indexes
   that contain `scan_job_id`) under an `ACCESS EXCLUSIVE` lock. Stop the web and worker
   units while `migrate` runs. The string keys are 36 bytes instead of 16, so these

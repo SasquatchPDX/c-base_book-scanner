@@ -89,7 +89,7 @@ def test_string_pk_migration_types_and_timing_on_postgresql(
         assert new_job.objects.get(pk=sample).stage_states.count() == PAGES_PER_JOB
         with capsys.disabled():
             print(
-                f"\n[0037 on PostgreSQL] {JOBS} jobs, {JOBS * PAGES_PER_JOB} pages, "
+                f"\n[0041 on PostgreSQL] {JOBS} jobs, {JOBS * PAGES_PER_JOB} pages, "
                 f"{JOBS * PAGES_PER_JOB} stage states: {elapsed:.2f}s"
             )
     finally:
