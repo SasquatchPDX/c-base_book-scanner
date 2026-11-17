@@ -126,11 +126,15 @@ class Command(BaseCommand):
             user = user_model.objects.create_user(username=username)
 
         created_job_ids = []
+        budget = intake.archive_space_budget()
         for location in locations:
+            if budget is not None and budget.exhausted:
+                break
             try:
                 jobs = intake.discover_source_jobs_for_location(
                     source_location=location,
                     uploader=user,
+                    byte_budget=budget,
                 )
             except IntakeError as exc:
                 self.stdout.write(f"source {location.id} error: {exc}")
@@ -142,3 +146,9 @@ class Command(BaseCommand):
         self.stdout.write(
             f"ingest queued={len(created_job_ids)} total_files={len(created_job_ids)}"
         )
+        if budget is not None and budget.exhausted:
+            self.stderr.write(
+                "insufficient free space on the archive volume: stopped queueing new "
+                "imports to keep BOOK_SCANNER_STORAGE_MIN_FREE_BYTES free. Free space "
+                "(or enlarge the volume) and run ingest_sources again.",
+            )
