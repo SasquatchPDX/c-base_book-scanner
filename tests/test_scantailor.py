@@ -1440,3 +1440,119 @@ def test_content_box_on_dark_surroundings_finds_text_not_frame() -> None:
     assert right < 950
     assert top > 150
     assert bottom < 1250
+
+
+def _page_with_number_outside_quad() -> Image.Image:
+    """Text block plus a page number and corner marks that lie outside the text quad."""
+    page = Image.new("L", (600, 800), 240)
+    draw = ImageDraw.Draw(page)
+    for y in range(80, 680, 30):
+        draw.rectangle((80, y, 520, y + 10), fill=20)
+    draw.rectangle((285, 740, 315, 770), fill=20)  # page number below the text block
+    for x, y in ((5, 5), (580, 5), (580, 780), (5, 780)):
+        draw.rectangle((x, y, x + 14, y + 14), fill=20)  # corner marks at the very edge
+    return page
+
+
+def _project(matrix: np.ndarray, x: float, y: float) -> tuple[int, int]:
+    px, py, pw = matrix @ np.array([x, y, 1.0])
+    return int(round(px / pw)), int(round(py / pw))
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        # axis-aligned quad hugging the text block
+        [[80, 80], [520, 80], [520, 680], [80, 680]],
+        # keystoned quad (top edge narrower than bottom)
+        [[110, 80], [490, 80], [520, 680], [80, 680]],
+    ],
+)
+def test_dewarp_keeps_content_outside_the_quad(points: list[list[int]], tmp_path: Path) -> None:
+    source = _save(_page_with_number_outside_quad(), tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(
+        _state({"dewarp_mode": "manual", "dewarp_points": points}),
+        source,
+        output,
+        tmp_path / "prev.png",
+    )
+    assert result["dewarp_mode"] == "manual"
+    assert result["dewarp_canvas_clipped"] is False
+
+    quad = scantailor._ordered_quad_points([(int(x), int(y)) for x, y in points])
+    geometry = scantailor._dewarp_output_geometry(quad, (600, 800))
+    warped = np.asarray(Image.open(output).convert("L"))
+    assert warped.shape == (geometry.canvas_height, geometry.canvas_width)
+    assert geometry.canvas_width >= 590 and geometry.canvas_height >= 790
+    # the page number and every corner mark survive, at their transformed positions
+    for x, y in ((300, 755), (12, 12), (587, 12), (587, 787), (12, 787)):
+        tx, ty = _project(geometry.matrix, x, y)
+        assert 0 <= tx < warped.shape[1] and 0 <= ty < warped.shape[0]
+        assert warped[ty, tx] < 100, (x, y, tx, ty)
+    # and the quad itself still becomes an upright rectangle at the recorded offset
+    ox, oy = result["dewarp_quad_offset"]
+    expected = [
+        (0, 0),
+        (geometry.quad_width, 0),
+        (geometry.quad_width, geometry.quad_height),
+        (0, geometry.quad_height),
+    ]
+    for (x, y), (ex, ey) in zip(quad, expected, strict=True):
+        tx, ty = _project(geometry.matrix, x, y)
+        assert abs(tx - (ex + ox)) <= 1 and abs(ty - (ey + oy)) <= 1
+
+
+def test_axis_aligned_dewarp_quad_is_near_identity(tmp_path: Path) -> None:
+    page = _page_with_number_outside_quad()
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    points = [[80, 80], [520, 80], [520, 680], [80, 680]]
+    scantailor._run_perspective_dewarp(
+        _state({"dewarp_mode": "manual", "dewarp_points": points}),
+        source,
+        output,
+        tmp_path / "prev.png",
+    )
+    warped = Image.open(output).convert("L")
+    # an already-upright quad crops nothing and changes nothing
+    assert warped.size == page.size
+    difference = np.abs(np.asarray(warped, dtype=np.int16) - np.asarray(page, dtype=np.int16))
+    assert float(difference.mean()) < 0.5
+
+
+def test_degenerate_dewarp_quad_canvas_is_bounded() -> None:
+    # a sliver-thin quad would project the rest of the page towards infinity
+    quad = scantailor._ordered_quad_points([(100, 100), (500, 100), (300, 104), (290, 104)])
+    geometry = scantailor._dewarp_output_geometry(quad, (600, 800))
+    assert geometry.clipped is True
+    assert geometry.canvas_width <= geometry.quad_width + 2 * 600 + 2
+    assert geometry.canvas_height <= geometry.quad_height + 2 * 800 + 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stage_run_records_current_algorithm_version() -> None:
+    client, job = _create_scan_job("scan-user-dewarp-version")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_trapezoid_bytes(),
+        filename="dewarp-version.png",
+        content_type="image/png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    url = _stage_url(str(job.id), str(page.id), "dewarping")
+    points = [[18, 14], [392, 28], [412, 286], [10, 270]]
+    payload = json.dumps({"parameters": {"dewarp_mode": "manual", "dewarp_points": points}})
+    assert client.post(url, data=payload, content_type="application/json").status_code == 202
+    # a row created by an older release still carries the old implementation version
+    ScanTailorStageState.objects.filter(scan_page=page, stage="dewarping").update(
+        algorithm_version="opencv-v1"
+    )
+    assert client.post(url, data=payload, content_type="application/json").status_code == 202
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="dewarping")
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.algorithm_version == scantailor.DEFAULT_STAGE_ALGORITHM_VERSION["dewarping"]
+    assert state.algorithm_version != "opencv-v1"
