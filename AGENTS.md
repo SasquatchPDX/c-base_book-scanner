@@ -289,7 +289,18 @@ Scanner integration is job-based.
 
 A `ScanJob` must have persistent identity and state shared by the scanner and ScanTailor-Web.
 
-Use server-generated UUIDs.
+Job IDs are opaque, immutable strings. A job created by the libreflip scanner uses the
+scanner-assigned job ID (`YYYYMMDDTHHMMSSZ[-N]`) as its primary key. A job created in the web UI
+gets a server-generated UUID string. An ID already registered with different data is rejected
+(409), never overwritten. (Changed 2026-11-17, from "server-generated UUIDs" only, to follow the
+libreflip contract [`docs/sans-serif-interface.md`](https://github.com/libreflip/serif/blob/master/docs/sans-serif-interface.md).)
+
+The libreflip scanner (`sans`) talks to this server only through the device API
+`/api/scanner/v1/`, which that contract defines. The contract wins over this file wherever they
+differ. A scan uploaded by the scanner is a raw scan (state `captured`). It becomes a library
+Book only after ScanTailor-Web processing and an explicit finish, and it never appears in the
+library before that. The scanner's `metadata.opf` is authoritative bibliographic metadata.
+Server-side identification runs only when the scanner supplies no title.
 
 A scan job should support fields such as:
 
@@ -326,6 +337,8 @@ Suggested states:
 - CLAIMED
 - COMPLETED
 - CANCELLED
+
+Rescan requests are allowed while a job is `captured` and after it is `complete`; a replacement on a `complete` job returns it to `captured` for re-finish.
 
 When a replacement page arrives:
 

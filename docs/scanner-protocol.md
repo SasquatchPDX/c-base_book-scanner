@@ -1,12 +1,57 @@
-# Sprint001 Scanner Protocol Draft (v1)
+# Scanner protocol
 
-## Core resources
+There are two scanner-facing APIs:
+
+1. **Device API v1 (`/api/scanner/v1/`), planned and the target for the
+   libreflip scanner (`sans`).** It is specified in full in the canonical
+   contract [`libreflip/serif` `docs/sans-serif-interface.md`](https://github.com/libreflip/serif/blob/master/docs/sans-serif-interface.md). It
+   uses per-device API keys (`Authorization: Bearer`), TLS 1.3, the
+   scanner-assigned job ID as primary key, background per-page upload,
+   `scan.jsonl` events, `metadata.opf` as authoritative metadata,
+   `capture-complete` into the new raw-scan state `captured`, and the rescan
+   endpoints. The summary below lists what this repository has to build for
+   it. If anything here disagrees with that document, that document wins.
+2. **Session API (`/scan/...`), implemented.** It is described from
+   "Sprint001 Scanner Protocol Draft" onwards. It stays in place for browsers,
+   the portal and generic clients.
+
+## Device API v1: server-side work (summary)
+
+- `ScannerDevice` model with a SHA-256-hashed key, plus
+  `manage.py scanner_device create|rotate|revoke|list` (Sprint020 H). A
+  device key reaches only `/api/scanner/v1/`, and a session cannot reach it.
+  The views are CSRF-exempt because no cookies are involved.
+- `ScanJob.id` becomes a string primary key. Scanner jobs use the scanner's
+  ID (`YYYYMMDDTHHMMSSZ[-N]`); web-created jobs keep `str(uuid4())`. The
+  migration covers every foreign key and the `scan_job_id` values in JSON
+  details. Routes accept both formats.
+- New state `captured` (raw scan, not in the library) between `capturing`
+  and `finalizing`. Book linking happens only at finish: by OPF ISBN, else a
+  new Book from the OPF, else the existing identification. A replacement on
+  a `complete` job returns it to `captured`.
+- Versioned scan covers (front/back), versioned OPF, and stored `scan.jsonl`
+  lines (origin `sans`/`serif`, `line_no`, raw text). The combined
+  `scan.jsonl` is written atomically into the job folder. `rescan_flag` and
+  `rescan_replace` are appended by the server.
+- Zero-based `logical_sequence_number` for device jobs (`side=single`;
+  camera role parity is checked).
+- Rescan flagging is allowed in `captured` and `complete` as well.
+- `/j/<job_id>` portal route (login, then redirect to the workspace) and
+  `BOOK_SCANNER_PUBLIC_BASE_URL`.
+- Raw scans are listed in the portal and never in library browse, search or
+  download.
+
+---
+
+## Session API: Sprint001 Scanner Protocol Draft
+
+### Core resources
 
 - `ScanJob`: server-generated UUID, metadata hints, status, operator, scanner id.
 - `ScanPage`: logical page identity and one or more immutable artifacts.
 - `ScanTodo`: optional tasks like `RESCAN`.
 
-## API surface (v1)
+### API surface (v1)
 
 - `POST /scan/jobs/` -> create job
 - `GET /scan/jobs/` -> list open jobs for scanner/operator
@@ -20,7 +65,7 @@
 - `GET /ocr/{job_id}/` -> OCR job status/provenance
 - `POST /scan/jobs/{job_id}/finish/` -> queue identification when unlinked, otherwise finalize
 
-## Page upload contract
+### Page upload contract
 
 - multipart form fields (`POST /scan/jobs/{job_id}/pages/`):
   - `file` (required): the image; JPEG, PNG, TIFF, BMP or WebP. Anything Pillow cannot decode
@@ -50,7 +95,7 @@
 - `GET /scan/pages/{page_id}/image/` serves a downscaled (max 1600 px) JPEG of the active
   version with `ETag`/`Cache-Control`; originals are never streamed to browsers.
 
-## Finish and raw pages
+### Finish and raw pages
 
 `POST /scan/jobs/{job_id}/finish/` (JSON or form body) finalizes a job linked to a book. By
 default only pages with processed ScanTailor output are accepted. Raw scanner pages are
@@ -65,7 +110,7 @@ rejected with 400:
 Send `{"allow_raw_pages": true}` to build from the raw uploads instead. A job with no linked
 book queues bibliographic identification instead (202, `requires_bibliographic_review`).
 
-## Client recipe (non-browser clients)
+### Client recipe (non-browser clients)
 
 1. **Log in.** `GET /accounts/login/` and keep the `csrftoken` cookie. Then
    `POST /accounts/login/` as a form with `username`, `password` and
@@ -102,13 +147,13 @@ book queues bibliographic identification instead (202, `requires_bibliographic_r
 
 A runnable version of this flow is `scripts/scanner_client_example.py`.
 
-## Storage and resilience
+### Storage and resilience
 
 - Scanner sends raw image artifacts; server stores immutable upload.
 - Replacements create new page version and mark previous version inactive.
 - Source deletion by scanner is decoupled; pipeline policy handles source cleanup.
 
-## Rescan todo flow
+### Rescan todo flow
 
 - `POST /scan/pages/{page_id}/rescan/` creates a new RESCAN todo for the page.
 - `GET /scan/jobs/{job_id}/todos/` lists todos for a specific job.
@@ -118,7 +163,7 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 - `POST /scan/todos/{todo_id}/cancel/` cancels a todo.
 - `GET /scan/jobs/?with_open_todos=true` lists jobs with open rescan todos.
 
-## Security
+### Security
 
 - Upload endpoints require an authenticated session (401 JSON for API clients).
 - Filenames are sanitized before storage.
