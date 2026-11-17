@@ -108,10 +108,18 @@ class Command(BaseCommand):
             if output_json:
                 self.stdout.write(json.dumps(payload, indent=2))
             else:
+                audio_rows = 0
                 for row in payload:
                     if "error" in row:
                         self.stdout.write(
                             f"source {row['source_location_id']} error: {row['error']}"
+                        )
+                        continue
+                    if row.get("skipped") == "audio":
+                        audio_rows += 1
+                        self.stdout.write(
+                            f"skipped [{row['reason']}] => {row['path']} (source "
+                            f"#{row['source_location_id']})"
                         )
                         continue
                     line = (
@@ -127,6 +135,11 @@ class Command(BaseCommand):
                             f"title={hints['title']!r} series={hints['series']!r}]"
                         )
                     self.stdout.write(line)
+                if audio_rows:
+                    self.stdout.write(
+                        f"skipped_audio={audio_rows} (audiobooks are not managed here; "
+                        "see docs/design/32-audiobooks.md)"
+                    )
             return
 
         user_model = get_user_model()
@@ -135,6 +148,7 @@ class Command(BaseCommand):
             user = user_model.objects.create_user(username=username)
 
         created_job_ids = []
+        skipped_audio: list[int] = []
         budget = intake.archive_space_budget()
         for location in locations:
             if budget is not None and budget.exhausted:
@@ -144,6 +158,7 @@ class Command(BaseCommand):
                     source_location=location,
                     uploader=user,
                     byte_budget=budget,
+                    skipped_audio=skipped_audio,
                 )
             except IntakeError as exc:
                 self.stdout.write(f"source {location.id} error: {exc}")
@@ -152,9 +167,10 @@ class Command(BaseCommand):
                 enqueue(intake.process_import_job, str(job.id))
                 created_job_ids.append(str(job.id))
 
-        self.stdout.write(
-            f"ingest queued={len(created_job_ids)} total_files={len(created_job_ids)}"
-        )
+        summary = f"ingest queued={len(created_job_ids)} total_files={len(created_job_ids)}"
+        if sum(skipped_audio):
+            summary += f" skipped_audio={sum(skipped_audio)}"
+        self.stdout.write(summary)
         if budget is not None and budget.exhausted:
             self.stderr.write(
                 "insufficient free space on the archive volume: stopped queueing new "

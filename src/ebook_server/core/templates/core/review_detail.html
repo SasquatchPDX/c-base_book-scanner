@@ -1,4 +1,5 @@
 {% extends "core/base.html" %}
+{% load review_reader_tags %}{% block body_extra %}{% review_reader_panel task %}{% endblock %}
 {% block title %}Review {{ task.source_filename }} · Hackerspace Library{% endblock %}
 {% block head %}{% if active_search_job %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
 {% block content %}<p class="eyebrow">Metadata review</p><h1>{{ task.inferred_title|default:task.source_filename }}</h1>

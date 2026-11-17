@@ -9,7 +9,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0021_source_location_path_layouts"),
+        ("core", "0022_source_location_group_sibling_formats"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -40,7 +40,11 @@ class Migration(migrations.Migration):
                 (
                     "state",
                     models.CharField(
-                        choices=[("complete", "Complete"), ("failed", "Failed")],
+                        choices=[
+                            ("complete", "Complete"),
+                            ("failed", "Failed"),
+                            ("discarded", "Not applied"),
+                        ],
                         max_length=16,
                     ),
                 ),
@@ -142,6 +146,16 @@ class Migration(migrations.Migration):
                 fields=["scan_job", "-finished_at"],
                 name="core_metada_scan_jo_fd1db2_idx",
             ),
+        ),
+        migrations.AddField(
+            model_name="importjob",
+            name="current_search_job_id",
+            field=models.UUIDField(blank=True, editable=False, null=True),
+        ),
+        migrations.AddField(
+            model_name="scanjob",
+            name="current_search_job_id",
+            field=models.UUIDField(blank=True, editable=False, null=True),
         ),
         migrations.AddConstraint(
             model_name="metadatasearch",

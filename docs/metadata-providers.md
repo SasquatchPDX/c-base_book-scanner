@@ -189,6 +189,19 @@ next search fails it and starts a new one. New terms submitted while a search is
 queued replace its terms; while one is running they are saved and the reviewer is
 asked to search again once it finishes (HTTP 409 for API clients).
 
+Searches are fenced so that an obsolete search can never publish. The import
+job / scan job records its current search job in `current_search_job_id`, moved
+under that row's lock whenever a new search replaces an older one (whose RQ
+entry, enqueued with the id `metadata-search-<job id>`, is also cancelled, best
+effort). A delivered queue entry only runs while its job is still QUEUED (or
+RUNNING with a dead worker) and current; a FAILED, finished or superseded job is
+ignored. When the providers return, the results become current only if, under
+the task, source and job row locks, the job is still current, still the attempt
+that started, and the review is still open (not resolved/cancelled, the import
+not complete, the scan not linked to a book). Otherwise the run is stored as a
+`discarded` ("Not applied") search whose candidates are history only: a review
+resolved while the providers ran keeps its decision and is never reopened.
+
 ## Subject / genre evidence
 
 Subject tags are captured as evidence only; they do not affect candidate scoring and
