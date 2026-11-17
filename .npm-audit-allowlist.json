@@ -1,0 +1,8 @@
+[
+  {
+    "advisory": "GHSA-fc5q-39xc-vjpf",
+    "package": "picomatch",
+    "reason": "ReDoS via attacker-supplied extglob patterns. picomatch is only reached through vite/vitest (build and test tooling); the app never passes untrusted globs to it and it is not part of the shipped bundle. No patched release exists (vulnerable <=4.0.7, latest 4.0.7). Remove this entry and upgrade as soon as a fixed picomatch is published.",
+    "expires": "2026-12-31"
+  }
+]
