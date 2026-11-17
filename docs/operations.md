@@ -283,6 +283,32 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Audio files and audiobooks
+
+This system does not manage audiobooks. The decision and its research are in
+`docs/design/32-audiobooks.md` (proposed in PR #107, issue #32): members who want
+audiobooks use a separate audiobook server such as Audiobookshelf, reading its own
+folder on the NAS. Intake therefore recognises audio files only to skip them:
+
+- Extensions `.m4b .m4a .mp3 .aac .ogg .oga .opus .flac .wav .wma .mka .ape .aif
+  .aiff .aa .aax .aaxc` are classified as `audio (not managed here)`. They never
+  create an `ImportJob`, are never hashed, copied, moved or converted, and a MOVE
+  source leaves them where they are.
+- Audible files (`.aa`, `.aax`, `.aaxc`) are DRM-protected and are reported as
+  such. This project never removes or works around DRM.
+- `ingest_sources --preview` lists them as `skipped [audio (not managed here)] =>
+  <path>` plus a `skipped_audio=N` total; with `--json` they are rows with
+  `"skipped": "audio"`, `"drm_protected"` and `"reason"` (no `source_type`).
+  A discovery run appends `skipped_audio=N` to its summary line.
+- Discovery logs one `intake_audio_files_skipped` event (source id and count, no
+  filenames) per source and pass. There is no Prometheus series for it, because
+  `/metrics/` only reports persisted state and skipped audio is not persisted.
+- Web uploads of audio files (by extension, or an `audio/*` content type on a
+  non-book extension) are refused with HTTP 415 before anything is staged. The
+  message links to `BOOK_SCANNER_AUDIOBOOK_SERVICE_URL` when it is set to an
+  `http(s)://` URL, and otherwise asks the member to contact the library admins.
+  The upload page shows the same pointer.
+
 ### Folder layouts (author/title from paths)
 
 Collections are organised differently, so each source can declare how its folders
