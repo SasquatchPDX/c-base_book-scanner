@@ -16,8 +16,9 @@ from ebook_server.core.models import ImportJob, MetadataCandidate, ReviewTask
 class Command(BaseCommand):
     help = (
         "Attach genres to already imported books from their accepted candidate's subjects "
-        "(or the file's embedded subjects), using the same rules as intake. Books with "
-        "reviewer- or admin-set genres are skipped. Re-run after adding genres or aliases."
+        "(or the file's embedded subjects), using the same rules as intake. Books whose "
+        "genres a reviewer or admin decided (including deciding on none) are skipped. "
+        "Re-run after adding genres or aliases."
     )
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:

@@ -349,6 +349,91 @@ def test_reviewer_can_accept_with_no_genres(
     task.refresh_from_db()
     assert task.resolved_book is not None
     assert _links(task.resolved_book) == {}
+    assert task.resolved_book.genres_curated_at is not None
+    assert task.resolved_book.genres_curated_by is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_empty_reviewer_genre_choice_survives_backfill_and_automatic_assignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seeded: None
+) -> None:
+    """Regression (PR #100 review): "no genres" is a curated decision, not an absence."""
+    client, job = _upload(
+        tmp_path,
+        monkeypatch,
+        provider_subjects=["Science Fiction"],
+        embedded_subjects=["Horror"],
+        auto_accept=False,
+    )
+    task = ReviewTask.objects.get(import_job=job)
+    candidate = job.metadata_candidates.get()
+    response = client.post(
+        f"/reviews/{task.id}/accept-candidate/",
+        {"candidate_id": candidate.id, "genres_reviewed": "1"},
+    )
+    assert response.status_code == 200
+    task.refresh_from_db()
+    book = task.resolved_book
+    assert book is not None
+    assert task.decision_payload["reviewer_genres"] == []
+
+    out = StringIO()
+    call_command("assign_genres", stdout=out)
+    assert "Linked 0 genre(s) to 0 book(s)." in out.getvalue()
+    assert _links(book) == {}
+
+    stale = Book.objects.get(pk=book.pk)
+    assert (
+        genres.assign_automatic(
+            stale, provider_subjects=["Science Fiction"], embedded_subjects=["Horror"]
+        )
+        == []
+    )
+    assert _links(book) == {}
+
+
+@pytest.mark.django_db
+def test_admin_genre_edit_marks_book_curated_even_when_emptied(seeded: None) -> None:
+    from django.contrib import admin as django_admin
+    from django.contrib.auth import get_user_model
+    from django.test import RequestFactory
+
+    from ebook_server.core.admin import BookAdmin, BookGenreInline
+
+    book = Book.objects.create(title="Admin curated")
+    genres.assign_automatic(book, provider_subjects=["Horror"], embedded_subjects=[])
+    link = BookGenre.objects.get(book=book)
+    admin_user = get_user_model().objects.create_superuser("genre-admin", "", "x")
+    request = RequestFactory().post("/")
+    request.user = admin_user
+
+    inline = BookGenreInline(Book, django_admin.site)
+    formset_class = inline.get_formset(request, book)
+    prefix = formset_class.get_default_prefix()
+    data = {
+        f"{prefix}-TOTAL_FORMS": "1",
+        f"{prefix}-INITIAL_FORMS": "1",
+        f"{prefix}-MIN_NUM_FORMS": "0",
+        f"{prefix}-MAX_NUM_FORMS": "1000",
+        f"{prefix}-0-id": str(link.pk),
+        f"{prefix}-0-book": str(book.pk),
+        f"{prefix}-0-genre": str(link.genre_id),
+        f"{prefix}-0-source": link.source,
+        f"{prefix}-0-DELETE": "on",
+    }
+    formset = formset_class(data, instance=book, prefix=prefix)
+    assert formset.is_valid(), formset.errors
+
+    class _Form:
+        instance = book
+
+    BookAdmin(Book, django_admin.site).save_formset(request, _Form(), formset, change=True)
+
+    book.refresh_from_db()
+    assert _links(book) == {}
+    assert book.genres_curated_at is not None
+    assert book.genres_curated_by == admin_user
+    assert genres.assign_automatic(book, provider_subjects=["Horror"], embedded_subjects=[]) == []
 
 
 @pytest.mark.django_db(transaction=True)
@@ -515,6 +600,48 @@ def test_migrations_keep_existing_links_as_admin_set_and_reverse() -> None:
     reverted_book = reverted_apps.get_model("core", "Book").objects.get(pk=old_book.pk)
     assert [genre.name for genre in reverted_book.genres.all()] == ["Hand Picked"]
     assert not reverted_apps.get_model("core", "Genre").objects.filter(name="Fantasy").exists()
+
+    executor = MigrationExecutor(connection)
+    executor.migrate(executor.loader.graph.leaf_nodes())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_seed_reversal_keeps_pre_existing_admin_taxonomy() -> None:
+    """Regression (PR #100 review): unseeding deletes only rows the seed created."""
+    from django.db import connection
+    from django.db.migrations.executor import MigrationExecutor
+
+    schema_only = [("core", "0022_genre_alias_book_genre_provenance")]
+    seeded_state = [("core", "0023_seed_genres")]
+    executor = MigrationExecutor(connection)
+    executor.migrate(schema_only)
+    old_apps = executor.loader.project_state(schema_only).apps
+    old_genre_model = old_apps.get_model("core", "Genre")
+    old_genre_model.objects.all().delete()
+    admin_genre = old_genre_model.objects.create(name="Science fiction")
+    admin_alias = old_apps.get_model("core", "GenreAlias").objects.create(
+        genre=admin_genre, alias="Sci-Fi", key="scifi"
+    )
+
+    executor = MigrationExecutor(connection)
+    executor.migrate(seeded_state)
+    new_apps = executor.loader.project_state(seeded_state).apps
+    genre_model = new_apps.get_model("core", "Genre")
+    alias_model = new_apps.get_model("core", "GenreAlias")
+    # Forward seeding reuses the admin rows instead of creating twins.
+    assert genre_model.objects.filter(name="Science fiction").count() == 1
+    assert alias_model.objects.get(key="scifi").pk == admin_alias.pk
+    assert alias_model.objects.filter(genre_id=admin_genre.pk, seeded=True).exists()
+    assert genre_model.objects.get(name="Fantasy").seeded
+
+    executor = MigrationExecutor(connection)
+    executor.migrate(schema_only)
+    reverted_apps = executor.loader.project_state(schema_only).apps
+    reverted_genres = reverted_apps.get_model("core", "Genre")
+    reverted_aliases = reverted_apps.get_model("core", "GenreAlias")
+    assert reverted_genres.objects.filter(pk=admin_genre.pk, name="Science fiction").exists()
+    assert list(reverted_aliases.objects.values_list("pk", "key")) == [(admin_alias.pk, "scifi")]
+    assert not reverted_genres.objects.filter(name="Fantasy").exists()
 
     executor = MigrationExecutor(connection)
     executor.migrate(executor.loader.graph.leaf_nodes())

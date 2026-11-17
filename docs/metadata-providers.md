@@ -185,7 +185,10 @@ in the Django admin (Genre change page, "Genre aliases" inline, or the Genre ali
 list). The admin rejects an alias that duplicates another alias or another genre's
 name. Migration `0023_seed_genres` ships a small starter set (about 20 genres, with
 common fiction spellings and BISAC/Open Library strings) that admins may edit or
-delete.
+delete. It reuses an equivalent genre or alias an admin already created instead of
+adding a twin, and marks only the rows it creates (`seeded=True`). Reversing it
+deletes only those seeded aliases and the seeded genres that have no books and no
+remaining aliases; pre-existing admin taxonomy is never removed.
 
 **Assignment and precedence.** When an import is linked to a Book through an
 accepted candidate (auto-accept in intake, or a reviewer's "Accept"):
@@ -202,7 +205,11 @@ accepted candidate (auto-accept in intake, or a reviewer's "Accept"):
    reviewer's `genre_ids`). Merging into an existing book changes no genres.
 
 Automatic assignment only adds links. It never removes a link, and it does nothing
-for a Book that already has a reviewer- or admin-set genre. A reviewer's choice turns
+for a Book whose genres are curated: a reviewer genre choice (including the empty
+choice) or an admin edit of the genre links records `Book.genres_curated_at` and
+`genres_curated_by`, and a Book with a reviewer- or admin-set link also counts as
+curated. Curation is stored on the Book, so "no genres" stays "no genres" even
+though it leaves no link rows. A reviewer's choice turns
 matching automatic links into reviewer links but never changes admin-set ones, and it
 does not remove genres the existing Book already has from other files.
 
@@ -217,7 +224,8 @@ migration `0022` and links added in the admin are `admin`. The review task's
 names, as before. Book pages list their genres as browse links.
 
 **Backfill.** `python manage.py assign_genres` applies the automatic rules to
-already imported books (books with curated genres are skipped); re-run it after
+already imported books (curated books, including ones a reviewer left with no
+genres, are skipped); re-run it after
 adding genres or aliases. `--dry-run` reports without writing, and `--unmapped N`
 lists the N most frequent tags that map to no genre, which are candidates for new
 aliases.

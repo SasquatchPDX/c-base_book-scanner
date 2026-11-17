@@ -104,6 +104,9 @@ class Genre(models.Model):
 
     name = models.CharField(max_length=128, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
 
     class Meta:
         ordering: ClassVar[list[str]] = ["name"]
@@ -125,6 +128,9 @@ class GenreAlias(models.Model):
     )
     key = models.CharField(max_length=255, unique=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
 
     class Meta:
         ordering: ClassVar[list[str]] = ["alias"]
@@ -356,6 +362,18 @@ class Book(models.Model):
         related_name="books",
         blank=True,
         through="BookGenre",
+    )
+    # Set on any reviewer or admin genre decision, including "no genres" (#50). Automatic
+    # assignment and the ``assign_genres`` backfill never touch a curated Book, whether
+    # or not it has genre links.
+    genres_curated_at = models.DateTimeField(null=True, blank=True, editable=False)
+    genres_curated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="+",
+        on_delete=models.SET_NULL,
     )
 
     front_cover = models.ForeignKey(

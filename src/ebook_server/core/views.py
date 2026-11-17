@@ -1258,14 +1258,19 @@ def _apply_review_genres(
     task: ReviewTask,
     reviewer_genres: list[Genre] | None,
     provider_subjects: list[Any] | None,
+    reviewer: Any = None,
 ) -> dict[str, Any]:
-    """Attach genres on a review decision; returns decision-payload additions."""
+    """Attach genres on a review decision; returns decision-payload additions.
+
+    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
+    """
     embedded = genres.embedded_subjects(task.embedded_metadata)
     if reviewer_genres is not None:
         genres.assign_reviewer(
             book,
             reviewer_genres,
             suggestion=genres.suggest(provider_subjects, embedded),
+            user=reviewer,
         )
         return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
     added = genres.assign_automatic(
@@ -3928,6 +3933,7 @@ def review_accept_candidate(
                 task=task,
                 reviewer_genres=reviewer_genres,
                 provider_subjects=candidate.subjects,
+                reviewer=request.user,
             )
         )
         decision_payload: dict[str, Any] | None = None
@@ -4193,6 +4199,7 @@ def review_manual_entry(
         task=task,
         reviewer_genres=reviewer_genres,
         provider_subjects=None,
+        reviewer=request.user,
     )
 
     variant = _resolve_review_source(

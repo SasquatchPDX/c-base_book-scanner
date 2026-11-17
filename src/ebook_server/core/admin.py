@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from django.contrib import admin
+from typing import Any
 
+from django.contrib import admin
+from django.http import HttpRequest
+
+from . import genres
 from .models import (
     AppUserProfile,
     Author,
@@ -51,6 +55,14 @@ class BookAdmin(admin.ModelAdmin[Book]):
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories")
     inlines = (BookGenreInline,)
+    readonly_fields = ("genres_curated_at", "genres_curated_by")
+
+    def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
+        super().save_formset(request, form, formset, change)
+        # Any admin edit of the genre links, removing the last one included, is a human
+        # decision that automatic assignment and backfills must not override.
+        if formset.model is BookGenre and formset.has_changed():
+            genres.mark_curated(form.instance, user=request.user)
 
 
 @admin.register(Author)

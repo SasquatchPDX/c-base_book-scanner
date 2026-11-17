@@ -139,9 +139,12 @@ def seed_genres(apps, schema_editor):
             _genre_key(other): other for other in Genre.objects.values_list("name", flat=True)
         }
         existing = name_keys.get(_genre_key(name))
-        # An admin may already have an equivalent genre; reuse it instead of a twin.
+        # An admin may already have an equivalent genre; reuse it instead of a twin. Only
+        # rows created here are marked ``seeded`` (owned by this migration).
         seeded[name] = (
-            Genre.objects.get(name=existing) if existing else Genre.objects.create(name=name)
+            Genre.objects.get(name=existing)
+            if existing
+            else Genre.objects.create(name=name, seeded=True)
         )
     name_keys = {_genre_key(name) for name in Genre.objects.values_list("name", flat=True)}
     for name, aliases in SEED_GENRES.items():
@@ -149,18 +152,20 @@ def seed_genres(apps, schema_editor):
             key = _genre_key(alias)
             if key in name_keys or GenreAlias.objects.filter(key=key).exists():
                 continue
-            GenreAlias.objects.create(genre=seeded[name], alias=alias, key=key)
+            GenreAlias.objects.create(genre=seeded[name], alias=alias, key=key, seeded=True)
 
 
 def unseed_genres(apps, schema_editor):
+    """Remove only what ``seed_genres`` created, and only genres nobody has used.
+
+    Rows that existed before the migration (``seeded=False``) are never touched, even
+    when their names or aliases match the seed list. A seeded genre that has books or
+    admin-added aliases is kept.
+    """
     Genre = apps.get_model("core", "Genre")
     GenreAlias = apps.get_model("core", "GenreAlias")
-    for name, aliases in SEED_GENRES.items():
-        GenreAlias.objects.filter(
-            genre__name=name, key__in=[_genre_key(alias) for alias in aliases]
-        ).delete()
-        # Only remove seeded genres nobody has used or extended.
-        Genre.objects.filter(name=name, books__isnull=True, aliases__isnull=True).delete()
+    GenreAlias.objects.filter(seeded=True).delete()
+    Genre.objects.filter(seeded=True, books__isnull=True, aliases__isnull=True).delete()
 
 
 class Migration(migrations.Migration):

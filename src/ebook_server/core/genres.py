@@ -8,7 +8,8 @@ Decisions (see docs/metadata-providers.md, "Genres and categories"):
 - Provider subjects of the accepted candidate are preferred; embedded file subjects
   are used only when the provider's tags map to no genre.
 - Automatic assignment only adds links. It never removes links and never runs on a
-  Book that already has reviewer- or admin-set genres.
+  Book whose genres a reviewer or admin has decided: ``Book.genres_curated_at`` records
+  that decision even when it was "no genres", and reviewer-/admin-set links count too.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from django.db import transaction
+from django.utils import timezone
 
 from .models import Book, BookGenre, Genre, GenreAlias, genre_key
 
@@ -137,7 +139,21 @@ def embedded_subjects(evidence: Any) -> list[str]:
 
 
 def has_curated_genres(book: Book) -> bool:
+    """Whether a human decided ``book``'s genres, including deciding on none.
+
+    Read from the database, not the possibly stale instance, so a decision made
+    elsewhere (another worker, the admin) is honoured.
+    """
+    if Book.objects.filter(pk=book.pk, genres_curated_at__isnull=False).exists():
+        return True
     return BookGenre.objects.filter(book=book, source__in=CURATED_SOURCES).exists()
+
+
+def mark_curated(book: Book, *, user: Any = None) -> None:
+    """Record a reviewer/admin genre decision on ``book`` (also an empty one)."""
+    book.genres_curated_at = timezone.now()
+    book.genres_curated_by = user if getattr(user, "pk", None) is not None else None
+    book.save(update_fields=["genres_curated_at", "genres_curated_by", "updated_at"])
 
 
 @transaction.atomic
@@ -176,13 +192,17 @@ def assign_reviewer(
     genres: Iterable[Genre],
     *,
     suggestion: GenreSuggestion | None = None,
+    user: Any = None,
 ) -> list[Genre]:
     """Link the reviewer's chosen genres; automatic links to them become reviewer links.
 
     ``suggestion`` only supplies the tag a confirmed genre came from. Admin links are
     left untouched, and genres the reviewer did not choose are not removed from an
-    existing Book (other files of it may justify them).
+    existing Book (other files of it may justify them). The Book is marked curated even
+    when ``genres`` is empty, so later automatic assignment and backfills leave it alone.
     """
+    genres = list(genres)
+    mark_curated(book, user=user)
     tags: dict[int, str] = {}
     for match in suggestion.matches if suggestion is not None else []:
         if match.genre is not None:
