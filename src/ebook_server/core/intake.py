@@ -349,7 +349,7 @@ def _block_reason(
     file_authors: list[str],
     file_evidence: identification.IdentificationInput,
 ) -> tuple[str | None, list[str]]:
-    """Why ``candidate`` may not be accepted automatically (author, then edition checks).
+    """Why ``candidate`` may not be accepted automatically (LLM, author, edition checks).
 
     Returns the block reason (``None`` when it may be accepted) and the edition
     conflicts found, which are reported even when an author check blocks first.
@@ -395,8 +395,8 @@ def decide_auto_accept(
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
-    Candidates found through LLM-proposed search terms require human review.
-    candidate must also name at least one real author, and its authors must not
+    candidate must not have been found through LLM-proposed search terms (those always
+    need a person), it must name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
     is no evidence about authorship. The candidate must also be the file's edition:
     ``file_evidence`` (the normalised file signals: ISBNs, language, publisher) is
