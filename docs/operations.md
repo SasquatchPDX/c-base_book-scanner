@@ -333,6 +333,43 @@ web uploads, otherwise the source location's `default_source_type`
 (`incoming_folder` or `network_source`). An exact duplicate reuses the existing
 variant and keeps that variant's original origin.
 
+### Books split across per-chapter files (multi-part works)
+
+Some collections store one book as many files in one folder (`ch01.pdf` …
+`ch20.pdf`, `Appendix1.pdf`, `FM.pdf`, `Index.pdf`). Source discovery detects these
+from file names only: at least three files of one format in the same folder whose
+names share a prefix followed by a chapter/part/section/lesson token
+(`ch`, `chap`, `chapter`, `kapitel`, `part`, `pt`, `teil`, `sec`, `section`,
+`lesson`, `lektion`) and distinct numbers (digits, or roman numerals after a
+separator). Appendices (`AppA`, `Appendix 2`) and front/back matter (`FM`, `toc`,
+`preface`, `glossary`, `index`, …) join a detected group but never form one.
+Volume/book/band numbers are not part tokens (those are usually separate books),
+and the *folder* name is ignored: a single complete novel in a folder called
+`CHAPTER ONE` is not a split work. On the two real-world listings in
+`tests/fixtures/real_world_samples/` the detector flags exactly the two known split
+books and nothing in the 1,136-folder Calibre library.
+
+Each part is still hashed, validated and archived on its own (COPY keeps the source;
+MOVE removes it only after the archive copy verified). Instead of identifying every
+chapter separately, the parts wait in `low_confidence` and, once all of them have
+settled, one review task of type `multipart_work` is opened for the whole folder,
+searched by the folder name. `ingest_sources --preview --json` shows
+`multipart_group`/`part_label` for files that would be grouped.
+
+The reviewer can fix the proposed order and labels, then either
+
+- accept a candidate, enter metadata, or link an existing book: every part becomes
+  its own `FileVariant` of that one Book with `part_index`/`part_label` set (book
+  pages list them in order; parts are never offered as single-chapter conversions),
+  or
+- choose **Not one book**: the group is rejected and every file is identified as an
+  independent import in the background (auto-accepted only under the normal rules,
+  otherwise an ordinary review task).
+
+Originals are never merged, rewritten or deleted by either path. Completeness cannot
+be verified automatically; gaps in the numbering are shown on the review page.
+Disable detection with `BOOK_SCANNER_MULTIPART_DETECTION=false`.
+
 ### Metadata provider rate limits
 
 Every outbound metadata-provider request waits for a client-side slot before it is

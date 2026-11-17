@@ -24,7 +24,7 @@
         <h2>Available files</h2>
         <div class="variant-list">
           {% for variant in variants %}
-            <div><div><strong>{{ variant.format|upper }}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
+            <div><div><strong>{{ variant.format|upper }}{% if variant.part_index is not None %} · {{ variant.part_index }}. {{ variant.part_label|default:"Part" }}{% endif %}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
    href="{% url 'library-book-download' book.id %}?variant_id={{ variant.id }}">Download</a></div>
 {% empty %}<p>No downloadable variants are ready.</p>{% endfor %}
   </div>

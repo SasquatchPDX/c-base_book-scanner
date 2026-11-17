@@ -573,7 +573,10 @@ def discover_source_jobs_for_location(
     With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
     would not fit, so a bulk import cannot queue more than the archive can hold.
     """
+    from . import multipart
+
     jobs: list[ImportJob] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
             continue
@@ -607,16 +610,21 @@ def discover_source_jobs_for_location(
                 )
                 break
         try:
-            jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
+            job = create_source_import_job(candidate, source_location, uploader=uploader)
         except IntakeError:
             continue
+        multipart.assign_discovered_job(job, source_location, folder_groups=folder_groups)
+        jobs.append(job)
     return jobs
 
 
 def preview_source_jobs(
     source_location: SourceLocation,
 ) -> list[dict[str, Any]]:
+    from . import multipart
+
     rows: list[dict[str, Any]] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
             continue
@@ -630,6 +638,16 @@ def preview_source_jobs(
             # Lets an admin check a folder layout before importing anything.
             hints = source_layout.hints_for_source_file(source_location, str(candidate))
             row["path_layout"] = hints.as_evidence() if hints is not None else None
+        if multipart.detection_enabled():
+            folder = candidate.parent
+            if folder not in folder_groups:
+                folder_groups[folder] = multipart.groups_for_folder(folder)
+            for detected in folder_groups[folder]:
+                part = next((p for p in detected.parts if p.filename == candidate.name), None)
+                if part is not None:
+                    row["multipart_group"] = detected.key
+                    row["part_label"] = part.label
+                    break
         rows.append(row)
     return rows
 
@@ -1211,6 +1229,8 @@ def _create_or_reuse_file_variant(
     *,
     storage_identifier: str | None = None,
     source_type: str = "",
+    part_index: int | None = None,
+    part_label: str = "",
 ) -> FileVariant:
     if not source_type:
         source_type = variant_source_type_for_job(job)
@@ -1250,6 +1270,8 @@ def _create_or_reuse_file_variant(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        part_index=part_index,
+        part_label=_fit(FileVariant, "part_label", part_label),
     )
 
 
@@ -1333,8 +1355,23 @@ def resolve_import_with_review_data(
     """Resolve a reviewed import; ``source_type`` defaults to the job's origin."""
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
-    variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant, job)
+    if review_task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+        from . import multipart
+
+        # Any identifying action on a multi-part review confirms the grouping: every
+        # archived part becomes an ordered part FileVariant of ``book``.
+        part_variants = multipart.confirm_parts(lead_job=job, review_task=review_task, book=book)
+        payload = dict(decision_payload if decision_payload is not None else {})
+        payload["multipart_confirmed"] = {
+            "import_group_id": str(job.import_group_id),
+            "file_variant_ids": [part.id for part in part_variants],
+        }
+        decision_payload = payload
+        job.refresh_from_db()
+        variant = job.file_variant or part_variants[0]
+    else:
+        variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
+        _try_extract_front_cover(variant, job)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -1483,9 +1520,62 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     return job.next_retry_at is not None and job.attempt_count <= max_retries
 
 
+def _archive_for_review(job: ImportJob) -> None:
+    """Archive a job that waits for a reviewer, then leave it LOW_CONFIDENCE.
+
+    The source is only removed (MOVE sources) after the archive copy verified.
+    """
+    job.state = ImportJob.State.ARCHIVING
+    job.save(update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(_default_storage(), job)
+    job.storage_identifier = destination
+    job.storage_location = _default_storage_location()
+    job.save(
+        update_fields=[
+            "storage_identifier",
+            "storage_location_id",
+            "state",
+            "updated_at",
+        ],
+    )
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    job.save(
+        update_fields=[
+            "state",
+            "storage_identifier",
+            "storage_location_id",
+            "updated_at",
+        ],
+    )
+
+
+def _settle_multipart_part(job: ImportJob) -> None:
+    """After a grouped part settles, open the group's review once all parts have."""
+    from . import multipart
+
+    group = multipart.pending_group_for(job)
+    if group is None:
+        return
+    try:
+        multipart.maybe_open_review(group)
+    except Exception as exc:  # the part itself is safely archived; retry on next settle
+        logger.warning(
+            "multipart_review_open_failed",
+            import_group_id=str(group.id),
+            error_type=type(exc).__name__,
+        )
+
+
 def process_import_job(job_id: str) -> None:
     """Process one intake job from staging file to durable archive and optional matching."""
-    job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
+    from . import multipart
+
+    job = ImportJob.objects.select_related("uploader", "source_location", "import_group").get(
+        pk=job_id
+    )
     if job.state == ImportJob.State.COMPLETE:
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
@@ -1548,6 +1638,7 @@ def process_import_job(job_id: str) -> None:
                 ),
             )
             _try_extract_front_cover(duplicate_variant, job)
+            _settle_multipart_part(job)
             return
 
         metadata = extract_metadata(
@@ -1568,6 +1659,12 @@ def process_import_job(job_id: str) -> None:
                 "updated_at",
             ],
         )
+        if multipart.pending_group_for(job) is not None:
+            # One part of a suspected multi-part work: archive it like any import
+            # awaiting review, but identify the work once for the whole group.
+            _archive_for_review(job)
+            _settle_multipart_part(job)
+            return
 
         signals = identification.build_identification_input(
             source_path=job.source_path,
@@ -1603,31 +1700,7 @@ def process_import_job(job_id: str) -> None:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
-            job.state = ImportJob.State.ARCHIVING
-            job.save(update_fields=["state", "updated_at"])
-            destination, verified = _archive_source(_default_storage(), job)
-            job.storage_identifier = destination
-            job.storage_location = _default_storage_location()
-            job.save(
-                update_fields=[
-                    "storage_identifier",
-                    "storage_location_id",
-                    "state",
-                    "updated_at",
-                ],
-            )
-            _finalize_source_cleanup(job, verified)
-            if not verified:
-                raise RuntimeError("archive verification failed")
-            job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(
-                update_fields=[
-                    "state",
-                    "storage_identifier",
-                    "storage_location_id",
-                    "updated_at",
-                ],
-            )
+            _archive_for_review(job)
             return
 
         job.state = ImportJob.State.MATCHED
@@ -1703,4 +1776,5 @@ def process_import_job(job_id: str) -> None:
             source_type=job.source_type,
             error_recorded=True,
         )
+        _settle_multipart_part(job)
         raise

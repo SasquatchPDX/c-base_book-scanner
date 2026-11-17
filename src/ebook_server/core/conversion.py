@@ -246,8 +246,11 @@ def describe_plan(plan: ConversionPlan) -> list[dict[str, Any]]:
 
 def conversion_options_for_book(book: Book) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
+    # A part of a split work (#60) is not the whole book: converting one chapter would
+    # yield a "complete" variant that is really a fragment.
     for variant in book.file_variants.filter(
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        part_index__isnull=True,
     ):
         for target_format, route in list_conversion_targets(variant.format).items():
             options.append(
@@ -269,6 +272,8 @@ def request_conversion(
     requested_by_user_id: int | None = None,
     request_options: Mapping[str, Any] | None = None,
 ) -> ProcessingJob:
+    if source_variant.part_index is not None:
+        raise ConversionError("a single part of a multi-part work cannot be converted alone")
     normalized_target = _normalize_format(target_format)
     plan = find_conversion_plan(source_variant.format, normalized_target)
     if plan is None or not plan.steps:

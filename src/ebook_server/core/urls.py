@@ -194,6 +194,16 @@ urlpatterns = [
         name="review-edit-search-terms",
     ),
     path(
+        "reviews/<int:task_id>/multipart/order/",
+        views.review_multipart_order,
+        name="review-multipart-order",
+    ),
+    path(
+        "reviews/<int:task_id>/multipart/reject/",
+        views.review_multipart_reject,
+        name="review-multipart-reject",
+    ),
+    path(
         "review-identifications/<uuid:job_id>/",
         views.review_identification_job_status,
         name="review-identification-job-status",

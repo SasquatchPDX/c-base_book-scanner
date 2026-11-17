@@ -416,6 +416,12 @@ class FileVariant(models.Model):
         default=ProcessingState.DISCOVERED,
     )
     job_id = models.UUIDField(default=None, null=True, blank=True)
+    # Set only when this file is one part of a work split across several files (#60),
+    # e.g. "ch07.pdf" of a book whose chapters are separate files. Null means the
+    # variant is a complete representation of the book. The order and label were
+    # confirmed by a reviewer; parts are never merged into or replaced by each other.
+    part_index = models.PositiveIntegerField(null=True, blank=True)
+    part_label = models.CharField(max_length=128, blank=True)
 
     class Meta:
         indexes = [
@@ -766,6 +772,60 @@ class ProcessingJob(models.Model):
         return f"{self.job_id}:{self.job_type}"
 
 
+class ImportGroup(models.Model):
+    """Source files that intake suspects belong together, pending a reviewer's decision.
+
+    Today the only kind is a work split across several per-chapter files in one
+    folder (#60). Detection is a filename heuristic, so the group stays PENDING until
+    a reviewer confirms it (parts of one Book) or rejects it (independent imports).
+    """
+
+    class Kind(models.TextChoices):
+        MULTIPART_WORK = "multipart_work", "Multi-part work"
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending review"
+        CONFIRMED = "confirmed", "Confirmed as one work"
+        REJECTED = "rejected", "Rejected (independent imports)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=32, choices=Kind.choices, default=Kind.MULTIPART_WORK)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.PENDING)
+    source_location = models.ForeignKey(
+        "SourceLocation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_groups",
+    )
+    folder = models.CharField(max_length=1024)
+    group_key = models.CharField(max_length=512)
+    detection = models.JSONField(default=dict, blank=True)
+    book = models.ForeignKey(
+        Book,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_groups",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["source_location", "state"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source_location", "folder", "group_key"],
+                condition=models.Q(state="pending"),
+                name="uniq_pending_import_group_per_folder_key",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.id}:{self.kind}:{self.state}"
+
+
 class ImportJob(models.Model):
     """Stateful intake job for uploaded or discovered source files."""
 
@@ -841,6 +901,16 @@ class ImportJob(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Membership in a suspected multi-part work (#60) and this file's proposed place in it.
+    import_group = models.ForeignKey(
+        ImportGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_jobs",
+    )
+    part_index = models.PositiveIntegerField(null=True, blank=True)
+    part_label = models.CharField(max_length=128, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -951,6 +1021,7 @@ class ReviewTask(models.Model):
         NEEDS_ATTENTION = "needs_attention", "Needs attention"
         SOURCE_REVIEW = "source_review", "Source review"
         QUALITY_REVIEW = "quality_review", "Quality review"
+        MULTIPART_WORK = "multipart_work", "Multi-part work"
 
     class State(models.TextChoices):
         OPEN = "open", "Open"
@@ -966,6 +1037,7 @@ class ReviewTask(models.Model):
         MANUAL_ENTRY = "manual_entry", "Manual entry"
         MERGED_BOOK = "merged_book", "Merged with existing book"
         MARK_UNIDENTIFIED = "mark_unidentified", "Mark unidentified"
+        SPLIT_PARTS = "split_parts", "Not one work: import parts separately"
 
     import_job = models.ForeignKey(
         ImportJob,

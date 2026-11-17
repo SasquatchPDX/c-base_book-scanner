@@ -13,6 +13,7 @@ from .models import (
     FileVariant,
     Genre,
     Identifier,
+    ImportGroup,
     ImportJob,
     MetadataCandidate,
     ProcessingJob,
@@ -175,6 +176,13 @@ class ProcessingJobAdmin(admin.ModelAdmin[ProcessingJob]):
 class ImportJobAdmin(admin.ModelAdmin[ImportJob]):
     list_display = ("id", "state", "source_type", "uploader", "original_filename", "created_at")
     list_filter = ("state", "source_type")
+
+
+@admin.register(ImportGroup)
+class ImportGroupAdmin(admin.ModelAdmin[ImportGroup]):
+    list_display = ("id", "kind", "state", "folder", "book", "created_at")
+    list_filter = ("kind", "state")
+    search_fields = ("folder",)
 
 
 @admin.register(MetadataCandidate)
