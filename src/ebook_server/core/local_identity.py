@@ -50,7 +50,7 @@ ORIGIN_CONTENT = "content"
 ORIGIN_EMBEDDED = "embedded"
 # Which origin's spelling of the title/authors to keep when several agree.
 _TITLE_ORIGIN_PREFERENCE = (ORIGIN_EMBEDDED, ORIGIN_CONTENT, ORIGIN_PATH)
-_AUTHOR_SOURCE_PREFERENCE = ("embedded", "sidecar", "header", "layout")
+_AUTHOR_SOURCE_PREFERENCE = ("embedded", "sidecar", "header", "layout", "header_likely")
 
 # Surname similarity (0-100) that still counts as the same person: tolerates typos in
 # hand-named folders ("Cliffard D Simak" vs. "Clifford D. Simak", "Issac Asimov").
@@ -234,10 +234,14 @@ def _authors_by_source(metadata: dict[str, Any]) -> dict[str, list[str]]:
         add("sidecar", sidecar["fields"].get("authors"))
     header = metadata.get(TEXT_HEADER_EVIDENCE_KEY)
     if isinstance(header, dict):
-        add("header", (header.get("authors") or []) + (header.get("likely_authors") or []))
+        add("header", header.get("authors"))
     layout = metadata.get("path_layout")
     if isinstance(layout, dict):
         add("layout", layout.get("authors"))
+    if not found and isinstance(header, dict):
+        # A bare name-like line beside the title may be a character or a typist; it
+        # only counts when nothing else names an author, and never contradicts.
+        add("header_likely", header.get("likely_authors"))
     return found
 
 
@@ -276,6 +280,17 @@ def local_consensus(
     if any(not same_people(lists[0], other) for other in lists[1:]):
         return None
     authors = lists[0]
+    # The file name's author part ("John Roe - Borderline Match") is a guess, too weak to
+    # name the author, but a person it names must not contradict the chosen authors.
+    _titles, filename_authors = identification.parse_filename_signals(filename)
+    named = [
+        _display_name(name)
+        for name in filename_authors
+        # A single word ("Gold", "Frustration") is a title part, not a person.
+        if plausible_person(name) and len(name.split()) >= 2 and _key(name) != key
+    ]
+    if named and not same_people(authors, named):
+        return None
     if plausible_person(display) and "," in display:
         return None  # "Kohl, Walter" as the title: author and title are swapped
     if any(_key(display) == _key(author) for author in authors):

@@ -151,6 +151,34 @@ def test_swapped_title_and_author_folders_are_refused() -> None:
     )
 
 
+def test_file_name_author_contradicting_the_embedded_author_is_no_consensus() -> None:
+    assert (
+        _consensus(
+            "John Roe - Borderline Match.epub",
+            embedded={"title": "Borderline Match", "authors": ["Jane Doe"]},
+        )
+        is None
+    )
+
+
+def test_file_name_author_agreeing_with_the_embedded_author_is_fine() -> None:
+    local = _consensus(
+        "Absolution Gap - Alastair Reynolds.epub",
+        embedded={"title": "Absolution Gap", "authors": ["Alastair Reynolds"]},
+    )
+    assert local is not None
+
+
+def test_single_word_file_name_parts_are_no_author() -> None:
+    local = _consensus(
+        "Gold - 03 - Frustration.txt",
+        header_text="Frustration\n\nHerman Gelb...\n",
+        layout_authors=["Isaac Asimov"],
+    )
+    assert local is not None
+    assert (local.title, local.authors) == ("Frustration", ["Isaac Asimov"])
+
+
 def test_disagreeing_authors_are_no_consensus() -> None:
     assert (
         _consensus(
