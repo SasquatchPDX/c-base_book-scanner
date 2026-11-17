@@ -1061,6 +1061,23 @@ then hands the file to nginx (`X-Accel-Redirect`) instead of streaming it from
 a Python worker; see `deploy/nginx/README.md`. A cover that cannot be decoded
 keeps the full-size cover in lists and is logged as `cover_thumbnail_failed`.
 
+A job publishes only when the cover still has the bytes it rendered. It checks
+the cover's current hash under a lock on the cover row, so a slow job for a
+replaced cover ends as `stale` and leaves the newer thumbnails alone.
+Thumbnail files are content-addressed and shared by identical covers, so they
+are never deleted inline. When the last row referencing a file is replaced or
+deleted, the file's `CoverThumbnailFile` registry row is marked unreferenced.
+A periodic collection deletes files that stayed unreferenced for longer than
+`BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS` (default one day). It re-checks
+references under the same registry row lock that publication takes, and a
+publisher that finds a file collected writes it again. Run collection from cron
+or a systemd timer, for example hourly:
+
+```bash
+uv run python manage.py collect_cover_thumbnails
+uv run python manage.py collect_cover_thumbnails --grace-seconds 3600 --limit 5000
+```
+
 ## Metrics and logs
 
 Set a long random `BOOK_SCANNER_METRICS_BEARER_TOKEN` in production and configure

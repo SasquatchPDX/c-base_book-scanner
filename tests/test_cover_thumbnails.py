@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
+from datetime import timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from django.core.management import call_command
 from django.db import connection
 from django.test import Client, override_settings
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from PIL import Image
 
 from ebook_server import jobs
@@ -25,6 +27,7 @@ from ebook_server.core.models import (
     Book,
     CoverImage,
     CoverThumbnail,
+    CoverThumbnailFile,
     StorageLocation,
     get_or_create_profile,
 )
@@ -136,9 +139,20 @@ def test_job_is_idempotent_and_refreshes_when_the_cover_changes() -> None:
     new = {row.size: row for row in CoverThumbnail.objects.filter(cover=cover)}
     assert {row.sha256 for row in new.values()}.isdisjoint(row.sha256 for row in old.values())
     assert CoverThumbnail.objects.filter(cover=cover).count() == 2
-    # Replaced files that nothing references any more are removed.
+    # Replaced files are never deleted inline: they are marked, and collection removes
+    # them only after the grace period.
+    assert all(_thumbnail_path(row).exists() for row in old.values())
+    assert all(_thumbnail_path(row).exists() for row in new.values())
+    old_files = CoverThumbnailFile.objects.filter(
+        storage_identifier__in=[row.storage_identifier for row in old.values()]
+    )
+    assert old_files.count() == 2
+    assert all(record.unreferenced_since is not None for record in old_files)
+    assert thumbnails.collect_unreferenced_files().deleted == 0  # within the grace period
+    assert thumbnails.collect_unreferenced_files(grace_seconds=0).deleted == 2
     assert not any(_thumbnail_path(row).exists() for row in old.values())
     assert all(_thumbnail_path(row).exists() for row in new.values())
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
 
 
 @pytest.mark.django_db
@@ -191,7 +205,7 @@ def test_enqueue_failure_never_breaks_the_cover_write(
 
 
 @pytest.mark.django_db
-def test_deleting_the_book_removes_thumbnail_rows_and_files(
+def test_deleting_the_book_removes_thumbnail_rows_and_later_the_files(
     django_capture_on_commit_callbacks: OnCommit,
 ) -> None:
     book = Book.objects.create(title="Gone Soon")
@@ -204,7 +218,14 @@ def test_deleting_the_book_removes_thumbnail_rows_and_files(
         book.delete()
 
     assert not CoverThumbnail.objects.exists()
+    assert all(path.exists() for path in paths)  # kept for the grace period
+    assert CoverThumbnailFile.objects.filter(unreferenced_since__isnull=False).count() == 2
+
+    out = StringIO()
+    call_command("collect_cover_thumbnails", "--grace-seconds", "0", stdout=out)
+    assert "deleted: 2" in out.getvalue()
     assert not any(path.exists() for path in paths)
+    assert not CoverThumbnailFile.objects.exists()
 
 
 @pytest.mark.django_db
@@ -336,7 +357,8 @@ def test_browse_list_thumbnail_lookup_is_one_query_for_the_page() -> None:
     with CaptureQueriesContext(connection) as seven:
         client.get("/library/books/?view=html", headers=HTML)
 
-    assert len(one) == len(seven) <= 10
+    # The HTML form adds one constant query: the genre datalist (#50).
+    assert len(one) == len(seven) <= 11
 
 
 @pytest.mark.django_db
@@ -350,3 +372,169 @@ def test_metrics_report_missing_thumbnails_and_search_rows() -> None:
     assert 'ebook_server_library_derived_rows_missing{kind="cover_thumbnails"} 1.0' in body
     assert 'ebook_server_library_derived_rows_missing{kind="search_documents"}' in body
     assert "ebook_server_search_index_lag_seconds " in body
+
+
+# ------------------------------------------------- deterministic interleavings
+
+
+def _replace_cover_bytes(cover: CoverImage, payload: bytes) -> str:
+    """Overwrite the stored cover and its hash, as a cover refresh does."""
+    path = Path(django_settings.APP_DATA_DIR) / "library-artifacts" / cover.storage_identifier
+    path.write_bytes(payload)
+    sha256 = hashlib.sha256(payload).hexdigest()
+    CoverImage.objects.filter(pk=cover.pk).update(sha256=sha256, size_bytes=len(payload))
+    return sha256
+
+
+def _assert_served(cover: CoverImage) -> None:
+    client, _profile = _client("interleaving-reader")
+    rows = list(CoverThumbnail.objects.filter(cover=cover))
+    assert len(rows) == 2
+    for row in rows:
+        assert _thumbnail_path(row).exists()
+        response = client.get(thumbnails.thumbnail_url(row))
+        assert response.status_code == 200
+        body = b"".join(response.streaming_content)  # type: ignore[attr-defined]
+        assert hashlib.sha256(body).hexdigest() == row.sha256
+
+
+@pytest.mark.django_db
+def test_stale_worker_cannot_overwrite_a_newer_covers_thumbnails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe 1: old worker renders, a newer cover's job publishes, the old one resumes."""
+    book = Book.objects.create(title="Racing Covers")
+    cover = _cover(book, _png(color="#111111"))
+    old_sha = cover.sha256
+    original_render = thumbnails.render_thumbnails
+    steps: list[str] = []
+
+    def render_then_let_the_newer_job_finish(payload: bytes) -> list[Any]:
+        rendered = original_render(payload)
+        if not steps:
+            steps.append("old worker rendered")
+            new_sha = _replace_cover_bytes(cover, _png(color="#eeeeee"))
+            steps.append(new_sha)
+            assert thumbnails.generate_cover_thumbnails(cover.pk) == "created"
+        return rendered
+
+    monkeypatch.setattr(thumbnails, "render_thumbnails", render_then_let_the_newer_job_finish)
+
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "stale"
+
+    new_sha = steps[1]
+    assert new_sha != old_sha
+    assert set(
+        CoverThumbnail.objects.filter(cover=cover).values_list("source_sha256", flat=True)
+    ) == {new_sha}
+    _assert_served(cover)
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
+    assert not thumbnails.covers_needing_thumbnails().filter(pk=cover.pk).exists()
+
+
+@pytest.mark.django_db
+def test_worker_fences_on_the_bytes_it_rendered_not_the_row_it_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cover changes between reading its row and reading its bytes."""
+    book = Book.objects.create(title="Swapped Bytes")
+    cover = _cover(book, _png(color="#222222"))
+    original_read = thumbnails._read_cover
+    replaced: list[str] = []
+
+    def replace_then_read(row: CoverImage) -> bytes:
+        if not replaced:
+            replaced.append(_replace_cover_bytes(cover, _png(color="#dddddd")))
+        return original_read(row)
+
+    monkeypatch.setattr(thumbnails, "_read_cover", replace_then_read)
+
+    # The bytes rendered are the cover's current bytes, so they are published as such.
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "created"
+    assert set(
+        CoverThumbnail.objects.filter(cover=cover).values_list("source_sha256", flat=True)
+    ) == {replaced[0]}
+    assert thumbnails.generate_cover_thumbnails(cover.pk) == "current"
+
+
+@pytest.mark.django_db
+def test_shared_file_collected_between_reuse_and_publication_is_written_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe 2: B sees A's shared bytes, A is refreshed and its old bytes collected,
+    then B publishes. B's thumbnails must still point at files that exist."""
+    shared = _png(color="#445566")
+    cover_a = _cover(Book.objects.create(title="Cover A"), shared)
+    cover_b = _cover(Book.objects.create(title="Cover B"), shared, name="b.png")
+    assert thumbnails.generate_cover_thumbnails(cover_a.pk) == "created"
+    shared_paths = [_thumbnail_path(row) for row in CoverThumbnail.objects.filter(cover=cover_a)]
+
+    original_store = thumbnails._store
+    steps: list[str] = []
+
+    def store_then_interleave(location: StorageLocation, rendered: Any) -> str:
+        identifier = original_store(location, rendered)
+        if not steps:
+            steps.append("B saw the shared file")
+            assert all(path.exists() for path in shared_paths)
+            # Cover A is refreshed: its rows move to new bytes; the shared files are
+            # only marked, never deleted inline.
+            _replace_cover_bytes(cover_a, _png(color="#998877"))
+            assert thumbnails.generate_cover_thumbnails(cover_a.pk) == "created"
+            assert all(path.exists() for path in shared_paths)
+            # Worst case: the grace period has passed and collection runs now.
+            assert thumbnails.collect_unreferenced_files(grace_seconds=0).deleted == 2
+            assert not any(path.exists() for path in shared_paths)
+            steps.append("shared files collected")
+        return identifier
+
+    monkeypatch.setattr(thumbnails, "_store", store_then_interleave)
+
+    assert thumbnails.generate_cover_thumbnails(cover_b.pk) == "created"
+
+    assert steps == ["B saw the shared file", "shared files collected"]
+    assert all(path.exists() for path in shared_paths)  # written again under the lock
+    _assert_served(cover_b)
+    _assert_served(cover_a)
+    assert thumbnails.generate_cover_thumbnails(cover_b.pk) == "current"
+    files = CoverThumbnailFile.objects.filter(
+        storage_identifier__in=CoverThumbnail.objects.filter(cover=cover_b).values(
+            "storage_identifier"
+        )
+    )
+    assert files.count() == 2 and not files.filter(unreferenced_since__isnull=False).exists()
+    # Nothing referenced is ever collected.
+    assert thumbnails.collect_unreferenced_files(grace_seconds=0).deleted == 0
+    _assert_served(cover_b)
+
+
+@pytest.mark.django_db
+def test_collection_rechecks_references_under_the_lock() -> None:
+    """A file marked unreferenced but referenced again before collection is kept."""
+    book, thumbnail = _generated("Re-referenced")
+    path = _thumbnail_path(thumbnail)
+    CoverThumbnailFile.objects.filter(storage_identifier=thumbnail.storage_identifier).update(
+        unreferenced_since=timezone.now() - timedelta(days=2)
+    )
+
+    report = thumbnails.collect_unreferenced_files(grace_seconds=0)
+
+    assert report.deleted == 0 and report.kept == 1
+    assert path.exists()
+    assert (
+        CoverThumbnailFile.objects.get(
+            storage_identifier=thumbnail.storage_identifier
+        ).unreferenced_since
+        is None
+    )
+    assert book.front_cover is not None
+
+
+@pytest.mark.django_db
+def test_current_requires_the_files_to_exist() -> None:
+    _book, thumbnail = _generated("Lost File")
+    _thumbnail_path(thumbnail).unlink()  # lost outside the application
+
+    assert thumbnails.generate_cover_thumbnails(thumbnail.cover_id) == "created"
+    assert _thumbnail_path(thumbnail).exists()
+    assert thumbnails.generate_cover_thumbnails(thumbnail.cover_id) == "current"

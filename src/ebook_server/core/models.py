@@ -689,6 +689,42 @@ class CoverThumbnail(models.Model):
         return f"{self.cover_id}:{self.size}"
 
 
+class CoverThumbnailFile(models.Model):
+    """Registry row of one content-addressed thumbnail file (#28).
+
+    Identical covers share a file, so a file may be referenced by several
+    `CoverThumbnail` rows, and by none once they are replaced or deleted. Files
+    are never deleted inline: `unreferenced_since` marks a file nothing points
+    at, and `thumbnails.collect_unreferenced_files` deletes it after a grace
+    period. Publication and collection both lock this row, so a file cannot be
+    deleted while a worker is attaching a new reference to it.
+    """
+
+    storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        related_name="cover_thumbnail_files",
+    )
+    storage_identifier = models.CharField(max_length=512)
+    sha256 = models.CharField(max_length=64)
+    unreferenced_since = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["storage_location", "storage_identifier"],
+                name="uniq_cover_thumbnail_file",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["unreferenced_since"], name="coverthumbfile_unref_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return self.storage_identifier
+
+
 class FileVariant(models.Model):
     """One concrete representation of a book."""
 

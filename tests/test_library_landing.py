@@ -99,8 +99,8 @@ def _library() -> dict[str, Any]:
     bob = Author.objects.create(full_name="Bob Byte")
     cyd = Author.objects.create(full_name="Cyd Charisse")
     Author.objects.create(full_name="Orphan Author")  # no books: never listed
-    fantasy = Genre.objects.create(name="Fantasy")
-    manual = Genre.objects.create(name="Manual")
+    fantasy = Genre.objects.get_or_create(name="Fantasy")[0]  # seeded by 0027
+    manual = Genre.objects.get_or_create(name="Manual")[0]
     computing = Category.objects.create(name="Computing")
     rows = [
         ("Analytical Engines", "en", 1843, [ada], [manual], [computing], ["epub", "pdf"], True),

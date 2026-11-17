@@ -11,6 +11,13 @@ background and addressed by their own SHA-256:
 - Files live in the `cover-thumbnails` `StorageLocation`, a regenerable cache on
   the application VM, under `<sha[:2]>/<sha>.webp`. The original cover is never
   touched.
+- Publication is conditional on the cover's current hash (under the cover row
+  lock), so a slow worker cannot overwrite a newer cover's thumbnails.
+- Identical covers share files, so files are never deleted inline. A file whose
+  last reference goes is marked in `CoverThumbnailFile`, and
+  `collect_unreferenced_files` (`manage.py collect_cover_thumbnails`) deletes it
+  after a grace period, re-checking references under the same row lock that
+  publication takes.
 - `/library/covers/<sha256>/<size>.webp` serves them with
   `Cache-Control: private, max-age=31536000, immutable`; the URL changes when
   the bytes do. With `BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX` set, Django
@@ -21,8 +28,9 @@ from __future__ import annotations
 
 import hashlib
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from importlib.metadata import version
 from io import BytesIO
 from tempfile import NamedTemporaryFile
@@ -31,14 +39,15 @@ from typing import Any, Final
 import structlog
 from django.conf import settings
 from django.db import transaction
-from django.db.models import CharField, OuterRef, QuerySet, Subquery, Value
+from django.db.models import CharField, Exists, OuterRef, QuerySet, Subquery, Value
 from django.db.models.functions import Cast, Concat
 from django.db.models.signals import post_delete, post_save
+from django.utils import timezone
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ebook_server import jobs
 
-from .models import Book, CoverImage, CoverThumbnail, StorageLocation
+from .models import Book, CoverImage, CoverThumbnail, CoverThumbnailFile, StorageLocation
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 logger = structlog.get_logger(__name__)
@@ -228,43 +237,64 @@ def _read_cover(cover: CoverImage) -> bytes:
     return payload
 
 
-def _store(location: StorageLocation, rendered: RenderedThumbnail) -> str:
-    storage = backend_for_location(location)
-    identifier = thumbnail_storage_identifier(rendered.sha256)
-    if storage.exists(identifier):  # content-addressed: identical bytes already stored
-        return identifier
-    storage.ensure_free_space(len(rendered.payload))
+def _write_file(storage: Any, identifier: str, payload: bytes) -> None:
+    storage.ensure_free_space(len(payload))
     with NamedTemporaryFile(suffix=".webp", delete_on_close=False) as output_file:
-        output_file.write(rendered.payload)
+        output_file.write(payload)
         output_file.close()
         storage.store(output_file.name, identifier)
+
+
+def _store(location: StorageLocation, rendered: RenderedThumbnail) -> str:
+    """Write a rendition unless identical bytes are already stored (content addressing).
+
+    Runs before publication and without locks, so seeing the file here proves
+    nothing: collection may remove it before this worker's rows exist.
+    `_publish` checks again under the file's registry lock and rewrites it.
+    """
+    storage = backend_for_location(location)
+    identifier = thumbnail_storage_identifier(rendered.sha256)
+    if not storage.exists(identifier):
+        _write_file(storage, identifier, rendered.payload)
     return identifier
 
 
 def is_current(cover: CoverImage, thumbnails: Iterable[CoverThumbnail]) -> bool:
-    """Whether every size exists and derives from the cover's current bytes."""
+    """Whether every size has a row derived from the cover's current bytes."""
     by_size = {thumbnail.size: thumbnail for thumbnail in thumbnails}
     return all(
         size in by_size and by_size[size].source_sha256 == cover.sha256 for size in THUMBNAIL_WIDTHS
     )
 
 
+def _files_exist(thumbnails: Iterable[CoverThumbnail]) -> bool:
+    for thumbnail in thumbnails:
+        storage = backend_for_location(thumbnail.storage_location)
+        if not storage.exists(thumbnail.storage_identifier):
+            return False
+    return True
+
+
 def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
     """Create or refresh the thumbnails of one cover (worker job). Returns an outcome.
 
-    Outcomes: `created`, `current` (nothing to do), `missing` (cover gone) or
-    `failed` (unreadable cover; logged, not retried; the list falls back to the
-    full cover). Storage outages raise, so the queue retries them.
+    Outcomes: `created`; `current` (rows derive from the cover's current bytes and
+    their files exist: nothing to do); `stale` (the cover changed while this job
+    rendered it: nothing published, the newer cover's own job publishes);
+    `missing` (cover gone) or `failed` (unreadable cover; logged, not retried; the
+    list falls back to the full cover). Storage outages raise, so the queue
+    retries them.
     """
     try:
         cover = CoverImage.objects.select_related("storage_location").get(pk=cover_id)
     except CoverImage.DoesNotExist:
         return "missing"
-    existing = list(cover.thumbnails.all())
-    if not force and is_current(cover, existing):
+    existing = list(cover.thumbnails.select_related("storage_location"))
+    if not force and is_current(cover, existing) and _files_exist(existing):
         return "current"
     try:
-        rendered = render_thumbnails(_read_cover(cover))
+        payload = _read_cover(cover)
+        rendered = render_thumbnails(payload)
     except (ThumbnailError, FileNotFoundError, StorageConfigurationError) as exc:
         logger.warning(
             "cover_thumbnail_failed",
@@ -276,20 +306,92 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
         return "failed"
 
     location = thumbnail_storage_location()
-    stored = [(item, _store(location, item)) for item in rendered]
+    for item in rendered:
+        _store(location, item)
+    # Fence on the bytes actually rendered, not on the row read before reading them.
+    outcome = _publish(cover.pk, hashlib.sha256(payload).hexdigest(), location, rendered)
+    if outcome == "created":
+        logger.info("cover_thumbnails_created", cover_id=cover.id, book_id=cover.book_id)
+    elif outcome == "stale":
+        logger.info("cover_thumbnail_stale", cover_id=cover.id, book_id=cover.book_id)
+    return outcome
+
+
+def _lock_file_record(
+    location: StorageLocation, identifier: str, sha256: str
+) -> CoverThumbnailFile:
+    """Create, or lock, the registry row of one thumbnail file.
+
+    Collection deletes a file and its registry row in one transaction while
+    holding this lock. A publisher that waited for the lock and then finds the
+    row gone knows the file went with it, and creates the row again.
+    """
+    for _attempt in range(5):
+        record, _created = CoverThumbnailFile.objects.get_or_create(
+            storage_location=location,
+            storage_identifier=identifier,
+            defaults={"sha256": sha256},
+        )
+        locked = CoverThumbnailFile.objects.select_for_update().filter(pk=record.pk).first()
+        if locked is not None:
+            return locked
+    raise RuntimeError("thumbnail file registry row kept disappearing")
+
+
+def _publish(
+    cover_id: int,
+    source_sha256: str,
+    location: StorageLocation,
+    rendered: Sequence[RenderedThumbnail],
+) -> str:
+    """Point the cover's thumbnail rows at `rendered`, if it is still the cover's content.
+
+    Conditional publication: the cover row is locked, and rows change only when
+    the cover's current hash equals the hash of the bytes that were rendered. An
+    old worker therefore cannot overwrite what a newer cover's job published.
+
+    Each file's registry row is locked before the file's existence is checked
+    and before a reference to it is written, and collection takes the same lock
+    before it re-checks references and deletes. A file seen by `_store` but
+    collected since is written again here, so a published row never points at a
+    missing file. Replaced files are only marked unreferenced, never deleted.
+    """
+    storage = backend_for_location(location)
     tool_version = _tool_version()
     with transaction.atomic():
-        if not CoverImage.objects.filter(pk=cover.pk).exists():
-            return "missing"  # deleted meanwhile; the files are content-addressed cache
-        for item, identifier in stored:
+        current = (
+            CoverImage.objects.select_for_update()
+            .filter(pk=cover_id)
+            .values_list("sha256", flat=True)
+            .first()
+        )
+        if current is None:
+            return "missing"  # deleted meanwhile; its rows went with it
+        if current != source_sha256:
+            return "stale"
+        # One lock order (by file hash) for every publisher.
+        for item in sorted(rendered, key=lambda thumbnail: thumbnail.sha256):
+            identifier = thumbnail_storage_identifier(item.sha256)
+            record = _lock_file_record(location, identifier, item.sha256)
+            if record.unreferenced_since is not None:
+                record.unreferenced_since = None
+                record.save(update_fields=["unreferenced_since"])
+            if not storage.exists(identifier):
+                _write_file(storage, identifier, item.payload)
+        previous = set(
+            CoverThumbnail.objects.filter(cover_id=cover_id).values_list(
+                "storage_location_id", "storage_identifier"
+            )
+        )
+        for item in rendered:
             CoverThumbnail.objects.update_or_create(
-                cover=cover,
+                cover_id=cover_id,
                 size=item.size,
                 defaults={
                     "storage_location": location,
-                    "storage_identifier": identifier,
+                    "storage_identifier": thumbnail_storage_identifier(item.sha256),
                     "sha256": item.sha256,
-                    "source_sha256": cover.sha256,
+                    "source_sha256": source_sha256,
                     "width": item.width,
                     "height": item.height,
                     "mime_type": "image/webp",
@@ -298,25 +400,103 @@ def generate_cover_thumbnails(cover_id: int, *, force: bool = False) -> str:
                     "tool_version": tool_version,
                 },
             )
-    replaced = {thumbnail.sha256 for thumbnail in existing} - {item.sha256 for item, _ in stored}
-    for thumbnail in existing:
-        if thumbnail.sha256 in replaced:
-            _delete_unreferenced_file(thumbnail.storage_location_id, thumbnail.storage_identifier)
-    logger.info("cover_thumbnails_created", cover_id=cover.id, book_id=cover.book_id)
+        mark_unreferenced(previous)
     return "created"
 
 
-def _delete_unreferenced_file(location_id: int, identifier: str) -> None:
-    """Remove a thumbnail file once no row points at it (identical covers share files)."""
-    if CoverThumbnail.objects.filter(
+# ------------------------------------------------------------ file collection
+
+
+def _references(location_id: Any, identifier: Any) -> QuerySet[CoverThumbnail]:
+    return CoverThumbnail.objects.filter(
         storage_location_id=location_id, storage_identifier=identifier
-    ).exists():
-        return
-    try:
-        location = StorageLocation.objects.get(pk=location_id)
-        backend_for_location(location).delete(identifier)
-    except Exception:  # a stale cache file is harmless; never fail the caller
-        logger.warning("cover_thumbnail_cleanup_failed", storage_identifier=identifier)
+    )
+
+
+def mark_unreferenced(files: Iterable[tuple[int, str]]) -> int:
+    """Start the grace period of files that no thumbnail row points at any more.
+
+    Only a hint for `collect_unreferenced_files`, which re-checks references
+    under the file's lock before deleting anything. Returns the files marked.
+    """
+    marked = 0
+    now = timezone.now()
+    for location_id, identifier in files:
+        marked += (
+            CoverThumbnailFile.objects.filter(
+                storage_location_id=location_id,
+                storage_identifier=identifier,
+                unreferenced_since__isnull=True,
+            )
+            .filter(~Exists(_references(location_id, identifier)))
+            .update(unreferenced_since=now)
+        )
+    return marked
+
+
+@dataclass(frozen=True)
+class CollectionReport:
+    marked: int
+    deleted: int
+    kept: int
+
+
+def collect_unreferenced_files(
+    *, grace_seconds: int | None = None, limit: int = 10_000
+) -> CollectionReport:
+    """Delete thumbnail files nothing has referenced for longer than the grace period.
+
+    The periodic garbage collection of the content-addressed cache
+    (`manage.py collect_cover_thumbnails`). First every registry row without a
+    reference is marked (rows removed by cascades or crashes included). Then each
+    file marked longer ago than the grace period is handled in its own
+    transaction: its registry row is locked (`SKIP LOCKED`: a publisher holding it
+    wins), references are checked again, and only then are the file and the row
+    deleted together. A file referenced meanwhile is unmarked and kept.
+    """
+    grace = (
+        int(getattr(settings, "BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS", 86_400))
+        if grace_seconds is None
+        else grace_seconds
+    )
+    unreferenced = ~Exists(
+        CoverThumbnail.objects.filter(
+            storage_location_id=OuterRef("storage_location_id"),
+            storage_identifier=OuterRef("storage_identifier"),
+        )
+    )
+    now = timezone.now()
+    marked = CoverThumbnailFile.objects.filter(
+        unreferenced, unreferenced_since__isnull=True
+    ).update(unreferenced_since=now)
+    cutoff = now - timedelta(seconds=max(grace, 0))
+    candidates = list(
+        CoverThumbnailFile.objects.filter(unreferenced_since__lte=cutoff)
+        .order_by("pk")
+        .values_list("pk", flat=True)[:limit]
+    )
+    deleted = kept = 0
+    for pk in candidates:
+        with transaction.atomic():
+            record = (
+                CoverThumbnailFile.objects.select_for_update(skip_locked=True)
+                .select_related("storage_location")
+                .filter(pk=pk, unreferenced_since__lte=cutoff)
+                .first()
+            )
+            if record is None:
+                continue  # a publisher holds it, or it was unmarked meanwhile
+            if _references(record.storage_location_id, record.storage_identifier).exists():
+                record.unreferenced_since = None
+                record.save(update_fields=["unreferenced_since"])
+                kept += 1
+                continue
+            backend_for_location(record.storage_location).delete(record.storage_identifier)
+            record.delete()
+            deleted += 1
+    if marked or deleted or kept:
+        logger.info("cover_thumbnail_files_collected", marked=marked, deleted=deleted, kept=kept)
+    return CollectionReport(marked=marked, deleted=deleted, kept=kept)
 
 
 def covers_needing_thumbnails() -> Any:
@@ -357,8 +537,9 @@ def _on_cover_saved(sender: type[CoverImage], instance: CoverImage, **kwargs: An
 def _on_thumbnail_deleted(
     sender: type[CoverThumbnail], instance: CoverThumbnail, **kwargs: Any
 ) -> None:
-    location_id, identifier = instance.storage_location_id, instance.storage_identifier
-    transaction.on_commit(lambda: _delete_unreferenced_file(location_id, identifier))
+    # Never delete the shared file here: only start its grace period.
+    key = (instance.storage_location_id, instance.storage_identifier)
+    transaction.on_commit(lambda: mark_unreferenced([key]))
 
 
 def connect_signals() -> None:

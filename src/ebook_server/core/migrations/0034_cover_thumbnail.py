@@ -72,4 +72,41 @@ class Migration(migrations.Migration):
                 ],
             },
         ),
+        migrations.CreateModel(
+            name="CoverThumbnailFile",
+            fields=[
+                (
+                    "id",
+                    models.BigAutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                ("storage_identifier", models.CharField(max_length=512)),
+                ("sha256", models.CharField(max_length=64)),
+                ("unreferenced_since", models.DateTimeField(blank=True, null=True)),
+                ("created_at", models.DateTimeField(auto_now_add=True)),
+                (
+                    "storage_location",
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name="cover_thumbnail_files",
+                        to="core.storagelocation",
+                    ),
+                ),
+            ],
+            options={
+                "indexes": [
+                    models.Index(fields=["unreferenced_since"], name="coverthumbfile_unref_idx")
+                ],
+                "constraints": [
+                    models.UniqueConstraint(
+                        fields=("storage_location", "storage_identifier"),
+                        name="uniq_cover_thumbnail_file",
+                    )
+                ],
+            },
+        ),
     ]
