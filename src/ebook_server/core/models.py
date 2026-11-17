@@ -15,6 +15,7 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.fields.json import KT
 from django.db.models.functions import Lower
 from django.utils.timezone import now
 
@@ -638,6 +639,12 @@ class FileVariant(models.Model):
         default=ProcessingState.DISCOVERED,
     )
     job_id = models.UUIDField(default=None, null=True, blank=True)
+    # Set only when this file is one part of a work split across several files (#60),
+    # e.g. "ch07.pdf" of a book whose chapters are separate files. Null means the
+    # variant is a complete representation of the book. The order and label were
+    # confirmed by a reviewer; parts are never merged into or replaced by each other.
+    part_index = models.PositiveIntegerField(null=True, blank=True)
+    part_label = models.CharField(max_length=128, blank=True)
 
     class ReferenceState(models.TextChoices):
         OK = "ok", "OK"
@@ -1062,6 +1069,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
         SCAN_LOG = "scan_log", "Scanner log"
 
@@ -1086,8 +1094,74 @@ class ProcessingJob(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        constraints = [
+            # At most one queued/running combine job per book and target format (#60):
+            # concurrent first requests cannot both enqueue one.
+            models.UniqueConstraint(
+                KT("details__book_id"),
+                KT("details__target_format"),
+                condition=models.Q(job_type="combine_parts", state__in=["queued", "running"]),
+                name="uniq_active_combine_job_per_book_format",
+            ),
+        ]
+
     def __str__(self) -> str:
         return f"{self.job_id}:{self.job_type}"
+
+
+class ImportGroup(models.Model):
+    """Source files that intake suspects belong together, pending a reviewer's decision.
+
+    Today the only kind is a work split across several per-chapter files in one
+    folder (#60). Detection is a filename heuristic, so the group stays PENDING until
+    a reviewer confirms it (parts of one Book) or rejects it (independent imports).
+    """
+
+    class Kind(models.TextChoices):
+        MULTIPART_WORK = "multipart_work", "Multi-part work"
+
+    class State(models.TextChoices):
+        PENDING = "pending", "Pending review"
+        CONFIRMED = "confirmed", "Confirmed as one work"
+        REJECTED = "rejected", "Rejected (independent imports)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=32, choices=Kind.choices, default=Kind.MULTIPART_WORK)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.PENDING)
+    source_location = models.ForeignKey(
+        "SourceLocation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_groups",
+    )
+    folder = models.CharField(max_length=1024)
+    group_key = models.CharField(max_length=512)
+    detection = models.JSONField(default=dict, blank=True)
+    book = models.ForeignKey(
+        Book,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_groups",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["source_location", "state"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source_location", "folder", "group_key"],
+                condition=models.Q(state="pending"),
+                name="uniq_pending_import_group_per_folder_key",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.id}:{self.kind}:{self.state}"
 
 
 class ImportJob(models.Model):
@@ -1171,6 +1245,16 @@ class ImportJob(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Membership in a suspected multi-part work (#60) and this file's proposed place in it.
+    import_group = models.ForeignKey(
+        ImportGroup,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_jobs",
+    )
+    part_index = models.PositiveIntegerField(null=True, blank=True)
+    part_label = models.CharField(max_length=128, blank=True)
     # Exclusive ownership while a worker processes the job (HASHING through ARCHIVING).
     # Set atomically when a delivery claims the job, renewed on every phase transition,
     # and cleared when the job leaves the active phases. Empty means unowned.
@@ -1395,6 +1479,7 @@ class ReviewTask(models.Model):
         NEEDS_ATTENTION = "needs_attention", "Needs attention"
         SOURCE_REVIEW = "source_review", "Source review"
         QUALITY_REVIEW = "quality_review", "Quality review"
+        MULTIPART_WORK = "multipart_work", "Multi-part work"
 
     class State(models.TextChoices):
         OPEN = "open", "Open"
@@ -1410,6 +1495,7 @@ class ReviewTask(models.Model):
         MANUAL_ENTRY = "manual_entry", "Manual entry"
         MERGED_BOOK = "merged_book", "Merged with existing book"
         MARK_UNIDENTIFIED = "mark_unidentified", "Mark unidentified"
+        SPLIT_PARTS = "split_parts", "Not one work: import parts separately"
 
     import_job = models.ForeignKey(
         ImportJob,
