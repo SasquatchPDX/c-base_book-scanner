@@ -719,6 +719,7 @@ class ImportJob(models.Model):
         ARCHIVING = "archiving", "Archiving"
         COMPLETE = "complete", "Complete"
         FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
 
     class SourceType(models.TextChoices):
         UPLOAD = "upload", "Upload"

@@ -26,6 +26,7 @@ from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.db import models as django_models
+from django.db import transaction
 from django.utils import timezone
 from pypdf import PdfReader
 
@@ -1262,10 +1263,63 @@ def _claim_discovered_job(job: ImportJob) -> bool:
     return bool(claimed)
 
 
+class ImportCancelledError(IntakeError):
+    """Raised inside a running import whose job was cancelled by an operator."""
+
+
+def _is_cancelled(job: ImportJob) -> bool:
+    return ImportJob.objects.filter(pk=job.pk, state=ImportJob.State.CANCELLED).exists()
+
+
+def _save_unless_cancelled(job: ImportJob, update_fields: list[str]) -> None:
+    """Persist a pre-archive phase unless the job was cancelled meanwhile.
+
+    The row lock makes the check and the write atomic against
+    ``cancel_source_imports`` (on PostgreSQL), so a running worker cannot overwrite
+    CANCELLED with its next phase and carry on.
+    """
+    with transaction.atomic():
+        locked = ImportJob.objects.select_for_update().filter(pk=job.pk)
+        if locked.filter(state=ImportJob.State.CANCELLED).exists():
+            raise ImportCancelledError(f"import job {job.pk} was cancelled")
+        job.save(update_fields=update_fields)
+
+
+def cancel_source_imports(source_location: SourceLocation) -> list[str]:
+    """Pause a source and cancel its import jobs that have not started archiving.
+
+    Returns the ids of the cancelled jobs. Jobs already ARCHIVING are allowed to
+    finish, because their source file may already have been moved into the archive.
+    LOW_CONFIDENCE jobs are archived and waiting for review, so they are untouched.
+    Cancelled files are rediscovered by ``ingest_sources`` once the source is resumed.
+    """
+    with transaction.atomic():
+        SourceLocation.objects.filter(pk=source_location.pk).update(is_paused=True)
+        source_location.is_paused = True
+        jobs = ImportJob.objects.select_for_update().filter(
+            source_location=source_location,
+            state__in=[state for state in IN_FLIGHT_STATES if state != ImportJob.State.ARCHIVING],
+        )
+        ids = [str(pk) for pk in jobs.values_list("pk", flat=True)]
+        ImportJob.objects.filter(pk__in=ids).update(
+            state=ImportJob.State.CANCELLED,
+            last_error="cancelled by operator",
+            next_retry_at=None,
+            updated_at=timezone.now(),
+        )
+    logger.info(
+        "intake_source_cancelled",
+        source_location_id=source_location.pk,
+        cancelled=len(ids),
+    )
+    return ids
+
+
 def process_import_job(job_id: str) -> None:
     """Process one intake job from staging file to durable archive and optional matching."""
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
-    if job.state == ImportJob.State.COMPLETE:
+    if job.state in (ImportJob.State.COMPLETE, ImportJob.State.CANCELLED):
+        # CANCELLED: RQ may redeliver an abandoned job after a worker restart.
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
@@ -1286,7 +1340,7 @@ def process_import_job(job_id: str) -> None:
 
     try:
         job.state = ImportJob.State.HASHING
-        job.save(update_fields=["state", "updated_at"])
+        _save_unless_cancelled(job, ["state", "updated_at"])
 
         job.sha256 = compute_sha256(job.source_path)
         job.size_bytes = source_path.stat().st_size
@@ -1297,8 +1351,9 @@ def process_import_job(job_id: str) -> None:
         if not job.normalized_filename:
             job.normalized_filename = normalize_filename(job.original_filename)
         job.state = ImportJob.State.METADATA_EXTRACTION
-        job.save(
-            update_fields=[
+        _save_unless_cancelled(
+            job,
+            [
                 "state",
                 "sha256",
                 "size_bytes",
@@ -1315,8 +1370,9 @@ def process_import_job(job_id: str) -> None:
             job.storage_identifier = duplicate_variant.storage_identifier
             job.storage_location = duplicate_variant.storage_location
             job.state = ImportJob.State.COMPLETE
-            job.save(
-                update_fields=[
+            _save_unless_cancelled(
+                job,
+                [
                     "state",
                     "book_id",
                     "file_variant_id",
@@ -1343,8 +1399,9 @@ def process_import_job(job_id: str) -> None:
         )
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
-        job.save(
-            update_fields=[
+        _save_unless_cancelled(
+            job,
+            [
                 "evidence",
                 "state",
                 "updated_at",
@@ -1357,17 +1414,19 @@ def process_import_job(job_id: str) -> None:
             extracted_metadata=metadata,
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
-        job.save(update_fields=["state", "updated_at"])
+        _save_unless_cancelled(job, ["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
         _save_metadata_candidates(job, candidates)
 
         top_candidate = candidates[0] if candidates else None
         if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+            if _is_cancelled(job):  # cancelled during the external lookup
+                raise ImportCancelledError(f"import job {job.pk} was cancelled")
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(update_fields=["state", "updated_at"])
+            _save_unless_cancelled(job, ["state", "updated_at"])
             job.state = ImportJob.State.ARCHIVING
-            job.save(update_fields=["state", "updated_at"])
+            _save_unless_cancelled(job, ["state", "updated_at"])
             destination, verified = _archive_source(_default_storage(), job)
             job.storage_identifier = destination
             job.storage_location = _default_storage_location()
@@ -1394,11 +1453,11 @@ def process_import_job(job_id: str) -> None:
             return
 
         job.state = ImportJob.State.MATCHED
-        job.save(update_fields=["state", "updated_at"])
+        _save_unless_cancelled(job, ["state", "updated_at"])
         storage = _default_storage()
         storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
-        job.save(update_fields=["state", "updated_at"])
+        _save_unless_cancelled(job, ["state", "updated_at"])
         destination, verified = _archive_source(storage, job)
         _finalize_source_cleanup(job, verified)
         if not verified:
@@ -1446,7 +1505,14 @@ def process_import_job(job_id: str) -> None:
                 "updated_at",
             ],
         )
+    except ImportCancelledError:
+        logger.info("intake_cancelled", import_job_id=str(job.id))
+        return
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
+        if _is_cancelled(job):
+            # Keep CANCELLED; failing would schedule an RQ retry of a cancelled job.
+            logger.info("intake_cancelled", import_job_id=str(job.id))
+            return
         job.last_error = str(exc)
         job.state = ImportJob.State.FAILED
         job.attempt_count += 1
