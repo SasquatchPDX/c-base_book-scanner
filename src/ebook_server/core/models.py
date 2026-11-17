@@ -626,6 +626,13 @@ class CoverImage(models.Model):
         FRONT = "front", "Front"
         BACK = "back", "Back"
 
+    class Source(models.TextChoices):
+        """Where the cover came from (Sprint020 G: every cover records its origin)."""
+
+        EXTRACTED = "extracted", "Extracted from a book file"
+        SIDECAR = "sidecar", "Sidecar image next to the book file"
+        SCANNER = "scanner", "Photographed by the scanner"
+
     book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name="cover_images")
     position = models.CharField(max_length=16, choices=CoverPosition.choices)
     storage_location = models.ForeignKey(
@@ -646,6 +653,17 @@ class CoverImage(models.Model):
     )
     extractor_tool = models.CharField(max_length=128, blank=True)
     extractor_version = models.CharField(max_length=64, blank=True)
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.EXTRACTED)
+    # The scanner cover version this cover was made from (source ``scanner``, #128).
+    scan_cover = models.ForeignKey(
+        "ScanCover",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="library_covers",
+    )
+    # Provenance of the cover this one replaced, if any (Sprint020 G).
+    replaced = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -892,6 +910,13 @@ class ScanJob(models.Model):
         return self.state not in {self.State.COMPLETE, self.State.CANCELLED}
 
 
+class ScanUploadSource(models.TextChoices):
+    """Where a scan page or cover version came from (#128)."""
+
+    WEB = "web", "Web upload"
+    SCANNER = "scanner", "Scanner device API"
+
+
 class ScanPage(models.Model):
     """One logical page within a scan job; multiple immutable versions are allowed."""
 
@@ -904,6 +929,11 @@ class ScanPage(models.Model):
     scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="pages")
     logical_sequence_number = models.PositiveIntegerField()
     side = models.CharField(max_length=16, choices=Side.choices, default=Side.SINGLE)
+    # The printed page number the scanner recognised (a string, e.g. "23" or "xiv"),
+    # and the scanner's capture status for the page ("ok", ...). Set with the device
+    # page upload (#128) and from the latest ``page`` event in scan.jsonl (#129).
+    recognized_page_number = models.CharField(max_length=64, null=True, blank=True)
+    status = models.CharField(max_length=32, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -948,6 +978,13 @@ class ScanPageVersion(models.Model):
         blank=True,
         related_name="scan_page_versions",
     )
+    # Who sent the version: a member in the web UI (``uploader``) or the scanner over
+    # /api/scanner/v1/ (``uploader`` is then NULL, contract §9).
+    source = models.CharField(
+        max_length=16,
+        choices=ScanUploadSource.choices,
+        default=ScanUploadSource.WEB,
+    )
     original_filename = models.CharField(max_length=512, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -975,6 +1012,64 @@ class ScanPageVersion(models.Model):
 
     def __str__(self) -> str:
         return f"{self.scan_page_id}:v{self.version}:{self.checksum_sha256[:8]}"
+
+
+class ScanCover(models.Model):
+    """Immutable versions of a scan job's raw front/back cover photo (#128, §4.3, §6.6).
+
+    The scanner uploads the raw photo; a rectified one, if it ever sends one, is a new
+    version of the same position. Exactly one version per position is active. At finish
+    the active versions become the Book's covers (``CoverImage.Source.SCANNER``).
+    """
+
+    class Position(models.TextChoices):
+        FRONT = "front", "Front"
+        BACK = "back", "Back"
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="covers")
+    position = models.CharField(max_length=8, choices=Position.choices)
+    version = models.PositiveIntegerField(default=1)
+    storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        related_name="scan_covers",
+    )
+    storage_identifier = models.CharField(max_length=512)
+    checksum_sha256 = models.CharField(max_length=64)
+    mime_type = models.CharField(max_length=128)
+    size_bytes = models.PositiveBigIntegerField()
+    capture_timestamp = models.DateTimeField(null=True, blank=True)
+    original_filename = models.CharField(max_length=512, blank=True)
+    uploader = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    source = models.CharField(
+        max_length=16,
+        choices=ScanUploadSource.choices,
+        default=ScanUploadSource.SCANNER,
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan_job", "position", "version"],
+                name="uniq_scancover_version_number",
+            ),
+            models.UniqueConstraint(
+                fields=["scan_job", "position"],
+                condition=models.Q(is_active=True),
+                name="uniq_scancover_active_version",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.scan_job_id}:{self.position}:v{self.version}"
 
 
 class ScanTodo(models.Model):

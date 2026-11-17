@@ -150,7 +150,8 @@ Devices authenticate with their own key (`Authorization: Bearer`, see `docs/oper
   `BOOK_SCANNER_PUBLIC_BASE_URL` as `<base>j/<job_id>`.
 - `GET /api/scanner/v1/jobs/{job_id}` (§6.4) returns the job status: `job_id`, `state`,
   `portal_url`, `scan_started_at`, `capture_layout`, `events.sans_last_line_no`, `pages`
-  (`sequence_number`, `sha256`, `version` of each active version), `open_rescans`, and
+  (`sequence_number`, `sha256`, `version` of each active version), `covers` (`position`,
+  `sha256`, `version` of each active cover), `open_rescans`, and
   `note: "re-finish needed"` while a complete job waits for a re-finish. Another
   device's job, a web job or an unknown ID is `404`.
 - `POST /api/scanner/v1/jobs/{job_id}/capture-complete` (§6.9) takes the full manifest
@@ -167,17 +168,59 @@ Devices authenticate with their own key (`Authorization: Bearer`, see `docs/oper
 - `POST /api/scanner/v1/jobs/{job_id}/abort` (§6.10) moves `open`/`capturing` to
   `cancelled` and keeps every uploaded file. Repeating it is `200`; from `captured` or
   later it is `409 job_state`.
+- `PUT /api/scanner/v1/jobs/{job_id}/pages/{sequence_number}` (§6.5, #128) uploads one
+  page as `multipart/form-data` with a `metadata` part (JSON: `sha256` lowercase hex,
+  `camera_role` `left`/`right`, optional `captured_at`, `recognized_page_number` string
+  or `null`, `status`) and an `image` part. Either part may be sent with or without a
+  filename. `sequence_number` is zero-based; the page is stored as `ScanPage`
+  (`logical_sequence_number = sequence_number`, `side = single`) with
+  `recognized_page_number` and `status`, and an immutable `ScanPageVersion` with
+  `uploader = NULL` and `source = scanner`.
+  - `201`: stored as version 1; the job moves `open` -> `capturing`.
+  - `200`: the same checksum is already active; nothing changes.
+  - `409 page_conflict`: a different image is active for that `sequence_number`
+    (`details.sha256`). Replacements go through the rescan flow only.
+  - `409 job_state`: the job is not `open`/`capturing` (`details.state`).
+  - `422 camera_role_parity` (even numbers are `left`, odd `right`),
+    `422 checksum_mismatch`, `422 invalid_image` (not a decodable JPEG/PNG/TIFF/WebP).
+  - `413 payload_too_large`: the image is above `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES`
+    (the `max_image_bytes` that `ping` reports), or `Content-Length` is above that plus
+    1 MiB of multipart overhead. `415` for a body that is not `multipart/form-data`;
+    `400` for malformed metadata (`details.field`) or a missing part;
+    `400 upload_interrupted` when the body ends early.
+  - `507 insufficient_storage` / `503 storage_unavailable`: transient, retry.
+- `PUT /api/scanner/v1/jobs/{job_id}/covers/{front|back}` (§6.6) has the same shape with
+  `metadata` `{"sha256", "captured_at"}`. The active checksum is `200`; a new checksum
+  adds a version (`201`) and keeps the earlier ones (`ScanCover`). Allowed in `open`,
+  `capturing` and `captured`; a cover does not move the job to `capturing`. At finish
+  (scan finalization) the active covers become the Book's front/back `CoverImage`s with
+  `source = scanner`: a normalized JPEG (as for covers extracted from files) in the
+  library archive, linked to the `ScanCover` it came from; the raw photo stays in scan
+  storage. A cover the Book already had is replaced, and the new cover records the old
+  one's provenance in `replaced`.
+
+**How an upload is stored.** The body is parsed as a stream (Django's multipart parser,
+64 KiB reads); the `image` part is written chunk by chunk to a temporary file in
+`scan-artifacts/uploads/` and hashed on the way, so the image is never held in memory and
+`request.body` is never read. After the checksum and image checks, the staged file gets
+its final name with `publish_unique` (an exclusive hard link on the same volume; nothing
+is ever overwritten), the published copy is re-hashed, and only then, under the job's row
+lock, is the version row created and made active. A dropped connection, a size, checksum
+or image error, or a crash before that commit leaves no version row, and the staged and
+published files are removed. (Behind ASGI the server spools the body to a temporary file
+before the view runs; it is still never one in-memory blob.)
 
 ### Manifest sources: what exists now and how later tickets extend it
 
 `GET jobs/{id}` and `capture-complete` are built from *manifest sources* in
 `core/scan_manifest.py`. Each source owns one field (`pages`, `covers`, `metadata_opf`):
-what serif holds, its JSON status and how the request's field is parsed. Only pages exist
-so far. Until a feature is stored on serif it is "nothing expected":
+what serif holds, its JSON status and how the request's field is parsed. Pages and
+covers (S4, `core/scan_covers.py`, registered at app start) exist so far. Until a feature
+is stored on serif it is "nothing expected":
 
 - a field with no registered source is left out of `GET jobs/{id}` and ignored in a
-  `capture-complete` request (covers until S4, `metadata_opf` until S6). `metadata_opf`
-  may be `null` either way;
+  `capture-complete` request (`metadata_opf` until S6). `metadata_opf` may be `null`
+  either way;
 - the event high-water mark is `0` until S5 stores `scan.jsonl` lines, and
   `capture-complete` compares the request's `sans_last_line_no` with that `0`.
 

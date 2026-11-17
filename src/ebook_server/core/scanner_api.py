@@ -25,8 +25,8 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from . import scan_lifecycle, scan_manifest
-from .models import ScanJob, ScannerDevice, ScanTodo
+from . import scan_lifecycle, scan_manifest, scanner_uploads
+from .models import ScanCover, ScanJob, ScannerDevice, ScanTodo
 from .scan_job_ids import is_device_job_id
 from .scanner_devices import authenticate_key, bearer_token
 
@@ -162,8 +162,8 @@ def portal_url(request: HttpRequest, job_id: str) -> str:
 def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
     """Job status and received inventory (§6.4).
 
-    The item sections come from :mod:`.scan_manifest`: ``pages`` now; ``covers`` and
-    ``metadata_opf`` appear once their stores register a source (S4/S6). ``events``
+    The item sections come from :mod:`.scan_manifest`: ``pages``, ``covers`` (S4) and,
+    once its store registers a source, ``metadata_opf`` (S6). ``events``
     carries the stored-event high-water mark (``0`` until S5 stores events).
     """
     payload: dict[str, Any] = {
@@ -381,6 +381,125 @@ def abort(request: HttpRequest, device: ScannerDevice, job_id: str) -> JsonRespo
     except scan_lifecycle.LifecycleError as exc:
         return error_response(409, "job_state", str(exc), {"state": exc.state})
     return JsonResponse(job_status_payload(request, aborted))
+
+
+# --- page (§6.5) and cover (§6.6) uploads -------------------------------------------------
+
+
+def _scanner_upload_job(device: ScannerDevice, job_id: str) -> ScanJob | None:
+    """The scanner's own job for an upload, else ``None`` (answered ``404``, §6.1).
+
+    The only ownership check of the upload views. Uploads record ``source=scanner``
+    and no device: there is a single scanner (the device registry is being dropped).
+    """
+    return _device_job(device, job_id)
+
+
+def _upload_error(exc: scanner_uploads.UploadError) -> JsonResponse:
+    return error_response(exc.status, exc.code, str(exc), exc.details)
+
+
+@scanner_api_view(["PUT"])
+def page(
+    request: HttpRequest, device: ScannerDevice, job_id: str, sequence_number: str
+) -> JsonResponse:
+    """Upload one page (§6.5): ``201`` new, ``200`` same active checksum.
+
+    ``409 page_conflict`` for a different image under an existing ``sequence_number``,
+    ``409 job_state`` outside ``open``/``capturing``, ``422 camera_role_parity`` /
+    ``checksum_mismatch`` / ``invalid_image``, ``413`` above the image size limit.
+    The image is streamed to a staged file, never read into memory.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    try:
+        number = scanner_uploads.parse_sequence_number(sequence_number)
+        current = _scanner_upload_job(device, job_id)
+        if current is None:
+            return _not_found()
+        # Refuse before reading the body; re-checked under the row lock when storing.
+        if current.state not in scanner_uploads.PAGE_UPLOAD_STATES:
+            return _job_state_error(current, f"Pages are not accepted for a {current.state} job.")
+        upload = scanner_uploads.receive_upload(request)
+        try:
+            metadata = scanner_uploads.page_metadata(upload.metadata, number)
+            scanner_uploads.verify_checksum(upload, metadata.sha256)
+            assert upload.image_path is not None
+            mime_type, extension = scanner_uploads.sniff_image(upload.image_path)
+            stored = scanner_uploads.store_page(
+                job=current,
+                sequence_number=number,
+                upload=upload,
+                metadata=metadata,
+                mime_type=mime_type,
+                extension=extension,
+            )
+        finally:
+            upload.discard()
+    except scanner_uploads.UploadError as exc:
+        return _upload_error(exc)
+    return JsonResponse(
+        {
+            "sequence_number": number,
+            "sha256": stored.sha256,
+            "version": stored.version,
+            "state": stored.state,
+        },
+        status=201 if stored.created else 200,
+    )
+
+
+@scanner_api_view(["PUT"])
+def cover(request: HttpRequest, device: ScannerDevice, job_id: str, position: str) -> JsonResponse:
+    """Upload a cover photo (§6.6): ``201`` new version, ``200`` same active checksum.
+
+    Allowed in ``open``, ``capturing`` and ``captured``; a new checksum adds a version
+    (for a later rectified photo) and keeps the earlier ones.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    if position not in ScanCover.Position.values:
+        return error_response(
+            400,
+            "invalid_cover_position",
+            "The cover position must be 'front' or 'back'.",
+            {"position": position[:16]},
+        )
+    try:
+        current = _scanner_upload_job(device, job_id)
+        if current is None:
+            return _not_found()
+        if current.state not in scanner_uploads.COVER_UPLOAD_STATES:
+            return _job_state_error(current, f"Covers are not accepted for a {current.state} job.")
+        upload = scanner_uploads.receive_upload(request)
+        try:
+            sha256 = scanner_uploads.declared_sha256(upload.metadata)
+            captured = scanner_uploads.captured_at(upload.metadata)
+            scanner_uploads.verify_checksum(upload, sha256)
+            assert upload.image_path is not None
+            mime_type, extension = scanner_uploads.sniff_image(upload.image_path)
+            stored = scanner_uploads.store_cover(
+                job=current,
+                position=position,
+                upload=upload,
+                sha256=sha256,
+                captured=captured,
+                mime_type=mime_type,
+                extension=extension,
+            )
+        finally:
+            upload.discard()
+    except scanner_uploads.UploadError as exc:
+        return _upload_error(exc)
+    return JsonResponse(
+        {
+            "position": position,
+            "sha256": stored.sha256,
+            "version": stored.version,
+            "state": stored.state,
+        },
+        status=201 if stored.created else 200,
+    )
 
 
 @scanner_api_view(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])

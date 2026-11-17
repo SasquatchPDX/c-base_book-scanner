@@ -122,7 +122,8 @@ def _manifest(pages: dict[int, str], **extra: Any) -> dict[str, Any]:
         "finished_at": "2026-11-17T15:40:00Z",
         "sans_last_line_no": 0,
         "pages": [{"sequence_number": n, "sha256": sha} for n, sha in sorted(pages.items())],
-        "covers": [{"position": "front", "sha256": "a" * 64}],
+        # Covers are checked since S4 (#128); these jobs have none.
+        "covers": [],
         "metadata_opf": None,
         **extra,
     }
@@ -178,8 +179,8 @@ def test_get_job_reports_state_inventory_and_portal_url(
         {"sequence_number": 1, "sha256": sha1, "version": 1},
         {"sequence_number": 2, "sha256": sha2, "version": 1},
     ]
-    # Covers and the OPF are not stored yet (S4/S6), so they are not reported.
-    assert "covers" not in body
+    # No covers uploaded (S4 reports an empty list); the OPF is not stored yet (S6).
+    assert body["covers"] == []
     assert "metadata_opf" not in body
     assert body["open_rescans"] == 0
 
@@ -351,11 +352,14 @@ class _FakeCoverSource:
 
 @pytest.fixture
 def fake_extensions() -> Iterator[_FakeCoverSource]:
+    real = {source.name: source for source in scan_manifest.manifest_sources()}.get("covers")
     source = _FakeCoverSource({"front": "a" * 64})
     scan_manifest.register_manifest_source(source)
     scan_manifest.register_event_high_water_mark(lambda job: 812)
     yield source
     scan_manifest.unregister_manifest_source("covers")
+    if real is not None:  # the S4 cover store (#128)
+        scan_manifest.register_manifest_source(real)
     scan_manifest.register_event_high_water_mark(None)
 
 

@@ -20,7 +20,7 @@ from rq import get_current_job
 from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import contributions, conversion, intake, ocr, scan_lifecycle
+from . import contributions, conversion, intake, ocr, scan_covers, scan_lifecycle
 from .models import (
     FileVariant,
     ProcessingJob,
@@ -690,6 +690,9 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
                     if isinstance(details.get("request_options"), dict)
                     else None,
                 )
+
+        # The scanner's cover photos become the Book's covers (#128, §4.3).
+        scan_covers.apply_scan_covers_to_book(scan_job)
 
         finished_at = timezone.now()
         details = {

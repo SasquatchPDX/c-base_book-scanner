@@ -11,7 +11,11 @@ class CoreConfig(AppConfig):
     verbose_name = "Core"
 
     def ready(self) -> None:
-        from . import checks  # noqa: F401  (registers system checks)
+        from . import (
+            checks,  # noqa: F401  (registers system checks)
+            scan_covers,
+        )
         from .search import connect_signals
 
         connect_signals()
+        scan_covers.register()
