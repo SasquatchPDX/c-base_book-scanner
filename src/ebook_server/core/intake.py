@@ -1296,6 +1296,18 @@ def _sibling_jobs(job: ImportJob) -> list[ImportJob]:
     ]
 
 
+def sibling_group_key(job: ImportJob) -> tuple[int, str, str] | None:
+    """Key shared by all formats of one book (``_sibling_jobs``), or ``None``.
+
+    ``(source location id, parent folder, case-folded file stem)``; only for sources with
+    ``group_sibling_formats``.
+    """
+    if not _groups_sibling_formats(job) or job.source_location_id is None:
+        return None
+    path = Path(job.source_path)
+    return (job.source_location_id, str(path.parent), path.stem.casefold())
+
+
 def _resolved_sibling(job: ImportJob) -> ImportJob | None:
     for sibling in _sibling_jobs(job):
         if sibling.state == ImportJob.State.COMPLETE and sibling.book is not None:
