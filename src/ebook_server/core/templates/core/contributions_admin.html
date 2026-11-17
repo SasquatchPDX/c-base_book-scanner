@@ -1,0 +1,100 @@
+{% extends "core/base.html" %}
+{% block title %}Contribution admin · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Admin</p>
+      <h1>Contribution recognition</h1>
+    </div>
+    <span>hold period {{ hold_days }} days · weights v{{ weight_version }}</span>
+  </div>
+  {% if message %}<p class="status status-success" role="status">{{ message }}</p>{% endif %}
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <p class="muted">Every action is recorded in the ledger. Contribution data is never used to judge or ban members.</p>
+  <div class="detail-layout">
+    <section class="action-panel">
+      <h2>Adjust points</h2>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="adjust">
+        <label>Username<input name="username" required></label>
+        <label>Points (negative to deduct)<input name="points" required></label>
+        <label>Reason<input name="reason" required maxlength="255"></label>
+        <button type="submit">Add adjustment</button>
+      </form>
+    </section>
+    <section class="action-panel">
+      <h2>Void an event</h2>
+      <p class="muted">A pending event is voided; a settled one gets a clawback.</p>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="void">
+        <label>Event id<input name="event_id" required></label>
+        <label>Reason<input name="reason" required maxlength="255"></label>
+        <button type="submit">Void</button>
+      </form>
+    </section>
+    <section class="action-panel">
+      <h2>Flag a review decision as wrong</h2>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="flag_review">
+        <label>Review task id<input name="review_task_id" required></label>
+        <label>Note<input name="note"></label>
+        <button type="submit">Flag</button>
+      </form>
+    </section>
+    <section class="action-panel">
+      <h2>Leaderboard exclusion</h2>
+      <form method="post">{% csrf_token %}
+        <label>Username<input name="username" required></label>
+        <label>Reason<input name="reason" maxlength="255"></label>
+        <button type="submit" name="action" value="exclude">Exclude</button>
+        <button class="secondary" type="submit" name="action" value="include">Include again</button>
+      </form>
+    </section>
+    <section class="action-panel">
+      <h2>Weights</h2>
+      <p class="muted">Saving creates a new version; past events keep the version they were recorded with.</p>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="weights">
+        {% for kind, label, spec in weight_rows %}
+          <fieldset><legend>{{ label }}</legend>
+            <label>Base<input name="{{ kind }}__base" value="{{ spec.base_points }}" required></label>
+            <label>Per page<input name="{{ kind }}__per_unit" value="{{ spec.per_unit_points }}" required></label>
+            <label>Cap per job (blank: none)<input name="{{ kind }}__cap" value="{{ spec.cap|default_if_none:'' }}"></label>
+            <label>Own-upload multiplier<input name="{{ kind }}__own" value="{{ spec.own_upload_multiplier }}" required></label>
+          </fieldset>
+        {% endfor %}
+        <button type="submit">Save new version</button>
+      </form>
+    </section>
+    <section class="action-panel">
+      <h2>Settlement</h2>
+      <p class="muted">Normally run daily by <code>manage.py settle_contributions</code>.</p>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="settle"><button class="secondary" type="submit">Run settlement now</button></form>
+    </section>
+    <section class="action-panel danger-zone">
+      <h2>Member data (GDPR)</h2>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="export">
+        <label>Username<input name="username" required></label>
+        <button class="secondary" type="submit">Export JSON</button>
+      </form>
+      <form method="post">{% csrf_token %}<input type="hidden" name="action" value="erase">
+        <label>Username<input name="username" required></label>
+        <label>Type <code>erase</code> to confirm<input name="confirm" autocomplete="off" required></label>
+        <button class="danger" type="submit">Erase contribution data</button>
+      </form>
+    </section>
+  </div>
+  <section>
+    <h2>Latest ledger entries</h2>
+    <div class="list-stack">
+      {% for event in recent %}
+        <article class="review-row">
+          <div class="grow">
+            <h3>{{ event.user.username }} · {{ event.get_kind_display }}</h3>
+            <p class="muted mono">{{ event.id }}</p>
+            <p class="muted">{{ event.occurred_at|date:"Y-m-d H:i" }}{% if event.review_task_id %} · review #{{ event.review_task_id }}{% endif %}{% if event.reason %} · {{ event.reason }}{% endif %}</p>
+          </div>
+          <span class="status status-{{ event.state }}">{{ event.get_state_display }}{% if event.points is not None %} · {{ event.points }}{% endif %}</span>
+        </article>
+      {% empty %}
+        <p class="empty-state">The ledger is empty.</p>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

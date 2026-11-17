@@ -5,7 +5,7 @@ from __future__ import annotations
 from django.urls import path
 from django.views.generic import RedirectView
 
-from . import views
+from . import contributions_views, views
 
 urlpatterns = [
     path("", RedirectView.as_view(pattern_name="library-home", permanent=False)),
@@ -210,6 +210,16 @@ urlpatterns = [
         name="review-edit-search-terms",
     ),
     path(
+        "reviews/<int:task_id>/ask-llm/",
+        views.review_ask_llm,
+        name="review-ask-llm",
+    ),
+    path(
+        "llm-identifications/<uuid:job_id>/",
+        views.llm_identification_job_status,
+        name="llm-identification-job-status",
+    ),
+    path(
         "reviews/<int:task_id>/multipart/order/",
         views.review_multipart_order,
         name="review-multipart-order",
@@ -228,5 +238,45 @@ urlpatterns = [
         "review-identifications/<uuid:job_id>/",
         views.review_identification_job_status,
         name="review-identification-job-status",
+    ),
+    path(
+        "me/contributions/",
+        contributions_views.my_contributions,
+        name="my-contributions",
+    ),
+    path(
+        "me/contributions/leaderboard/",
+        contributions_views.my_leaderboard_preference,
+        name="my-contributions-leaderboard",
+    ),
+    path(
+        "me/contributions/export/",
+        contributions_views.my_contributions_export,
+        name="my-contributions-export",
+    ),
+    path(
+        "me/contributions/erase/",
+        contributions_views.my_contributions_erase,
+        name="my-contributions-erase",
+    ),
+    path(
+        "contributions/stats/",
+        contributions_views.collective_stats,
+        name="contributions-stats",
+    ),
+    path(
+        "contributions/leaderboard/",
+        contributions_views.leaderboard,
+        name="contributions-leaderboard",
+    ),
+    path(
+        "contributions/admin/",
+        contributions_views.contributions_admin,
+        name="contributions-admin",
+    ),
+    path(
+        "contributions/admin/users/<str:username>/export/",
+        contributions_views.contributions_admin_export,
+        name="contributions-admin-export",
     ),
 ]

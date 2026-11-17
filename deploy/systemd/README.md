@@ -37,3 +37,8 @@ journalctl -u book-scanner-web -u 'book-scanner-worker@*' -f
 Run `migrate` and `collectstatic` as the `book-scanner` user before the first
 start and after every upgrade, then restart the units. See the "Deployment
 walkthrough" in [docs/operations.md](../../docs/operations.md).
+
+Optional: `book-scanner-contributions.service` and `.timer` run the daily
+contribution settlement (`manage.py settle_contributions --enqueue`). They only
+do work when `BOOK_SCANNER_CONTRIBUTIONS_ENABLED=true`; see
+[docs/contributions.md](../../docs/contributions.md).

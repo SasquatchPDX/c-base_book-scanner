@@ -1,0 +1,66 @@
+{% extends "core/base.html" %}
+{% block title %}My contributions · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Only you can see this page</p>
+      <h1>My contributions</h1>
+    </div>
+    <a href="{% url 'contributions-stats' %}?view=html">What members did together</a>
+  </div>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <section class="stats" aria-label="Your points">
+    <div><strong>{{ card.season_points }}</strong><span>points this season (since {{ card.season_start|date:"Y-m-d" }})</span></div>
+    <div><strong>{{ card.all_time_points }}</strong><span>points all time</span></div>
+    <div><strong>{{ card.pending_total }}</strong><span>outcomes waiting out the {{ hold_days }}-day hold</span></div>
+    <div><strong>{% if card.accuracy.percent is not None %}{{ card.accuracy.percent }}%{% else %}–{% endif %}</strong><span>review decisions that held up ({{ card.accuracy.held_up }} of {{ card.accuracy.decided }})</span></div>
+  </section>
+  <p class="muted">Points come only from outcomes that hold up: a resolved review or a scan finished into the library counts once the {{ hold_days }}-day hold has passed without the decision being reopened, redone or the book deleted. Uploads, claims and time spent earn nothing. Reviewing your own upload earns half.</p>
+  <section>
+    <div class="section-heading"><h2>Work you can pick up</h2><a href="{% url 'review-queue' %}?view=html">Review queue</a></div>
+    <p>{{ open_work }} open review{{ open_work|pluralize }} you can resolve.</p>
+  </section>
+  <section>
+    <h2>Recent outcomes</h2>
+    <div class="list-stack">
+      {% for event in card.recent %}
+        <article class="review-row">
+          <div class="grow">
+            <h3>{{ event.get_kind_display }}{% if event.own_upload %} <span class="muted">(own upload)</span>{% endif %}</h3>
+            <p class="muted">{{ event.occurred_at|date:"Y-m-d H:i" }}{% if event.review_task_id %} · review #{{ event.review_task_id }}{% endif %}{% if event.reason %} · {{ event.reason }}{% endif %}</p>
+          </div>
+          <span class="status status-{{ event.state }}">{{ event.get_state_display }}{% if event.points is not None %} · {{ event.points }}{% endif %}</span>
+        </article>
+      {% empty %}
+        <p class="empty-state">No recorded outcomes yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+  {% if leaderboard_enabled %}
+    <section class="action-panel">
+      <h2>Leaderboard</h2>
+      {% if card.preference and card.preference.excluded_from_leaderboard %}
+        <p>An admin has removed you from the leaderboard. Your scorecard is unaffected.</p>
+      {% elif card.preference and card.preference.leaderboard_opt_in %}
+        <p>You are on the <a href="{% url 'contributions-leaderboard' %}?view=html">members-only leaderboard</a> as <strong>{{ card.preference.display_handle }}</strong>.</p>
+        <form method="post" action="{% url 'my-contributions-leaderboard' %}">{% csrf_token %}<input type="hidden" name="opt_in" value="false"><button class="secondary" type="submit">Leave the leaderboard</button></form>
+      {% else %}
+        <p>The leaderboard is optional and only signed-in members see it. It is for recognition, never for evaluating members. You can leave at any time and are removed immediately.</p>
+        <form method="post" action="{% url 'my-contributions-leaderboard' %}">{% csrf_token %}
+          <input type="hidden" name="opt_in" value="true">
+          <label>Display handle (shown instead of your account name)<input name="display_handle" maxlength="40" required></label>
+          <label class="checkbox"><input type="checkbox" name="consent" value="true" required> I agree to show this handle and my points to signed-in members.</label>
+          <button type="submit">Join the leaderboard</button>
+        </form>
+      {% endif %}
+    </section>
+  {% endif %}
+  <section class="danger-zone">
+    <h2>Your data</h2>
+    <p><a href="{% url 'my-contributions-export' %}">Download your contribution data (JSON)</a></p>
+    <form method="post" action="{% url 'my-contributions-erase' %}">{% csrf_token %}
+      <label>Erase your contribution history. Type <code>erase</code> to confirm.<input name="confirm" autocomplete="off" required></label>
+      <button class="danger" type="submit">Erase my contribution history</button>
+    </form>
+  </section>
+{% endblock %}
