@@ -44,7 +44,14 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import genres, identification, metadata_search, referenced_files, source_layout
+from . import (
+    archive_layout,
+    genres,
+    identification,
+    metadata_search,
+    referenced_files,
+    source_layout,
+)
 from .models import (
     Author,
     Book,
@@ -59,7 +66,13 @@ from .models import (
     StorageLocation,
     clean_publication_year,
 )
-from .storage_registry import archive_root, backend_for_location, default_archive_location
+from .storage_registry import (
+    DEFAULT_ARCHIVE_LOCATION_IDENTIFIER,
+    archive_root,
+    backend_for_location,
+    default_archive_location,
+    filesystem_backend_for_location,
+)
 from .text_header import parse_text_header
 
 logger = structlog.get_logger(__name__)
@@ -649,6 +662,14 @@ def _default_storage() -> LocalFilesystemStorage:
 
 def _default_storage_location() -> StorageLocation:
     return default_archive_location()
+
+
+def _storage_for_location(job: ImportJob) -> LocalFilesystemStorage:
+    """Filesystem backend for the location ``job`` archived its file to."""
+    location = job.storage_location
+    if location is None or location.identifier == DEFAULT_ARCHIVE_LOCATION_IDENTIFIER:
+        return _default_storage()
+    return filesystem_backend_for_location(location)
 
 
 def _source_transfer_mode(job: ImportJob) -> str:
@@ -2071,13 +2092,15 @@ def _create_or_reuse_file_variant(
             return duplicate_variant
 
     storage = _default_storage()
+    if not storage_identifier and job.storage_identifier:
+        # Archived while awaiting review: move it from _unsorted/ into the book folder.
+        archive_layout.place_pending_original(job, book, _storage_for_location(job))
     storage_id = storage_identifier or job.storage_identifier
     if not storage_id:
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
-            storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
             storage.ensure_free_space(Path(job.source_path).stat().st_size)
-            storage.store(job.source_path, storage_id)
+            storage_id = archive_layout.publish_original(storage, job, book, job.source_path)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
         else:
@@ -2797,6 +2820,9 @@ def _link_variant_and_complete(
 ) -> FileVariant:
     job.storage_identifier = destination
     job.storage_location = storage_location
+    # Move it out of _unsorted/ into the book's archive folder (no-op under "job").
+    archive_layout.place_pending_original(job, book, _storage_for_location(job))
+    destination = job.storage_identifier
     job.normalized_filename = normalize_filename(
         f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
     )
@@ -2917,7 +2943,9 @@ def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[st
         verified = referenced_files.index_source_file(job)
         return job.storage_identifier, verified
     storage_location = _default_storage_location()
-    destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    # The Book is not known yet: under a book-scoped layout the file goes to _unsorted/
+    # and is moved into the book folder once identification or review settles the Book.
+    destination = archive_layout.pending_destination(storage, job)
     # Checked per file, so a bulk import already queued still stops before the disk fills.
     storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):

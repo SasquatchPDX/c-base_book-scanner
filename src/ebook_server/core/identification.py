@@ -1416,6 +1416,10 @@ def _normalize_candidate(
         isbn13 = _normalize_identifier(payload["isbn_13"])
 
     queried_isbn = _normalize_identifier(str(payload.get("_queried_isbn") or ""))
+    if queried_isbn is not None and not _record_lists_isbn(payload, queried_isbn):
+        # The echoed query is no evidence: a record that does not itself list the
+        # ISBN we asked for keeps its own identifiers (#108 review).
+        queried_isbn = None
     if queried_isbn is not None:
         # Edition records can list several ISBNs; the one we looked up must be the one
         # the candidate carries, otherwise the ISBN-match score bonus is lost.
@@ -1556,6 +1560,23 @@ def _normalize_candidate(
         concrete_edition=concrete_edition,
     )
     return _apply_scoring(signals, candidate)
+
+
+def _isbn13_form(value: str) -> str | None:
+    normalized = _normalize_identifier(value)
+    if normalized is None:
+        return None
+    return _isbn10_to_isbn13(normalized) if len(normalized) == 10 else normalized
+
+
+def _record_lists_isbn(payload: dict[str, Any], isbn: str) -> bool:
+    """True when the provider record's own ISBN fields list ``isbn`` (10/13 equivalent)."""
+    wanted = _isbn13_form(isbn)
+    return wanted is not None and any(
+        _isbn13_form(value) == wanted
+        for key in ("isbn_10", "isbn_13", "isbn")
+        for value in _as_str_list(payload.get(key))
+    )
 
 
 def _as_str_list(value: Any) -> list[str]:

@@ -828,6 +828,8 @@ def test_part_identical_to_another_books_file_blocks_until_acknowledged_then_joi
     part_one = variants[0]
     assert part_one.id != other_variant.id
     assert part_one.sha256 == other_variant.sha256
+    # Confirming can publish the archived part from _unsorted into the Book folder.
+    job.refresh_from_db()
     assert part_one.storage_identifier == job.storage_identifier
     assert storage.hash(part_one.storage_identifier) == part_one.sha256
     identical_to = part_one.converter_options["multipart_identical_to"]
