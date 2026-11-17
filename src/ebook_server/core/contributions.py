@@ -530,8 +530,10 @@ def settle(*, now: datetime | None = None) -> SettlementReport:
     for event_id in pending_ids:
         try:
             with transaction.atomic():
+                # Lock only the event row: review_task and scan_job are nullable, so
+                # they are outer joins and PostgreSQL refuses FOR UPDATE on them.
                 event = (
-                    ContributionEvent.objects.select_for_update()
+                    ContributionEvent.objects.select_for_update(of=("self",))
                     .select_related("review_task", "scan_job")
                     .get(pk=event_id)
                 )
