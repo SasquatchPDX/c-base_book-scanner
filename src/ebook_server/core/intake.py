@@ -437,12 +437,68 @@ def _already_handled(source_location: SourceLocation, path: Path, normalized: st
     return False
 
 
+# States in which an import job still holds a slot of its source's batch: queued or
+# being processed by a worker. LOW_CONFIDENCE is excluded because those jobs are
+# already archived and only wait for a human reviewer.
+IN_FLIGHT_STATES = (
+    ImportJob.State.DISCOVERED,
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+
+def _source_limit(value: int | None, setting_name: str) -> int | None:
+    """Per-source override, else the global setting; ``None`` means unlimited."""
+    limit = value if value is not None else int(getattr(django_settings, setting_name, 0) or 0)
+    return limit if limit > 0 else None
+
+
+def source_ingest_capacity(
+    source_location: SourceLocation,
+    *,
+    batch_size: int | None = None,
+) -> int | None:
+    """How many new import jobs may be queued for a source right now.
+
+    Bounded by the source's batch size (jobs in flight at once) and its hourly rate.
+    ``batch_size`` overrides the configured batch size (``ingest_sources --limit``;
+    0 means unlimited). Returns ``None`` when neither limit applies.
+    """
+    if source_location.is_paused:
+        return 0
+    limits: list[int] = []
+    batch = (
+        (batch_size or None)
+        if batch_size is not None
+        else _source_limit(source_location.ingest_batch_size, "BOOK_SCANNER_INGEST_BATCH_SIZE")
+    )
+    jobs = ImportJob.objects.filter(source_location=source_location)
+    if batch is not None:
+        in_flight = jobs.filter(state__in=IN_FLIGHT_STATES).count()
+        limits.append(max(batch - in_flight, 0))
+    per_hour = _source_limit(
+        source_location.ingest_max_per_hour, "BOOK_SCANNER_INGEST_MAX_PER_HOUR"
+    )
+    if per_hour is not None:
+        recent = jobs.filter(created_at__gte=timezone.now() - timedelta(hours=1)).count()
+        limits.append(max(per_hour - recent, 0))
+    return min(limits) if limits else None
+
+
 def discover_source_jobs_for_location(
     source_location: SourceLocation,
     *,
     uploader: Any | None = None,
+    limit: int | None = None,
 ) -> list[ImportJob]:
+    """Create DISCOVERED jobs for new files, stopping after ``limit`` jobs if given."""
     jobs: list[ImportJob] = []
+    if limit is not None and limit <= 0:
+        return jobs
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
             continue
@@ -467,6 +523,8 @@ def discover_source_jobs_for_location(
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
             continue
+        if limit is not None and len(jobs) >= limit:
+            break
     return jobs
 
 
@@ -1191,6 +1249,19 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     return job.next_retry_at is not None and job.attempt_count <= max_retries
 
 
+def _claim_discovered_job(job: ImportJob) -> bool:
+    """Atomically move a DISCOVERED job to HASHING; False if another delivery won.
+
+    Two queue entries for the same job (e.g. a re-queued orphan whose original entry
+    was in fact still queued) may both load it as DISCOVERED; only one may proceed.
+    """
+    claimed = ImportJob.objects.filter(pk=job.pk, state=ImportJob.State.DISCOVERED).update(
+        state=ImportJob.State.HASHING,
+        updated_at=timezone.now(),
+    )
+    return bool(claimed)
+
+
 def process_import_job(job_id: str) -> None:
     """Process one intake job from staging file to durable archive and optional matching."""
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
@@ -1198,6 +1269,13 @@ def process_import_job(job_id: str) -> None:
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
+    if job.state == ImportJob.State.DISCOVERED:
+        if job.source_location is not None and job.source_location.is_paused:
+            # Leave the job DISCOVERED; ingest_sources re-queues it after resume.
+            logger.info("intake_skipped_paused_source", import_job_id=str(job.id))
+            return
+        if not _claim_discovered_job(job):
+            return
 
     source_path = Path(job.source_path)
     if not source_path.exists():

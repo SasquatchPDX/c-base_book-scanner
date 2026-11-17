@@ -148,6 +148,42 @@ def scheduler_active(queue: Queue) -> bool:
         return False
 
 
+def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
+    """Return (first positional arg of every live RQ job, scheduler running?).
+
+    "Live" covers the queue itself plus the started, scheduled and deferred
+    registries, i.e. every RQ job that may still execute. Job functions take the
+    database row id as their first argument, so the set identifies rows that still
+    have an RQ job. ``None`` means Redis could not be consulted (or the inline queue
+    is in use) and callers must not assume anything about queued work.
+    """
+    queue = get_queue()
+    rq_queue = getattr(queue, "queue", None)
+    if rq_queue is None:
+        return None, None
+    from rq.registry import (
+        DeferredJobRegistry,
+        ScheduledJobRegistry,
+        StartedJobRegistry,
+    )
+
+    try:
+        jobs = list(rq_queue.get_jobs())
+        for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
+            registry = registry_cls(queue=rq_queue)
+            jobs.extend(rq_queue.fetch_job(job_id) for job_id in registry.get_job_ids())
+        scheduler = scheduler_active(rq_queue)
+    except Exception:
+        return None, None
+    ids = {str(job.args[0]) for job in jobs if job is not None and job.args}
+    return ids, scheduler
+
+
+def queue_is_async() -> bool:
+    """True when jobs go to a real RQ queue rather than running inline."""
+    return isinstance(get_queue(), ConfiguredQueue)
+
+
 def get_queue() -> QueueLike | None:
     if not settings.BOOK_SCANNER_QUEUE_URL:
         return None

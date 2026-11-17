@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     storage_sentinel_file: str = ""
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
+    ingest_batch_size: int = 100
+    ingest_max_per_hour: int = 0
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -241,6 +243,8 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
+BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_METADATA_USER_AGENT = settings.metadata_user_agent
 BOOK_SCANNER_QUEUE_URL = settings.redis_url
 BOOK_SCANNER_QUEUE_NAME = settings.queue_name

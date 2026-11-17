@@ -170,6 +170,31 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Batching, rate limits, and pausing a source
+
+`ingest_sources` never queues a whole source at once. Each run queues at most:
+
+- the source's **batch size**: import jobs in flight (DISCOVERED through
+  ARCHIVING; LOW_CONFIDENCE jobs waiting for review do not count). Set it per
+  source in admin (`ingest_batch_size`) or globally with
+  `BOOK_SCANNER_INGEST_BATCH_SIZE` (default 100); `0` means unlimited. `--limit N`
+  overrides it for one run (`--limit 0` = unlimited).
+- the source's **hourly rate**: new import jobs created in the last rolling hour
+  (`ingest_max_per_hour` per source, or `BOOK_SCANNER_INGEST_MAX_PER_HOUR`;
+  default `0` = unlimited). Use it to keep a large one-off migration from
+  flooding external metadata providers.
+
+Files beyond the limit are picked up by later runs, so run `ingest_sources` on a
+schedule (cron/systemd timer) to work through a large source gradually.
+
+To pause a source, use the "Pause imports" admin action (or set `is_paused`).
+A paused source queues nothing, and queued jobs that have not started yet are
+skipped by the worker and stay DISCOVERED. After "Resume imports", the next
+`ingest_sources` run re-queues them. Each run also re-queues DISCOVERED jobs that
+no longer have an RQ job (for example after `rq empty` or a Redis flush); a job
+that ends up queued twice is still processed only once. If the RQ queue cannot
+be inspected, re-queueing is skipped with a warning.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for

@@ -11,11 +11,14 @@ from django.core.management.base import BaseCommand, CommandError
 from ebook_server.core import intake
 from ebook_server.core.intake import IntakeError
 from ebook_server.core.models import ImportJob, SourceLocation
-from ebook_server.jobs import enqueue
+from ebook_server.jobs import enqueue, queue_is_async, rq_pending_job_args
 
 
 class Command(BaseCommand):
-    help = "Discover files from configured source locations and enqueue import jobs."
+    help = (
+        "Discover files from configured source locations and enqueue import jobs, "
+        "respecting each source's pause flag, batch size, and hourly rate limit."
+    )
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -40,6 +43,15 @@ class Command(BaseCommand):
             help="Fallback username for source jobs when no uploader is assigned.",
         )
         parser.add_argument(
+            "--limit",
+            type=int,
+            default=None,
+            help=(
+                "Maximum import jobs in flight per source for this run, overriding the "
+                "source's batch size (0 = unlimited). The hourly rate limit still applies."
+            ),
+        )
+        parser.add_argument(
             "--json",
             action="store_true",
             help="Emit JSON payload in preview mode.",
@@ -52,6 +64,9 @@ class Command(BaseCommand):
         retry_failed = options.get("retry_failed", False)
         username = options.get("system_user", "system-source-ingest")
         output_json = options.get("json", False)
+        limit = options.get("limit")
+        if limit is not None and limit < 0:
+            raise CommandError("--limit must be zero or positive")
 
         queryset = SourceLocation.objects.filter(is_active=True)
         if source_ids:
@@ -125,20 +140,67 @@ class Command(BaseCommand):
         if user is None:
             user = user_model.objects.create_user(username=username)
 
-        created_job_ids = []
+        pending_rq_ids, _ = rq_pending_job_args()
+        requeue_orphans = pending_rq_ids is not None or not queue_is_async()
+        if not requeue_orphans:
+            self.stdout.write(
+                "warning: cannot inspect the RQ queue; DISCOVERED jobs are not re-queued",
+            )
+        created_job_ids: list[str] = []
+        requeued_job_ids: list[str] = []
+        throttled = False
         for location in locations:
+            if location.is_paused:
+                self.stdout.write(f"source {location.id} paused; skipped")
+                continue
+            if requeue_orphans:
+                requeued_job_ids.extend(self._requeue_orphans(location, pending_rq_ids))
+            capacity = intake.source_ingest_capacity(location, batch_size=limit)
             try:
                 jobs = intake.discover_source_jobs_for_location(
                     source_location=location,
                     uploader=user,
+                    limit=capacity,
                 )
             except IntakeError as exc:
                 self.stdout.write(f"source {location.id} error: {exc}")
                 continue
+            if capacity is not None and len(jobs) >= capacity:
+                throttled = True
+                self.stdout.write(
+                    f"source {location.id} batch/rate limit reached; "
+                    "run again later to queue more files",
+                )
             for job in jobs:
                 enqueue(intake.process_import_job, str(job.id))
                 created_job_ids.append(str(job.id))
 
         self.stdout.write(
-            f"ingest queued={len(created_job_ids)} total_files={len(created_job_ids)}"
+            f"ingest queued={len(created_job_ids)} requeued={len(requeued_job_ids)} "
+            f"throttled={'yes' if throttled else 'no'}"
         )
+
+    def _requeue_orphans(
+        self,
+        location: SourceLocation,
+        pending_rq_ids: set[str] | None,
+    ) -> list[str]:
+        """Re-queue DISCOVERED jobs that no longer have an RQ job.
+
+        They are left behind when the queue is emptied, Redis is flushed, or a job was
+        skipped while its source was paused. With no RQ queue (inline or none
+        configured) nothing waits in a queue, so every DISCOVERED job is an orphan.
+        ``process_import_job`` claims DISCOVERED jobs atomically, so a job that ends up
+        queued twice is still processed once.
+        """
+        requeued: list[str] = []
+        orphans = ImportJob.objects.filter(
+            source_location=location,
+            state=ImportJob.State.DISCOVERED,
+        ).order_by("created_at")
+        for job in orphans:
+            if pending_rq_ids is not None and str(job.id) in pending_rq_ids:
+                continue
+            enqueue(intake.process_import_job, str(job.id))
+            requeued.append(str(job.id))
+        return requeued

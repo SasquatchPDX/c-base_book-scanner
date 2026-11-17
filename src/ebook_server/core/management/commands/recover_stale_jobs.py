@@ -10,35 +10,7 @@ from django.utils import timezone
 
 from ebook_server.core import scan_pipeline
 from ebook_server.core.models import ProcessingJob, ScanJob
-from ebook_server.jobs import get_queue, is_stale_running, scheduler_active, stale_after
-
-
-def _queued_rq_job_ids() -> tuple[set[str] | None, bool | None]:
-    """Return (ProcessingJob ids that still have an RQ job, scheduler running?).
-
-    ``None`` for the id set means Redis could not be consulted (or the inline
-    queue is in use), so QUEUED rows cannot be judged safely.
-    """
-    queue = get_queue()
-    rq_queue = getattr(queue, "queue", None)
-    if rq_queue is None:
-        return None, None
-    from rq.registry import (
-        DeferredJobRegistry,
-        ScheduledJobRegistry,
-        StartedJobRegistry,
-    )
-
-    try:
-        jobs = list(rq_queue.get_jobs())
-        for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
-            registry = registry_cls(queue=rq_queue)
-            jobs.extend(rq_queue.fetch_job(job_id) for job_id in registry.get_job_ids())
-        scheduler = scheduler_active(rq_queue)
-    except Exception:
-        return None, None
-    ids = {str(job.args[0]) for job in jobs if job is not None and job.args}
-    return ids, scheduler
+from ebook_server.jobs import is_stale_running, rq_pending_job_args, stale_after
 
 
 class Command(BaseCommand):
@@ -58,7 +30,7 @@ class Command(BaseCommand):
     def handle(self, *args: Any, **options: Any) -> None:
         apply = bool(options["apply"])
         now = timezone.now()
-        rq_ids, scheduler = _queued_rq_job_ids()
+        rq_ids, scheduler = rq_pending_job_args()
         self.stdout.write(f"mode: {'APPLY' if apply else 'dry-run (pass --apply to act)'}")
         if rq_ids is None:
             self.stdout.write(

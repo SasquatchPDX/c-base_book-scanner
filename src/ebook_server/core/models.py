@@ -137,6 +137,29 @@ class SourceLocation(models.Model):
         default=SourceType.NETWORK_SOURCE,
     )
     default_metadata = models.JSONField(default=dict, blank=True)
+    is_paused = models.BooleanField(
+        default=False,
+        help_text=(
+            "Paused sources queue no new imports, and queued imports that have not "
+            "started stay DISCOVERED until the source is resumed."
+        ),
+    )
+    ingest_batch_size = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum import jobs in flight for this source. Blank uses "
+            "BOOK_SCANNER_INGEST_BATCH_SIZE; 0 means unlimited."
+        ),
+    )
+    ingest_max_per_hour = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum new import jobs queued per rolling hour for this source. Blank "
+            "uses BOOK_SCANNER_INGEST_MAX_PER_HOUR; 0 means unlimited."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
