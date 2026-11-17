@@ -9,7 +9,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from ebook_server.core import intake, scan_pipeline
-from ebook_server.core.models import ProcessingJob, ScanJob
+from ebook_server.core.models import ProcessingJob, ScanJob, ScanLog
 from ebook_server.jobs import is_stale_running, rq_pending_job_args, stale_after
 
 
@@ -128,3 +128,10 @@ class Command(BaseCommand):
             scan = ScanJob.objects.filter(pk=details.get("scan_job_id")).first()
             if scan is not None:
                 scan_pipeline._restore_scan_after_failure(scan, details)
+        elif job.job_type == ProcessingJob.JobType.SCAN_LOG:
+            # The staged upload is kept; the log's state shows the scanner it failed.
+            ScanLog.objects.filter(processing_job=job, state=ScanLog.State.QUEUED).update(
+                state=ScanLog.State.FAILED,
+                error=details["error"][:500],
+                updated_at=timezone.now(),
+            )

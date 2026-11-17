@@ -193,6 +193,42 @@ def _normalized_cover_bytes(image: Image.Image) -> bytes:
         return output.getvalue()
 
 
+# A scanner's raw cover photo (#128): a 3840x2160 frame is ~8 MP; leave room for
+# higher-resolution cameras while refusing decompression bombs.
+MAX_SCAN_COVER_PIXELS = 64_000_000
+SCANNER_EXTRACTOR_TOOL = "scanner+pillow"
+
+
+def normalized_cover_from_file(path: Path) -> bytes:
+    """Normalized library cover JPEG from an untrusted image file (a scanner cover).
+
+    JPEGs are decoded at a reduced scale (``draft``) close to the cover size, so a
+    large photo never needs its full-resolution bitmap in memory.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path, formats=["JPEG", "PNG", "TIFF", "WEBP"]) as source:
+                width, height = source.size
+                if width <= 0 or height <= 0 or width * height > MAX_SCAN_COVER_PIXELS:
+                    raise CoverExtractionError("scan cover dimensions exceed the safe limit")
+                source.draft("RGB", COVER_SIZE)
+                source.load()
+                image = source.copy()
+        return _normalized_cover_bytes(image)
+    except CoverExtractionError:
+        raise
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
+        raise CoverExtractionError("scan cover is not a valid image") from exc
+
+
 def _extract_image(variant: FileVariant, path: Path) -> tuple[Image.Image, str] | None:
     if variant.format == FileVariant.VariantFormat.EPUB:
         payload = _epub_cover_payload(path)
@@ -397,6 +433,11 @@ def extract_front_cover(
                 source_variant=variant,
                 extractor_tool=extractor_tool,
                 extractor_version=extractor_version,
+                source=(
+                    CoverImage.Source.SIDECAR
+                    if extractor_tool == SIDECAR_EXTRACTOR_TOOL
+                    else CoverImage.Source.EXTRACTED
+                ),
             )
             book.front_cover = cover
             book.save(update_fields=["front_cover_id", "updated_at"])

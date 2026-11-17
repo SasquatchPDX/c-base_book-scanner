@@ -9,9 +9,9 @@ from pathlib import Path
 import structlog
 from django.db import transaction
 
-from ebook_server.storage import StorageBackend
+from ebook_server.storage import LocalFilesystemStorage, StorageBackend
 
-from . import contributions
+from . import book_opf, contributions
 from .models import Book, StorageLocation
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -96,10 +96,12 @@ def delete_book_safely(
     """Quarantine artifacts, delete the DB graph atomically, then purge quarantine."""
     book_id = book.id
     missing_count = 0
+    archive_folder = ""
     quarantined: list[QuarantinedArtifact] = []
     try:
         with transaction.atomic():
             locked_book = Book.objects.select_for_update().get(pk=book_id)
+            archive_folder = locked_book.archive_folder
             artifacts = _book_artifacts(locked_book)
             resolved: list[tuple[ArtifactToDelete, StorageBackend]] = []
             for artifact in artifacts:
@@ -153,6 +155,11 @@ def delete_book_safely(
             quarantined_artifact.backend.delete(quarantined_artifact.quarantine_identifier)
         except Exception as exc:  # pragma: no cover - backend-specific cleanup failure
             cleanup_warnings.append(f"{quarantined_artifact.quarantine_identifier}: {exc}")
+    if archive_folder:
+        # The book's generated metadata.opf would otherwise keep its folder alive.
+        for quarantined_artifact in quarantined:
+            if isinstance(quarantined_artifact.backend, LocalFilesystemStorage):
+                book_opf.remove_orphaned_opf(quarantined_artifact.backend, archive_folder)
     logger.info(
         "book_deleted",
         book_id=book_id,

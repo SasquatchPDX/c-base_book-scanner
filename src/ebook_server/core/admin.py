@@ -8,7 +8,7 @@ from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
 
-from . import genres
+from . import genres, scanner_opf
 from .models import (
     AppUserProfile,
     Author,
@@ -32,7 +32,9 @@ from .models import (
     ProcessingJob,
     ReviewDecisionCorrection,
     ReviewTask,
+    ScanEvent,
     ScanJob,
+    ScanLog,
     ScanPage,
     ScanPageVersion,
     ScanTailorStageState,
@@ -67,6 +69,27 @@ class BookAdmin(admin.ModelAdmin[Book]):
     # archive_folder is assigned by core.archive_layout; editing it by hand would orphan
     # the book's folder.
     readonly_fields = ("genres_curated_at", "genres_curated_by", "archive_folder")
+    actions = ("plan_archive_reorganize",)
+
+    @admin.action(description="Plan moving selected books into their archive folders (dry run)")
+    def plan_archive_reorganize(self, request: HttpRequest, queryset: QuerySet[Book]) -> None:
+        _queue_reorganize(self, request, book_ids=list(queryset.values_list("pk", flat=True)))
+
+    def save_model(self, request: HttpRequest, obj: Book, form: Any, change: bool) -> None:
+        if change and obj.pk is not None:
+            stored = Book.objects.filter(pk=obj.pk).first()
+            if stored is not None:
+                # Compared after the related authors are saved (save_related).
+                request._book_before = scanner_opf.snapshot_book(stored)  # type: ignore[attr-defined]
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request: HttpRequest, form: Any, formsets: Any, change: bool) -> None:
+        super().save_related(request, form, formsets, change)
+        before = getattr(request, "_book_before", None)
+        if isinstance(before, dict):
+            # Hand edits are reviewer provenance: a later scanner OPF never overwrites
+            # them (#130).
+            scanner_opf.record_reviewer_edits(form.instance, before, user=request.user)
 
     def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
         super().save_formset(request, form, formset, change)
@@ -223,13 +246,95 @@ def _queue_reference_check(
 
 @admin.register(ScanJob)
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
-    list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
+    list_display = (
+        "id",
+        "state",
+        "scanner_id",
+        "source",
+        "operator",
+        "book",
+        "scan_started_at",
+        "created_at",
+        "finished_at",
+    )
+    list_filter = ("state", "source")
+    search_fields = ("id", "scanner_id")
+
+
+@admin.register(ScanEvent)
+class ScanEventAdmin(admin.ModelAdmin[ScanEvent]):
+    """scan.jsonl lines are append-only evidence: viewable, never edited here (#129)."""
+
+    list_display = ("id", "scan_job", "origin", "line_no", "type", "received_at")
+    list_filter = ("origin", "type")
+    search_fields = ("scan_job__id",)
+    readonly_fields = ("scan_job", "origin", "line_no", "type", "raw", "received_at")
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+    def has_change_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: Any = None) -> bool:
+        # Deleting a line would open a gap in the scanner's numbering.
+        return False
+
+
+@admin.register(ScanLog)
+class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
+    list_display = (
+        "scan_job",
+        "original_filename",
+        "state",
+        "size_bytes",
+        "storage_location",
+        "created_at",
+    )
     list_filter = ("state",)
+    readonly_fields = (
+        "state",
+        "staging_identifier",
+        "storage_location",
+        "storage_identifier",
+        "sha256",
+        "size_bytes",
+        "duplicate_of",
+        "processing_job",
+        "error",
+    )
+    actions = ("retry_failed_logs",)
+
+    @admin.action(description="Retry selected failed logs (staged upload kept)")
+    def retry_failed_logs(self, request: HttpRequest, queryset: QuerySet[ScanLog]) -> None:
+        from .scan_logs import ScanLogDispatchError, retry_failed_scan_log
+
+        requeued = 0
+        try:
+            for log in queryset.filter(state=ScanLog.State.FAILED):
+                if retry_failed_scan_log(log):
+                    requeued += 1
+        except ScanLogDispatchError as exc:
+            self.message_user(request, f"Queue unavailable: {exc}", messages.ERROR)
+            return
+        self.message_user(
+            request,
+            f"Queued {requeued} log(s) again; failed logs without a staged upload were skipped.",
+            messages.SUCCESS if requeued else messages.WARNING,
+        )
 
 
 @admin.register(ScanPage)
 class ScanPageAdmin(admin.ModelAdmin[ScanPage]):
-    list_display = ("id", "scan_job", "logical_sequence_number", "side", "updated_at")
+    list_display = (
+        "id",
+        "scan_job",
+        "logical_sequence_number",
+        "side",
+        "recognized_page_number",
+        "status",
+        "updated_at",
+    )
     list_filter = ("side",)
 
 
@@ -299,7 +404,7 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "ingest_max_per_hour",
     )
     list_filter = ("transfer_mode", "is_active", "is_paused")
-    actions = ("pause_imports", "resume_imports")
+    actions = ("pause_imports", "resume_imports", "plan_sort_into_archive_tree")
     fieldsets = (
         (
             None,
@@ -350,11 +455,134 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
             f"Resumed {updated} source(s). Run ingest_sources to re-queue waiting imports.",
         )
 
+    @admin.action(
+        description="Plan sorting books imported from these sources into the archive tree (dry run)"
+    )
+    def plan_sort_into_archive_tree(
+        self,
+        request: HttpRequest,
+        queryset: QuerySet[SourceLocation],
+    ) -> None:
+        _queue_reorganize(
+            self,
+            request,
+            source_location_ids=list(queryset.values_list("pk", flat=True)),
+        )
+
+
+REORGANIZE_REPORT_ROWS = 500
+
+
+def _queue_reorganize(
+    model_admin: Any,
+    request: HttpRequest,
+    *,
+    book_ids: list[int] | None = None,
+    source_location_ids: list[int] | None = None,
+    apply_plan_job: ProcessingJob | None = None,
+) -> None:
+    """Record an archive-reorganize ProcessingJob; planning and moving run in a worker."""
+    from django.urls import reverse
+    from django.utils.html import format_html
+
+    from .archive_reorganize import ReorganizeDispatchError, ReorganizeError, request_reorganize
+
+    user_id = request.user.pk if request.user.is_authenticated else None
+    try:
+        job, dispatched = request_reorganize(
+            book_ids=book_ids,
+            source_location_ids=source_location_ids,
+            apply_plan_job=apply_plan_job,
+            requested_by_user_id=user_id,
+        )
+    except ReorganizeError as exc:
+        model_admin.message_user(request, f"Not queued: {exc}", messages.ERROR)
+        return
+    except ReorganizeDispatchError as exc:
+        model_admin.message_user(
+            request, f"Recorded but could not be queued: {exc}", messages.ERROR
+        )
+        return
+    url = reverse("admin:core_processingjob_change", args=[job.pk])
+    what = "Applying the plan" if apply_plan_job is not None else "Dry-run plan"
+    if dispatched:
+        model_admin.message_user(
+            request,
+            format_html(
+                '{} queued as job <a href="{}">{}</a>. Review it there, then apply a plan '
+                'with the "Apply selected archive reorganize plans" action.',
+                what,
+                url,
+                job.job_id,
+            ),
+            messages.SUCCESS,
+        )
+    else:
+        model_admin.message_user(
+            request,
+            format_html(
+                '{} recorded as job <a href="{}">{}</a>, but no worker queue is configured. '
+                "Run <code>manage.py reorganize_archive --run-queued</code>.",
+                what,
+                url,
+                job.job_id,
+            ),
+            messages.WARNING,
+        )
+
 
 @admin.register(ProcessingJob)
 class ProcessingJobAdmin(admin.ModelAdmin[ProcessingJob]):
     list_display = ("job_id", "job_type", "state", "file_variant", "scheduled_at", "finished_at")
     list_filter = ("job_type", "state")
+    readonly_fields = ("reorganize_report",)
+    actions = ("apply_reorganize_plan",)
+
+    @admin.display(description="Archive reorganize")
+    def reorganize_report(self, obj: ProcessingJob) -> str:
+        from django.utils.html import format_html, format_html_join
+        from django.utils.safestring import mark_safe
+
+        if obj.job_type != ProcessingJob.JobType.ARCHIVE_REORGANIZE:
+            return "-"
+        details = obj.details if isinstance(obj.details, dict) else {}
+        is_plan = details.get("mode") == "plan"
+        rows = list((details.get("plan") if is_plan else details.get("results")) or [])
+        shown = rows[:REORGANIZE_REPORT_ROWS]
+        if is_plan:
+            head = mark_safe("<tr><th>File</th><th>From</th><th>To</th></tr>")
+            body = format_html_join(
+                "",
+                "<tr><td>{} {}</td><td>{}</td><td>{}/{}</td></tr>",
+                (
+                    (r.get("kind"), r.get("id"), r.get("from"), r.get("to_folder"), r.get("name"))
+                    for r in shown
+                ),
+            )
+        else:
+            head = mark_safe("<tr><th>File</th><th>Status</th><th>Detail</th></tr>")
+            body = format_html_join(
+                "",
+                "<tr><td>{} {}</td><td>{}</td><td>{}</td></tr>",
+                ((r.get("kind"), r.get("id"), r.get("status"), r.get("detail")) for r in shown),
+            )
+        more = len(rows) - len(shown)
+        return format_html(
+            "<p>{}</p><table>{}{}</table><p>{}</p>",
+            details.get("summary", ""),
+            head,
+            body,
+            f"... and {more} more" if more > 0 else "",
+        )
+
+    @admin.action(description="Apply selected archive reorganize plans (moves files)")
+    def apply_reorganize_plan(
+        self,
+        request: HttpRequest,
+        queryset: QuerySet[ProcessingJob],
+    ) -> None:
+        for plan_job in queryset:
+            _queue_reorganize(self, request, apply_plan_job=plan_job)
 
 
 @admin.register(ImportJob)
