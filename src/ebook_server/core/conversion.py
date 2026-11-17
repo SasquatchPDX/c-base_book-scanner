@@ -21,7 +21,7 @@ from django.utils import timezone
 
 from ebook_server.jobs import get_queue, is_stale_running, tunable_setting
 
-from . import intake
+from . import archive_layout, intake
 from .models import Book, FileVariant, ProcessingJob
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import (
@@ -489,12 +489,14 @@ def _execute_plan(
         if existing is not None:
             return existing
 
-        output_name = f"{uuid.uuid4()}.{target_format}"
-        storage_identifier = output_storage.generate_destination(
-            f"books/{source_variant.book_id}/converted",
-            output_name,
+        storage_identifier = archive_layout.publish_derived(
+            output_storage,
+            source_variant.book,
+            str(current_path),
+            f"{archive_layout.book_file_stem(source_variant.book)}.{target_format}",
+            legacy_namespace=f"books/{source_variant.book_id}/converted",
+            legacy_filename=f"{uuid.uuid4()}.{target_format}",
         )
-        output_storage.store(str(current_path), storage_identifier)
 
         return FileVariant.objects.create(
             book=source_variant.book,

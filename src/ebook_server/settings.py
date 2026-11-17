@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     storage_sentinel_file: str = ""
     # Free space to keep on the archive volume (bytes); 0 disables the check.
     storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
+    # On-disk layout for files written to the archive (see core.archive_layout):
+    # "author_title" (Author/Title/, Calibre-style), "calibre" (Author/Title (id)/),
+    # "job" (the original books/<import job id>/), or a custom template.
+    archive_layout: str = "author_title"
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     ingest_batch_size: int = 100
@@ -277,6 +281,9 @@ APP_DATA_DIR = Path(settings.storage_root)
 # not separately configurable: keeping it under the storage root keeps it behind the
 # mount/sentinel check, and renaming it would orphan every archived artifact.
 BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
+# Folder layout inside the archive. Changing it applies to newly archived files only;
+# existing files stay where they are until an admin runs a reorganize.
+BOOK_SCANNER_ARCHIVE_LAYOUT = settings.archive_layout
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
