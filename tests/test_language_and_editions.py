@@ -25,6 +25,7 @@ from ebook_server.core.identification import (
     build_identification_input,
     edition_conflicts,
     edition_evidence,
+    publisher_signal,
     resolve_candidates,
 )
 from ebook_server.core.languages import normalize_language, normalize_languages
@@ -402,6 +403,43 @@ def test_candidate_without_isbn_does_not_confirm_a_file_isbn() -> None:
     candidate = _normalize_candidate("openlibrary", work_only, signals)
     assert candidate.score >= AUTO_ACCEPT_SCORE
     assert edition_conflicts(candidate, signals) == [EDITION_ISBN_UNCONFIRMED]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Ace Books", "ace books"),
+        ("  Little,  Brown and Company ", "little, brown and company"),
+        ("ePub Bud (www.epubbud.com)", ""),
+        ("pubOne.Info", ""),
+        ("http://example.org/books", ""),
+        ("calibre", ""),
+        ("Unknown", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_publisher_signal_ignores_converters_and_web_addresses(
+    raw: str | None, expected: str
+) -> None:
+    assert publisher_signal(raw) == expected
+
+
+def test_converter_publisher_is_no_edition_conflict() -> None:
+    """A file whose 'publisher' is the converter site is not blocked as another edition."""
+    signals = build_identification_input(
+        source_path="/lib/Alastair Reynolds/Absolution Gap (1169)/Absolution Gap.epub",
+        original_filename="Absolution Gap - Alastair Reynolds.epub",
+        extracted_metadata={
+            "title": "Absolution Gap",
+            "authors": ["Alastair Reynolds"],
+            "publisher": "ePub Bud (www.epubbud.com)",
+            "language": "en",
+        },
+    )
+    assert signals.publisher == ""
+    candidate = _normalize_candidate("openlibrary", SEARCH_DOC, signals)
+    assert EDITION_PUBLISHER_MISMATCH not in edition_conflicts(candidate, signals)
 
 
 def test_isbn_confirmed_edition_tolerates_an_imprint_publisher() -> None:

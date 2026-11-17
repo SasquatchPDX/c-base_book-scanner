@@ -101,6 +101,22 @@ WORK_ISBN_MATCH_SCORE = getattr(
 )
 # Minimum rapidfuzz token_set_ratio for two publisher names (noise words removed).
 PUBLISHER_MATCH_MIN_RATIO = 90.0
+# Values ebook tools write into the publisher field that name no publisher (the
+# converter or the site the file came from). Compared after ``normalize_text``.
+IGNORED_PUBLISHERS = frozenset(
+    " ".join(str(value).lower().split())
+    for value in getattr(
+        django_settings,
+        "BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS",
+        ["calibre", "unknown"],
+    )
+)
+# A publisher written as a web address ("ePub Bud (www.epubbud.com)", "pubOne.Info") is
+# a distribution site or converter, not the edition's publisher.
+_PUBLISHER_WEB_ADDRESS = re.compile(
+    r"(?:https?://|www\.|\b[a-z0-9-]+\.(?:com|net|org|info|biz|de|co\.uk|io)\b)",
+    re.IGNORECASE,
+)
 _PUBLISHER_NOISE_TOKENS = frozenset(
     {
         "ag",
@@ -904,7 +920,7 @@ def build_identification_input(
         # Normalised (ISO 639-1, else 639-3) so "en" and "eng" compare equal; "UND" and
         # unknown codes become None ("no signal"), never a mismatch.
         language=normalize_language(_first_str(extracted_metadata.get("language"))),
-        publisher=normalize_text(extracted_metadata.get("publisher")),
+        publisher=publisher_signal(extracted_metadata.get("publisher")),
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
         else None,
@@ -1643,6 +1659,19 @@ def _pick_language(
             if normalize_language(value) == signal_language:
                 return normalize_text(value)
     return normalize_text(usable_work[0]) if usable_work else None
+
+
+def publisher_signal(value: Any) -> str:
+    """The file's publisher as identification evidence, or ``""`` for no signal.
+
+    Converter names and web addresses (see ``IGNORED_PUBLISHERS`` and
+    ``_PUBLISHER_WEB_ADDRESS``) are not publishers. They count as a missing value:
+    no edition conflict and no publisher bonus.
+    """
+    text = normalize_text(value if isinstance(value, str) else None)
+    if not text or text in IGNORED_PUBLISHERS or _PUBLISHER_WEB_ADDRESS.search(text):
+        return ""
+    return text
 
 
 def _publisher_tokens(value: str) -> str:
