@@ -112,8 +112,11 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 
 ## Rescan todo flow
 
-- `POST /scan/pages/{page_id}/rescan/` creates a new RESCAN todo for the page (or returns
-  the open one). Allowed while the job is being captured or processed, and also for
+- `POST /scan/pages/{page_id}/rescan/` creates a new RESCAN todo for the page (`201`), or
+  returns the outstanding one (`200`, `created: false`): an `open` or `claimed` todo, as
+  the scanner lists both, unchanged and with its assignee, and without a second
+  `rescan_flag` line. After it is `completed` or `cancelled` a new flag creates a new
+  todo. The check runs under the job's row lock. Allowed while the job is being captured or processed, and also for
   `captured` and `complete` jobs (D7). For a scanner job it appends a `rescan_flag` line
   to `scan.jsonl` in the same transaction. The scanner fetches and fulfils these todos
   through the device API (see "Rescans over the device API" below).

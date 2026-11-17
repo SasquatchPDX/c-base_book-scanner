@@ -257,11 +257,16 @@ class FlagResult:
 
 
 def flag_page(page: ScanPage, *, reason: str, user: Any) -> FlagResult:
-    """Create (or return the open) rescan todo for ``page``; ``rescan_flag`` for scanner jobs.
+    """Create (or return the outstanding) rescan todo for ``page``; ``rescan_flag`` for
+    scanner jobs.
 
-    Allowed in :data:`scan_lifecycle.RESCAN_STATES` (``captured`` and ``complete``
-    included, D7), checked under the job's row lock. The todo and the event commit
-    together. Raises :class:`scan_lifecycle.LifecycleError` for another state.
+    An ``open`` or ``claimed`` todo for the page is outstanding (the scanner lists both,
+    :data:`OPEN_TODO_STATES`): flagging again returns it unchanged, assignee included,
+    and appends no event. Once it is ``completed`` or ``cancelled`` a new flag creates a
+    new todo. Allowed in :data:`scan_lifecycle.RESCAN_STATES` (``captured`` and
+    ``complete`` included, D7); the lookup and the insert run under the job's row lock,
+    so concurrent flags cannot both create one. The todo and the event commit together.
+    Raises :class:`scan_lifecycle.LifecycleError` for another state.
     """
     with transaction.atomic():
         job = ScanJob.objects.select_for_update().get(pk=page.scan_job_id)
@@ -270,7 +275,7 @@ def flag_page(page: ScanPage, *, reason: str, user: Any) -> FlagResult:
                 job.state, "scan job is not accepting rescan requests"
             )
         existing = (
-            page.todos.filter(todo_type=ScanTodo.TodoType.RESCAN, state=ScanTodo.State.OPEN)
+            page.todos.filter(todo_type=ScanTodo.TodoType.RESCAN, state__in=OPEN_TODO_STATES)
             .order_by("-created_at")
             .first()
         )

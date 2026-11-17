@@ -567,6 +567,73 @@ def test_portal_flagging_states_and_web_jobs(
     assert not ScanEvent.objects.filter(scan_job=web_job).exists()
 
 
+def _rescan_flags() -> list[dict[str, Any]]:
+    return [event for event in _serif_events() if event["type"] == "rescan_flag"]
+
+
+@pytest.mark.django_db
+def test_reflagging_a_claimed_page_returns_the_claimed_todo(
+    key: str,  # noqa: F811
+    member: Client,
+) -> None:
+    """OPEN and CLAIMED are both outstanding for the scanner: reflagging a page whose
+    request is claimed returns that request, keeps its assignee and adds no event."""
+    _scan_book(key)
+    first = _flag(member, 1)
+    assert first.status_code == 201, first.content
+    todo_id = first.json()["todo"]["id"]
+    claimer = Client()
+    claimer.force_login(get_or_create_profile("rescan-claimer").user)
+    assert claimer.post(f"/scan/todos/{todo_id}/claim/").status_code == 200
+    claimed = ScanTodo.objects.get(pk=todo_id)
+    assert claimed.state == ScanTodo.State.CLAIMED
+
+    again = _flag(member, 1, reason="still glare")
+
+    assert again.status_code == 200, again.content
+    assert again.json()["created"] is False
+    assert again.json()["todo"]["id"] == todo_id
+    todo = ScanTodo.objects.get(pk=todo_id)
+    assert todo.state == ScanTodo.State.CLAIMED
+    assert todo.claimed_by_id == claimed.claimed_by_id
+    assert todo.reason == "glare"
+    assert ScanTodo.objects.filter(scan_page=_page(1)).count() == 1
+    assert len(_rescan_flags()) == 1
+    detail = _get(key, f"jobs/{JOB_ID}/rescans").json()
+    assert [item["todo_id"] for item in detail["todos"]] == [todo_id]
+    assert _get(key, "rescans").json()["items"][0]["open_rescans"] == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("finish", ["replacement", "cancel"])
+def test_a_page_can_be_flagged_again_after_its_request_is_done(
+    key: str,  # noqa: F811
+    member: Client,
+    finish: str,
+) -> None:
+    _scan_book(key)
+    first = _flag(member, 1)
+    todo_id = first.json()["todo"]["id"]
+    assert member.post(f"/scan/todos/{todo_id}/claim/").status_code == 200
+    if finish == "replacement":
+        assert _replace(key, todo_id, _jpeg(b"retaken"), 1).status_code == 201
+        assert ScanTodo.objects.get(pk=todo_id).state == ScanTodo.State.COMPLETED
+    else:
+        assert member.post(f"/scan/todos/{todo_id}/cancel/").status_code == 200
+        assert ScanTodo.objects.get(pk=todo_id).state == ScanTodo.State.CANCELLED
+
+    second = _flag(member, 1, reason="new problem")
+
+    assert second.status_code == 201, second.content
+    assert second.json()["created"] is True
+    new_id = second.json()["todo"]["id"]
+    assert new_id != todo_id
+    assert ScanTodo.objects.get(pk=new_id).state == ScanTodo.State.OPEN
+    assert len(_rescan_flags()) == 2
+    detail = _get(key, f"jobs/{JOB_ID}/rescans").json()
+    assert [item["todo_id"] for item in detail["todos"]] == [new_id]
+
+
 @pytest.mark.django_db
 def test_flag_and_event_commit_together(
     key: str,  # noqa: F811
