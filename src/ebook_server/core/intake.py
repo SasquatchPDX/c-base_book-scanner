@@ -12,7 +12,6 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -42,7 +41,7 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import genres, identification, referenced_files, source_layout
+from . import genres, identification, metadata_search, referenced_files, source_layout
 from .models import (
     Author,
     Book,
@@ -50,6 +49,7 @@ from .models import (
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ReviewTask,
     SourceLocation,
     StorageLocation,
@@ -1366,31 +1366,29 @@ def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
     *,
+    signals: identification.IdentificationInput,
+    outcomes: list[identification.ProviderOutcome],
     allow_match: bool = True,
 ) -> None:
-    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
-    # Ensure idempotence if jobs are retried.
-    MetadataCandidate.objects.filter(import_job=job).delete()
-    for candidate in candidates:
-        state = MetadataCandidate.CandidateState.REVIEW
-        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
-            state = MetadataCandidate.CandidateState.MATCH
-        MetadataCandidate.objects.create(
+    """Record the intake search run and its candidates.
+
+    ``allow_match=False`` keeps all candidates in REVIEW state.
+    """
+    with transaction.atomic():
+        # Ensure idempotence if jobs are retried: drop the earlier intake attempt.
+        metadata_search.discard_intake_runs(job)
+        search = metadata_search.record_search(
+            trigger=MetadataSearch.Trigger.INTAKE,
+            signals=signals,
+            outcomes=outcomes,
+            candidate_count=len(candidates),
             import_job=job,
-            provider_id=candidate.provider_id,
-            provider_ref=_fit(MetadataCandidate, "provider_ref", candidate.provider_ref),
-            title=_fit(MetadataCandidate, "title", candidate.title),
-            authors=candidate.authors,
-            isbn10=_fit(MetadataCandidate, "isbn10", candidate.isbn10),
-            isbn13=_fit(MetadataCandidate, "isbn13", candidate.isbn13),
-            score=Decimal(str(candidate.score)),
-            raw_payload=candidate.raw,
-            subjects=candidate.subjects,
-            language=_fit(MetadataCandidate, "language", candidate.language),
-            publisher=_fit(MetadataCandidate, "publisher", candidate.publisher),
-            description=candidate.description or "",
-            publication_year=candidate.publication_year,
-            state=state,
+            requested_by_id=job.uploader_id,
+        )
+        metadata_search.save_candidates(
+            search=search,
+            candidates=candidates,
+            match_threshold=AUTO_ACCEPT_SCORE if allow_match else None,
         )
 
 
@@ -2573,7 +2571,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
         _save_job(job, update_fields=["state", "updated_at"])
-        candidates = identification.resolve_candidates(signals)
+        candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
         decision = decide_auto_accept(candidates, file_authors)
         if decision.blocked_reason is not None:
@@ -2592,6 +2590,8 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_metadata_candidates(
             job,
             candidates,
+            signals=signals,
+            outcomes=provider_outcomes,
             allow_match=decision.blocked_reason is None,
         )
 

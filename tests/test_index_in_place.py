@@ -77,8 +77,8 @@ def app_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def matched(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         identification,
-        "resolve_candidates",
-        lambda _signals: [_strong_candidate("Shared Book")],
+        "resolve_candidates_with_report",
+        lambda _signals: ([_strong_candidate("Shared Book")], []),
     )
 
 
@@ -151,7 +151,7 @@ def test_matched_index_import_references_file_without_copying(
 def test_low_confidence_index_import_is_referenced_after_review(
     tmp_path: Path, app_storage: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(identification, "resolve_candidates", lambda _signals: [])
+    monkeypatch.setattr(identification, "resolve_candidates_with_report", lambda _signals: ([], []))
     location, book = _index_source(tmp_path)
 
     job = _import(location, book)

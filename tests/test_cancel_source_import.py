@@ -108,11 +108,11 @@ def test_cancel_during_metadata_lookup_stops_before_archiving(
     location = _source(tmp_path, 1)
     (job,) = _jobs(location)
 
-    def _lookup_then_cancel(_signals: Any) -> list[Any]:
+    def _lookup_then_cancel(_signals: Any) -> tuple[list[Any], list[Any]]:
         intake.cancel_source_imports(location)
-        return []
+        return [], []
 
-    monkeypatch.setattr(identification, "resolve_candidates", _lookup_then_cancel)
+    monkeypatch.setattr(identification, "resolve_candidates_with_report", _lookup_then_cancel)
 
     intake.process_import_job(str(job.id))  # returns cleanly: no RQ retry
 
