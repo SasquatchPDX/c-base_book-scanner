@@ -1007,3 +1007,41 @@ def test_recovering_a_stale_part_settles_its_group(
 
     task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
     assert [p["filename"] for p in task.embedded_metadata["missing_parts"]] == ["AppA.txt"]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("membership", ["complete", "pending", "missing", "duplicate"])
+def test_batch_accept_leaves_multipart_for_individual_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, membership: str
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    if membership == "duplicate":
+        _other_book_with_identical_file(parts[0])
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.import_job is not None
+    task.import_job.metadata_candidates.update(score=0.99)
+    if membership in {"pending", "missing"}:
+        ImportJob.objects.filter(original_filename="AppA.txt").update(
+            state=ImportJob.State.HASHING if membership == "pending" else ImportJob.State.FAILED
+        )
+    books_before = Book.objects.count()
+
+    def reject_inline_extraction(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("batch acceptance must not extract a multipart cover in the request")
+
+    monkeypatch.setattr(intake, "_try_extract_front_cover", reject_inline_extraction)
+    response = _admin_client().post(
+        "/reviews/batch-accept/", {"task_ids": [task.pk]}, content_type="application/json"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] == 0
+    assert response.json()["results"][0]["outcome"] == "requires_individual_review"
+    assert Book.objects.count() == books_before
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.OPEN
+    assert ImportGroup.objects.get().state == ImportGroup.State.PENDING

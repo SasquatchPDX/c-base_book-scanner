@@ -4338,6 +4338,12 @@ def _batch_accept_one(
             result["title"] = task.inferred_title or task.source_filename
             if task.state not in REVIEW_QUEUE_STATES:
                 return {**result, "outcome": "closed"}
+            if task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+                return {
+                    **result,
+                    "outcome": "requires_individual_review",
+                    "detail": "Confirm multipart membership and reading order on its review page.",
+                }
             candidates = list(_review_candidates(task))
             eligibility = review_batch.evaluate_top_candidates(
                 [candidate.score for candidate in candidates],

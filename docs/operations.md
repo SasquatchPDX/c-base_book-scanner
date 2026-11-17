@@ -716,7 +716,10 @@ code path as accepting a candidate on the detail page. A task is accepted only i
 
 Everything else stays open and is reported per task (`accepted`, `ambiguous`,
 `below_min_score`, `no_candidates`, `closed`, `forbidden`, `not_found`,
-`error`). A batch holds at most `BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
+`requires_individual_review`, `error`). Multi-part works require their individual
+review page to confirm membership, missing or duplicate parts, and reading order;
+batch acceptance always leaves those tasks unchanged. A batch holds at most
+`BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
 100) tasks. Batch-resolved tasks record `batch_accept`, the scores and the
 thresholds used in `decision_payload`. The originals were already archived when
 the review task was created, so accepting only links records; no archive copy,
