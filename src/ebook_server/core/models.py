@@ -894,12 +894,18 @@ class ScanJob(models.Model):
     page_number_crop = models.JSONField(null=True, blank=True)
     completeness_flags = models.JSONField(null=True, blank=True)
     completeness_checked_at = models.DateTimeField(null=True, blank=True)
-    # Highest ScanEvent id already rendered into scan.jsonl in the job folder and in
-    # the book folder; lets queued renders that have nothing new to write skip (#129).
+    # Highest ScanEvent id rendered into scan.jsonl in the job folder and in the book
+    # folder, recorded only after the written file read back correctly (#129). Renders
+    # decide whether a file is current by reading it, not from these marks.
     scan_jsonl_job_rendered_through = models.BigIntegerField(null=True, blank=True, editable=False)
     scan_jsonl_book_rendered_through = models.BigIntegerField(null=True, blank=True, editable=False)
-    # This job's scan.jsonl in the book folder, claimed once at the first write after
-    # finish ("<folder>/scan.jsonl", or "scan-<job id>.jsonl" when the book already has one).
+    # Fences scan.jsonl renders: each pass takes the next generation under the row lock
+    # and may only publish while its generation is still the newest (#129).
+    scan_jsonl_render_generation = models.BigIntegerField(default=0, editable=False)
+    # This job's scan.jsonl in its scan folder and in the book folder, each claimed with
+    # an exclusive create at its first write ("scan.jsonl", else "scan-<job id>.jsonl",
+    # else that name with a random token). serif only ever rewrites a file it claimed.
+    scan_jsonl_job_identifier = models.CharField(max_length=1024, blank=True, editable=False)
     scan_jsonl_book_identifier = models.CharField(max_length=1024, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -24,21 +24,27 @@ Idempotency
 Rendering
     The file is derived state; the database is authoritative. It is written after the
     transaction commits, by a background job (inline when no queue is configured),
-    atomically (temporary file, then rename) through the storage backend. Renders are
-    idempotent snapshots: a render that finds nothing new skips the write, and a render
-    that loses a race with a newer one notices and renders again.
+    atomically (temporary file, then rename) through the storage backend. The first
+    write claims a free name with an exclusive create and records it on the job; serif
+    never overwrites a file it did not claim (an uploaded log, another job's file).
+    Each render pass takes a generation under the job's row lock and only renames its
+    snapshot into place while that generation is still the newest, so an older pass
+    never replaces a newer snapshot. A file is current when it reads back as the
+    snapshot (size and SHA-256); the recorded high-water mark is only bookkeeping.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, TypeGuard
+from typing import Any, Final
 
 import structlog
 from django.conf import settings
@@ -47,7 +53,7 @@ from django.db.models import Max, Q
 from django.utils import timezone
 
 from ebook_server.jobs import enqueue
-from ebook_server.storage import LocalFilesystemStorage
+from ebook_server.storage import MAX_PUBLISH_ATTEMPTS, LocalFilesystemStorage, StorageBackend
 
 from . import archive_layout, intake
 from .models import Book, ScanEvent, ScanJob, ScanPage
@@ -66,6 +72,9 @@ MAX_EVENT_TYPE_LENGTH: Final = 64
 # A render that keeps losing races to newer events gives up after this many passes;
 # the next stored event schedules another render.
 MAX_RENDER_PASSES: Final = 5
+# ScanPage.logical_sequence_number is a PositiveIntegerField; a larger value in an event
+# names no page and is ignored rather than sent to the database.
+MAX_SEQUENCE_NUMBER: Final = 2_147_483_647
 
 JOB_EVENT = "job"
 PAGE_EVENT = "page"
@@ -141,7 +150,7 @@ def parse_event_line(raw: str, *, line_no: int | None = None) -> dict[str, Any]:
         )
     try:
         event = json.loads(raw)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise InvalidEvent("A line must be one JSON object.", details) from exc
     if not isinstance(event, dict):
         raise InvalidEvent("A line must be one JSON object.", details)
@@ -319,8 +328,32 @@ def append_serif_event(
 # --- projection -------------------------------------------------------------------------
 
 
-def _is_number(value: Any) -> TypeGuard[int | float]:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+def _finite_float(value: Any) -> float | None:
+    """``value`` as a finite float, or None when it is not a JSON number that fits one.
+
+    JSON integers are unbounded in Python; one too large for a float (``float()`` raises
+    ``OverflowError``) is malformed like a string would be, never an error of the batch.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _json_safe(value: Any) -> bool:
+    """Whether ``value`` can be stored in a JSON column (no NaN/Infinity, not too deep)."""
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return True
+
+
+# The ScanPage fields a ``page`` event can set.
+_PAGE_FIELDS: Final = ("recognized_page_number", "status")
 
 
 def _page_changes(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -337,7 +370,7 @@ def _page_changes(event: Mapping[str, Any]) -> dict[str, Any]:
 
 def _page_sequence_number(event: Mapping[str, Any]) -> int | None:
     value = event.get("sequence_number")
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_SEQUENCE_NUMBER:
         return value
     return None
 
@@ -355,11 +388,11 @@ def _project(job: ScanJob, events: Iterable[Mapping[str, Any]]) -> None:
     for event in events:
         event_type = event.get("type")
         if event_type == JOB_EVENT:
-            width = event.get("page_width_mm")
-            if _is_number(width) and width > 0:
-                job_updates["page_width_mm"] = float(width)
+            width = _finite_float(event.get("page_width_mm"))
+            if width is not None and width > 0:
+                job_updates["page_width_mm"] = width
             crop = event.get("page_number_crop")
-            if isinstance(crop, dict):
+            if isinstance(crop, dict) and _json_safe(crop):
                 job_updates["page_number_crop"] = crop
         elif event_type == PAGE_EVENT:
             sequence_number = _page_sequence_number(event)
@@ -368,7 +401,7 @@ def _project(job: ScanJob, events: Iterable[Mapping[str, Any]]) -> None:
                 page_updates.setdefault(sequence_number, {}).update(changes)
         elif event_type == COMPLETENESS_EVENT:
             flags = event.get("flags")
-            if isinstance(flags, list):
+            if isinstance(flags, list) and _json_safe(flags):
                 job_updates["completeness_flags"] = flags
                 job_updates["completeness_checked_at"] = timezone.now()
     now = timezone.now()
@@ -385,10 +418,13 @@ def _project(job: ScanJob, events: Iterable[Mapping[str, Any]]) -> None:
 
 
 def project_page_from_events(page: ScanPage) -> bool:
-    """Apply the latest stored ``page`` event for ``page`` to it; True if one applied.
+    """Apply the stored ``page`` events for ``page`` to it; True if any value applied.
 
     A ``page`` event can arrive before the page's image. The device page upload (#128)
-    calls this after creating a page so the event's values are not lost.
+    calls this after creating a page so the events' values are not lost. As in the live
+    projection (:func:`_project`), each field takes the latest valid value any event
+    gave it: a later event that carries only ``status`` keeps an earlier
+    ``recognized_page_number``.
     """
     if page.side != ScanPage.Side.SINGLE:
         return False
@@ -397,23 +433,26 @@ def project_page_from_events(page: ScanPage) -> bool:
         .order_by("-id")
         .values_list("raw", flat=True)
     )
+    changes: dict[str, Any] = {}
     for raw in candidates.iterator():
         try:
             event = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(event, dict):
             continue
         if _page_sequence_number(event) != page.logical_sequence_number:
             continue
-        changes = _page_changes(event)
-        if not changes:
-            continue
-        ScanPage.objects.filter(pk=page.pk).update(**changes, updated_at=timezone.now())
-        for name, value in changes.items():
-            setattr(page, name, value)
-        return True
-    return False
+        for name, value in _page_changes(event).items():
+            changes.setdefault(name, value)  # newest first: the first value seen wins
+        if len(changes) == len(_PAGE_FIELDS):
+            break
+    if not changes:
+        return False
+    ScanPage.objects.filter(pk=page.pk).update(**changes, updated_at=timezone.now())
+    for name, value in changes.items():
+        setattr(page, name, value)
+    return True
 
 
 # --- rendering --------------------------------------------------------------------------
@@ -436,83 +475,196 @@ def _scan_storage() -> LocalFilesystemStorage:
 
 
 def job_scan_jsonl_identifier(job_id: str) -> str:
-    """Storage id of the rendered file in the job's folder of scan storage."""
+    """Preferred storage id of the rendered file in the job's folder of scan storage.
+
+    The file actually written is the one claimed in ``ScanJob.scan_jsonl_job_identifier``;
+    it differs from this name only when something else already occupied it.
+    """
     return _scan_storage().generate_destination(f"{JOB_NAMESPACE}/{job_id}", SCAN_JSONL_NAME)
 
 
-def _book_scan_jsonl_identifier(job: ScanJob, book: Book, storage: LocalFilesystemStorage) -> str:
-    """Claim (once) the name of this job's ``scan.jsonl`` in the book's folder.
+class ScanJsonlWriteError(OSError):
+    """The rendered file did not read back as the bytes just written."""
 
-    The first scan job of a book gets ``scan.jsonl``; another scan job of the same book
-    (or a name already taken by a file serif did not render) gets
-    ``scan-<job id>.jsonl``, so two jobs never overwrite each other's log. The claim is
-    stored on the job and kept, like the book folder itself.
+
+@dataclass(frozen=True)
+class _Target:
+    """One destination of the rendered file: the job folder or the book folder."""
+
+    name: str
+    identifier_field: str
+    rendered_field: str
+
+
+_JOB_TARGET: Final = _Target("job", "scan_jsonl_job_identifier", "scan_jsonl_job_rendered_through")
+_BOOK_TARGET: Final = _Target(
+    "book", "scan_jsonl_book_identifier", "scan_jsonl_book_rendered_through"
+)
+
+
+def _book_folder(book: Book, storage: StorageBackend) -> str:
+    if archive_layout.configured_layout().job_scoped:
+        return f"books/{book.pk}"
+    return archive_layout.book_folder(book, storage)
+
+
+def _candidate_names(job_id: str) -> Iterator[str]:
+    """``scan.jsonl``, then ``scan-<job id>.jsonl``, then that name with a random token."""
+    yield SCAN_JSONL_NAME
+    yield f"scan-{job_id}.jsonl"
+    for _attempt in range(MAX_PUBLISH_ATTEMPTS - 2):
+        yield f"scan-{job_id}-{uuid.uuid4().hex[:8]}.jsonl"
+
+
+def _holds(storage: StorageBackend, identifier: str, data: bytes) -> bool:
+    """Whether ``identifier`` currently holds exactly ``data`` (size, then SHA-256)."""
+    try:
+        size, _mtime = storage.stat(identifier)
+        if size != len(data):
+            return False
+        return storage.hash(identifier) == hashlib.sha256(data).hexdigest()
+    except FileNotFoundError:
+        return False
+
+
+def _claim(storage: StorageBackend, staged: str, folder: str, job_id: str, target: _Target) -> str:
+    """Publish ``staged`` under the first free name of :func:`_candidate_names`.
+
+    Each name is taken with an exclusive create (the allocation ``publish_unique``
+    uses), so a file that already exists there is never replaced, whoever wrote it: an
+    independently uploaded log (#113), another tool, another job. Names another job has
+    claimed are skipped even when their file has gone, so that job never writes over ours.
     """
-    if job.scan_jsonl_book_identifier:
-        return job.scan_jsonl_book_identifier
+    for name in _candidate_names(job_id):
+        candidate = f"{folder}/{name}"
+        field = target.identifier_field
+        if ScanJob.objects.filter(**{field: candidate}).exclude(pk=job_id).exists():
+            continue
+        try:
+            return storage.commit_staged_exclusive(staged, candidate)
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"no free name for scan.jsonl in {folder!r}")
+
+
+def _begin_render(job_id: str) -> tuple[ScanJob, int, int] | None:
+    """Start a render pass: ``(job, generation, through)``, or None if nothing to render.
+
+    Under the job's row lock (which every event insert also takes) the pass reads the
+    newest event id it will render through and takes the next render generation. A
+    pass may only publish while its generation is still the job's newest, so an older
+    pass can never replace the snapshot of a newer one.
+    """
     with transaction.atomic():
-        Book.objects.select_for_update().filter(pk=book.pk).first()
-        current = (
-            ScanJob.objects.filter(pk=job.pk).values_list("scan_jsonl_book_identifier", flat=True)
-        ).first()
-        if current:
-            job.scan_jsonl_book_identifier = current
-            return current
-        if archive_layout.configured_layout().job_scoped:
-            folder = f"books/{book.pk}"
-        else:
-            folder = archive_layout.book_folder(book, storage)
-        preferred = f"{folder}/{SCAN_JSONL_NAME}"
-        taken = (
-            ScanJob.objects.filter(scan_jsonl_book_identifier=preferred).exclude(pk=job.pk).exists()
-        )
-        identifier = preferred
-        if taken or storage.exists(preferred):
-            identifier = f"{folder}/scan-{job.pk}.jsonl"
-        ScanJob.objects.filter(pk=job.pk).update(scan_jsonl_book_identifier=identifier)
-        job.scan_jsonl_book_identifier = identifier
-        return identifier
+        job = ScanJob.objects.select_for_update().filter(pk=job_id).first()
+        if job is None:
+            return None
+        through = job.events.aggregate(top=Max("id"))["top"]
+        if through is None:
+            return None
+        generation = job.scan_jsonl_render_generation + 1
+        ScanJob.objects.filter(pk=job.pk).update(scan_jsonl_render_generation=generation)
+        job.scan_jsonl_render_generation = generation
+    return job, generation, int(through)
 
 
-def _mark_rendered(job_id: str, field_name: str, through: int) -> None:
+def _publish(
+    job: ScanJob,
+    generation: int,
+    through: int,
+    data: bytes,
+    target: _Target,
+    storage: StorageBackend,
+    folder: str | None,
+) -> bool:
+    """Make ``target``'s file hold ``data``; False when a newer render superseded this one.
+
+    A file that already holds ``data`` (checked by size and hash, not by the recorded
+    mark) is left alone. Otherwise the bytes are staged beside it, then, under the job's
+    row lock and only while ``generation`` is still the newest, renamed into place (or
+    claimed exclusively on the first write), read back, and only then recorded.
+    """
+    identifier = getattr(job, target.identifier_field)
+    if identifier and _holds(storage, identifier, data):
+        _record(job.pk, generation, target, identifier, through)
+        return True
+    if not identifier and folder is None:
+        raise ValueError("a first write needs the target folder")
+    staged = storage.stage_bytes(identifier or f"{folder}/{SCAN_JSONL_NAME}", data)
+    try:
+        with transaction.atomic():
+            locked = ScanJob.objects.select_for_update().filter(pk=job.pk).first()
+            if locked is None or locked.scan_jsonl_render_generation != generation:
+                return False
+            identifier = getattr(locked, target.identifier_field)
+            if identifier:
+                storage.commit_staged(staged, identifier)
+            else:
+                assert folder is not None
+                identifier = _claim(storage, staged, folder, job.pk, target)
+            verified = _holds(storage, identifier, data)
+            updates: dict[str, Any] = {target.identifier_field: identifier}
+            if verified:
+                updates[target.rendered_field] = through
+            ScanJob.objects.filter(pk=job.pk).update(**updates)
+            setattr(job, target.identifier_field, identifier)
+    finally:
+        storage.discard_staged(staged)
+    if not verified:
+        raise ScanJsonlWriteError(f"{identifier!r} does not hold the rendered snapshot")
+    return True
+
+
+def _record(job_id: str, generation: int, target: _Target, identifier: str, through: int) -> None:
+    """Record a verified snapshot, unless a newer render has taken over meanwhile."""
     ScanJob.objects.filter(
-        Q(**{f"{field_name}__isnull": True}) | Q(**{f"{field_name}__lt": through}),
+        Q(**{f"{target.rendered_field}__isnull": True})
+        | Q(**{f"{target.rendered_field}__lt": through}),
         pk=job_id,
-    ).update(**{field_name: through})
+        scan_jsonl_render_generation=generation,
+        **{target.identifier_field: identifier},
+    ).update(**{target.rendered_field: through})
 
 
 def write_scan_jsonl(job_id: str) -> None:
     """Render ``scan.jsonl`` into the job folder and, once finished, the book folder.
 
-    Background job. Each pass renders a snapshot of the stored lines and replaces the
-    file atomically. If newer lines were stored meanwhile (or a concurrent render may
-    have replaced the file with an older snapshot after this one), it renders again.
+    Background job. Each pass takes a render generation and a snapshot of the stored
+    lines (:func:`_begin_render`) and publishes it with :func:`_publish`. A pass that a
+    newer one has superseded stops: the newer pass renders at least as many lines. If
+    newer lines were stored meanwhile, it renders again. Whether a file is current is
+    decided by reading it back, never by the recorded high-water mark, so a retry after
+    a failed or interrupted pass always repairs the file.
     """
-    force = False
     for _pass in range(MAX_RENDER_PASSES):
-        job = ScanJob.objects.select_related("book").filter(pk=job_id).first()
-        if job is None:
+        begun = _begin_render(job_id)
+        if begun is None:
             return
-        rows = list(job.events.order_by("id").values_list("id", "raw"))
-        if not rows:
-            return
-        through = rows[-1][0]
-        data = b"".join(raw.encode("utf-8") + b"\n" for _id, raw in rows)
-        if force or job.scan_jsonl_job_rendered_through != through:
-            _scan_storage().replace_bytes(job_scan_jsonl_identifier(job.pk), data)
-            _mark_rendered(job.pk, "scan_jsonl_job_rendered_through", through)
+        job, generation, through = begun
+        rows = job.events.filter(id__lte=through).order_by("id").values_list("raw", flat=True)
+        data = b"".join(raw.encode("utf-8") + b"\n" for raw in rows.iterator())
+        job_folder = None if job.scan_jsonl_job_identifier else f"{JOB_NAMESPACE}/{job.pk}"
+        targets: list[tuple[_Target, StorageBackend, str | None]] = [
+            (_JOB_TARGET, _scan_storage(), job_folder)
+        ]
         book = job.book
         if job.state == ScanJob.State.COMPLETE and book is not None:
-            if force or job.scan_jsonl_book_rendered_through != through:
-                storage = intake._default_storage()
-                identifier = _book_scan_jsonl_identifier(job, book, storage)
-                storage.replace_bytes(identifier, data)
-                _mark_rendered(job.pk, "scan_jsonl_book_rendered_through", through)
+            storage = intake._default_storage()
+            folder = None if job.scan_jsonl_book_identifier else _book_folder(book, storage)
+            targets.append((_BOOK_TARGET, storage, folder))
+        for target, target_storage, target_folder in targets:
+            if not _publish(job, generation, through, data, target, target_storage, target_folder):
+                logger.info(
+                    "scan_jsonl_render_superseded",
+                    scan_job_id=job.pk,
+                    target=target.name,
+                    generation=generation,
+                )
+                return
         latest = job.events.aggregate(top=Max("id"))["top"]
         if latest == through:
-            logger.info("scan_jsonl_rendered", scan_job_id=job.pk, lines=len(rows))
+            logger.info("scan_jsonl_rendered", scan_job_id=job.pk, bytes=len(data))
             return
-        force = True
     logger.warning("scan_jsonl_render_gave_up", scan_job_id=job_id, passes=MAX_RENDER_PASSES)
 
 

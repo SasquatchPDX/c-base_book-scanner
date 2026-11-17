@@ -20,6 +20,7 @@ from django.db import connections
 from ebook_server.core import scan_events
 from ebook_server.core.models import ScanEvent, ScanJob
 from ebook_server.core.scanner_devices import create_device
+from ebook_server.storage import LocalFilesystemStorage
 
 pytestmark = [
     pytest.mark.infrastructure,
@@ -147,3 +148,60 @@ def test_serif_events_and_scanner_batches_interleave_without_loss(job: ScanJob) 
     assert scan_events.render_scan_jsonl(JOB_ID) == b"".join(
         event.raw.encode() + b"\n" for event in events
     )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_an_older_render_is_fenced_out_by_a_newer_one(
+    job: ScanJob, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PDXDJN #140 finding 2 on real row locks: a render that staged an older snapshot
+    and stalls while a newer render publishes must not rename its snapshot over it."""
+    scan_events.append_sans_lines(JOB_ID, 1, [_line(1)])
+    job_file = tmp_path / "scan-artifacts" / "scan-jobs" / JOB_ID / "scan.jsonl"
+    job_file.unlink(missing_ok=True)  # stale: the older render must write
+    staged = threading.Event()
+    release = threading.Event()
+    commits: list[str] = []
+    original_stage = LocalFilesystemStorage.stage_bytes
+    original_commit = LocalFilesystemStorage.commit_staged
+
+    def stalling(self: LocalFilesystemStorage, destination: str, data: bytes) -> str:
+        result = original_stage(self, destination, data)
+        if threading.current_thread().name == "older-render":
+            staged.set()
+            assert release.wait(WAIT_SECONDS)
+        return result
+
+    def counting(self: LocalFilesystemStorage, staged_id: str, destination: str) -> str:
+        commits.append(threading.current_thread().name)
+        return original_commit(self, staged_id, destination)
+
+    monkeypatch.setattr(LocalFilesystemStorage, "stage_bytes", stalling)
+    monkeypatch.setattr(LocalFilesystemStorage, "commit_staged", counting)
+    errors: list[BaseException] = []
+
+    def older() -> None:
+        try:
+            scan_events.write_scan_jsonl(JOB_ID)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            connections.close_all()
+
+    thread = threading.Thread(target=older, name="older-render", daemon=True)
+    thread.start()
+    assert staged.wait(WAIT_SECONDS)
+    # Stored and committed while the older render holds its staged one-line snapshot;
+    # the on-commit render (inline here) is the newer worker.
+    scan_events.append_sans_lines(JOB_ID, 2, [_line(2)])
+    scan_events.write_scan_jsonl(JOB_ID)
+    release.set()
+    thread.join(WAIT_SECONDS)
+    assert not thread.is_alive()
+    assert errors == []
+    assert "older-render" not in commits
+    assert job_file.read_bytes() == scan_events.render_scan_jsonl(JOB_ID)
+    assert job_file.read_text(encoding="utf-8") == f"{_line(1)}\n{_line(2)}\n"
+    assert not list(job_file.parent.glob("*.partial"))
+    job.refresh_from_db()
+    assert job.scan_jsonl_job_rendered_through == ScanEvent.objects.latest("id").pk
