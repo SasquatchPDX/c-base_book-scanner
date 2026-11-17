@@ -446,3 +446,15 @@ def test_review_probes_end_to_end_through_source_intake(
     assert absent not in queried_authors
     assert isinstance(job.evidence, dict)
     assert absent not in job.evidence.get(TEXT_HEADER_EVIDENCE_KEY, {}).get("authors", [])
+
+
+def test_text_header_keeps_filename_title_fallback_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "Midworld - Alan Dean Foster.txt"
+    path.write_text("Title: Midworld\nAuthor: Alan Dean Foster\n" + BODY, encoding="utf-8")
+
+    metadata = intake.extract_metadata(str(path), "txt", original_filename=path.name)
+
+    assert metadata["title"] == path.stem
+    assert metadata[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
+    assert metadata[TEXT_HEADER_EVIDENCE_KEY]["title"] == "Midworld"
+    assert metadata[TEXT_HEADER_EVIDENCE_KEY]["authors"] == ["Alan Dean Foster"]

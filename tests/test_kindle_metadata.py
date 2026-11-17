@@ -109,7 +109,12 @@ def test_kindle_metadata_falls_back_when_ebook_meta_is_missing(
 
     metadata = intake.extract_metadata(str(source), "mobi", original_filename=source.name)
 
-    assert metadata == {"title": "Untooled Book", "raw_metadata": {}, "container_type": "mobi"}
+    assert metadata == {
+        "title": "Untooled Book",
+        "raw_metadata": {},
+        "container_type": "mobi",
+        "title_source": "filename",
+    }
     assert fake.calls == []
 
 
@@ -158,7 +163,12 @@ def test_kindle_metadata_falls_back_on_unusable_ebook_meta_output(
 
     metadata = intake.extract_metadata(str(source), "mobi", original_filename=source.name)
 
-    assert metadata == {"title": "Odd Book", "raw_metadata": {}, "container_type": "mobi"}
+    assert metadata == {
+        "title": "Odd Book",
+        "raw_metadata": {},
+        "container_type": "mobi",
+        "title_source": "filename",
+    }
 
 
 def test_parse_opf_metadata_rejects_entity_declarations() -> None:
