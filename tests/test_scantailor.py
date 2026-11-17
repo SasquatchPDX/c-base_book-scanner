@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import struct
+import zlib
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
 from typing import cast
@@ -11,7 +13,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile
 
 from ebook_server.core import scantailor, views
 from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
@@ -1499,7 +1501,7 @@ def test_exif_rotated_input_is_normalised_and_sized_like_load_image(tmp_path: Pa
 
 
 def test_zero_angle_deskew_keeps_identical_pixels_by_copy(tmp_path: Path) -> None:
-    source = _save(_text_page(300, 400), tmp_path / "in.png")
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(300, 300))
     output = tmp_path / "out.png"
     preview = tmp_path / "preview.png"
     result = scantailor._run_deskew(_state({"manual_angle": 0}), source, output, preview)
@@ -1546,3 +1548,149 @@ def test_noop_stage_still_persists_own_output_artifact_with_provenance() -> None
     assert deskew.output_sha256 == split.output_sha256
     assert deskew.output_size_bytes == split.output_size_bytes
     assert deskew.parameters["output_width"] == deskew.parameters["input_width"]
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _raw_png(
+    width: int,
+    height: int,
+    bit_depth: int,
+    colour_type: int,
+    row: bytes,
+    *,
+    interlace: int = 0,
+    extra: Iterable[tuple[bytes, bytes]] = (),
+) -> bytes:
+    """Hand-built PNG (``row`` repeated for every scanline, filter type 0)."""
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, colour_type, 0, 0, interlace)
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + b"".join(_png_chunk(kind, data) for kind, data in extra)
+        + _png_chunk(b"pHYs", struct.pack(">IIB", 11811, 11811, 1))
+        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _with_chunk_after_ihdr(png: bytes, chunk_type: bytes, data: bytes) -> bytes:
+    ihdr_end = 8 + 8 + 13 + 4
+    return png[:ihdr_end] + _png_chunk(chunk_type, data) + png[ihdr_end:]
+
+
+def _encoder_png(path: Path, mode: str = "L") -> Path:
+    colour: int | tuple[int, int, int] = 200 if mode == "L" else (200, 190, 180)
+    scantailor._save_png(Image.new(mode, (40, 60), colour), path, (300, 300))
+    return path
+
+
+@pytest.mark.parametrize("mode", ["L", "RGB"])
+def test_png_written_by_stage_encoder_is_passthrough_eligible(mode: str, tmp_path: Path) -> None:
+    source = _encoder_png(tmp_path / "in.png", mode)
+    layout = scantailor._read_png_layout(source)
+    assert layout is not None
+    assert layout.chunk_types <= scantailor._PNG_PASSTHROUGH_CHUNKS
+    assert scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() == source.read_bytes()
+
+
+def _not_normalised_cases() -> dict[str, tuple[bytes, tuple[int, int]]]:
+    encoded = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(encoded, format="PNG", dpi=(300, 300))
+    plain = encoded.getvalue()
+    palette = io.BytesIO()
+    Image.new("P", (40, 60), 3).save(palette, format="PNG", dpi=(300, 300))
+    no_phys = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(no_phys, format="PNG")
+    exif = Image.Exif()
+    exif[0x0112] = 1
+    return {
+        # scanimage --format=png --depth 16: 48-bit RGB, which Pillow opens as "RGB"
+        "rgb16": (_raw_png(4, 3, 16, 2, b"\x80\x00\x40\x00\x20\x00" * 4), (4, 3)),
+        # 2/4-bit greyscale, which Pillow opens as "L"
+        "gray2": (_raw_png(8, 3, 2, 0, b"\x1b\xe4"), (8, 3)),
+        "gray4": (_raw_png(4, 3, 4, 0, b"\x0f\xf0"), (4, 3)),
+        "palette": (palette.getvalue(), (40, 60)),
+        # Adam7 data of a 1x1 image is a single pass-1 pixel
+        "interlaced": (_raw_png(1, 1, 8, 0, b"\x80", interlace=1), (1, 1)),
+        "gAMA": (_with_chunk_after_ihdr(plain, b"gAMA", struct.pack(">I", 45455)), (40, 60)),
+        "iCCP": (
+            _with_chunk_after_ihdr(plain, b"iCCP", b"fake\x00\x00" + zlib.compress(b"x" * 64)),
+            (40, 60),
+        ),
+        "sRGB": (_with_chunk_after_ihdr(plain, b"sRGB", b"\x00"), (40, 60)),
+        "eXIf": (_with_chunk_after_ihdr(plain, b"eXIf", exif.tobytes()), (40, 60)),
+        "tEXt": (_with_chunk_after_ihdr(plain, b"tEXt", b"Comment\x00hello"), (40, 60)),
+        "no-pHYs": (no_phys.getvalue(), (40, 60)),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["rgb16", "gray2", "gray4", "palette", "interlaced", "gAMA", "iCCP", "sRGB", "eXIf", "tEXt"]
+    + ["no-pHYs"],
+)
+def test_non_normalised_png_is_reencoded_not_copied(case: str, tmp_path: Path) -> None:
+    """#54 review: bit depth/colour type/interlace/ancillary chunks come from IHDR, not mode."""
+    payload, size = _not_normalised_cases()[case]
+    source = tmp_path / "in.png"
+    source.write_bytes(payload)
+    assert not scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() != payload
+    layout = scantailor._read_png_layout(output)
+    assert layout is not None
+    assert (layout.bit_depth, layout.interlace) == (8, 0)
+    assert layout.colour_type in {0, 2}
+    assert (layout.width, layout.height) == size
+    assert scantailor._oriented_size(source) == size
+
+
+def _forbid_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _no_decode(self: object) -> None:
+        raise AssertionError("pixel data was decoded")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", _no_decode)
+    monkeypatch.setattr(Image.Image, "load", _no_decode)
+
+
+def test_png_passthrough_checks_and_sizes_do_not_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _encoder_png(tmp_path / "in.png", "RGB")
+    output = tmp_path / "out.png"
+    output.write_bytes(source.read_bytes())
+    _forbid_decode(monkeypatch)
+
+    assert scantailor._is_normalised_png(source)
+    assert scantailor._oriented_size(source) == (40, 60)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (40, 60)
+    assert (recorded["output_width"], recorded["output_height"]) == (40, 60)
+
+
+def test_png_exif_orientation_is_sized_from_chunk_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    plain = io.BytesIO()
+    Image.new("L", (80, 50), 200).save(plain, format="PNG", dpi=(300, 300))
+    source = tmp_path / "in.png"
+    source.write_bytes(_with_chunk_after_ihdr(plain.getvalue(), b"eXIf", exif.tobytes()))
+    expected = scantailor._load_image(source).size
+    assert expected == (50, 80)
+
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) == expected
+    assert not scantailor._is_normalised_png(source)
