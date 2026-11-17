@@ -26,7 +26,7 @@ jobs:
           npm run check
           npm test
           npm run build
-          npm audit --audit-level=high
+          uv run python scripts/npm_audit_check.py
           git diff --exit-code -- src/ebook_server/core/static/core/dist
       - name: Observability assets
         run: |
