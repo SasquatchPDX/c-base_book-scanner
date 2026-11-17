@@ -1182,6 +1182,45 @@ def _review_action_response(
     return JsonResponse(payload)
 
 
+def _parse_author_list(raw_authors: Any) -> list[str]:
+    """Authors from a comma-separated form value or a JSON list."""
+    if isinstance(raw_authors, str):
+        return [entry.strip() for entry in raw_authors.split(",") if entry.strip()]
+    if isinstance(raw_authors, list):
+        return [str(name).strip() for name in raw_authors if str(name).strip()]
+    return []
+
+
+_AUTO_ACCEPT_BLOCK_MESSAGES = {
+    "no_provider_authors": (
+        "The best match scored high enough to be accepted automatically, but the "
+        "metadata provider lists no authors for it. Confirm or edit the suggested "
+        "authors from the file before accepting it."
+    ),
+    "author_conflict": (
+        "The best match scored high enough to be accepted automatically, but its "
+        "authors differ from the authors in the file's own metadata."
+    ),
+}
+
+
+def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
+    """Why an otherwise auto-accepted import was routed to review, for the review page."""
+    evidence = task.embedded_metadata if isinstance(task.embedded_metadata, dict) else {}
+    reason = evidence.get(intake.AUTO_ACCEPT_BLOCKED_KEY)
+    if not isinstance(reason, str) or not reason:
+        return None
+    details = evidence.get(intake.AUTO_ACCEPT_BLOCK_DETAILS_KEY)
+    return {
+        "reason": reason,
+        "message": _AUTO_ACCEPT_BLOCK_MESSAGES.get(
+            reason, "The best match was not accepted automatically."
+        ),
+        "details": details if isinstance(details, dict) else {},
+        "suggested_authors": _parse_author_list(evidence.get(intake.SUGGESTED_AUTHORS_KEY)),
+    }
+
+
 def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     from . import identification
 
@@ -1192,13 +1231,7 @@ def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     if not title:
         raise ValueError("title required")
 
-    raw_authors = payload.get("authors", [])
-    if isinstance(raw_authors, str):
-        authors = [entry.strip() for entry in raw_authors.split(",") if entry.strip()]
-    elif isinstance(raw_authors, list):
-        authors = [str(name).strip() for name in raw_authors if str(name).strip()]
-    else:
-        authors = []
+    authors = _parse_author_list(payload.get("authors", []))
 
     publication_year: int | None = None
     raw_year = payload.get("publication_year")
@@ -3482,6 +3515,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     payload["candidates"] = [
         _serialize_candidate(candidate) for candidate in _review_candidates(task)
     ]
+    auto_accept_block = _auto_accept_block(task)
+    payload["auto_accept_block"] = auto_accept_block
     if _wants_html(request):
         return render(
             request,
@@ -3489,6 +3524,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
             {
                 "task": task,
                 "payload": payload,
+                "auto_accept_block": auto_accept_block,
                 "candidates": _review_candidates(task),
                 "books": Book.objects.order_by("title")[:250],
             },
@@ -3603,6 +3639,27 @@ def review_accept_candidate(
                 )
             book.save()
 
+        # A candidate without authors (the provider record names none) can be accepted
+        # with authors the reviewer confirmed, e.g. the file's suggested authors. They
+        # only fill a Book that has no authors yet; provider authors always win.
+        candidate_has_authors = any(
+            isinstance(name, str) and name.strip() for name in candidate.authors
+        )
+        reviewer_authors = (
+            [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
+        )
+        decision_payload: dict[str, Any] | None = None
+        if reviewer_authors and not book.authors.exists():
+            for author_name in reviewer_authors:
+                author, _ = Author.objects.get_or_create(
+                    full_name=intake._fit(Author, "full_name", author_name),
+                )
+                book.authors.add(author)
+            decision_payload = {
+                **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
+                "reviewer_authors": reviewer_authors,
+            }
+
         variant = _resolve_review_source(
             task=task,
             book=book,
@@ -3610,6 +3667,7 @@ def review_accept_candidate(
             reviewer=profile.user,
             decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
             decision_notes=f"Accepted candidate {candidate.id}",
+            decision_payload=decision_payload,
         )
         return _review_action_response(
             request,

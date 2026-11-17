@@ -7,7 +7,7 @@ import mimetypes
 import re
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
@@ -128,6 +128,73 @@ MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+
+# ImportJob.evidence keys written when a candidate scores high enough to be accepted
+# automatically but is routed to review anyway (shown on the review page).
+AUTO_ACCEPT_BLOCKED_KEY = "auto_accept_blocked"
+AUTO_ACCEPT_BLOCK_DETAILS_KEY = "auto_accept_block_details"
+# Authors from the file's own metadata, offered to the reviewer; never applied
+# to a Book without a person confirming them.
+SUGGESTED_AUTHORS_KEY = "suggested_authors"
+# The provider record names no authors (e.g. an edition without them): accepting it
+# would create, or attach to, a Book whose authors nobody verified.
+BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
+# The provider's authors and the file's embedded authors name different people.
+BLOCK_AUTHOR_CONFLICT = "author_conflict"
+
+
+@dataclass(frozen=True)
+class AutoAcceptDecision:
+    """Outcome of the auto-accept check: the candidate to accept, or why not."""
+
+    candidate: identification.IdentificationCandidate | None
+    blocked_reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def _block_details(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "score": float(candidate.score),
+        "candidate_authors": list(candidate.authors),
+        "file_authors": list(file_authors),
+    }
+
+
+def decide_auto_accept(
+    candidates: list[identification.IdentificationCandidate],
+    file_authors: list[str],
+) -> AutoAcceptDecision:
+    """Pick the candidate to accept without review, or record why there is none.
+
+    A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
+    candidate must also name at least one real author, and its authors must not
+    contradict the file's own embedded authors. A high score from an ISBN match alone
+    is no evidence about authorship.
+    """
+    top = candidates[0] if candidates else None
+    if top is None or top.score < AUTO_ACCEPT_SCORE:
+        return AutoAcceptDecision(candidate=None)
+    provider_authors = [
+        name for name in top.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
+            details=_block_details(top, file_authors),
+        )
+    if identification.authors_conflict(provider_authors, file_authors):
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_AUTHOR_CONFLICT,
+            details=_block_details(top, file_authors),
+        )
+    return AutoAcceptDecision(candidate=top)
 
 
 def normalize_filename(raw: str) -> str:
@@ -886,12 +953,15 @@ def _find_text_any(root: ET.Element, expression: str) -> str | None:
 def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
+    *,
+    allow_match: bool = True,
 ) -> None:
+    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
     # Ensure idempotence if jobs are retried.
     MetadataCandidate.objects.filter(import_job=job).delete()
     for candidate in candidates:
         state = MetadataCandidate.CandidateState.REVIEW
-        if candidate.score >= AUTO_ACCEPT_SCORE:
+        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             import_job=job,
@@ -1369,10 +1439,29 @@ def process_import_job(job_id: str) -> None:
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
         job.save(update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
-        _save_metadata_candidates(job, candidates)
+        file_authors = identification.evidence_author_names(metadata)
+        decision = decide_auto_accept(candidates, file_authors)
+        if decision.blocked_reason is not None:
+            metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
+            metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
+            metadata[SUGGESTED_AUTHORS_KEY] = file_authors
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_blocked",
+                import_job_id=str(job.id),
+                reason=decision.blocked_reason,
+                provider_id=decision.details.get("provider_id"),
+                score=decision.details.get("score"),
+            )
+        _save_metadata_candidates(
+            job,
+            candidates,
+            allow_match=decision.blocked_reason is None,
+        )
 
-        top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+        top_candidate = decision.candidate
+        if top_candidate is None:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
