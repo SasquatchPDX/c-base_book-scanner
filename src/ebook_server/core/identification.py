@@ -56,6 +56,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Candidates scoring within this margin of the best one are treated as tied when
+# choosing a candidate to accept automatically.
+TIE_MARGIN = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN", 0.02)
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -837,6 +840,34 @@ def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) 
     return not any(
         _author_names_agree(candidate, other) for candidate in candidates for other in evidence
     )
+
+
+def _candidate_isbn13s(candidate: IdentificationCandidate) -> set[str]:
+    isbns: set[str] = set()
+    if candidate.isbn13:
+        isbns.add(candidate.isbn13)
+    if candidate.isbn10 and _isbn10_valid(candidate.isbn10):
+        isbns.add(_isbn10_to_isbn13(candidate.isbn10))
+    return isbns
+
+
+def candidates_describe_same_book(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """True when two provider records evidently describe the same book.
+
+    They share an ISBN, or they have the same title (full title score) and both name
+    authors that agree. Used to tell a harmless tie (two providers returning one
+    book) from an ambiguous one (two different books scoring the same).
+    """
+    if _candidate_isbn13s(left) & _candidate_isbn13s(right):
+        return True
+    if _title_match_score(left.title, right.title) < 1.0:
+        return False
+    if not left.authors or not right.authors:
+        return False
+    return not authors_conflict(left.authors, right.authors)
 
 
 def _apply_scoring(

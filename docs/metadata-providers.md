@@ -69,6 +69,18 @@ authors without placeholder creators such as "Microsoft Office User", "Owner" or
 authors. They are applied only when a reviewer accepts a candidate that has no
 authors of its own, and only to a Book without authors; provider authors always win.
 
+**Ties.** Candidates at or above the threshold whose score is within
+`BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN` (default 0.02) of the best one count as
+tied. With several providers an ISBN match often scores 1.0 at each of them, and
+their order is only the configured provider order. Intake therefore applies the author
+checks to every tied candidate and accepts the first one that passes, recording
+`auto_accept_tie_break` (the chosen candidate and the ones passed over, with their
+block reasons) in the evidence. Passed-over candidates stay in `REVIEW` state. If
+tied candidates that pass describe different books (no shared ISBN, and not the same
+title with agreeing authors), the import goes to review as `ambiguous_tie`. If none
+passes, the first-ranked candidate's block reason applies. A candidate outside the
+margin is never accepted in place of a blocked better one.
+
 For Open Library ISBN lookups, an edition record without `authors` falls back to the
 authors of its first work record (`works[0]`), where Open Library usually keeps them.
 

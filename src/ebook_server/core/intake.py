@@ -123,6 +123,7 @@ MAX_UPLOAD_BYTES = getattr(
 )
 AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
+AUTO_ACCEPT_TIE_MARGIN = identification.TIE_MARGIN
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
@@ -141,6 +142,11 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# Several different books tie for the best score and pass the author checks.
+BLOCK_AMBIGUOUS_TIE = "ambiguous_tie"
+# ImportJob.evidence key recording that a tied candidate was accepted instead of the
+# first-ranked one, and why the others were passed over.
+AUTO_ACCEPT_TIE_BREAK_KEY = "auto_accept_tie_break"
 
 
 @dataclass(frozen=True)
@@ -150,6 +156,35 @@ class AutoAcceptDecision:
     candidate: identification.IdentificationCandidate | None
     blocked_reason: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # Set when the accepted candidate is not the first-ranked one (see decide_auto_accept).
+    tie_break: dict[str, Any] | None = None
+    # Candidates at or above the threshold that were not accepted.
+    passed_over: tuple[identification.IdentificationCandidate, ...] = ()
+
+
+def _author_block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> str | None:
+    """Why the author checks forbid accepting ``candidate`` automatically, if they do."""
+    provider_authors = [
+        name for name in candidate.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return BLOCK_NO_PROVIDER_AUTHORS
+    if identification.authors_conflict(provider_authors, file_authors):
+        return BLOCK_AUTHOR_CONFLICT
+    return None
+
+
+def _candidate_summary(candidate: identification.IdentificationCandidate) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "title": candidate.title,
+        "authors": list(candidate.authors),
+        "score": float(candidate.score),
+    }
 
 
 def _block_details(
@@ -175,26 +210,65 @@ def decide_auto_accept(
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
     is no evidence about authorship.
+
+    Candidates within ``AUTO_ACCEPT_TIE_MARGIN`` of the best score count as tied (two
+    providers often both score an ISBN match at 1.0, and their order is only the
+    configured provider order). Among tied candidates the first one that passes the
+    author checks is accepted. If tied candidates that pass describe different books,
+    the choice is ambiguous and goes to review.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
         return AutoAcceptDecision(candidate=None)
-    provider_authors = [
-        name for name in top.authors if not identification.is_placeholder_author(name)
+    tied = [
+        candidate
+        for candidate in candidates
+        if candidate.score >= AUTO_ACCEPT_SCORE
+        and top.score - candidate.score <= AUTO_ACCEPT_TIE_MARGIN
     ]
-    if not provider_authors:
+    block_reasons = [_author_block_reason(candidate, file_authors) for candidate in tied]
+    eligible = [
+        candidate for candidate, reason in zip(tied, block_reasons, strict=True) if reason is None
+    ]
+    above_threshold = [c for c in candidates if c.score >= AUTO_ACCEPT_SCORE]
+    if not eligible:
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
+            blocked_reason=block_reasons[0],
             details=_block_details(top, file_authors),
+            passed_over=tuple(above_threshold),
         )
-    if identification.authors_conflict(provider_authors, file_authors):
+    chosen = eligible[0]
+    if any(
+        not identification.candidates_describe_same_book(chosen, other) for other in eligible[1:]
+    ):
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_AUTHOR_CONFLICT,
-            details=_block_details(top, file_authors),
+            blocked_reason=BLOCK_AMBIGUOUS_TIE,
+            details={
+                **_block_details(top, file_authors),
+                "tied_candidates": [_candidate_summary(candidate) for candidate in eligible],
+            },
+            passed_over=tuple(above_threshold),
         )
-    return AutoAcceptDecision(candidate=top)
+    tie_break: dict[str, Any] | None = None
+    if chosen is not top:
+        tie_break = {
+            "chosen": _candidate_summary(chosen),
+            "passed_over": [
+                {**_candidate_summary(candidate), "reason": reason}
+                for candidate, reason in zip(tied, block_reasons, strict=True)
+                if reason is not None
+            ],
+        }
+    eligible_ids = {id(candidate) for candidate in eligible}
+    return AutoAcceptDecision(
+        candidate=chosen,
+        tie_break=tie_break,
+        passed_over=tuple(
+            candidate for candidate in above_threshold if id(candidate) not in eligible_ids
+        ),
+    )
 
 
 def normalize_filename(raw: str) -> str:
@@ -954,14 +1028,15 @@ def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
     *,
-    allow_match: bool = True,
+    passed_over: Iterable[identification.IdentificationCandidate] = (),
 ) -> None:
-    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
+    """Persist candidates; ``passed_over`` ones stay in REVIEW state whatever their score."""
+    passed_over_ids = {id(candidate) for candidate in passed_over}
     # Ensure idempotence if jobs are retried.
     MetadataCandidate.objects.filter(import_job=job).delete()
     for candidate in candidates:
         state = MetadataCandidate.CandidateState.REVIEW
-        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
+        if candidate.score >= AUTO_ACCEPT_SCORE and id(candidate) not in passed_over_ids:
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             import_job=job,
@@ -1454,11 +1529,17 @@ def process_import_job(job_id: str) -> None:
                 provider_id=decision.details.get("provider_id"),
                 score=decision.details.get("score"),
             )
-        _save_metadata_candidates(
-            job,
-            candidates,
-            allow_match=decision.blocked_reason is None,
-        )
+        elif decision.tie_break is not None:
+            metadata[AUTO_ACCEPT_TIE_BREAK_KEY] = decision.tie_break
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_tie_break",
+                import_job_id=str(job.id),
+                provider_id=decision.tie_break["chosen"]["provider_id"],
+                passed_over_count=len(decision.tie_break["passed_over"]),
+            )
+        _save_metadata_candidates(job, candidates, passed_over=decision.passed_over)
 
         top_candidate = decision.candidate
         if top_candidate is None:
