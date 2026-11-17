@@ -13,7 +13,8 @@
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
-- `POST /scan/jobs/{job_id}/logs/` -> upload the scanner's `scan.log` (idempotent by content)
+- `POST /scan/jobs/{job_id}/logs/` -> upload the scanner's `scan.log` (202, processed by a worker)
+- `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
 - `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
@@ -106,9 +107,16 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 ## Scanner logs and where scan output is stored
 
 `POST /scan/jobs/{job_id}/logs/` takes a multipart `file` field holding the scanner's
-log (libreflip `scan.log`): plain text, at most 8 MiB. The same content uploaded twice
-for a job is recorded once (200 instead of 201). The client filename is only kept as
-provenance; the server picks the storage name.
+log (libreflip `scan.log`): plain text, at most 8 MiB. The request only writes the
+bounded upload to scan staging (an empty or oversized upload is refused with 400) and
+records the log with a `scan_log` processing job, which is queued once the request's
+transaction commits; it answers `202` with the log (`state: queued`) and a
+`status_url`. A worker then checks that the content is text, hashes it and stores it.
+The log's `state` becomes `stored`, `duplicate` (the same content is already stored
+for the job; `duplicate_of` names that log, and no second file is written) or
+`failed` (with `error`). `GET /scan/jobs/{job_id}/logs/` and the scan job detail
+(`logs`) report it. The client filename is only kept as provenance; the server picks
+the storage name.
 
 Everything the library keeps from a scan goes into the book's archive folder on the
 attached storage (`<Author>/<Title>/` under the default `BOOK_SCANNER_ARCHIVE_LAYOUT`):

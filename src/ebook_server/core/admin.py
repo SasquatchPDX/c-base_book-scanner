@@ -223,8 +223,26 @@ class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
 
 @admin.register(ScanLog)
 class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
-    list_display = ("scan_job", "original_filename", "size_bytes", "storage_location", "created_at")
-    readonly_fields = ("storage_location", "storage_identifier", "sha256", "size_bytes")
+    list_display = (
+        "scan_job",
+        "original_filename",
+        "state",
+        "size_bytes",
+        "storage_location",
+        "created_at",
+    )
+    list_filter = ("state",)
+    readonly_fields = (
+        "state",
+        "staging_identifier",
+        "storage_location",
+        "storage_identifier",
+        "sha256",
+        "size_bytes",
+        "duplicate_of",
+        "processing_job",
+        "error",
+    )
 
 
 @admin.register(ScanPage)
