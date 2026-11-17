@@ -25,7 +25,9 @@ from ebook_server.storage import LocalFilesystemStorage
 
 from .models import (
     ProcessingJob,
+    ScanJob,
     ScanPage,
+    ScanPageVersion,
     ScanTailorStageState,
     StorageLocation,
 )
@@ -221,8 +223,6 @@ def get_or_create_stage_state(
     page_id: str,
     stage: str,
 ) -> ScanTailorStageState:
-    from .models import ScanJob  # local import to avoid cycle at module import time
-
     scan_job = ScanJob.objects.get(id=scan_job_id)
     scan_page = ScanPage.objects.get(id=page_id)
     predecessor_name = previous_stage(stage)
@@ -260,26 +260,142 @@ def get_or_create_stage_state(
         defaults=defaults,
     )
 
-    if state.input_stage_state_id != (predecessor.id if predecessor else None):
-        state.input_stage_state = predecessor
-    if predecessor is None and active_version is not None:
-        state.input_scan_page_version = active_version
-        state.input_storage_identifier = active_version.storage_identifier
-    if not state.algorithm:
-        state.algorithm = _default_algorithm(stage)
-    if not state.algorithm_version:
-        state.algorithm_version = _default_algorithm_version(stage)
-
-    state.save(
-        update_fields=[
-            "input_stage_state",
-            "input_scan_page_version",
-            "input_storage_identifier",
-            "algorithm",
-            "algorithm_version",
-        ],
+    changed = _apply_stage_state_defaults(
+        state,
+        predecessor=predecessor,
+        active_version=active_version,
     )
+    if changed:
+        # Only write when something actually changed: workspace loads call this for
+        # every page/stage and must not turn into thousands of no-op UPDATEs (#51).
+        state.save(update_fields=[*changed, "updated_at"])
     return state
+
+
+_STAGE_STATE_DEFAULT_FIELDS: Final[tuple[str, ...]] = (
+    "input_stage_state",
+    "input_scan_page_version",
+    "input_storage_identifier",
+    "algorithm",
+    "algorithm_version",
+)
+
+
+def _apply_stage_state_defaults(
+    state: ScanTailorStageState,
+    *,
+    predecessor: ScanTailorStageState | None,
+    active_version: ScanPageVersion | None,
+) -> list[str]:
+    """Bring ``state``'s input links/algorithm defaults up to date; return changed fields."""
+    changed: list[str] = []
+    predecessor_id = predecessor.id if predecessor is not None else None
+    if state.input_stage_state_id != predecessor_id:
+        state.input_stage_state = predecessor
+        changed.append("input_stage_state")
+    if predecessor is None and active_version is not None:
+        if state.input_scan_page_version_id != active_version.id:
+            state.input_scan_page_version = active_version
+            changed.append("input_scan_page_version")
+        if state.input_storage_identifier != active_version.storage_identifier:
+            state.input_storage_identifier = active_version.storage_identifier
+            changed.append("input_storage_identifier")
+    if not state.algorithm:
+        state.algorithm = _default_algorithm(state.stage)
+        changed.append("algorithm")
+    if not state.algorithm_version:
+        state.algorithm_version = _default_algorithm_version(state.stage)
+        changed.append("algorithm_version")
+    return changed
+
+
+@transaction.atomic
+def ensure_stage_states_for_pages(
+    scan_job: ScanJob,
+    pages: Sequence[ScanPage],
+    active_versions: dict[Any, ScanPageVersion | None],
+) -> dict[Any, dict[str, ScanTailorStageState]]:
+    """Bulk equivalent of ``get_or_create_stage_state`` for every stage of ``pages``.
+
+    Uses a bounded number of queries independent of the page count: one read of the
+    job's existing states, plus (only when rows are missing) one insert and one
+    re-read per stage. Rows whose input links are already correct are not written.
+    Rows that do need relinking (e.g. after a rescan) go through the locked
+    single-row path, which is rare.
+
+    ``active_versions`` maps page id -> active ScanPageVersion (callers usually have
+    the versions prefetched). Returns page id -> {stage: state}.
+    """
+    page_ids = [page.id for page in pages]
+    by_page: dict[Any, dict[str, ScanTailorStageState]] = {page_id: {} for page_id in page_ids}
+    if not page_ids:
+        return by_page
+
+    def _load(stage: str | None = None) -> None:
+        query = ScanTailorStageState.objects.filter(scan_job=scan_job, scan_page_id__in=page_ids)
+        if stage is not None:
+            query = query.filter(stage=stage)
+        for existing in query:
+            by_page[existing.scan_page_id][existing.stage] = existing
+
+    _load()
+    for stage in stage_order():
+        predecessor_name = previous_stage(stage)
+        missing: list[ScanTailorStageState] = []
+        for page in pages:
+            if stage in by_page[page.id]:
+                continue
+            predecessor = by_page[page.id].get(predecessor_name) if predecessor_name else None
+            active_version = active_versions.get(page.id)
+            first_input = predecessor is None and active_version is not None
+            missing.append(
+                ScanTailorStageState(
+                    scan_job=scan_job,
+                    scan_page=page,
+                    stage=stage,
+                    algorithm=_default_algorithm(stage),
+                    algorithm_version=_default_algorithm_version(stage),
+                    input_stage_state=predecessor,
+                    input_scan_page_version=active_version if first_input else None,
+                    input_storage_identifier=(
+                        active_version.storage_identifier
+                        if first_input and active_version is not None
+                        else ""
+                    ),
+                ),
+            )
+        if missing:
+            # ignore_conflicts: a concurrent request may have created some rows.
+            ScanTailorStageState.objects.bulk_create(missing, ignore_conflicts=True)
+            _load(stage)
+
+    for page in pages:
+        page_states = by_page[page.id]
+        for stage in stage_order():
+            state = page_states.get(stage)
+            if state is None:
+                continue
+            predecessor_name = previous_stage(stage)
+            predecessor = page_states.get(predecessor_name) if predecessor_name else None
+            probe = ScanTailorStageState(
+                stage=state.stage,
+                input_stage_state_id=state.input_stage_state_id,
+                input_scan_page_version_id=state.input_scan_page_version_id,
+                input_storage_identifier=state.input_storage_identifier,
+                algorithm=state.algorithm,
+                algorithm_version=state.algorithm_version,
+            )
+            if _apply_stage_state_defaults(
+                probe,
+                predecessor=predecessor,
+                active_version=active_versions.get(page.id),
+            ):
+                page_states[stage] = get_or_create_stage_state(
+                    scan_job_id=str(scan_job.id),
+                    page_id=str(page.id),
+                    stage=stage,
+                )
+    return by_page
 
 
 def invalidate_downstream_states(
