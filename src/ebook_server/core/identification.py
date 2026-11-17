@@ -197,6 +197,15 @@ _NOT_NAME_WORDS = {
     "part",
     "series",
     "edition",
+    "stories",
+    "tales",
+    "saga",
+    "chronicles",
+    "novel",
+    "novella",
+    "anthology",
+    "collection",
+    "omnibus",
 }
 # "Title, The/A/An/Der/Die/Das" -> "The/A/An/Der/Die/Das Title" (library sorting convention).
 _INVERTED_ARTICLE = re.compile(r"^(.*),\s*(The|A|An|Der|Die|Das)$", re.IGNORECASE)
@@ -236,12 +245,17 @@ def _looks_like_last_first(value: str) -> str | None:
 
 
 _AUTHOR_LIST_SEPARATOR = re.compile(r"\s*(?:&|;|\band\b|\bund\b)\s*", re.IGNORECASE)
+_PLACEHOLDER_AUTHOR = {"unknown", "anonymous", "various", "n/a", "na"}
 
 
 def _author_group_like(value: str) -> bool:
     """Like `_name_like`, but also accepts "David Weber & Linda Evans" (co-authors)."""
     parts = [p.strip() for p in _AUTHOR_LIST_SEPARATOR.split(value) if p.strip()]
     return bool(parts) and all(_name_like(p) or _looks_like_last_first(p) for p in parts)
+
+
+def _is_placeholder_author(value: str) -> bool:
+    return value.strip().lower().strip(".") in _PLACEHOLDER_AUTHOR
 
 
 def _pick_author_segment(segments: list[str]) -> tuple[str | None, list[str]]:
@@ -251,15 +265,40 @@ def _pick_author_segment(segments: list[str]) -> tuple[str | None, list[str]]:
     first; "Author - Title" is also common enough to support as a fallback. A segment in
     the *middle* of a 3+-part split is never treated as an author on its own - only the
     outermost ends are, since that is where this convention actually puts one.
+
+    A placeholder like "- Unknown" has to be recognised explicitly and stop the lookup
+    right there (dropped from the title, no author) - not just rejected as "not a name",
+    which would otherwise make the lookup fall through and guess an author from the
+    *other* end instead. On a real-world sample this produced some genuinely bad guesses:
+    "Much Ado About Nothing - Unknown" ended up with "Much Ado About Nothing" picked as
+    the author and "Unknown" as the title, because "Unknown" correctly isn't name-shaped,
+    but that's a 4-word title, not a name - it just happens to pass the same permissive
+    shape check a real name would.
+
+    An explicit "Last, First" form is a much stronger signal than the generic name-shape
+    check, so it's checked at *both* ends before falling back to shape-checking either
+    one - otherwise a last segment that merely happens to look name-shaped (e.g. a short
+    two-word title) can win over a first segment that unambiguously *is* one. Real
+    example: "Carre, John Le - Absolute Freunde" - without this, "Absolute Freunde" (the
+    title) was picked as the author before "Carre, John Le" was ever even considered.
     """
     if len(segments) < 2:
         return None, segments
-    last = segments[-1]
-    if _looks_like_last_first(last) or _author_group_like(last):
-        return _looks_like_last_first(last) or last, segments[:-1]
-    first = segments[0]
-    if _looks_like_last_first(first) or _author_group_like(first):
-        return _looks_like_last_first(first) or first, segments[1:]
+    last, first = segments[-1], segments[0]
+    if _is_placeholder_author(last):
+        return None, segments[:-1]
+    if _is_placeholder_author(first):
+        return None, segments[1:]
+    last_first = _looks_like_last_first(last)
+    if last_first:
+        return last_first, segments[:-1]
+    first_first = _looks_like_last_first(first)
+    if first_first:
+        return first_first, segments[1:]
+    if _author_group_like(last):
+        return last, segments[:-1]
+    if _author_group_like(first):
+        return first, segments[1:]
     return None, segments
 
 

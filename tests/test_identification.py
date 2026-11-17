@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from ebook_server.core.identification import (
     IdentificationCandidate,
     IdentificationInput,
@@ -126,6 +128,39 @@ def test_parse_filename_signals_does_not_guess_a_role_other_than_author() -> Non
 
     assert author_hints == []
     assert title_hints == ["Odyssey - Keith Laumer & edited By Eric Flint"]
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "Much Ado About Nothing - Unknown.txt",
+        "As You Like It - Unknown.txt",
+        "I Am Legend - Unknown.txt",
+        "Brave New World - Unknown.txt",
+    ],
+)
+def test_parse_filename_signals_unknown_placeholder_is_not_an_author(filename: str) -> None:
+    """Regression found via a 1,577-file real-world batch check (#15): "Unknown" isn't
+    name-shaped, but rejecting it used to fall through to checking the *other* end - and
+    several short, plain-English titles (e.g. 4 capitalised words, no stray words) happen
+    to pass the same permissive shape check a real name would, flipping title and author
+    entirely. "Unknown"/"anonymous" etc. must stop the lookup, not redirect it."""
+    title_hints, author_hints = parse_filename_signals(filename)
+
+    assert author_hints == []
+    assert title_hints[0] == filename.rsplit(" - Unknown", 1)[0]
+
+
+def test_parse_filename_signals_explicit_last_first_wins_over_a_title_shaped_last_segment() -> None:
+    """Regression found via the same batch check: an explicit "Last, First" form is a much
+    stronger signal than the generic name-shape check, and has to win even when it's on
+    the *first* segment and the last segment merely happens to look name-shaped too (a
+    short title can). Real example from the batch: "Absolute Freunde" (the title) was
+    being picked as the author, before "Carre, John Le" was ever considered."""
+    title_hints, author_hints = parse_filename_signals("Carre, John Le - Absolute Freunde.rtf")
+
+    assert author_hints == ["John Le Carre"]
+    assert title_hints[0] == "Absolute Freunde"
 
 
 def test_parse_filename_signals_ambiguous_split_guesses_no_author() -> None:
