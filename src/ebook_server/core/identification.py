@@ -1970,16 +1970,12 @@ def candidates_describe_same_work(
 ) -> bool:
     """True when two provider records are the same work, possibly different editions.
 
-    Same full title, both name authors and they agree, and their languages overlap when
-    both name some. Unlike ``candidates_describe_same_book`` different ISBNs do not tell
-    them apart: two editions of "Little Women" are one work.
+    Same full title and agreeing authors. Unlike ``candidates_describe_same_book``
+    neither different ISBNs nor different languages tell them apart: two editions or
+    translations of "Lady Susan" by Jane Austen are one work.
     """
     if candidates_describe_same_book(left, right):
         return True
-    left_languages = _candidate_languages(left)
-    right_languages = _candidate_languages(right)
-    if left_languages and right_languages and not left_languages & right_languages:
-        return False
     if _title_match_score(left.title, right.title) < 1.0:
         return False
     if not left.authors or not right.authors:
@@ -1987,9 +1983,23 @@ def candidates_describe_same_work(
     return not authors_conflict(left.authors, right.authors)
 
 
-def _without_edition_fields(candidate: IdentificationCandidate) -> IdentificationCandidate:
-    """``candidate`` as the work only: no ISBN, publisher or year of one chosen edition."""
-    return replace(
+def editions_disagree_on_language(candidates: list[IdentificationCandidate]) -> bool:
+    """Whether same-work candidates name different languages (e.g. translations)."""
+    named = [_candidate_languages(candidate) for candidate in candidates]
+    named = [languages for languages in named if languages]
+    return len(named) > 1 and not set.intersection(*(set(n) for n in named))
+
+
+def work_only(
+    candidate: IdentificationCandidate, *, drop_language: bool = False
+) -> IdentificationCandidate:
+    """``candidate`` as the work only: no ISBN, publisher or year of one chosen edition.
+
+    Used when several editions of the work fit the file equally and the file itself
+    names no ISBN. ``drop_language`` also removes the language when those editions
+    disagree on it and the file names none.
+    """
+    stripped = replace(
         candidate,
         isbn10=None,
         isbn13=None,
@@ -2000,6 +2010,9 @@ def _without_edition_fields(candidate: IdentificationCandidate) -> Identificatio
         edition_publishers=(),
         concrete_edition=False,
     )
+    if drop_language:
+        stripped = replace(stripped, language=None, edition_languages=(), work_languages=())
+    return stripped
 
 
 # Reasons an otherwise acceptable candidate stands for another edition than the file.
@@ -2412,10 +2425,17 @@ def _apply_strong_match_rule(
         blocked_by.append("multiple_qualifying_candidates")
     # Without a file ISBN, other editions of the work at (nearly) the same score mean the
     # file's edition is unknown: accept the work, not one arbitrary edition's details.
-    edition_ambiguous = not signals.isbns and any(
-        top.score - other.score <= config.tie_margin
+    tied_editions = [
+        other
         for other in candidates[1:]
-        if candidates_describe_same_work(top, other)
+        if top.score - other.score <= config.tie_margin
+        and candidates_describe_same_work(top, other)
+    ]
+    edition_ambiguous = not signals.isbns and bool(tied_editions)
+    language_ambiguous = (
+        edition_ambiguous
+        and not signals.language
+        and editions_disagree_on_language([top, *tied_editions])
     )
 
     applied = not blocked_by
@@ -2436,6 +2456,7 @@ def _apply_strong_match_rule(
         "missing_coauthors": assessment["missing_coauthors"],
         "same_work_editions": same_work_editions,
         "edition_ambiguous": edition_ambiguous,
+        "language_ambiguous": language_ambiguous,
     }
     if applied:
         logger.info(
@@ -2444,7 +2465,9 @@ def _apply_strong_match_rule(
             provider_id=top.provider_id,
             base_score=top.score,
         )
-    base = _without_edition_fields(top) if applied and edition_ambiguous else top
+    base = (
+        work_only(top, drop_language=language_ambiguous) if applied and edition_ambiguous else top
+    )
     promoted = replace(
         base,
         score=max(top.score, AUTO_ACCEPT_SCORE) if applied else top.score,

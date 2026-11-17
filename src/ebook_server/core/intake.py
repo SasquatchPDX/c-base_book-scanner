@@ -453,10 +453,29 @@ def decide_auto_accept(
             details=details,
             passed_over=tuple(above_threshold),
         )
-    chosen = eligible[0]
-    if any(
+    chosen = picked = eligible[0]
+    different_editions = any(
         not identification.candidates_describe_same_book(chosen, other) for other in eligible[1:]
+    )
+    file_isbns = file_evidence.isbns
+    if (
+        different_editions
+        and not file_isbns
+        and all(
+            identification.candidates_describe_same_work(chosen, other) for other in eligible[1:]
+        )
     ):
+        # Several editions (or translations) of one work fit a file that names no ISBN:
+        # the work is identified, its edition is not. Accept the work without one
+        # arbitrary edition's ISBN, publisher and year (and language, if they disagree
+        # and the file names none).
+        chosen = identification.work_only(
+            chosen,
+            drop_language=not file_evidence.language
+            and identification.editions_disagree_on_language(eligible),
+        )
+        different_editions = False
+    if different_editions:
         return AutoAcceptDecision(
             candidate=None,
             blocked_reason=BLOCK_AMBIGUOUS_TIE,
@@ -467,7 +486,7 @@ def decide_auto_accept(
             passed_over=tuple(above_threshold),
         )
     tie_break: dict[str, Any] | None = None
-    if chosen is not top:
+    if picked is not top:
         passed_over_summaries: list[dict[str, Any]] = []
         for candidate, (reason, conflicts) in zip(tied, checks, strict=True):
             if reason is None:

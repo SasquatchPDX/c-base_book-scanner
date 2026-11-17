@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from django.test import override_settings
 
+from ebook_server.core import identification
 from ebook_server.core.identification import (
     AUTHOR_VARIANT_MATCH_SCORE,
     AUTO_ACCEPT_SCORE,
@@ -587,8 +589,9 @@ def test_editions_of_the_same_work_do_not_tie_and_accept_the_work_only() -> None
     assert top.edition_isbns == ()
 
 
-def test_near_tied_rival_book_still_blocks() -> None:
-    # Same title and author but another language is another book, not another edition.
+def test_translations_of_the_same_work_do_not_tie_and_drop_the_language() -> None:
+    # A file without language: an English and a German "Poems" are one work, and the
+    # language of neither edition is the file's.
     candidates = _resolve(
         _signals(title="Poems", author="Emily Dickinson"),
         [
@@ -607,8 +610,23 @@ def test_near_tied_rival_book_still_blocks() -> None:
         ],
     )
 
-    assert all(candidate.score < AUTO_ACCEPT_SCORE for candidate in candidates)
-    evidence = _rule_evidence(candidates[0])
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["language_ambiguous"] is True
+    assert top.language is None
+
+
+def test_near_tied_rival_book_still_blocks() -> None:
+    signals = _signals(title="Poems", author="Emily Dickinson")
+    top = _resolve(signals, [{"title": "Poems", "author_name": ["Emily Dickinson"]}])[0]
+    base = dataclasses.replace(top, score=0.85, raw={})
+    rival = dataclasses.replace(base, provider_ref="other", authors=["Emily Brontë"])
+
+    ranked = identification._apply_strong_match_rule(signals, [base, rival])
+
+    evidence = _rule_evidence(ranked[0])
+    assert evidence["applied"] is False
     assert evidence["blocked_by"] == ["near_tied_candidate"]
     assert evidence["same_work_editions"] == 0
 
