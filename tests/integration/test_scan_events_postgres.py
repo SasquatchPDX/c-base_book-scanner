@@ -19,7 +19,6 @@ from django.db import connections
 
 from ebook_server.core import scan_events
 from ebook_server.core.models import ScanEvent, ScanJob
-from ebook_server.core.scanner_devices import create_device
 from ebook_server.storage import LocalFilesystemStorage
 
 pytestmark = [
@@ -66,11 +65,10 @@ def _run_concurrently(targets: list[Callable[[], Any]]) -> list[BaseException]:
 @pytest.fixture
 def job(tmp_path: Path, settings: Any) -> ScanJob:
     settings.APP_DATA_DIR = tmp_path
-    device, _key = create_device("libreflip-pg")
     return ScanJob.objects.create(
         id=JOB_ID,
         state=ScanJob.State.CAPTURING,
-        device=device,
+        source=ScanJob.Source.SCANNER,
         scan_started_at=datetime(2026, 11, 17, 14, 32, 1, tzinfo=UTC),
     )
 

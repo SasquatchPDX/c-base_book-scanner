@@ -288,7 +288,8 @@ and §6.7) arrives line by line. Each line is stored raw as a `ScanEvent` (`orig
 - `413 payload_too_large`: more than 1000 lines or 1 MiB of line bytes in one batch.
 - `409 job_state`: the job is cancelled. Every other state accepts events, so the final
   `completeness_check` still arrives after capture.
-- `404 not_found`: no such job, or it belongs to another device.
+- `404 not_found`: no such job, or a web-created job (only `source=scanner` jobs are
+  served).
 
 Overlapping batches that arrive concurrently are serialised by the job's row lock, with
 the unique constraint as the backstop: no duplicate and no gap can be stored.

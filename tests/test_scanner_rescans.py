@@ -39,7 +39,6 @@ from tests.test_scanner_api_uploads import (
     _multipart,
     _put_page,
     _sha,
-    device,  # noqa: F401  (fixture)
     key,  # noqa: F401  (fixture)
 )
 

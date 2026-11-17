@@ -31,7 +31,7 @@ from django.db.models import Count, Q, QuerySet
 
 from . import scan_events, scan_lifecycle, scan_pipeline, scanner_uploads, scantailor
 from .models import Book, ScanJob, ScanPage, ScanPageVersion, ScanTodo, ScanUploadSource
-from .scan_thumbnails import render_jpeg_thumbnail
+from .scan_thumbnails import render_jpeg_thumbnail as render_jpeg_thumbnail
 from .storage_registry import backend_for_location
 
 logger = structlog.get_logger(__name__)
@@ -55,14 +55,14 @@ THUMBNAIL_CACHE_DIRNAME: Final = "thumbnails"
 def scanner_jobs() -> QuerySet[ScanJob]:
     """Jobs that came from the scanner, as opposed to web-created ones.
 
-    There is a single scanner (no device registry); a scanner job is one the scanner
-    registered over the device API.
+    There is a single scanner (no device registry): a scanner job is one with
+    ``source = scanner``, the same rule as ``scanner_api.scanner_job``.
     """
-    return ScanJob.objects.filter(device__isnull=False)
+    return ScanJob.objects.filter(source=ScanJob.Source.SCANNER)
 
 
 def is_scanner_job(job: ScanJob) -> bool:
-    return job.device_id is not None
+    return job.source == ScanJob.Source.SCANNER
 
 
 def open_rescan_todos(job: ScanJob) -> QuerySet[ScanTodo]:
@@ -83,7 +83,8 @@ def _opf_fields(job: ScanJob) -> dict[str, Any]:
 
     S6 stores OPF versions as ``job.opf_versions``; without it (or without an OPF)
     there is nothing to read. An OPF that carries the application's own "generated"
-    marker is not metadata and is skipped.
+    marker is not metadata and is skipped (S6's ``effective_opf``).
+    TODO(S6, #130): call ``scanner_opf.effective_opf`` once #143 is merged.
     """
     versions = getattr(job, "opf_versions", None)
     if versions is None:

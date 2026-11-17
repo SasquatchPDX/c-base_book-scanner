@@ -136,7 +136,7 @@ def scanner_api_view(
         def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponseBase:
             job_id = kwargs.get("job_id")
             try:
-                response = _refusal(request, allowed)
+                response: HttpResponseBase | None = _refusal(request, allowed)
                 if response is None:
                     response = view(request, *args, **kwargs)
                     response.setdefault("Cache-Control", "no-store")
@@ -547,15 +547,6 @@ def cover(request: HttpRequest, job_id: str, position: str) -> JsonResponse:
     )
 
 
-def scanner_owns_job(device: ScannerDevice, job_id: str) -> bool:
-    """Whether the job routes of the device API may act on ``job_id`` (§6.1).
-
-    Any other job (unknown, or not this scanner's) is answered with ``404``, so the
-    API never reveals jobs it does not serve. The one place that rule lives.
-    """
-    return ScanJob.objects.filter(pk=job_id, device=device).exists()
-
-
 # --- events (§6.7) ----------------------------------------------------------------------
 
 # The JSON body escapes the raw lines (every quote gains a backslash), so it may be
@@ -636,8 +627,8 @@ def job_events(request: HttpRequest, job_id: str) -> JsonResponse:
     ``200 {"sans_last_line_no": N}`` when stored, or when every line was already stored
     identically. ``409 event_gap`` (with ``details.expected_first_line_no``),
     ``409 event_conflict``, ``409 job_state`` (cancelled), ``422 invalid_event``,
-    ``413 payload_too_large`` beyond 1000 lines or 1 MiB. Another device's job is
-    ``404`` (§6.1).
+    ``413 payload_too_large`` beyond 1000 lines or 1 MiB. A web-created or unknown job
+    is ``404`` (§6.1, :func:`scanner_job`).
     """
     if not is_device_job_id(job_id):
         return _invalid_job_id(job_id)
@@ -646,7 +637,7 @@ def job_events(request: HttpRequest, job_id: str) -> JsonResponse:
         return problem
     assert batch is not None
     first_line_no, lines = batch
-    if not scanner_owns_job(device, job_id):
+    if scanner_job(job_id) is None:
         return error_response(404, "not_found", "No such job.", {"job_id": job_id})
     try:
         result = scan_events.append_sans_lines(job_id, first_line_no, lines)
@@ -683,9 +674,7 @@ def job_rescans(request: HttpRequest, job_id: str) -> JsonResponse:
 
 
 @scanner_api_view(["GET"])
-def page_thumbnail(
-    request: HttpRequest, job_id: str, sequence_number: str
-) -> HttpResponseBase:
+def page_thumbnail(request: HttpRequest, job_id: str, sequence_number: str) -> HttpResponseBase:
     """A JPEG of the page's active version, longest edge <= ``max`` (§6.11), with ETag."""
     if not is_device_job_id(job_id):
         return _invalid_job_id(job_id)
@@ -727,9 +716,7 @@ def _todo_id(raw: str) -> int | None:
 
 
 @scanner_api_view(["POST"])
-def rescan_replacement(
-    request: HttpRequest, job_id: str, todo_id: str
-) -> JsonResponse:
+def rescan_replacement(request: HttpRequest, job_id: str, todo_id: str) -> JsonResponse:
     """Upload the replacement for a rescan todo (§6.11), atomically on serif's side.
 
     ``201`` new active version (the old one kept), todo ``completed``, a

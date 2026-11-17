@@ -17,11 +17,10 @@ from ebook_server.core.models import (
     ProcessingJob,
     ScanEvent,
     ScanJob,
-    ScannerDevice,
     ScanPage,
     get_or_create_profile,
 )
-from ebook_server.core.scanner_devices import create_device
+from ebook_server.core.scanner_auth import generate_key, hash_key
 from ebook_server.storage import LocalFilesystemStorage, ReadOnlyFilesystemStorage
 
 JOB_ID = "20261117T143201Z"
@@ -69,34 +68,36 @@ def app_data(tmp_path: Path, settings: Any) -> Path:
 
 
 @pytest.fixture
-def device(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01")
+def key(db: None, settings: Any) -> str:
+    """The scanner API key, configured as its SHA-256 (#125: one scanner, one key)."""
+    value = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(value)
+    return value
 
 
 @pytest.fixture
-def job(device: tuple[ScannerDevice, str], app_data: Path) -> ScanJob:
+def job(key: str, app_data: Path) -> ScanJob:
     return ScanJob.objects.create(
         id=JOB_ID,
         state=ScanJob.State.CAPTURING,
-        device=device[0],
-        scanner_id=device[0].scanner_id,
+        source=ScanJob.Source.SCANNER,
         scan_started_at=STARTED,
     )
 
 
 @pytest.fixture
 def post(
-    device: tuple[ScannerDevice, str],
+    key: str,
     django_capture_on_commit_callbacks: Callable[..., Any],
 ) -> Callable[..., Any]:
-    """POST an event batch with the device key; on-commit renders run immediately."""
+    """POST an event batch with the scanner key; on-commit renders run immediately."""
 
     def _post(
         first_line_no: Any,
         lines: Any,
         *,
         job_id: str = JOB_ID,
-        key: str | None = None,
+        bearer: str | None = None,
         body: Any = None,
     ) -> Any:
         payload = body if body is not None else {"first_line_no": first_line_no, "lines": lines}
@@ -105,7 +106,7 @@ def post(
                 f"/api/scanner/v1/jobs/{job_id}/events",
                 data=payload if isinstance(payload, str | bytes) else json.dumps(payload),
                 content_type="application/json",
-                headers={"Authorization": f"Bearer {key or device[1]}"},
+                headers={"Authorization": f"Bearer {bearer or key}"},
             )
 
     return _post
@@ -307,19 +308,22 @@ def test_cancelled_job_refuses_events(job: ScanJob, post: Any) -> None:
     assert ScanEvent.objects.count() == 0
 
 
-def test_other_devices_and_unknown_jobs_are_not_found(job: ScanJob, post: Any) -> None:
-    _other, other_key = create_device("libreflip-02")
-    assert post(1, [JOB_LINE], key=other_key).status_code == 404
+def test_web_created_and_unknown_jobs_are_not_found(job: ScanJob, post: Any) -> None:
+    assert post(1, [JOB_LINE], bearer=generate_key()).status_code == 401
     assert post(1, [JOB_LINE], job_id="20261117T143202Z").status_code == 404
+    # A web job whose ID happens to have the scanner format is still not the scanner's.
     web_job = ScanJob.objects.create(id="20261117T143203Z", provisional_title="web")
-    assert post(1, [JOB_LINE], job_id=web_job.pk).status_code == 404
+    assert web_job.source == ScanJob.Source.WEB
+    response = post(1, [JOB_LINE], job_id=web_job.pk)
+    assert response.status_code == 404
+    assert _code(response) == "not_found"
     response = post(1, [JOB_LINE], job_id="not-a-job")
     assert response.status_code == 400
     assert _code(response) == "invalid_job_id"
     assert ScanEvent.objects.count() == 0
 
 
-def test_events_need_a_device_key(job: ScanJob) -> None:
+def test_events_need_the_scanner_key(job: ScanJob) -> None:
     response = Client().post(
         f"/api/scanner/v1/jobs/{JOB_ID}/events",
         data=json.dumps({"first_line_no": 1, "lines": [JOB_LINE]}),
@@ -328,24 +332,22 @@ def test_events_need_a_device_key(job: ScanJob) -> None:
     assert response.status_code == 401
 
 
-def test_only_post_is_allowed(job: ScanJob, device: tuple[ScannerDevice, str]) -> None:
+def test_only_post_is_allowed(job: ScanJob, key: str) -> None:
     response = Client().get(
         f"/api/scanner/v1/jobs/{JOB_ID}/events",
-        headers={"Authorization": f"Bearer {device[1]}"},
+        headers={"Authorization": f"Bearer {key}"},
     )
     assert response.status_code == 405
 
 
-def test_job_status_reports_the_high_water_mark(
-    job: ScanJob, post: Any, device: tuple[ScannerDevice, str]
-) -> None:
+def test_job_status_reports_the_high_water_mark(job: ScanJob, post: Any, key: str) -> None:
     post(1, [JOB_LINE, attempt(0)])
     scan_events.append_serif_event(job, "rescan_flag", {"sequence_number": 0}, todo_id=1)
     response = Client().put(
         f"/api/scanner/v1/jobs/{JOB_ID}",
         data=json.dumps({"scan_started_at": "2026-11-17T14:32:01Z"}),
         content_type="application/json",
-        headers={"Authorization": f"Bearer {device[1]}"},
+        headers={"Authorization": f"Bearer {key}"},
     )
     assert response.status_code == 200
     assert response.json()["events"] == {"sans_last_line_no": 2}
@@ -765,7 +767,6 @@ def test_second_scan_of_a_book_gets_its_own_file(
     job: ScanJob,
     post: Any,
     library_root: Path,
-    device: tuple[ScannerDevice, str],
     django_capture_on_commit_callbacks: Callable[..., Any],
 ) -> None:
     book = Book.objects.create(title="Twice Scanned")
@@ -775,7 +776,7 @@ def test_second_scan_of_a_book_gets_its_own_file(
     second = ScanJob.objects.create(
         id="20261118T090000Z",
         state=ScanJob.State.CAPTURING,
-        device=device[0],
+        source=ScanJob.Source.SCANNER,
         scan_started_at=STARTED,
     )
     post(1, [attempt(9)], job_id=second.pk)

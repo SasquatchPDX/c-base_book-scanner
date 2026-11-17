@@ -420,7 +420,7 @@ def _project(job: ScanJob, events: Iterable[Mapping[str, Any]]) -> None:
 def project_page_from_events(page: ScanPage) -> bool:
     """Apply the stored ``page`` events for ``page`` to it; True if any value applied.
 
-    A ``page`` event can arrive before the page's image. The device page upload (#128)
+    A ``page`` event can arrive before the page's image. The scanner page upload (#128)
     calls this after creating a page so the events' values are not lost. As in the live
     projection (:func:`_project`), each field takes the latest valid value any event
     gave it: a later event that carries only ``status`` keeps an earlier

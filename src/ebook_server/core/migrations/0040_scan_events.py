@@ -5,12 +5,12 @@ from django.db import migrations, models
 
 
 # ScanPage.recognized_page_number and status, which the ``page`` event projects into,
-# are added by 0040_scanner_page_and_cover_upload (#128) with the same definitions.
+# are added by 0039_scanner_page_and_cover_upload (#128) with the same definitions.
 
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0040_scanner_page_and_cover_upload"),
+        ("core", "0039_scanner_page_and_cover_upload"),
     ]
 
     operations = [
