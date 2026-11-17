@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    multipart_detection: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
@@ -289,6 +290,7 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (

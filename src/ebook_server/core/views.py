@@ -62,6 +62,7 @@ from . import (
     genres,
     intake,
     metadata_search,
+    multipart,
     ocr,
     review_batch,
     review_identification,
@@ -1584,7 +1585,15 @@ def _serialize_book(
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
-        file_variants = _complete_variants(book)
+        file_variants = sorted(
+            _complete_variants(book),
+            # Complete representations first, then the parts of a split work in order.
+            key=lambda variant: (
+                variant.part_index is not None,
+                variant.part_index or 0,
+                variant.id,
+            ),
+        )
         variants = [
             {
                 "id": file_variant.id,
@@ -1596,6 +1605,8 @@ def _serialize_book(
                 "imported_at": (
                     file_variant.imported_at.isoformat() if file_variant.imported_at else None
                 ),
+                "part_index": file_variant.part_index,
+                "part_label": file_variant.part_label,
             }
             for file_variant in file_variants
         ]
@@ -4056,6 +4067,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    multipart_group = multipart.group_for_task(task)
+    payload["multipart"] = multipart_group
     search_context = _review_search_context(task)
     active_job = search_context["active_search_job"]
     payload["searches"] = [
@@ -4076,6 +4089,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
+                "multipart": multipart_group,
                 "candidates": candidates,
                 "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
@@ -4232,6 +4246,10 @@ def review_accept_candidate(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
+
     payload = _request_payload(request)
     candidate_id = _coerce_int(payload.get("candidate_id"), minimum=1)
     if candidate_id is None:
@@ -4320,6 +4338,12 @@ def _batch_accept_one(
             result["title"] = task.inferred_title or task.source_filename
             if task.state not in REVIEW_QUEUE_STATES:
                 return {**result, "outcome": "closed"}
+            if task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+                return {
+                    **result,
+                    "outcome": "requires_individual_review",
+                    "detail": "Confirm multipart membership and reading order on its review page.",
+                }
             candidates = list(_review_candidates(task))
             eligibility = review_batch.evaluate_top_candidates(
                 [candidate.score for candidate in candidates],
@@ -4662,6 +4686,10 @@ def review_manual_entry(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
+
     payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
@@ -4725,6 +4753,9 @@ def review_merge_existing(
         book = Book.objects.get(pk=book_id)
     except Book.DoesNotExist:
         return HttpResponseBadRequest("book not found")
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
 
     _resolve_review_source(
         task=task,
@@ -4736,6 +4767,126 @@ def review_merge_existing(
     return _review_action_response(
         request,
         {"task_id": str(task.id), "book_id": str(book.id)},
+    )
+
+
+def _multipart_review_task(
+    request: HttpRequest,
+    task_id: str,
+) -> tuple[ReviewTask | None, AppUserProfile | None, HttpResponseBase | None]:
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return None, None, HttpResponseBadRequest("forbidden")
+    try:
+        task = ReviewTask.objects.select_related("import_job", "import_job__import_group").get(
+            pk=task_id
+        )
+    except (ReviewTask.DoesNotExist, ValueError):
+        return None, None, HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return None, None, HttpResponseForbidden()
+    if task.task_type != ReviewTask.TaskType.MULTIPART_WORK:
+        return None, None, HttpResponseBadRequest("not a multi-part review")
+    if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
+        return None, None, HttpResponseBadRequest("review task is already closed")
+    return task, profile, None
+
+
+@require_POST
+@login_required
+def review_multipart_order(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Save the reviewer's part order/labels before confirming a multi-part work.
+
+    Form posts send ``part_index_<import_job_id>`` / ``part_label_<import_job_id>``;
+    JSON posts send ``{"parts": [{"import_job_id", "part_index", "part_label"}]}``.
+    """
+    task, _profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None:
+        return error or HttpResponseBadRequest("invalid request")
+    payload = _request_payload(request)
+    order: dict[str, tuple[int, str]] = {}
+    raw_parts = payload.get("parts")
+    if isinstance(raw_parts, list):
+        for entry in raw_parts:
+            if not isinstance(entry, dict):
+                return HttpResponseBadRequest("invalid parts")
+            index = _coerce_int(entry.get("part_index"), minimum=1)
+            if index is None:
+                return HttpResponseBadRequest("part_index must be a positive number")
+            order[str(entry.get("import_job_id"))] = (index, str(entry.get("part_label") or ""))
+    else:
+        for key, value in payload.items():
+            if not key.startswith("part_index_"):
+                continue
+            job_id = key.removeprefix("part_index_")
+            index = _coerce_int(value, minimum=1)
+            if index is None:
+                return HttpResponseBadRequest("part_index must be a positive number")
+            order[job_id] = (index, str(payload.get(f"part_label_{job_id}", "") or ""))
+    if not order:
+        return HttpResponseBadRequest("parts required")
+    try:
+        multipart.update_part_order(task, order)
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "multipart": multipart.group_for_task(task)},
+        task_id=task.id,
+    )
+
+
+@require_POST
+@login_required
+def review_multipart_acknowledge_incomplete(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Acknowledge the parts that block confirming a multi-part work.
+
+    Missing (failed/absent) parts are left out; parts identical to another Book's file
+    are included as parts of this work.
+    """
+    task, profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None or profile is None:
+        return error or HttpResponseBadRequest("invalid request")
+    try:
+        absent, duplicates = multipart.acknowledge_incomplete(
+            review_task=task, reviewer=profile.user
+        )
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {
+            "task_id": str(task.id),
+            "acknowledged_missing_parts": absent,
+            "acknowledged_duplicate_parts": duplicates,
+        },
+        task_id=task.id,
+    )
+
+
+@require_POST
+@login_required
+def review_multipart_reject(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Not one work: close the group and identify every file as its own import."""
+    task, profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None or profile is None:
+        return error or HttpResponseBadRequest("invalid request")
+    payload = _request_payload(request)
+    try:
+        split = multipart.reject_grouping(
+            review_task=task,
+            reviewer=profile.user,
+            notes=str(payload.get("notes", "")),
+        )
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {
+            "task_id": str(task.id),
+            "state": ReviewTask.State.RESOLVED,
+            "split_import_job_ids": [str(job.id) for job in split],
+        },
     )
 
 

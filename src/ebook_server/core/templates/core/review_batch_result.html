@@ -22,6 +22,7 @@
             {% elif item.outcome == 'ambiguous' %}Skipped: runner-up {{ item.runner_up_score|floatformat:2 }} is too close to the top candidate {{ item.top_score|floatformat:2 }}.
             {% elif item.outcome == 'below_min_score' %}Skipped: top candidate confidence {{ item.top_score|floatformat:2 }} is below the batch minimum.
             {% elif item.outcome == 'no_candidates' %}Skipped: no metadata candidates.
+            {% elif item.outcome == 'requires_individual_review' %}Skipped: confirm the multipart files and reading order on the individual review page.
             {% elif item.outcome == 'closed' %}Skipped: task is already closed.
             {% elif item.outcome == 'forbidden' %}Skipped: you may not resolve this task.
             {% elif item.outcome == 'not_found' %}Skipped: task not found.
