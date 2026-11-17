@@ -2443,8 +2443,9 @@ def _resolve_import(
 # * the file is still looked up externally, and its candidates are stored;
 # * the Book is scored with the provider scorer plus ``SIBLING_FORMAT_BONUS`` and must
 #   reach the auto-accept threshold;
-# * embedded ISBNs that conflict with the Book's ISBNs, or a confident provider match for
-#   a different book, send the file to review instead;
+# * embedded ISBNs that conflict with the Book's ISBNs, embedded authors or stronger
+#   title evidence (``identification.title_evidence_conflict``) that contradict the
+#   Book, or a confident provider match for a different book, send the file to review;
 # * a review task a reviewer has CLAIMED is never resolved automatically.
 
 SIBLING_EVIDENCE_KEY = "format_sibling_of"
@@ -2604,6 +2605,10 @@ def _assess_sibling_book(
         reason, accepted = "conflicting_isbn", False
     elif identification.authors_conflict(book_candidate.authors, file_authors):
         reason, accepted = BLOCK_AUTHOR_CONFLICT, False
+    elif identification.title_evidence_conflict(signals, book_candidate):
+        # Same shared title guard as ``decide_auto_accept``: a sibling's file name must
+        # not carry a file whose embedded title names another book into its Book.
+        reason, accepted = BLOCK_TITLE_EVIDENCE_CONFLICT, False
     elif (
         top_candidate is not None
         and top_candidate.score >= AUTO_ACCEPT_SCORE

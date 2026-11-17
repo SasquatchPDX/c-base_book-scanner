@@ -23,6 +23,7 @@ from zipfile import ZipFile
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import Client, override_settings
 from pypdf import PdfWriter
 
@@ -50,9 +51,11 @@ from ebook_server.core.identification import (
 )
 from ebook_server.core.models import (
     Book,
+    FileVariant,
     ImportJob,
     MetadataCandidate,
     ReviewTask,
+    SourceLocation,
     StorageLocation,
     get_or_create_profile,
 )
@@ -603,6 +606,70 @@ def test_decision_blocks_stronger_title_conflict_for_any_score() -> None:
     dragon = dataclasses.replace(_candidate("The Dragon in the Sea", ["Frank Herbert"]), score=1.0)
     accepted = intake.decide_auto_accept([dragon], ["Frank Herbert"], file_evidence=signals)
     assert accepted.candidate is dragon
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sibling_format_link_respects_stronger_title_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81 verification: with group_sibling_formats (#39), "Dune - Frank Herbert.txt" is
+    # imported as Dune; then "Dune - Frank Herbert.epub" embedding "The Dragon in the
+    # Sea" arrives. decide_auto_accept blocks the provider's Dune, and the sibling
+    # assessment must apply the same shared title guard instead of linking it to Dune.
+    _catalogue_provider(
+        monkeypatch,
+        [("Dune", ["Frank Herbert"])],
+        any_title=True,
+        extra_fields={"language": ["en"]},
+    )
+    StorageLocation.objects.get_or_create(
+        identifier="default",
+        defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
+    )
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+    folder = tmp_path / "share" / "Herbert"
+    folder.mkdir(parents=True)
+    location = SourceLocation.objects.create(
+        name="member",
+        root_path=str(tmp_path / "share"),
+        transfer_mode=SourceLocation.TransferMode.COPY,
+        group_sibling_formats=True,
+    )
+
+    (folder / "Dune - Frank Herbert.txt").write_text("A beginning is the time.")
+    call_command("ingest_sources", "--source-id", str(location.id))
+    first = ImportJob.objects.select_related("book").get(source_location=location)
+    assert first.state == ImportJob.State.COMPLETE
+    assert first.book is not None
+    assert first.book.title == "Dune"
+
+    (folder / "Dune - Frank Herbert.epub").write_bytes(
+        _epub_bytes(
+            "The Dragon in the Sea",
+            ["Frank Herbert"],
+            extra_metadata="<dc:language>en</dc:language>",
+        )
+    )
+    call_command("ingest_sources", "--source-id", str(location.id))
+    second = ImportJob.objects.exclude(pk=first.pk).get(source_location=location)
+
+    # The provider's Dune reached the threshold and the shared guard blocked it.
+    assert second.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    # The sibling's Dune Book is refused for the same reason, and a person decides.
+    sibling = second.evidence[intake.SIBLING_EVIDENCE_KEY]
+    assert sibling["import_job"] == str(first.id)
+    assert sibling["book_id"] == first.book_id
+    assert sibling["accepted"] is False
+    assert sibling["reason"] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    assert second.state == ImportJob.State.LOW_CONFIDENCE
+    assert second.book_id is None
+    assert Book.objects.count() == 1
+    assert not FileVariant.objects.filter(book=first.book, format="epub").exists()
+    task = ReviewTask.objects.get(import_job=second)
+    assert task.state == ReviewTask.State.OPEN
+    assert task.inferred_title == "The Dragon in the Sea"
 
 
 # --- unit: the #9 strong-match rule on typed evidence -----------------------------------
