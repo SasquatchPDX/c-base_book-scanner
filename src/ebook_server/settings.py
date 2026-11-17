@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    # Cover thumbnails (#28): a regenerable cache on the application VM. Empty root means
+    # `<storage_root>/cover-thumbnails`. With an accel prefix (for example
+    # `/_protected/cover-thumbnails/`) Django checks permissions and hands the file to
+    # nginx with X-Accel-Redirect; see deploy/nginx/book-scanner.conf.
+    cover_thumbnail_root: str = ""
+    cover_thumbnail_accel_prefix: str = ""
+    # Unreferenced thumbnail files are deleted by `collect_cover_thumbnails` only after
+    # this grace period, so a worker that just saw a shared file can still publish it.
+    cover_thumbnail_gc_grace_seconds: int = 24 * 60 * 60
     multipart_detection: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
@@ -385,6 +394,9 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_COVER_THUMBNAIL_ROOT = settings.cover_thumbnail_root
+BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX = settings.cover_thumbnail_accel_prefix
+BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS = max(settings.cover_thumbnail_gc_grace_seconds, 0)
 BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.

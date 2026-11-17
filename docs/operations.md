@@ -1432,6 +1432,83 @@ still works for one release and answers with a `Deprecation: true` header.
 Global facet counts and the unfiltered total are cached for up to five minutes.
 Search logs record the backend, sort, result count and duration, never the
 query text.
+`ebook_server_search_index_lag_seconds` (age of the oldest book without a search
+row) and `ebook_server_library_derived_rows_missing{kind="search_documents"}`
+should stay at 0; anything else means indexing failed for those books.
+
+### Landing page and author index
+
+`/library/` is search-first (#28): a search box, a facet sidebar with global
+counts (format, language, genre, category, author, decade, cover), shelves
+("Recently added", "Recently identified" from review, and "New in <language>"
+for the second and third most common languages) and an author A–Z index at
+`/library/authors/`. Every facet link opens `/library/books/` with an exact
+filter: `format`, `language`, `genre_id`, `category_id`, `author_id`, `decade`
+(`1990` for 1990–1999) or `has_cover` (`1`/`0`). The global counts, the total
+and the language shelves are cached for five minutes; "Recently added" and
+"Recently identified" are live. Everything works without JavaScript.
+
+### Cover thumbnails
+
+Lists and shelves show 120 px and 240 px wide WebP thumbnails instead of the
+full covers. They are derived, regenerable files (`CoverThumbnail`, migration
+0037) in the `cover-thumbnails` storage location, a cache on the application
+VM. Its directory is `BOOK_SCANNER_COVER_THUMBNAIL_ROOT` (default
+`<storage root>/cover-thumbnails`), copied into the location's `base_path`
+when the location is first created; change it later in the admin. Expect about
+15 KB per book.
+
+A background job renders them whenever a front cover is stored. After the
+upgrade to migration 0037, and whenever the
+`ebook_server_library_derived_rows_missing{kind="cover_thumbnails"}` metric is
+above zero, backfill them:
+
+```bash
+uv run python manage.py generate_cover_thumbnails            # missing or stale only
+uv run python manage.py generate_cover_thumbnails --enqueue  # one RQ job per cover
+uv run python manage.py generate_cover_thumbnails --force    # regenerate all
+uv run python manage.py generate_cover_thumbnails --verify   # also repair damaged files
+```
+
+`--verify` checks every front cover, including those whose rows look current,
+and regenerates only covers whose files are missing or whose size or SHA-256
+differ from the `CoverThumbnailFile` registry. Run it after restoring the cache
+from an old snapshot or after a disk error.
+
+Thumbnail URLs (`/library/covers/<sha256>/<size>.webp`) contain the file's
+hash and are served with `Cache-Control: private, max-age=31536000, immutable`.
+Django always checks the session and the member's status. With
+`BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX=/_protected/cover-thumbnails/` it
+then hands the file to nginx (`X-Accel-Redirect`) instead of streaming it from
+a Python worker; see `deploy/nginx/README.md`. A cover that cannot be decoded
+keeps the full-size cover in lists and is logged as `cover_thumbnail_failed`.
+
+A job publishes only when the cover still has the bytes it rendered. It checks
+the cover's current hash under a lock on the cover row, so a slow job for a
+replaced cover ends as `stale` and leaves the newer thumbnails alone.
+Thumbnail files are content-addressed and shared by identical covers, so they
+are never deleted inline. When the last row referencing a file is replaced or
+deleted, the file's `CoverThumbnailFile` registry row is marked unreferenced.
+A periodic collection deletes files that stayed unreferenced for longer than
+`BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS` (default one day). It re-checks
+references under the same registry row lock that publication takes, and a
+publisher that finds a file collected writes it again.
+
+Thumbnail files are written only while the publishing job holds the file's
+registry row lock, after the cover-hash check, and always through a temporary
+file in the same directory that is then renamed over the final name. Readers
+(Django or nginx) therefore never see a partial file, and a write that fails
+part way leaves the previous file as it was. An existing file is reused only
+when its size and SHA-256 match the registry; otherwise it is replaced (logged
+as `cover_thumbnail_file_repaired`). A job reports `current` only after the
+same check, so a retry repairs a damaged file instead of trusting that it
+exists. Serving trusts the rows and does not hash files. Run collection from cron
+or a systemd timer, for example hourly:
+
+```bash
+uv run python manage.py collect_cover_thumbnails
+uv run python manage.py collect_cover_thumbnails --grace-seconds 3600 --limit 5000
+```
 
 ## Metrics and logs
 

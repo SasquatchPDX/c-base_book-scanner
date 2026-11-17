@@ -15,7 +15,9 @@ class CoreConfig(AppConfig):
             book_opf,
             checks,  # noqa: F401  (registers system checks)
             search,
+            thumbnails,
         )
 
         search.connect_signals()
         book_opf.connect_signals()
+        thumbnails.connect_signals()
