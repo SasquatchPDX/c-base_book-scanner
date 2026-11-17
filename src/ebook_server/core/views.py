@@ -1084,6 +1084,7 @@ def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
         "publisher": candidate.publisher,
         "publication_year": candidate.publication_year,
         "description": candidate.description,
+        "subjects": candidate.subjects,
         "state": candidate.state,
     }
 
