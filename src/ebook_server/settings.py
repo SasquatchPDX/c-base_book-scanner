@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -104,6 +105,10 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    review_queue_page_size: int = 50
+    review_batch_min_score: float = 0.75
+    review_batch_ambiguity_margin: float = 0.05
+    review_batch_max_tasks: int = 100
     ocr_service_url: str = "http://localhost:8020"
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
@@ -284,6 +289,7 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
     settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT
@@ -320,6 +326,10 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
+BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
+BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin
+BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS = settings.review_batch_max_tasks
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts

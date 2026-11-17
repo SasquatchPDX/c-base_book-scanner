@@ -484,3 +484,72 @@ def test_embedded_title_contradicting_filename_title_is_not_imported_as_filename
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.get(import_job=job).inferred_title == "The Dragon in the Sea"
+
+
+@pytest.mark.django_db
+def test_explicit_text_header_keeps_joint_author_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "Good Omens - Terry Pratchett.txt"
+    path.write_text(
+        "Title: Good Omens\nAuthors: Terry Pratchett & Neil Gaiman\n\nBook text.",
+        encoding="utf-8",
+    )
+    metadata = intake.extract_metadata(str(path), "txt", original_filename=path.name)
+    signals = build_identification_input(
+        source_path=str(path), original_filename=path.name, extracted_metadata=metadata
+    )
+
+    assert metadata[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
+    header_groups = [group for group in signals.author_groups() if group.source == "header"]
+    assert len(header_groups) == 1
+    assert header_groups[0].kind == AUTHORS_COAUTHORS
+    assert header_groups[0].names == ("Terry Pratchett", "Neil Gaiman")
+    assert author_evidence_score(signals, ["Terry Pratchett"]) == pytest.approx(0.5)
+    assert author_evidence_score(signals, ["Terry Pratchett", "Neil Gaiman"]) == 1.0
+    assert {title.source for title in strongest_title_evidence(signals)} == {"header"}
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_title", "expected_source"),
+    [
+        ("embedded", "Midworld", "embedded"),
+        ("sidecar", "Midworld", "sidecar"),
+        ("filename", "Phylogenesis", "layout"),
+    ],
+)
+def test_explicit_title_provenance_beats_stem_equality(
+    source: str, expected_title: str, expected_source: str
+) -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Midworld.epub",
+        original_filename="Midworld.epub",
+        extracted_metadata={
+            "title": "Midworld",
+            intake.TITLE_SOURCE_KEY: source,
+            PATH_LAYOUT_EVIDENCE_KEY: {"title": "Phylogenesis"},
+        },
+    )
+
+    assert signals.best_title() == expected_title
+    assert {title.source for title in strongest_title_evidence(signals)} == {expected_source}
+
+
+def test_layout_author_keeps_priority_over_weak_header_hints() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Midworld.txt",
+        original_filename="Midworld.txt",
+        extracted_metadata={
+            "title": "Midworld",
+            intake.TITLE_SOURCE_KEY: "filename",
+            "text_header": {
+                "title": "Midworld",
+                "authors": [],
+                "likely_authors": ["Someone Else"],
+                "rules": [],
+            },
+            PATH_LAYOUT_EVIDENCE_KEY: {"authors": ["Alan Dean Foster"]},
+        },
+    )
+
+    assert signals.best_author() == "Alan Dean Foster"
+    assert author_evidence_score(signals, ["Someone Else"]) == 0.0
+    assert author_evidence_score(signals, ["Alan Dean Foster"]) == 1.0
