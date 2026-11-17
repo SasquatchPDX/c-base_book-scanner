@@ -37,6 +37,7 @@ def resolve_review_source(
     selected_candidate: MetadataCandidate | None = None,
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant | None:
     import_job = task.import_job
     if import_job is not None:
@@ -49,6 +50,7 @@ def resolve_review_source(
             decision=decision,
             decision_notes=decision_notes,
             decision_payload=decision_payload,
+            inline_cover_fallback=inline_cover_fallback,
         )
     if task.scan_job_id is None:
         raise ValueError("review task has no source")
@@ -209,6 +211,7 @@ def accept_candidate(
     isbn: str | None = None,
     decision_notes: str = "",
     extra_payload: dict[str, Any] | None = None,
+    inline_cover_fallback: bool = True,
 ) -> tuple[Book, FileVariant | None]:
     """Resolve ``task`` by accepting ``candidate`` (the page's "Accept" action).
 
@@ -256,6 +259,7 @@ def accept_candidate(
         decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
         decision_notes=decision_notes or f"Accepted candidate {candidate.id}",
         decision_payload=decision_payload,
+        inline_cover_fallback=inline_cover_fallback,
     )
     return book, variant
 

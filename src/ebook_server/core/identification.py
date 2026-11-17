@@ -57,6 +57,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Evidence key for title/author hints read from the first lines of plain-text books
+# (see core.text_header); written by intake, read when building signals.
+TEXT_HEADER_EVIDENCE_KEY = "text_header"
 # Added to an already linked Book's score when the file is another format of it (same
 # source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
 # title (0.55) it clears auto-accept; alone it does not (#39).
@@ -87,6 +90,48 @@ class MetadataProvider(Protocol):
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return raw candidate dicts from external metadata source."""
+
+
+# --- Typed evidence ----------------------------------------------------------------------
+# Where a title or author hint came from, strongest first. Embedded metadata is what the
+# file says about itself; a sidecar (Calibre metadata.opf) is curated next to it; a text
+# header is explicit but unstructured; a configured folder layout is deliberate but
+# coarse; a filename is a guess.
+EVIDENCE_EMBEDDED = "embedded"
+EVIDENCE_SIDECAR = "sidecar"
+EVIDENCE_HEADER = "header"
+EVIDENCE_LAYOUT = "layout"
+EVIDENCE_FILENAME = "filename"
+EVIDENCE_UNKNOWN = "unknown"
+EVIDENCE_RANK = {
+    EVIDENCE_EMBEDDED: 5,
+    EVIDENCE_SIDECAR: 4,
+    EVIDENCE_HEADER: 3,
+    EVIDENCE_LAYOUT: 2,
+    EVIDENCE_FILENAME: 1,
+    EVIDENCE_UNKNOWN: 0,
+}
+
+# How the names of one author group relate to each other.
+# * ALTERNATIVES: competing guesses, at most one of which is the author ("Stephen King -
+#   Pet Sematary" yields both halves). The best single match is the group's score.
+# * COAUTHORS: every name is a genuine author (embedded dc:creator list, sidecar, an
+#   explicit header). A candidate must cover them all; its score is the share covered.
+AUTHORS_ALTERNATIVES = "alternatives"
+AUTHORS_COAUTHORS = "coauthors"
+
+
+@dataclass(frozen=True)
+class AuthorEvidence:
+    kind: str
+    source: str
+    names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TitleEvidence:
+    title: str
+    source: str
 
 
 class ProviderRequestError(OSError):
@@ -156,12 +201,30 @@ class IdentificationInput:
     language: str | None
     publisher: str | None
     description: str | None
+    # Typed evidence behind the flat hint lists. Inputs built by hand (scan jobs, review
+    # re-searches, tests) may leave them empty: the hints then count as alternatives of
+    # unknown provenance, which is how they were always scored.
+    author_evidence: tuple[AuthorEvidence, ...] = ()
+    title_evidence: tuple[TitleEvidence, ...] = ()
 
     def best_title(self) -> str | None:
         return self.title_hints[0] if self.title_hints else None
 
     def best_author(self) -> str | None:
         return self.author_hints[0] if self.author_hints else None
+
+    def author_groups(self) -> tuple[AuthorEvidence, ...]:
+        if self.author_evidence:
+            return self.author_evidence
+        if not self.author_hints:
+            return ()
+        names = tuple(self.author_hints)
+        return (AuthorEvidence(AUTHORS_ALTERNATIVES, EVIDENCE_UNKNOWN, names),)
+
+    def title_sources(self) -> tuple[TitleEvidence, ...]:
+        if self.title_evidence:
+            return self.title_evidence
+        return tuple(TitleEvidence(title, EVIDENCE_UNKNOWN) for title in self.title_hints)
 
 
 @dataclass(frozen=True)
@@ -286,29 +349,407 @@ def normalize_text(value: str | None) -> str:
     return " ".join(value.lower().strip().split())
 
 
+# --- Person-name heuristics (#15) -------------------------------------------------------
+# Shared by every signal source that has to tell a person's name apart from a title
+# (filename parsing below, TXT header hints, ...). Keep them in this one place so the word
+# lists cannot drift between callers.
+
+_INITIALS_TOKEN = re.compile(r"^(?:[A-Z]\.?){1,3}$")
+_CAPITALISED_TOKEN = re.compile(r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*\.?$")
+# An inner capital after a lowercase letter, except in "McNab", "MacDonald", "DeWitt",
+# "LeGuin", "VanDyke", "O'Brien"-style surnames.
+_CAMEL_CASE_WORD = re.compile(r"^(?!Mc|Mac|De|Di|Da|La|Le|Van|Von).*[a-z][A-Z]")
+# Lowercase particles inside a name: "Ludwig van Beethoven", "Gabriel de la Cruz".
+_NAME_PARTICLES = frozenset(
+    {"von", "van", "de", "da", "di", "du", "la", "le", "del", "della", "zu", "y", "ter", "ten"},
+)
+# "der"/"den" count as particles only straight after von/van/de ("Johannes van der Waals");
+# anywhere else they are far more likely German title words ("Insel der Freibeuter").
+_COMPOUND_PARTICLES = frozenset({"der", "den"})
+_COMPOUND_PARTICLE_LEADS = frozenset({"von", "van", "de"})
+# Words that (almost) never occur in a person's name but are common in titles.
+_NOT_NAME_WORDS = frozenset(
+    {
+        # English function words
+        *("the", "a", "an", "of", "and", "or", "in", "on", "at", "to", "for", "with", "by"),
+        *("from", "into", "is", "are", "my", "your", "his", "her", "its", "our", "their"),
+        *("this", "that", "not", "no", "than", "as", "about", "after", "before", "over"),
+        *("under", "without", "all", "so", "if", "when", "who", "what", "how", "why"),
+        # German function words
+        *("der", "die", "das", "des", "dem", "den", "ein", "eine", "einer", "und", "oder"),
+        *("im", "am", "auf", "mit", "aus", "zum", "zur", "vom", "ohne"),
+        # placeholders and bibliographic words
+        *("unknown", "anonymous", "various", "unbekannt", "volume", "vol", "book", "band"),
+        *("bd", "part", "teil", "series", "edition", "stories", "tales", "saga"),
+        *("chronicles", "novel", "novella", "roman", "anthology", "collection", "omnibus"),
+        *("guide", "handbook", "introduction", "manual"),
+    },
+)
+# Placeholder authors ("Doctor Marigold - Unknown") are recognised with the shared
+# ``is_placeholder_author`` further down, which the author-conflict guard also uses.
+_TITLE_ARTICLES = frozenset({"the", "a", "an", "der", "die", "das"})
+_AUTHOR_LIST_SEPARATOR = re.compile(r"\s*(?:&|;|\+|\band\b|\bund\b)\s*", re.IGNORECASE)
+
+
+def looks_like_person_name(value: str) -> bool:
+    """True when ``value`` reads as one person's name in "First [Middle] Last" order.
+
+    Two to five tokens, each capitalised, an initial ("A.", "H.P.", "T"), or a lowercase
+    particle inside the name ("van"); no digits and no title/function words. This is
+    shape-based, so short title-case titles ("Pet Sematary") match too: callers must
+    treat a match as evidence, never as proof.
+    """
+    tokens = value.split()
+    if not 2 <= len(tokens) <= 5 or any(ch.isdigit() for ch in value):
+        return False
+    shouting = value.isupper()  # "HARRY HARRISON": all-caps tokens are fine here
+    has_name_word = False
+    for index, token in enumerate(tokens):
+        if _INITIALS_TOKEN.match(token):
+            continue
+        if not shouting and (token.isupper() or _CAMEL_CASE_WORD.search(token)):
+            return False  # acronyms and product names: "LDAP", "MATLAB", "MathWorks"
+        bare = token.lower().rstrip(".")
+        if token.islower() and 0 < index < len(tokens) - 1:
+            if bare in _NAME_PARTICLES or (
+                bare in _COMPOUND_PARTICLES and tokens[index - 1] in _COMPOUND_PARTICLE_LEADS
+            ):
+                continue
+        if bare in _NOT_NAME_WORDS or not _CAPITALISED_TOKEN.match(token):
+            return False
+        has_name_word = True
+    return has_name_word
+
+
+# Edition, volume and ordinal words: "Python Development, Second Edit", "Windows
+# Programming, Third Edition", "Faust, Zweite Auflage". A comma phrase containing one is
+# a title with its edition/volume suffix, never "Last, First" (#15). "Ed" alone is left
+# out on purpose: it is also a given name ("McBain, Ed"), and "2nd Ed." is caught by the
+# ordinal anyway.
+_EDITION_WORDS = frozenset(
+    {
+        *("edition", "editions", "edit", "ausgabe", "auflage", "aufl", "neuauflage"),
+        *("vol", "volume", "volumes", "part", "band", "bd", "teil", "book", "buch"),
+        *("revised", "expanded", "updated", "unabridged", "abridged", "reprint"),
+        *("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"),
+        *("ninth", "tenth", "eleventh", "twelfth"),
+    },
+)
+_GERMAN_ORDINAL = re.compile(
+    r"^(?:erst|zweit|dritt|viert|f(?:ü|ue|u)nft|sechst|siebt|acht|neunt|zehnt)(?:e|er|en|es)$",
+)
+_NUMERIC_ORDINAL = re.compile(r"^\d+(?:st|nd|rd|th|\.)?$")
+
+
+def is_edition_phrase(value: str) -> bool:
+    """True when ``value`` contains an edition, volume, part or ordinal word."""
+    for token in value.split():
+        bare = token.lower().strip(".,;:()[]")
+        if bare in _EDITION_WORDS or _GERMAN_ORDINAL.match(bare) or _NUMERIC_ORDINAL.match(bare):
+            return True
+    return False
+
+
+def invert_last_first_name(value: str) -> str | None:
+    """ "Corey, James S. A." -> "James S. A. Corey" when it reads as a person's name.
+
+    Returns ``None`` for anything else, including the library-sort title form
+    "Hobbit, The" and comma titles such as "Python Development, Second Edit": an
+    edition/volume/ordinal phrase on either side of the comma is never a name.
+    """
+    if value.count(",") != 1:
+        return None
+    last, first = (part.strip() for part in value.split(","))
+    if not last or not first or first.lower() in _TITLE_ARTICLES:
+        return None
+    if is_edition_phrase(first) or is_edition_phrase(last):
+        return None
+    # A surname is one or two words plus particles ("Le Guin", "van Vogt", "Carre").
+    surname_words = [t for t in last.split() if t.lower() not in _NAME_PARTICLES]
+    if len(surname_words) > 2:
+        return None
+    candidate = f"{first} {last}"
+    return candidate if looks_like_person_name(candidate) else None
+
+
+def split_author_list(value: str) -> list[str] | None:
+    """ "David Weber & Linda Evans" / "Cory Doctorow;Charles Stross" -> list of names.
+
+    Each part may be "First Last" or "Last, First" (returned as "First Last"). Returns
+    ``None`` unless every part reads as a person's name.
+    """
+    names: list[str] = []
+    for raw_part in _AUTHOR_LIST_SEPARATOR.split(value):
+        part = raw_part.strip()
+        if not part:
+            continue
+        inverted = invert_last_first_name(part)
+        if inverted:
+            names.append(inverted)
+        elif looks_like_person_name(part):
+            names.append(part)
+        else:
+            return None
+    return names or None
+
+
+# Lopsided separators ("Asimov- Foundation", "Foundation -Asimov") split too; a hyphen
+# inside a word ("Mother-Not", "Priest-Kings of Gor") never does.
+_FILENAME_SEPARATOR = re.compile(r"\s+-+\s*|\s*-+\s+|--+")
+# Calibre writes ":" as "_" ("Rabenseelen_ Roman") and the "." of a trailing initial as
+# "_" ("Lovecraft, H.P_").
+_UNDERSCORE_INITIAL = re.compile(r"(?<=\b[A-Za-z])_(?=\s|$)")
+_UNDERSCORE_COLON = re.compile(r"(?<=\w)_(?=\s)")
+# "Title, The" -> "The Title" (library sorting convention).
+_INVERTED_ARTICLE = re.compile(r"^(.+?),\s*(The|A|An|Der|Die|Das)$", re.IGNORECASE)
+_TRAILING_ANNOTATION = re.compile(r"\s*[(\[][^()\[\]]*[)\]]\s*$")
+_NUMERIC_SEGMENT = re.compile(r"^[\d\s.#]+$")
+_BY_PREFIX = re.compile(r"^by\s+", re.IGNORECASE)
+
+
+def _normalize_filename_stem(stem: str) -> str:
+    value = _UNDERSCORE_INITIAL.sub(".", stem)
+    value = _UNDERSCORE_COLON.sub(":", value)
+    return " ".join(value.replace("_", " ").split())
+
+
+def _title_variants(title: str) -> list[str]:
+    """Cheap, safe normalisations of one title guess, as extra hints (never a replacement)."""
+    variants = [title]
+    stripped = _TRAILING_ANNOTATION.sub("", title).strip()
+    if stripped:
+        variants.append(stripped)
+    for value in list(variants):
+        inverted = _INVERTED_ARTICLE.match(value)
+        if inverted:
+            variants.append(f"{inverted.group(2)} {inverted.group(1)}".strip())
+    main_title = title.split(": ", 1)[0].strip()
+    if main_title:
+        variants.append(main_title)
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def _titles_for(title_segments: list[str]) -> list[str]:
+    """Primary title, then the fuller fallback, for the segments left beside the author.
+
+    "Series 03 - Title" puts the title last; the series/volume prefix is only kept as a
+    fallback, since searching with it attached can make a provider return nothing.
+    """
+    if len(title_segments) == 1:
+        return title_segments
+    named = [s for s in title_segments if not _NUMERIC_SEGMENT.match(s)]
+    primary = named[-1] if named else title_segments[-1]
+    return [primary, " - ".join(title_segments)]
+
+
+def _same_title(left: str, right: str) -> bool:
+    def strip(value: str) -> str:
+        return normalize_text(_TRAILING_ANNOTATION.sub("", value))
+
+    return strip(left) == strip(right)
+
+
+# How strongly one end of a filename split reads as the author.
+_END_NOT_A_NAME = 0
+# A single word could be a bare surname ("Asimov - Foundation"), and "Series 2" could
+# be the series prefix of a name-shaped title ("Ender's Saga 1 - Ender's Game"): neither
+# is a name, but neither rules out the other end being a title.
+_END_UNCERTAIN = 1
+_END_NAME_SHAPED = 2
+_END_LAST_FIRST = 3
+_SINGLE_WORD = re.compile(r"^[^\W\d_][\w'’.\-]*$")
+_SERIES_NUMBER_SUFFIX = re.compile(r"\s(?:\d+|[IVX]+)$")
+_TRAILING_NUMBER = re.compile(r"[\s\d.#]+$")
+
+
+def _author_end(segment: str) -> tuple[int, list[str]]:
+    """Classify one end of a split and return the author name(s) it would provide.
+
+    A plain "A B and C D" list counts as name-shaped, not stronger: "Advanced
+    Mathematics and Mechanics Applications" splits into two name-shaped halves just as
+    well as two authors do.
+    """
+    segment = _TRAILING_ANNOTATION.sub("", segment).strip()  # "Dumas, Alexandre (d.A.)"
+    segment = _BY_PREFIX.sub("", segment)  # "By Cory Doctorow"
+    names = split_author_list(segment)
+    if names:
+        parts = (part.strip() for part in _AUTHOR_LIST_SEPARATOR.split(segment))
+        if any(invert_last_first_name(part) for part in parts if part):
+            return _END_LAST_FIRST, names
+        return _END_NAME_SHAPED, names
+    if _SINGLE_WORD.match(segment) or _SERIES_NUMBER_SUFFIX.search(segment):
+        return _END_UNCERTAIN, []
+    return _END_NOT_A_NAME, []
+
+
+def _ambiguous_author_hint(segment: str) -> str | None:
+    """One end of an ambiguous split, cleaned up for use as a (possible) author hint."""
+    cleaned = _TRAILING_ANNOTATION.sub("", segment).strip()
+    cleaned = _TRAILING_NUMBER.sub("", cleaned).strip()  # "Henning Mankell_2279"
+    if not cleaned or any(ch.isdigit() for ch in cleaned):
+        return None
+    return cleaned
+
+
+def _commits(author_end: int, other_end: int) -> bool:
+    """Whether one end is clearly enough the author to drop the other orientation."""
+    if author_end == _END_LAST_FIRST:
+        return other_end < _END_LAST_FIRST
+    return author_end == _END_NAME_SHAPED and other_end == _END_NOT_A_NAME
+
+
 def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
-    """Return title and author candidates from filename patterns."""
+    """Return title and author candidates from filename patterns.
+
+    "Title - Author" and "Author - Title" are both common, so the two ends of a split
+    filename are compared:
+
+    * "Title - Unknown" / "Unknown - Title": no author; the rest is the title.
+    * Exactly one end in "Last, First" form - or, failing that, one end name-shaped
+      and the other plainly not a name: commit to that orientation. The author hints
+      are that name (each name, for a co-author list) and nothing from the title side.
+    * Otherwise - both ends name-shaped ("Stephen King - Pet Sematary"), neither
+      ("Asimov - Foundation", "tolkien - the hobbit"), or the other end a single word
+      (maybe a bare surname) or a "Series 2" prefix: keep *both* orientations as hints,
+      "Title - Author" first since it is the more common convention. Author scoring
+      takes the best-matching hint, so the wrong orientation costs nothing.
+
+    Only the outermost segments can be an author. For "Series 03 - Title - Author" the
+    series/volume prefix is dropped from the primary title and kept as a fallback hint.
+    Library sort titles ("Title, The") and Calibre's "_" for ":" are also undone.
+    """
     stem = Path(raw_filename).stem
     if not stem:
         return [], []
+    normalized = _normalize_filename_stem(stem)
+    if not normalized:
+        return [], []
 
-    normalized = stem.replace("_", " ")
-    title_hints = [normalized]
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(normalized)]
+    segments = [s for s in segments if s.strip("-")]
+    title_guesses: list[str] = []
     author_hints: list[str] = []
 
-    for sep in [" - ", " -", "- ", "--"]:
-        if sep in normalized:
-            left, right = normalized.split(sep, 1)
-            left = left.strip()
-            right = right.strip()
-            if left and right:
-                title_hints.extend([left, right])
-                author_hints.extend([left, right])
-            break
+    if len(segments) >= 2:
+        first, last = segments[0], segments[-1]
+        if is_placeholder_author(last):
+            title_guesses = _titles_for(segments[:-1])
+        elif is_placeholder_author(first):
+            title_guesses = _titles_for(segments[1:])
+        elif len(segments) == 2 and _same_title(first, last):
+            title_guesses = [first, last]  # "Die Kandidaten - Die Kandidaten"
+        else:
+            last_strength, last_names = _author_end(last)
+            first_strength, first_names = _author_end(first)
+            if _commits(last_strength, first_strength):
+                author_hints = last_names
+                title_guesses = _titles_for(segments[:-1])
+            elif _commits(first_strength, last_strength):
+                author_hints = first_names
+                title_guesses = _titles_for(segments[1:])
+            else:
+                author_last_titles = _titles_for(segments[:-1])
+                author_first_titles = _titles_for(segments[1:])
+                title_guesses = [author_last_titles[0], author_first_titles[0]]
+                title_guesses += author_last_titles[1:] + author_first_titles[1:]
+                for names, end in ((last_names, last), (first_names, first)):
+                    hint = _ambiguous_author_hint(end)
+                    author_hints.extend(names or ([hint] if hint else []))
 
-    return list(dict.fromkeys([x for x in title_hints if x])), list(
-        dict.fromkeys([x for x in author_hints if x]),
+    title_hints: list[str] = []
+    for guess in [*title_guesses, normalized]:
+        title_hints.extend(_title_variants(guess))
+
+    return (
+        list(dict.fromkeys(h for h in title_hints if h)),
+        list(dict.fromkeys(h for h in author_hints if h)),
     )
+
+
+def _header_strings(value: Any) -> list[str]:
+    return [item.strip() for item in _as_str_list(value) if item.strip()]
+
+
+# "Last, First" in a filename part: one comma, a short name on each side, no digits,
+# and not a moved article ("Hobbit, The").
+_COMMA_FORM_AUTHOR = re.compile(r"^\s*([^,\d]{2,40}),\s*([^,\d]{1,40})\s*$")
+_MOVED_ARTICLES = frozenset({"the", "a", "an", "der", "die", "das", "le", "la", "les"})
+
+
+def comma_form_filename_authors(raw_filename: str) -> list[str]:
+    """Filename parts written as "Last, First" ("London, Jack - White Fang.txt").
+
+    That form is a deliberate author credit, so header hints read from the text may
+    add to it but never delete it.
+    """
+    stem = Path(raw_filename).stem.replace("_", " ")
+    authors: list[str] = []
+    for part in re.split(r"\s+-\s+", stem):
+        match = _COMMA_FORM_AUTHOR.match(part)
+        if match is None:
+            continue
+        last, first = match.group(1).strip(), match.group(2).strip()
+        if not last or not first or first.casefold() in _MOVED_ARTICLES:
+            continue
+        if len(last.split()) > 3 or len(first.split()) > 3:
+            continue
+        authors.append(part.strip())
+    return authors
+
+
+def _apply_text_header_hints(
+    header: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+    *,
+    protected_authors: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Merge hints read from a plain-text book's first lines (see ``core.text_header``).
+
+    Precedence for authors: explicit header rules (``Author:``, Gutenberg header,
+    ``by ...``, copyright line) replace the filename's "A - B" split guesses; heuristic
+    name-like lines are only appended after the other hints, so they never become the
+    author sent to providers ahead of them. Hints from an admin-configured source such
+    as a folder layout must likewise rank ahead of anything guessed from the text.
+
+    ``protected_authors`` (the filename's "Last, First" credits) are never removed:
+    not because the header title resembles them, and not by explicit header authors,
+    which are put in front of them instead.
+    """
+    title_hints = list(title_hints)
+    author_hints = list(author_hints)
+    protected = [name for name in protected_authors or [] if name.strip()]
+    protected_keys = {normalize_text(name) for name in protected}
+    header_title = header.get("title")
+    if isinstance(header_title, str) and header_title.strip():
+        header_title = header_title.strip()
+        title_hints.insert(1 if title_hints else 0, header_title)
+        # A filename part the text names as the title is not an author, unless the
+        # filename credits it in "Last, First" form.
+        author_hints = [
+            hint
+            for hint in author_hints
+            if normalize_text(hint) in protected_keys
+            or _title_match_score(hint, header_title) < 0.95
+        ]
+    explicit_authors = _header_strings(header.get("authors"))
+    if explicit_authors:
+        kept = [
+            name
+            for name in protected
+            if not any(
+                _author_name_similarity(normalize_text(name), normalize_text(explicit))
+                for explicit in explicit_authors
+            )
+        ]
+        return title_hints, explicit_authors + kept
+    author_hints = [
+        hint for hint in author_hints if normalize_text(hint) not in {"unknown", "anonymous"}
+    ]
+    for likely in _header_strings(header.get("likely_authors")):
+        if not any(_author_name_similarity(likely, known) for known in author_hints):
+            author_hints.append(likely)
+    return title_hints, author_hints
 
 
 # Evidence key holding hints from the source's configured folder layout (#35); written
@@ -325,12 +766,29 @@ def build_identification_input(
     filename_title_hints, filename_author_hints = parse_filename_signals(original_filename)
 
     metadata_title = extracted_metadata.get("title")
-    if isinstance(metadata_title, str) and normalize_text(metadata_title):
+    # Format extractors with nothing real to say fall back to the raw filename stem as
+    # "title" (see intake.extract_metadata). That is no better than the parsed filename
+    # hints above, so it must not jump ahead of them.
+    title_source = extracted_metadata.get("title_source")
+    is_stem_fallback = title_source == EVIDENCE_FILENAME or (
+        title_source is None
+        and isinstance(metadata_title, str)
+        and normalize_text(metadata_title) == normalize_text(Path(original_filename).stem)
+    )
+    if isinstance(metadata_title, str) and normalize_text(metadata_title) and not is_stem_fallback:
         title_hints = [metadata_title] + filename_title_hints
     else:
         title_hints = filename_title_hints
 
-    author_hints = filename_author_hints
+    author_hints = list(filename_author_hints)
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    if isinstance(header, dict):
+        title_hints, author_hints = _apply_text_header_hints(
+            header,
+            title_hints,
+            author_hints,
+            protected_authors=comma_form_filename_authors(original_filename),
+        )
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:
@@ -340,7 +798,14 @@ def build_identification_input(
                     author_hints.insert(0, normalized_author)
 
     title_hints, author_hints = _apply_path_layout_hints(
-        extracted_metadata, list(title_hints), list(author_hints)
+        extracted_metadata,
+        list(title_hints),
+        list(author_hints),
+        has_embedded_title=(
+            isinstance(metadata_title, str)
+            and bool(normalize_text(metadata_title))
+            and not is_stem_fallback
+        ),
     )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
@@ -359,6 +824,11 @@ def build_identification_input(
     folder_hint = Path(source_path).parent.name
     folder_hints = [folder_hint] if folder_hint else []
 
+    embedded_title = (
+        metadata_title
+        if isinstance(metadata_title, str) and normalize_text(metadata_title)
+        else None
+    )
     return IdentificationInput(
         title_hints=title_hints,
         author_hints=author_hints,
@@ -369,26 +839,127 @@ def build_identification_input(
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
         else None,
+        author_evidence=_author_evidence(extracted_metadata, filename_author_hints),
+        title_evidence=_title_evidence(
+            title_hints,
+            embedded_title=None if is_stem_fallback else embedded_title,
+            layout_title=_layout_value(extracted_metadata, "title"),
+            metadata_title_source=EVIDENCE_SIDECAR
+            if title_source == EVIDENCE_SIDECAR
+            else EVIDENCE_EMBEDDED,
+            header=header if isinstance(header, dict) else {},
+        ),
     )
+
+
+def _layout_value(extracted_metadata: dict[str, Any], key: str) -> Any:
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    return layout.get(key) if isinstance(layout, dict) else None
+
+
+def _coauthor_names(raw_names: Any) -> tuple[str, ...]:
+    """Real author names from one explicit author list, placeholders removed.
+
+    A single entry that is itself a list ("Terry Pratchett & Neil Gaiman") is split, so
+    each coauthor has to be covered on its own.
+    """
+    names: list[str] = []
+    for name in evidence_author_names({"authors": raw_names}):
+        names.extend(split_author_list(name) or [name])
+    return tuple(dict.fromkeys(names))
+
+
+def _author_evidence(
+    extracted_metadata: dict[str, Any],
+    filename_author_hints: list[str],
+) -> tuple[AuthorEvidence, ...]:
+    """Group the author hints by provenance and by how their names relate.
+
+    Embedded metadata, applied sidecar fields, explicit text headers and configured
+    folder layouts name *coauthors*: every name is meant. Filename splits and weak
+    header names are *alternatives*. A layout author replaces header/filename guesses,
+    as in ``_apply_path_layout_hints``.
+    """
+    groups: list[AuthorEvidence] = []
+    embedded = _coauthor_names(extracted_metadata.get("authors"))
+    sidecar = extracted_metadata.get("sidecar_metadata")
+    applied = sidecar.get("applied_fields", []) if isinstance(sidecar, dict) else []
+    if embedded:
+        source = EVIDENCE_SIDECAR if "authors" in applied else EVIDENCE_EMBEDDED
+        groups.append(AuthorEvidence(AUTHORS_COAUTHORS, source, embedded))
+    layout = _coauthor_names(_layout_value(extracted_metadata, "authors"))
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    # Configured layout authors replace header/filename hints in the flat input too.
+    if isinstance(header, dict) and not layout:
+        explicit = _coauthor_names(header.get("authors"))
+        if explicit:
+            groups.append(AuthorEvidence(AUTHORS_COAUTHORS, EVIDENCE_HEADER, explicit))
+        else:
+            likely = _coauthor_names(header.get("likely_authors"))
+            if likely:
+                groups.append(AuthorEvidence(AUTHORS_ALTERNATIVES, EVIDENCE_HEADER, likely))
+    if layout:
+        groups.append(AuthorEvidence(AUTHORS_COAUTHORS, EVIDENCE_LAYOUT, layout))
+    elif filename_author_hints:
+        filename = tuple(dict.fromkeys(filename_author_hints))
+        groups.append(AuthorEvidence(AUTHORS_ALTERNATIVES, EVIDENCE_FILENAME, filename))
+    return tuple(groups)
+
+
+def _title_evidence(
+    title_hints: list[str],
+    *,
+    embedded_title: str | None,
+    layout_title: Any,
+    metadata_title_source: str = EVIDENCE_EMBEDDED,
+    header: dict[str, Any] | None = None,
+) -> tuple[TitleEvidence, ...]:
+    """Each title hint with the strongest source that supplied it."""
+    sources: dict[str, str] = {}
+    if embedded_title:
+        sources[normalize_text(embedded_title)] = metadata_title_source
+    for rule in (header or {}).get("rules", []):
+        if (
+            isinstance(rule, dict)
+            and rule.get("rule") in {"labelled title", "gutenberg header", "title by author"}
+            and isinstance(rule.get("title"), str)
+        ):
+            sources.setdefault(normalize_text(rule["title"]), EVIDENCE_HEADER)
+    if isinstance(layout_title, str) and normalize_text(layout_title):
+        sources.setdefault(normalize_text(layout_title), EVIDENCE_LAYOUT)
+    return tuple(
+        TitleEvidence(hint, sources.get(normalize_text(hint), EVIDENCE_FILENAME))
+        for hint in title_hints
+    )
+
+
+def strongest_title_evidence(signals: IdentificationInput) -> list[TitleEvidence]:
+    """The title hints from the strongest source present (all of them, on a tie)."""
+    titles = signals.title_sources()
+    if not titles:
+        return []
+    best = max(EVIDENCE_RANK.get(t.source, 0) for t in titles)
+    return [t for t in titles if EVIDENCE_RANK.get(t.source, 0) == best]
 
 
 def _apply_path_layout_hints(
     extracted_metadata: dict[str, Any],
     title_hints: list[str],
     author_hints: list[str],
+    *,
+    has_embedded_title: bool,
 ) -> tuple[list[str], list[str]]:
     """Merge folder-layout hints (evidence, not truth) into the title/author hints.
 
-    A layout title goes after an embedded title (usually the best signal) and before
-    the raw filename guesses. A layout author replaces the filename "A - B" split
-    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    A layout title goes after a real embedded title (usually the best signal) and
+    before the raw filename guesses; an extractor's filename-stem fallback does not
+    count as embedded. A layout author replaces the filename "A - B" split guesses,
+    which add *both* halves as authors, but never outranks embedded authors.
     """
     layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
     if not isinstance(layout, dict):
         return title_hints, author_hints
 
-    metadata_title = extracted_metadata.get("title")
-    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
     layout_title = layout.get("title")
     if isinstance(layout_title, str) and layout_title.strip():
         title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
@@ -931,16 +1502,91 @@ def _author_name_similarity(left: str, right: str) -> float:
 
 
 def _author_match_score(left: list[str], right: list[str]) -> float:
+    """Best similarity between any author hint and any candidate author.
+
+    Author hints are alternatives, not a list that must all match: an ambiguous
+    "Stephen King - Pet Sematary" filename yields both halves as hints (#15), and only
+    one of them can be the author. Averaging over hints would halve the score of the
+    right candidate merely because the filename did not say which half is which.
+    """
     if not left or not right:
         return 0.0
-    left_names = list(dict.fromkeys(normalize_text(author) for author in left))
-    right_names = list(dict.fromkeys(normalize_text(author) for author in right))
-    if not left_names:
+    left_names = [name for name in dict.fromkeys(normalize_text(a) for a in left) if name]
+    right_names = [name for name in dict.fromkeys(normalize_text(a) for a in right) if name]
+    if not left_names or not right_names:
         return 0.0
-    total = sum(
-        max(_author_name_similarity(name, other) for other in right_names) for name in left_names
-    )
-    return total / len(left_names)
+    return max(_author_name_similarity(name, other) for name in left_names for other in right_names)
+
+
+def _author_coverage(names: list[str] | tuple[str, ...], candidate_authors: list[str]) -> float:
+    """Share of ``names`` the candidate covers (each name by its best similarity).
+
+    For coauthor lists every name counts: [Terry Pratchett, Neil Gaiman] against a
+    candidate naming only Terry Pratchett covers half of the book's authors.
+    """
+    wanted = [name for name in dict.fromkeys(normalize_text(a) for a in names) if name]
+    offered = [name for name in dict.fromkeys(normalize_text(a) for a in candidate_authors) if name]
+    if not wanted or not offered:
+        return 0.0
+    total = sum(max(_author_name_similarity(name, other) for other in offered) for name in wanted)
+    return total / len(wanted)
+
+
+def _group_score(group: AuthorEvidence, candidate_authors: list[str]) -> float:
+    if group.kind == AUTHORS_COAUTHORS:
+        return _author_coverage(group.names, candidate_authors)
+    return _author_match_score(list(group.names), candidate_authors)
+
+
+def author_evidence_score(signals: IdentificationInput, candidate_authors: list[str]) -> float:
+    """How well a candidate's authors match the file's typed author evidence.
+
+    Alternative groups contribute their best single match. A coauthor group the
+    candidate matches at all decides the score by its coverage, so a candidate that
+    omits a genuine coauthor cannot be lifted back to full credit by a filename guess
+    naming only one of them. A coauthor group the candidate does not match at all is
+    left to the author-conflict guard (#92) and does not zero out the filename hints.
+    """
+    best_alternative = 0.0
+    matched_coverage: list[float] = []
+    for group in signals.author_groups():
+        score = _group_score(group, candidate_authors)
+        if group.kind == AUTHORS_COAUTHORS:
+            if score > 0:
+                matched_coverage.append(score)
+        else:
+            best_alternative = max(best_alternative, score)
+    if matched_coverage:
+        return min(matched_coverage)
+    return best_alternative
+
+
+def missing_coauthors(signals: IdentificationInput, candidate_authors: list[str]) -> list[str]:
+    """Genuine coauthors (from coauthor groups) the candidate does not name.
+
+    Only groups the candidate matches at least partly are checked; a group it does not
+    match at all is an author conflict, not a missing coauthor.
+    """
+    offered = [normalize_text(a) for a in candidate_authors if normalize_text(a)]
+    missing: list[str] = []
+    for group in signals.author_groups():
+        if group.kind != AUTHORS_COAUTHORS or _group_score(group, candidate_authors) <= 0:
+            continue
+        for name in group.names:
+            key = normalize_text(name)
+            if key and not any(_author_name_similarity(key, other) > 0 for other in offered):
+                missing.append(name)
+    return list(dict.fromkeys(missing))
+
+
+def title_similarity(left: str, right: str) -> float:
+    """Public form of the candidate title score, for comparing two metadata sources."""
+    return _title_match_score(left, right)
+
+
+def author_similarity(left: list[str], right: list[str]) -> float:
+    """Public form of the candidate author score (0.0 when no name corresponds)."""
+    return _author_match_score(left, right)
 
 
 # Creator values that say nothing about who wrote the book: office-suite and PDF
@@ -955,6 +1601,8 @@ _PLACEHOLDER_AUTHORS = frozenset(
         "inconnu",
         "anonymous",
         "anonym",
+        "anon",
+        "na",
         "administrator",
         "admin",
         "user",
@@ -1049,7 +1697,7 @@ def _apply_scoring(
     if title_scores:
         score += 0.55 * max(title_scores)
 
-    author_score = _author_match_score(signals.author_hints, candidate.authors)
+    author_score = author_evidence_score(signals, candidate.authors)
     score += 0.3 * author_score
 
     if signals.language and candidate.language and signals.language == candidate.language:
@@ -1115,5 +1763,5 @@ def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> 
     if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
         return False
     if left.authors and right.authors:
-        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+        return _author_coverage(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
     return True

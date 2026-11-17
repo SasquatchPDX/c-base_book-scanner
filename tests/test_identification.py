@@ -57,8 +57,158 @@ def test_parse_filename_signals_handles_title_author_patterns() -> None:
         "Jules Verne - Around the World in 80 Days.epub",
     )
 
-    assert "Jules Verne" in author_hints
-    assert "Around the World in 80 Days" in title_hints
+    assert author_hints == ["Jules Verne"]
+    assert title_hints[0] == "Around the World in 80 Days"
+
+
+# Review regressions on PR #34: these used to give both halves as hints and must keep
+# doing so (never swapped, never dropped, never left unsplit).
+@pytest.mark.parametrize(
+    ("filename", "left", "right"),
+    [
+        ("Stephen King - Pet Sematary.epub", "Stephen King", "Pet Sematary"),
+        ("Frank Herbert - Dune Messiah.epub", "Frank Herbert", "Dune Messiah"),
+        ("Neil Gaiman - American Gods.epub", "Neil Gaiman", "American Gods"),
+        ("Asimov - Foundation.epub", "Asimov", "Foundation"),
+        ("Foundation - Asimov.epub", "Foundation", "Asimov"),
+        ("tolkien - the hobbit.txt", "tolkien", "the hobbit"),
+        ("Asimov- Foundation.txt", "Asimov", "Foundation"),
+        ("Foundation -Asimov.txt", "Foundation", "Asimov"),
+    ],
+)
+def test_parse_filename_signals_keeps_both_orientations_when_ambiguous(
+    filename: str,
+    left: str,
+    right: str,
+) -> None:
+    title_hints, author_hints = parse_filename_signals(filename)
+
+    assert set(title_hints[:2]) == {left, right}
+    # "Title - Author" is the more common convention, so the right end leads.
+    assert author_hints == [right, left]
+
+
+def test_parse_filename_signals_commits_when_only_one_end_is_a_name() -> None:
+    title_hints, author_hints = parse_filename_signals("Empire From the Ashes - David Weber.epub")
+
+    assert author_hints == ["David Weber"]
+    assert title_hints[0] == "Empire From the Ashes"
+
+
+@pytest.mark.parametrize(
+    ("filename", "author", "title"),
+    [
+        ("Carre, John Le - Absolute Freunde.rtf", "John Le Carre", "Absolute Freunde"),
+        ("Phylogenesis - Foster, Alan Dean.epub", "Alan Dean Foster", "Phylogenesis"),
+        # "Last, First" beats a name-shaped other end
+        ("Stephen King - Foster, Alan Dean.epub", "Alan Dean Foster", "Stephen King"),
+    ],
+)
+def test_parse_filename_signals_last_first_author_at_either_end(
+    filename: str,
+    author: str,
+    title: str,
+) -> None:
+    title_hints, author_hints = parse_filename_signals(filename)
+
+    assert author_hints == [author]
+    assert title_hints[0] == title
+
+
+def test_parse_filename_signals_series_prefix_is_only_a_fallback_title() -> None:
+    title_hints, author_hints = parse_filename_signals(
+        "Donaldson, Stephen R. - Covenant 01 - Der Fluch des Veraechters.pdf",
+    )
+
+    assert author_hints == ["Stephen R. Donaldson"]
+    assert title_hints[0] == "Der Fluch des Veraechters"
+    assert "Covenant 01 - Der Fluch des Veraechters" in title_hints
+
+
+def test_parse_filename_signals_series_title_author_keeps_author_and_clean_title() -> None:
+    title_hints, author_hints = parse_filename_signals(
+        "Expanse 03 - Abaddon's Gate - James S. A. Corey.mobi",
+    )
+
+    assert author_hints[0] == "James S. A. Corey"
+    assert title_hints[0] == "Abaddon's Gate"
+    assert "Expanse 03 - Abaddon's Gate" in title_hints
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["Much Ado About Nothing - Unknown.txt", "Brave New World - Unknown.txt"],
+)
+def test_parse_filename_signals_placeholder_author_is_not_an_author(filename: str) -> None:
+    title_hints, author_hints = parse_filename_signals(filename)
+
+    assert author_hints == []
+    assert title_hints[0] == filename.rsplit(" - Unknown", 1)[0]
+
+
+def test_parse_filename_signals_un_inverts_library_sort_titles() -> None:
+    title_hints, author_hints = parse_filename_signals(
+        "Butcher of Anderson Station, The - James S. A. Corey.mobi",
+    )
+
+    assert author_hints == ["James S. A. Corey"]
+    assert "The Butcher of Anderson Station" in title_hints
+
+
+def test_parse_filename_signals_splits_co_author_lists() -> None:
+    _, author_hints = parse_filename_signals("Crown of Slaves - David Weber & Eric Flint.epub")
+
+    assert author_hints == ["David Weber", "Eric Flint"]
+
+
+def test_parse_filename_signals_no_separator_is_unaffected() -> None:
+    assert parse_filename_signals("The Hobbit.txt") == (["The Hobbit"], [])
+    assert parse_filename_signals("For Love of Mother-Not.epub") == (
+        ["For Love of Mother-Not"],
+        [],
+    )
+
+
+def test_build_identification_input_deprioritises_stem_fallback_title() -> None:
+    """Extractors with nothing to say return the raw stem as "title" (MOBI, ...); that
+    must not out-rank the parsed filename title."""
+    payload = build_identification_input(
+        source_path="/incoming/Cibola Burn (The Expanse) - James S. A. Corey.mobi",
+        original_filename="Cibola Burn (The Expanse) - James S. A. Corey.mobi",
+        extracted_metadata={"title": "Cibola Burn (The Expanse) - James S. A. Corey"},
+    )
+
+    assert payload.title_hints[0] == "Cibola Burn (The Expanse)"
+    assert payload.author_hints[0] == "James S. A. Corey"
+
+
+def test_ambiguous_filename_hints_score_like_a_committed_orientation() -> None:
+    """Both-orientation hints must not cost the right candidate any author score (#15)."""
+    ambiguous = build_identification_input(
+        source_path="/incoming/Stephen King - Pet Sematary.epub",
+        original_filename="Stephen King - Pet Sematary.epub",
+        extracted_metadata={},
+    )
+    committed = IdentificationInput(
+        title_hints=["Pet Sematary"],
+        author_hints=["Stephen King"],
+        isbns=[],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+    payload = {"title": "Pet Sematary", "author_name": ["Stephen King"]}
+    scores = []
+    for signals in (ambiguous, committed):
+        with patch(
+            "ebook_server.core.identification._provider_instances",
+            lambda: [_stub_provider_from_candidates([payload])()],
+        ):
+            scores.append(resolve_candidates(signals)[0].score)
+
+    assert scores[0] == pytest.approx(scores[1])
+    assert scores[0] == pytest.approx(0.55 + 0.3)  # full title and full author credit
 
 
 def test_build_identification_input_uses_folder_as_hint() -> None:
@@ -229,9 +379,20 @@ def test_author_name_similarity_rejects_different_people(left: str, right: str) 
 def test_author_match_score_uses_best_variant_per_hint() -> None:
     assert _author_match_score(["Iain M. Banks"], ["Iain Banks"]) == AUTHOR_VARIANT_MATCH_SCORE
     assert _author_match_score(["Andy Weir"], ["Someone Else", "Andy Weir"]) == 1.0
-    # Unmatched hints still dilute the score, as before.
-    assert _author_match_score(["Andy Weir", "The Martian"], ["Andy Weir"]) == 0.5
     assert _author_match_score([], ["Andy Weir"]) == 0.0
+
+
+def test_author_match_score_treats_hints_as_alternatives() -> None:
+    # #15: an ambiguous filename yields both halves as author hints; the title half
+    # must not halve the score of the real author.
+    assert _author_match_score(["The Martian", "Andy Weir"], ["Andy Weir"]) == 1.0
+    assert _author_match_score(["Pet Sematary", "Stephen King"], ["Stephen King"]) == 1.0
+    assert (
+        _author_match_score(["Snow Crash", "Iain M. Banks"], ["Iain Banks"])
+        == AUTHOR_VARIANT_MATCH_SCORE
+    )
+    # A shared surname alone still does not count (#67).
+    assert _author_match_score(["Dune", "Brian Herbert"], ["Frank Herbert"]) == 0.0
 
 
 def test_title_match_score_does_not_give_full_marks_to_subset_titles() -> None:
