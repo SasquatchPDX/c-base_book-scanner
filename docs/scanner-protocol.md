@@ -144,7 +144,14 @@ keyed by scan job, because the job may still be unidentified and stages are re-r
 
 ## Rescan todo flow
 
-- `POST /scan/pages/{page_id}/rescan/` creates a new RESCAN todo for the page.
+- `POST /scan/pages/{page_id}/rescan/` creates a new RESCAN todo for the page (`201`), or
+  returns the outstanding one (`200`, `created: false`): an `open` or `claimed` todo, as
+  the scanner lists both, unchanged and with its assignee, and without a second
+  `rescan_flag` line. After it is `completed` or `cancelled` a new flag creates a new
+  todo. The check runs under the job's row lock. Allowed while the job is being captured or processed, and also for
+  `captured` and `complete` jobs (D7). For a scanner job it appends a `rescan_flag` line
+  to `scan.jsonl` in the same transaction. The scanner fetches and fulfils these todos
+  through the device API (see "Rescans over the device API" below).
 - `GET /scan/jobs/{job_id}/todos/` lists todos for a specific job.
 - `GET /scan/todos/?state=...` lists or filters todos across jobs.
 - `POST /scan/todos/{todo_id}/claim/` claims a todo.
@@ -419,8 +426,6 @@ no uploaded/imported variant of its own, and every cleaned variant built by an u
 scan job. Library browse, search (both backends; such books are never in the search
 index), home, book detail, download and covers use it. A raw scan never hides a book that
 is already in the library for another reason.
-
-
 ### `scan.jsonl` event lines (`POST /api/scanner/v1/jobs/{job_id}/events`)
 
 The scanner's append-only process log (`scan.jsonl`, libreflip/sans#48, contract §4.4
@@ -494,6 +499,57 @@ a retry after an interrupted or failed write always repairs the file.
 
 The database is authoritative; the files are renderings and can be rebuilt with
 `scan_events.write_scan_jsonl(job_id)`.
+
+### Rescans over the device API (#131, contract §6.11)
+
+A member flags a page in the portal (above); the scanner lists the work, prompts the
+operator and uploads each replacement against its todo (`core/scanner_rescans.py`).
+"Open" means a RESCAN todo in state `open` or `claimed`.
+
+- `GET /api/scanner/v1/rescans`: `{"items": [{job_id, state, title, authors, isbn,
+  open_rescans, scan_started_at}]}` for every scanner job, in any state except
+  `cancelled`, with at least one open rescan. `title`, `authors` and `isbn` come from the
+  current scanner OPF (S6), else from the linked Book, else `null`.
+- `GET /api/scanner/v1/jobs/{job_id}/rescans`: `job_id`, `state`, `page_width_mm`,
+  `page_number_crop` (from the `job` event), `pages` (every page's `sequence_number` and
+  `recognized_page_number`, so the scanner can interpolate missing numbers) and `todos`
+  (`todo_id`, `sequence_number`, `reason`, `created_at`, `thumbnail_url`).
+- `GET /api/scanner/v1/jobs/{job_id}/pages/{n}/thumbnail?max=800`: a JPEG of the page's
+  active (raw) version with its longest edge at most `max`. `max` defaults to 800, is
+  capped at 1600 and rounded down to a multiple of 100 (below 100 is `400`). The answer
+  carries an `ETag` (version and size) and `Cache-Control: private, max-age=0,
+  must-revalidate`; `If-None-Match` gives `304`. Thumbnails are rendered once per version
+  and size into `scan-artifacts/thumbnails/` (`core/scan_thumbnails.py`, shared with the
+  workspace thumbnails): a JPEG is decoded at reduced scale, Pillow's decompression-bomb
+  limit is an error, and at most two renders run at once per process.
+- `POST /api/scanner/v1/jobs/{job_id}/rescans/{todo_id}/replacement`: multipart like a
+  page upload (§6.5) with `metadata` `{sha256, captured_at, camera_role,
+  recognized_page_number, page_number_verified}` and `image`. The image is streamed,
+  checked and published as for a page upload; then, in **one transaction** under the
+  job's, the todo's and the page's row locks:
+  1. a new active `ScanPageVersion` (`source = scanner`, `uploader = NULL`,
+     `page_number_verified`, `scanner_metadata.todo_id`); the previous version is kept,
+     inactive;
+  2. the todo becomes `completed`;
+  3. a `rescan_replace` line (origin `serif`, with `sequence_number`, `sha256`,
+     `version`, `todo_id`) is appended to `scan.jsonl`;
+  4. ScanTailor stages of the page are marked stale and scan-derived library artifacts
+     are invalidated (the existing replacement logic);
+  5. a `complete` job goes back to `captured` with "re-finish needed"; its library
+     variants stay until the next finish.
+
+  Answers: `201` with `{todo_id, todo_state, sequence_number, sha256, version,
+  previous_version, state}`; `200` with the same body when this checksum already
+  fulfilled the todo; `409 todo_state` for a cancelled todo (the scanner skips the page)
+  or one completed with another image; `409 job_state` for a job that takes no rescans
+  (cancelled, finalizing); `404` for an unknown todo or a todo of another job; `422
+  camera_role_parity` / `checksum_mismatch` / `invalid_image` as for a page upload. A
+  failure before the commit leaves no version and no file.
+
+`page_number_verified: false` (the scanner's OCR did not confirm the printed number and
+the operator kept the image) is shown as "Page number not verified" on the page card in
+the workspace, and reported in the page JSON (`page_number_verified`, also per version).
+
 
 ### Upgrade note: migration `0041_scanjob_string_pk`
 

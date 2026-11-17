@@ -15,7 +15,6 @@ import io
 import json
 import struct
 import zlib
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import PropertyMock
@@ -868,17 +867,20 @@ def test_jobs_without_covers_or_book_apply_nothing(key: str) -> None:
     assert not CoverImage.objects.exists()
 
 
-@pytest.fixture
-def _no_s5(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[ScanPage]]:
-    calls: list[ScanPage] = []
-    monkeypatch.setattr(scanner_uploads, "project_page_from_events", calls.append)
-    yield calls
-
-
 @pytest.mark.django_db
-def test_page_events_are_projected_after_the_page_is_created(
-    key: str, _no_s5: list[ScanPage]
-) -> None:
-    """S5 (#129) hook: a ``page`` event that arrived first is applied to the new page."""
-    assert _put_page(key, 0, _jpeg(b"hook")).status_code == 201
-    assert [page.logical_sequence_number for page in _no_s5] == [0]
+def test_page_events_are_projected_after_the_page_is_created(key: str) -> None:
+    """S5 (#129): a ``page`` event that arrived before the image wins over the upload."""
+    line = json.dumps(
+        {"type": "page", "sequence_number": 0, "recognized_page_number": "xiv", "status": "ok"}
+    )
+    response = Client().post(
+        f"/api/scanner/v1/jobs/{JOB_ID}/events",
+        data=json.dumps({"first_line_no": 1, "lines": [line]}),
+        content_type="application/json",
+        headers=_auth(key),
+    )
+    assert response.status_code == 200, response.content
+    assert _put_page(key, 0, _jpeg(b"hook"), recognized_page_number="1").status_code == 201
+    page = ScanPage.objects.get(scan_job_id=JOB_ID, logical_sequence_number=0)
+    assert page.recognized_page_number == "xiv"
+    assert page.status == "ok"

@@ -1167,6 +1167,10 @@ class ScanPageVersion(models.Model):
         default=ScanUploadSource.WEB,
     )
     original_filename = models.CharField(max_length=512, blank=True)
+    # A scanner rescan replacement's check of the printed page number (§6.11, #131):
+    # False means the scanner's OCR did not match and the operator kept the image
+    # anyway; shown next to the page in the workspace. NULL when nothing was said.
+    page_number_verified = models.BooleanField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
