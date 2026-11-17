@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -12,8 +12,8 @@ from rq import get_current_job
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import identification
-from .models import MetadataCandidate, ProcessingJob, ReviewTask, ScanJob
+from . import identification, metadata_search
+from .models import MetadataSearch, ProcessingJob, ReviewTask, ScanJob
 
 logger = structlog.get_logger(__name__)
 
@@ -35,6 +35,8 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
         "scan_job_id": details.get("scan_job_id"),
         "review_task_id": details.get("review_task_id"),
         "candidate_count": details.get("candidate_count", 0),
+        "terms": details.get("terms"),
+        "search_id": details.get("search_id"),
         "attempt_count": details.get("attempt_count", 0),
         "error": details.get("error", ""),
         "scheduled_at": job.scheduled_at.isoformat(),
@@ -43,13 +45,26 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
     }
 
 
-def _signals(scan_job: ScanJob) -> identification.IdentificationInput:
+def _provisional_terms(scan_job: ScanJob) -> dict[str, Any]:
+    return {
+        "title": scan_job.provisional_title.strip(),
+        "authors": [
+            str(author).strip()
+            for author in scan_job.provisional_authors
+            if isinstance(author, str) and author.strip()
+        ],
+    }
+
+
+def _signals(terms: dict[str, Any]) -> identification.IdentificationInput:
+    raw_title = terms.get("title")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    raw_authors = terms.get("authors")
     authors = [
         str(author).strip()
-        for author in scan_job.provisional_authors
+        for author in (raw_authors if isinstance(raw_authors, list) else [])
         if isinstance(author, str) and author.strip()
     ]
-    title = scan_job.provisional_title.strip()
     return identification.IdentificationInput(
         title_hints=[title] if title else [],
         author_hints=authors,
@@ -61,40 +76,16 @@ def _signals(scan_job: ScanJob) -> identification.IdentificationInput:
     )
 
 
-def _save_candidates(
-    scan_job: ScanJob,
-    candidates: list[identification.IdentificationCandidate],
-) -> None:
-    MetadataCandidate.objects.filter(scan_job=scan_job).delete()
-    for index, candidate in enumerate(candidates, start=1):
-        provider_ref = candidate.provider_ref or f"result-{index}"
-        MetadataCandidate.objects.create(
-            scan_job=scan_job,
-            provider_id=candidate.provider_id,
-            provider_ref=provider_ref,
-            title=candidate.title,
-            authors=candidate.authors,
-            isbn10=candidate.isbn10 or "",
-            isbn13=candidate.isbn13 or "",
-            score=Decimal(str(candidate.score)),
-            raw_payload=candidate.raw,
-            subjects=candidate.subjects,
-            language=candidate.language or "",
-            publisher=candidate.publisher or "",
-            description=candidate.description or "",
-            publication_year=candidate.publication_year,
-            state=(
-                MetadataCandidate.CandidateState.MATCH
-                if candidate.score >= identification.AUTO_ACCEPT_SCORE
-                else MetadataCandidate.CandidateState.REVIEW
-            ),
-        )
-
-
 def _create_or_refresh_review(
     scan_job: ScanJob,
     candidates: list[identification.IdentificationCandidate],
 ) -> ReviewTask:
+    """Create the scan's review task, or refresh an open one after a new search.
+
+    An existing task keeps the reviewer's saved search terms: the scan job's
+    provisional hints only seed a new task. An empty run keeps the earlier
+    candidates' snapshot, because those candidates stay current.
+    """
     task = ReviewTask.objects.filter(
         scan_job=scan_job,
         state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED],
@@ -108,26 +99,15 @@ def _create_or_refresh_review(
     prior_reviewer = task.reviewer if task is not None else None
     prior_notes = task.decision_notes if task is not None else ""
     prior_decided_at = task.decided_at if task is not None else None
-    snapshot = [
-        {
-            "provider_id": candidate.provider_id,
-            "provider_ref": candidate.provider_ref,
-            "score": candidate.score,
-        }
-        for candidate in candidates
-    ]
     values: dict[str, Any] = {
         "created_by": scan_job.operator,
         "uploader": scan_job.operator,
         "source_filename": f"physical scan {scan_job.id}",
         "source_path_hint": f"scan-job:{scan_job.id}",
-        "inferred_title": scan_job.provisional_title,
-        "inferred_authors": scan_job.provisional_authors,
         "embedded_metadata": {
             "scanner_id": scan_job.scanner_id,
             "expected_page_count": scan_job.expected_page_count,
         },
-        "provider_snapshot": snapshot,
         "state": ReviewTask.State.OPEN,
         "decision": (
             ReviewTask.Decision.SEARCH_AGAIN if is_repeat_search else ReviewTask.Decision.UNRESOLVED
@@ -142,8 +122,15 @@ def _create_or_refresh_review(
         "decision_notes": prior_notes if is_repeat_search else "",
         "decided_at": prior_decided_at if is_repeat_search else None,
     }
+    if candidates or task is None:
+        values["provider_snapshot"] = metadata_search.snapshot(candidates)
     if task is None:
-        return ReviewTask.objects.create(scan_job=scan_job, **values)
+        return ReviewTask.objects.create(
+            scan_job=scan_job,
+            inferred_title=scan_job.provisional_title,
+            inferred_authors=scan_job.provisional_authors,
+            **values,
+        )
     for field, value in values.items():
         setattr(task, field, value)
     task.save()
@@ -154,19 +141,27 @@ def request_scan_identification(
     *,
     scan_job: ScanJob,
     requested_by_user_id: int | None,
+    terms: dict[str, Any] | None = None,
 ) -> ProcessingJob:
-    """Persist and dispatch metadata lookup outside the request process."""
+    """Persist and dispatch metadata lookup outside the request process.
+
+    ``terms`` defaults to the scan job's provisional hints. An already queued
+    search takes new terms; a running one with different terms raises
+    :class:`metadata_search.SearchInProgressError`; a stale one is replaced.
+    """
     if scan_job.book_id is not None:
         raise ScanIdentificationError("scan job is already linked to a book")
     if scan_job.state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
         raise ScanIdentificationError("scan job is not open for identification")
-    if not scan_job.provisional_title.strip() and not scan_job.provisional_authors:
-        raise ScanIdentificationError("a provisional title or author is required")
 
     with transaction.atomic():
         locked = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
+        search_terms = terms if terms is not None else _provisional_terms(locked)
+        if not search_terms.get("title") and not search_terms.get("authors"):
+            raise ScanIdentificationError("a provisional title or author is required")
         active = (
-            ProcessingJob.objects.filter(
+            ProcessingJob.objects.select_for_update()
+            .filter(
                 job_type=ProcessingJob.JobType.SCAN_IDENTIFICATION,
                 state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING],
                 details__scan_job_id=str(locked.id),
@@ -174,13 +169,15 @@ def request_scan_identification(
             .order_by("-scheduled_at")
             .first()
         )
-        if active is not None:
-            return active
+        reused = metadata_search.reuse_or_replace_active_job(active, search_terms)
+        if reused is not None:
+            return reused
         processing_job = ProcessingJob.objects.create(
             job_type=ProcessingJob.JobType.SCAN_IDENTIFICATION,
             details={
                 "scan_job_id": str(locked.id),
                 "requested_by_user_id": requested_by_user_id,
+                "terms": search_terms,
                 "attempt_count": 0,
                 "candidate_count": 0,
                 "error": "",
@@ -238,13 +235,33 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         processing_job.details = details
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
+    scan_job: ScanJob | None = None
+    signals: identification.IdentificationInput | None = None
+    outcomes: list[identification.ProviderOutcome] | None = None
+    search_started_at = timezone.now()
     try:
         scan_job = ScanJob.objects.select_related("operator").get(pk=details["scan_job_id"])
         if scan_job.book_id is not None:
             raise ScanIdentificationError("scan job is already linked to a book")
-        candidates = identification.resolve_candidates(_signals(scan_job))
+        terms = details.get("terms")
+        signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
+        candidates, outcomes = identification.resolve_candidates_with_report(signals)
         with transaction.atomic():
-            _save_candidates(scan_job, candidates)
+            search = metadata_search.record_search(
+                trigger=MetadataSearch.Trigger.SCAN,
+                signals=signals,
+                outcomes=outcomes,
+                candidate_count=len(candidates),
+                scan_job=scan_job,
+                processing_job_id=processing_job.job_id,
+                requested_by_id=details.get("requested_by_user_id"),
+                started_at=search_started_at,
+            )
+            metadata_search.save_candidates(
+                search=search,
+                candidates=candidates,
+                match_threshold=identification.AUTO_ACCEPT_SCORE,
+            )
             task = _create_or_refresh_review(scan_job, candidates)
             processing_job.state = ProcessingJob.JobState.SUCCESS
             processing_job.finished_at = timezone.now()
@@ -252,6 +269,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 **details,
                 "candidate_count": len(candidates),
                 "review_task_id": task.id,
+                "search_id": str(search.id),
                 "error": "",
             }
             processing_job.save(update_fields=["state", "finished_at", "details"])
@@ -273,6 +291,16 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         processing_job.finished_at = None if retry_pending else timezone.now()
         processing_job.details = {**details, "error": str(exc)}
         processing_job.save(update_fields=["state", "finished_at", "details"])
+        if signals is not None and scan_job is not None:
+            _record_failed_search(
+                scan_job=scan_job,
+                signals=signals,
+                outcomes=outcomes,
+                processing_job=processing_job,
+                requested_by_id=details.get("requested_by_user_id"),
+                started_at=search_started_at,
+                exc=exc,
+            )
         logger.exception(
             "scan_identification_failed",
             processing_job_id=str(processing_job.job_id),
@@ -282,3 +310,32 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         )
         if raise_on_error:
             raise
+
+
+def _record_failed_search(
+    *,
+    scan_job: ScanJob,
+    signals: identification.IdentificationInput,
+    outcomes: list[identification.ProviderOutcome] | None,
+    processing_job: ProcessingJob,
+    requested_by_id: int | None,
+    started_at: datetime,
+    exc: Exception,
+) -> None:
+    stage = "saving the results failed" if outcomes is not None else "the search failed"
+    try:
+        metadata_search.record_search(
+            trigger=MetadataSearch.Trigger.SCAN,
+            signals=signals,
+            outcomes=outcomes,
+            scan_job=scan_job,
+            processing_job_id=processing_job.job_id,
+            requested_by_id=requested_by_id,
+            started_at=started_at,
+            error=f"{stage}: {type(exc).__name__}",
+        )
+    except Exception:  # never mask the original failure
+        logger.exception(
+            "scan_identification_failure_not_recorded",
+            processing_job_id=str(processing_job.job_id),
+        )

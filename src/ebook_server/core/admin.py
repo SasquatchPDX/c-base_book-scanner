@@ -15,6 +15,7 @@ from .models import (
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ProcessingJob,
     ReviewTask,
     ScanJob,
@@ -186,9 +187,24 @@ class MetadataCandidateAdmin(admin.ModelAdmin[MetadataCandidate]):
         "title",
         "score",
         "state",
+        "superseded_at",
         "created_at",
     )
     list_filter = ("provider_id", "state")
+
+
+@admin.register(MetadataSearch)
+class MetadataSearchAdmin(admin.ModelAdmin[MetadataSearch]):
+    list_display = (
+        "import_job",
+        "scan_job",
+        "trigger",
+        "state",
+        "candidate_count",
+        "requested_by",
+        "finished_at",
+    )
+    list_filter = ("trigger", "state")
 
 
 @admin.register(ReviewTask)

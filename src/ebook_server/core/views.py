@@ -18,6 +18,7 @@ import redis
 import structlog
 from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
+from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
@@ -56,6 +57,7 @@ from . import (
     book_deletion,
     conversion,
     intake,
+    metadata_search,
     ocr,
     review_identification,
     scan_identification,
@@ -1066,13 +1068,53 @@ def _review_owner_id(task: ReviewTask) -> int | None:
 
 
 def _review_candidates(task: ReviewTask) -> Any:
-    import_job = task.import_job
-    if import_job is not None:
-        return import_job.metadata_candidates.order_by("-score")
-    scan_job = task.scan_job
-    if scan_job is not None:
-        return scan_job.metadata_candidates.order_by("-score")
-    return MetadataCandidate.objects.none()
+    """Current candidates only; superseded runs are history, not acceptable choices."""
+    return metadata_search.current_candidates(task)
+
+
+def _review_search_context(task: ReviewTask) -> dict[str, Any]:
+    """Recorded search runs plus the live/failed state of the latest search job."""
+    searches = metadata_search.searches_for_task(task)
+    active_job = metadata_search.active_search_job(task)
+    latest_job = metadata_search.latest_search_job(task)
+    latest_search = searches[0] if searches else None
+    current_ids = set(_review_candidates(task).values_list("id", flat=True))
+    # A failed job that recorded no run (dispatch failure, stale worker) must still
+    # be visible; one that did record a run is shown through that run.
+    failed_job = None
+    if (
+        active_job is None
+        and latest_job is not None
+        and latest_job.state != ProcessingJob.JobState.SUCCESS
+        and not any(search.processing_job_id == latest_job.job_id for search in searches)
+    ):
+        failed_job = latest_job
+    stale_job = (
+        latest_job is not None
+        and active_job is None
+        and latest_job.state in (metadata_search.ACTIVE_JOB_STATES)
+    )
+    return {
+        "searches": searches,
+        "latest_search": latest_search,
+        "earlier_searches": searches[1:],
+        "active_search_job": active_job,
+        "search_running": (
+            active_job is not None and active_job.state == ProcessingJob.JobState.RUNNING
+        ),
+        "failed_search_job": failed_job,
+        "failed_search_error": (
+            "the search did not finish (worker stopped or queue entry lost)"
+            if stale_job
+            else str((failed_job.details or {}).get("error") or "")
+            if failed_job is not None
+            else ""
+        ),
+        "latest_search_has_current_candidates": (
+            latest_search is not None
+            and any(candidate.id in current_ids for candidate in latest_search.candidates.all())
+        ),
+    }
 
 
 def _serialize_task(task: ReviewTask) -> dict[str, Any]:
@@ -3520,6 +3562,18 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    search_context = _review_search_context(task)
+    active_job = search_context["active_search_job"]
+    payload["searches"] = [
+        metadata_search.serialize_search(search) for search in search_context["searches"]
+    ]
+    payload["search_in_progress"] = active_job is not None
+    payload["active_search_job"] = (
+        {"job_id": str(active_job.job_id), "state": active_job.state}
+        if active_job is not None
+        else None
+    )
+    payload["failed_search_error"] = search_context["failed_search_error"]
     if _wants_html(request):
         return render(
             request,
@@ -3530,6 +3584,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "auto_accept_block": auto_accept_block,
                 "candidates": _review_candidates(task),
                 "books": Book.objects.order_by("title")[:250],
+                **search_context,
             },
         )
     return JsonResponse(payload)
@@ -3563,6 +3618,10 @@ def review_accept_candidate(
         return HttpResponseBadRequest("candidate not found")
     if candidate.import_job_id != task.import_job_id or candidate.scan_job_id != task.scan_job_id:
         return HttpResponseBadRequest("candidate not found")
+    if candidate.superseded_at is not None:
+        return HttpResponseBadRequest(
+            "candidate is from an earlier search; accept one of the current candidates"
+        )
 
     try:
         candidate_isbn13 = candidate.isbn13 or None
@@ -3715,12 +3774,27 @@ def review_mark_unidentified(
     return _review_action_response(request, {"task_id": str(task.id), "state": task.state})
 
 
+def _save_review_terms(task: ReviewTask, terms: dict[str, Any]) -> None:
+    """Store reviewer terms on the task and, for scans, as the scan's hints.
+
+    The task's terms are the reviewer's saved search terms; later automatic scan
+    identifications use the scan job's hints, so both are kept in step.
+    """
+    metadata_search.apply_terms(task, terms)
+    scan_job = task.scan_job if task.scan_job_id is not None else None
+    if scan_job is not None:
+        scan_job.provisional_title = task.inferred_title
+        scan_job.provisional_authors = task.inferred_authors
+        scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
+
+
 @require_POST
 @login_required
 def review_search_again(
     request: HttpRequest,
     task_id: str,
 ) -> HttpResponseBase:
+    """Save the posted search terms (if any) and queue a provider search with them."""
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -3734,18 +3808,24 @@ def review_search_again(
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
 
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
+    terms = metadata_search.task_terms(task)
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
     task.decision_notes = str(payload.get("notes", ""))
     task.decided_at = timezone.now()
-    task.decision_payload = {"search_again": True}
+    task.decision_payload = {"search_again": True, "terms": terms}
     task.save(
         update_fields=[
             "state",
             "decision",
             "decision_notes",
             "decision_payload",
+            "inferred_title",
+            "inferred_authors",
             "reviewer_id",
             "decided_at",
             "updated_at",
@@ -3756,34 +3836,40 @@ def review_search_again(
             scan_job = task.scan_job
             if scan_job is None:
                 raise scan_identification.ScanIdentificationError("scan job is unavailable")
-            scan_job.provisional_title = task.inferred_title
-            scan_job.provisional_authors = task.inferred_authors
-            scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
             processing_job = scan_identification.request_scan_identification(
                 scan_job=scan_job,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = scan_identification.job_payload(processing_job)
-            status_route = "scan-identification-job-status"
         else:
             processing_job = review_identification.request_review_identification(
                 review_task=task,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = review_identification.job_payload(processing_job)
-            status_route = "review-identification-job-status"
+    except metadata_search.SearchInProgressError as exc:
+        task.state = ReviewTask.State.OPEN
+        task.save(update_fields=["state", "updated_at"])
+        if _wants_html(request):
+            messages.warning(request, f"Search terms saved, but {exc}.")
+            return redirect("review-detail", task_id=task.id)
+        return JsonResponse({"task_id": str(task.id), "error": str(exc)}, status=409)
     except (
         review_identification.ReviewIdentificationError,
         scan_identification.ScanIdentificationError,
     ) as exc:
         task.state = ReviewTask.State.OPEN
         task.save(update_fields=["state", "updated_at"])
+        if _wants_html(request):
+            messages.error(request, f"The search could not be started: {exc}")
+            return redirect("review-detail", task_id=task.id)
         return HttpResponseBadRequest(str(exc))
 
     if _wants_html(request):
-        if processing_job.state == ProcessingJob.JobState.SUCCESS:
-            return redirect("review-detail", task_id=task.id)
-        return redirect(status_route, job_id=processing_job.job_id)
+        # The review page shows the search while it runs and its outcome afterwards.
+        return redirect("review-detail", task_id=task.id)
     return JsonResponse(
         {
             "task_id": str(task.id),
@@ -3845,19 +3931,9 @@ def review_edit_search_terms(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    inferred_title = payload.get("inferred_title")
-    if isinstance(inferred_title, str) and inferred_title.strip():
-        task.inferred_title = inferred_title.strip()
-
-    raw_inferred_authors = payload.get("inferred_authors")
-    if isinstance(raw_inferred_authors, str):
-        task.inferred_authors = [
-            author.strip() for author in raw_inferred_authors.split(",") if author.strip()
-        ]
-    elif isinstance(raw_inferred_authors, list):
-        task.inferred_authors = [
-            str(author).strip() for author in raw_inferred_authors if str(author).strip()
-        ]
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
 
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS

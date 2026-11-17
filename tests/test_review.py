@@ -343,7 +343,7 @@ def test_search_again_requeries_archived_import_and_replaces_candidates(
     assert payload["identification_job"]["candidate_count"] == 1
     task.refresh_from_db()
     import_job.refresh_from_db()
-    candidate = MetadataCandidate.objects.get(import_job=import_job)
+    candidate = MetadataCandidate.objects.get(import_job=import_job, superseded_at__isnull=True)
     assert candidate.id != old_candidate_id
     assert candidate.title == "Better Candidate"
     assert task.state == ReviewTask.State.OPEN
