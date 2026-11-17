@@ -33,6 +33,7 @@ from ebook_server.core.identification import (
     EVIDENCE_FILENAME,
     EVIDENCE_LAYOUT,
     PATH_LAYOUT_EVIDENCE_KEY,
+    STRONG_MATCH_EVIDENCE_KEY,
     AuthorEvidence,
     IdentificationCandidate,
     IdentificationInput,
@@ -42,6 +43,7 @@ from ebook_server.core.identification import (
     is_edition_phrase,
     missing_coauthors,
     parse_filename_signals,
+    resolve_candidates,
     same_book,
     strongest_title_evidence,
 )
@@ -397,13 +399,17 @@ def test_edition_filename_upload_creates_book_with_correct_title_and_author(
     author: str,
 ) -> None:
     queries = _catalogue_provider(monkeypatch, [(title, [author])])
-    # Title + author alone score 0.85; accept at that score so a Book is created.
-    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.85)
 
     job = _upload(tmp_path, monkeypatch, filename, _blank_pdf_bytes(), "application/pdf")
 
     assert queries[0] == title
     assert author not in queries
+    # Title + author alone score 0.85; the #9 rule promotes the exact match.
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is True
+    assert rule["title_hint"] == title
+    assert rule["author_hint"] == author
     assert job.state == ImportJob.State.COMPLETE
     assert job.book is not None
     assert job.book.title == title
@@ -432,8 +438,13 @@ def test_good_omens_provider_missing_a_coauthor_is_not_auto_accepted(
     )
 
     candidate = MetadataCandidate.objects.get(import_job=job)
-    # Title 0.55 + half of the author weight: only one of two coauthors is covered.
+    # Title 0.55 + half of the author weight: only one of two coauthors is covered,
+    # and the #9 strong-match rule refuses to promote a candidate missing a coauthor.
     assert float(candidate.score) == pytest.approx(0.70)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert "missing_coauthor" in rule["blocked_by"]
+    assert rule["missing_coauthors"] == ["Neil Gaiman"]
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
@@ -446,7 +457,6 @@ def test_good_omens_provider_naming_both_coauthors_gets_full_author_credit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _catalogue_provider(monkeypatch, [("Good Omens", ["Neil Gaiman", "Terry Pratchett"])])
-    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.85)
 
     job = _upload(
         tmp_path,
@@ -456,6 +466,11 @@ def test_good_omens_provider_naming_both_coauthors_gets_full_author_credit(
         "application/epub+zip",
     )
 
+    # Exact title + every coauthor covered: the #9 rule promotes 0.85 to auto-accept.
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is True
+    assert rule["base_score"] == pytest.approx(0.85)
     assert job.state == ImportJob.State.COMPLETE
     assert job.book is not None
     assert job.book.title == "Good Omens"
@@ -480,7 +495,108 @@ def test_embedded_title_contradicting_filename_title_is_not_imported_as_filename
 
     candidate = MetadataCandidate.objects.get(import_job=job)
     assert candidate.title == "Dune"
+    # "Dune" only matches the filename guess; the embedded title disagrees, so the
+    # #9 strong-match rule must not promote the 0.85 title + author score.
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert "stronger_title_evidence_disagrees" in rule["blocked_by"]
+    assert rule["title_source"] == "filename"
+    assert rule["strongest_title_source"] == "embedded"
+    assert float(candidate.score) == pytest.approx(0.85)
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.get(import_job=job).inferred_title == "The Dragon in the Sea"
+
+
+# --- unit: the #9 strong-match rule on typed evidence -----------------------------------
+
+
+def _rule(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    filename: str,
+    metadata: dict[str, Any],
+    candidate: tuple[str, list[str]],
+) -> dict[str, Any]:
+    _catalogue_provider(monkeypatch, [candidate], any_title=True)
+    signals = build_identification_input(
+        source_path=f"/incoming/{filename}",
+        original_filename=filename,
+        extracted_metadata=metadata,
+    )
+    top = resolve_candidates(signals)[0]
+    rule: dict[str, Any] = top.raw[STRONG_MATCH_EVIDENCE_KEY]
+    return rule
+
+
+def test_rule_promotes_when_embedded_title_is_a_subtitle_form_of_the_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Snow Crash - Neal Stephenson.epub",
+        metadata={"title": "Snow Crash: A Novel", "authors": ["Neal Stephenson"]},
+        candidate=("Snow Crash", ["Neal Stephenson"]),
+    )
+
+    assert rule["applied"] is True
+    assert rule["title_source"] == "filename"
+    assert rule["strongest_title_source"] == "embedded"
+
+
+def test_rule_blocks_filename_title_contradicted_by_embedded_title(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Dune - Frank Herbert.epub",
+        metadata={"title": "The Dragon in the Sea", "authors": ["Frank Herbert"]},
+        candidate=("Dune", ["Frank Herbert"]),
+    )
+
+    assert rule["applied"] is False
+    assert rule["blocked_by"] == ["stronger_title_evidence_disagrees"]
+
+
+def test_rule_blocks_candidate_missing_an_embedded_coauthor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Good Omens - Terry Pratchett.epub",
+        metadata={"title": "Good Omens", "authors": ["Terry Pratchett", "Neil Gaiman"]},
+        candidate=("Good Omens", ["Terry Pratchett"]),
+    )
+
+    assert rule["applied"] is False
+    assert "missing_coauthor" in rule["blocked_by"]
+    assert rule["author_score"] == pytest.approx(0.5)
+
+
+def test_rule_blocks_candidate_contradicting_embedded_author(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81's first review probe: filename "Dune - Frank Herbert", embedded Brian Herbert.
+    rule = _rule(
+        monkeypatch,
+        filename="Dune - Frank Herbert.txt",
+        metadata={"title": "Dune", "authors": ["Brian Herbert"]},
+        candidate=("Dune", ["Frank Herbert"]),
+    )
+
+    assert rule["applied"] is False
+    assert "author_evidence_conflict" in rule["blocked_by"]
+
+
+def test_rule_still_promotes_filename_only_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    rule = _rule(
+        monkeypatch,
+        filename="Stephen King - Pet Sematary.txt",
+        metadata={"title": "Stephen King - Pet Sematary"},  # extractor stem fallback
+        candidate=("Pet Sematary", ["Stephen King"]),
+    )
+
+    assert rule["applied"] is True
+    assert rule["title_hint"] == "Pet Sematary"
+    assert rule["author_hint"] == "Stephen King"

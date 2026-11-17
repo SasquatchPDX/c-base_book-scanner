@@ -1709,24 +1709,39 @@ def _strong_match_assessment(
 ) -> dict[str, Any]:
     """Check one candidate against the exact-title + strong-author rule.
 
-    The author side reuses ``_author_match_score`` per author hint, so improvements to
-    author-name matching apply here too. Scoring each hint on its own avoids the
-    dilution a filename split causes ("Author - Title" yields both halves as author
-    hints), while the matched title and author must come from different hints.
+    The author side uses the typed author evidence (``author_evidence_score``):
+    filename guesses are alternatives, so the dilution a filename split causes
+    ("Author - Title" yields both halves as author hints) costs nothing, while
+    embedded/layout coauthors must all be covered. A candidate that omits a genuine
+    coauthor, or matches none of an explicit author list, is never promoted. The
+    matched title and author must come from different hints, and the matched title
+    must not be contradicted by stronger title evidence (an embedded title beats a
+    filename guess).
     """
     title_score, title_hint = max(
         ((_title_match_score(hint, candidate.title), hint) for hint in signals.title_hints),
         default=(0.0, ""),
     )
-    author_score, author_hint = max(
-        ((_author_match_score([hint], candidate.authors), hint) for hint in signals.author_hints),
-        default=(0.0, ""),
+    author_names = [name for group in signals.author_groups() for name in group.names]
+    author_hint = max(
+        author_names,
+        key=lambda name: _author_match_score([name], candidate.authors),
+        default="",
     )
+    author_score = author_evidence_score(signals, candidate.authors)
+    missing = missing_coauthors(signals, candidate.authors)
+    title_source, strongest_source, title_agrees = _title_provenance(signals, title_hint, candidate)
     blocked_by: list[str] = []
     if title_score < config.min_title_score:
         blocked_by.append("title_not_exact")
+    if not title_agrees:
+        blocked_by.append("stronger_title_evidence_disagrees")
     if author_score < config.min_author_score:
         blocked_by.append("author_not_strong")
+    if missing:
+        blocked_by.append("missing_coauthor")
+    if _explicit_authors_unmatched(signals, candidate.authors):
+        blocked_by.append("author_evidence_conflict")
     if title_hint and default_process(title_hint) == default_process(author_hint):
         blocked_by.append("title_and_author_from_same_hint")
 
@@ -1754,10 +1769,61 @@ def _strong_match_assessment(
     return {
         "title_score": round(title_score, 4),
         "title_hint": title_hint,
+        "title_source": title_source,
+        "strongest_title_source": strongest_source,
         "author_score": round(author_score, 4),
         "author_hint": author_hint,
+        "missing_coauthors": missing,
         "blocked_by": blocked_by,
     }
+
+
+def _title_forms(title: str) -> list[str]:
+    """A title plus its cheap variants and its " - " segments, for agreement checks."""
+    forms = _title_variants(title)
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(title) if s.strip()]
+    return list(dict.fromkeys([*forms, *(s for s in segments if len(segments) > 1)]))
+
+
+def _title_provenance(
+    signals: IdentificationInput,
+    title_hint: str,
+    candidate: IdentificationCandidate,
+) -> tuple[str, str, bool]:
+    """Source of the matched title hint, the strongest title source, and whether they agree.
+
+    The matched hint may promote only when it is the strongest title evidence, or when
+    the strongest evidence names the candidate's title too (same title, a subtitle
+    variant, or a " - " segment of it). "Dune - Frank Herbert.epub" whose embedded
+    title is "The Dragon in the Sea" does not agree with a Dune candidate.
+    """
+    titles = signals.title_sources()
+    source = next((t.source for t in titles if t.title == title_hint), EVIDENCE_UNKNOWN)
+    strongest = strongest_title_evidence(signals)
+    if not strongest:
+        return source, source, True
+    strongest_source = strongest[0].source
+    if EVIDENCE_RANK.get(source, 0) >= EVIDENCE_RANK.get(strongest_source, 0):
+        return source, strongest_source, True
+    agrees = any(
+        _title_match_score(form, candidate.title) >= SAME_BOOK_TITLE_MIN_SCORE
+        for evidence in strongest
+        for form in _title_forms(evidence.title)
+    )
+    return source, strongest_source, agrees
+
+
+def _explicit_authors_unmatched(signals: IdentificationInput, candidate_authors: list[str]) -> bool:
+    """True when an explicit (coauthor) author list names nobody the candidate names.
+
+    Same test as the intake author-conflict guard (#92, ``authors_conflict``), applied
+    to embedded and folder-layout author lists before a score is promoted.
+    """
+    named = [a for a in candidate_authors if not is_placeholder_author(a)]
+    return any(
+        group.kind == AUTHORS_COAUTHORS and authors_conflict(named, list(group.names))
+        for group in signals.author_groups()
+    )
 
 
 def _apply_strong_match_rule(
@@ -1805,6 +1871,9 @@ def _apply_strong_match_rule(
         "title_hint": assessment["title_hint"],
         "author_score": assessment["author_score"],
         "author_hint": assessment["author_hint"],
+        "title_source": assessment["title_source"],
+        "strongest_title_source": assessment["strongest_title_source"],
+        "missing_coauthors": assessment["missing_coauthors"],
     }
     if applied:
         logger.info(

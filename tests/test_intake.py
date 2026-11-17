@@ -280,14 +280,6 @@ def test_exact_title_and_author_without_isbn_auto_accepts_with_evidence(
         # Placeholder authors on both sides agree, so the rule promotes the candidate,
         # but the provider record names nobody real (#42 / #92 guard).
         ("unknown.epub", "Unknown", ["Unknown"], intake.BLOCK_NO_PROVIDER_AUTHORS),
-        # The filename's author matches the provider strongly enough for the rule, but
-        # the file's embedded author is someone else.
-        (
-            "John Roe - Borderline Match.epub",
-            "Jane Doe",
-            ["John Roe"],
-            intake.BLOCK_AUTHOR_CONFLICT,
-        ),
     ],
 )
 def test_strong_match_promotion_still_goes_through_author_guard(
@@ -329,6 +321,48 @@ def test_strong_match_promotion_still_goes_through_author_guard(
     assert float(candidate.score) == pytest.approx(0.86)
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == blocked_reason
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_strong_match_rule_does_not_promote_against_embedded_author(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The filename's author matches the provider, but the file's embedded author is
+    # someone else: the rule itself refuses to promote, so the candidate stays at its
+    # plain score and the import goes to review.
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=["John Roe"],
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("strong-match-conflict-user")
+    client = Client()
+    client.force_login(profile.user)
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "conflict.epub"
+    _build_epub(epub_path, "Borderline Match", creator="Jane Doe")
+    response = client.post(
+        "/imports/upload/",
+        {"file": SimpleUploadedFile("John Roe - Borderline Match.epub", epub_path.read_bytes())},
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    evidence = candidate.raw_payload["_auto_accept_rule"]
+    assert evidence["applied"] is False
+    assert "author_evidence_conflict" in evidence["blocked_by"]
+    assert float(candidate.score) < 0.86
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.filter(import_job=job).exists()

@@ -42,12 +42,21 @@ if **all** of the following hold:
   `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE` (default 1.0, i.e. the same
   words after case/punctuation normalization). Subset titles ("Foundation" vs
   "Foundation and Earth") do not qualify.
-- **Strong author:** some author hint scores at least
-  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR` (default 0.9) against the
-  candidate's authors under the normal author-score function. Each hint is scored on
-  its own, because an "Author - Title" filename puts both halves into the author
-  hints. The title and author must come from different hints. Improvements to
-  author-name matching (such as name variants) apply to this rule automatically.
+- **Strongest title evidence agrees:** the matched title hint must come from the
+  strongest title source present (embedded > sidecar > header > folder layout >
+  filename), or that stronger evidence must name the candidate's title too (same
+  title, a "Title: Subtitle" form, or a " - " segment of it). An EPUB embedding "The
+  Dragon in the Sea" uploaded as "Dune - Frank Herbert.epub" is not promoted to a Dune
+  candidate (`stronger_title_evidence_disagrees`).
+- **Strong author:** the typed author score (see above) is at least
+  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR` (default 0.9). Filename
+  guesses are alternatives, so an "Author - Title" filename costs nothing, but
+  embedded/layout coauthors must all be covered: a candidate that omits a genuine
+  coauthor (`missing_coauthor`, e.g. Good Omens credited to Terry Pratchett alone) or
+  names nobody from an explicit author list (`author_evidence_conflict`, the #92
+  guard's test) is not promoted. The title and author must come from different
+  hints. Improvements to author-name matching (such as name variants) apply to this
+  rule automatically.
 - **No conflicting signal:** if the file has an ISBN, the candidate must carry an
   ISBN and one must match (otherwise `conflicting_isbn` / `file_isbn_unconfirmed`).
   If the file has a language, it must be among the candidate's languages, after
@@ -66,7 +75,8 @@ if **all** of the following hold:
 off. Whenever the rule is evaluated, the decision is stored on the top candidate's
 `raw_payload` under `_auto_accept_rule`. The record lists `rule`, `applied`,
 `blocked_by` (the failed conditions), `base_score`, `runner_up_score`, the title and
-author scores, and the hints that matched, so reviewers and audits can see why a
+author scores, the hints that matched, `title_source` / `strongest_title_source` and
+`missing_coauthors`, so reviewers and audits can see why a
 candidate was or was not auto-accepted. The rule runs inside `resolve_candidates`,
 so it applies equally to upload/incoming/network intake, review re-searches and
 scan-job identification.
