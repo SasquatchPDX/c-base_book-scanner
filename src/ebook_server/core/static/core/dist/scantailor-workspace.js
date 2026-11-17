@@ -1,17 +1,17 @@
-//#region \0rolldown/runtime.js
-var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescriptor, r = Object.getOwnPropertyNames, i = Object.getPrototypeOf, a = Object.prototype.hasOwnProperty, o = (e, t) => () => (t || (e((t = { exports: {} }).exports, t), e = null), t.exports), s = (e, i, o, s) => {
+// \0rolldown/runtime.js
+var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescriptor, r = Object.getOwnPropertyNames, i = Object.getPrototypeOf, a = Object.prototype.hasOwnProperty, o = (e, t) => () => (t || (e((t = { exports: {} }).exports, t, t.exports), e = null), t.exports), s = (e, i, o, s) => {
 	if (i && typeof i == "object" || typeof i == "function") for (var c = r(i), l = 0, u = c.length, d; l < u; l++) d = c[l], !a.call(e, d) && d !== o && t(e, d, {
 		get: ((e) => i[e]).bind(null, d),
 		enumerable: !(s = n(i, d)) || s.enumerable
 	});
 	return e;
-}, c = /* @__PURE__ */ ((n, r, o) => (o = n == null ? {} : e(i(n)), s(r || !n || !n.__esModule || !a.call(n, "default") ? t(o, "default", {
+}, c = /* @__PURE__ */ ((n, r, a) => (a = n == null ? {} : e(i(n)), s(t(a, "default", {
 	value: n,
 	enumerable: !0
-}) : o, n)))((/* @__PURE__ */ o(((e, t) => {
+}), n)))((/* @__PURE__ */ o(((e, t, n) => {
 	(function(n, r) {
 		typeof e == "object" && t !== void 0 ? t.exports = r() : typeof define == "function" && define.amd ? define(r) : (n = typeof globalThis < "u" ? globalThis : n || self).interact = r();
-	})(e, (function() {
+	})(n, (function() {
 		function e(e, t) {
 			var n = Object.keys(e);
 			if (Object.getOwnPropertySymbols) {
@@ -122,11 +122,11 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				if (typeof e != "object" || !e) return e;
 				var n = e[Symbol.toPrimitive];
 				if (n !== void 0) {
-					var r = n.call(e, t || "default");
+					var r = n.call(e, t);
 					if (typeof r != "object") return r;
 					throw TypeError("@@toPrimitive must return a primitive value.");
 				}
-				return (t === "string" ? String : Number)(e);
+				return String(e);
 			}(e, "string");
 			return typeof t == "symbol" ? t : t + "";
 		}
@@ -3819,7 +3819,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				},
 				"interactions:update-pointer": function(e) {
 					var t = e.down, n = e.pointerInfo;
-					!t && n.hold || (n.hold = {
+					(t || !n.hold) && (n.hold = {
 						duration: 1 / 0,
 						timeout: null
 					});
@@ -4827,7 +4827,6 @@ function k(e) {
 }
 var A = document.querySelector("[data-scantailor-workspace]");
 A && k(A);
-//#endregion
 export { l as STAGE_ORDER, f as clamp, m as displayBoxToSource, h as editableParameters, k as initializeScanTailorWorkspace, v as normalizeBox, _ as previewErrorMessage, g as previousStageName, p as sourceBoxToDisplay };
 
 //# sourceMappingURL=scantailor-workspace.js.map
