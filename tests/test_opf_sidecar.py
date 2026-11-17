@@ -458,7 +458,7 @@ def test_apply_sidecar_metadata_uses_title_source_not_filename_comparison(
 
     assert merged[intake.SIDECAR_EVIDENCE_KEY]["conflicts"] == expected_conflicts
     assert merged["title"] == expected_title
-    assert ("isbn" in merged) is not expected_conflicts
+    assert ("isbn" in merged) is (not expected_conflicts)
 
 
 GENERATED_OPF = CALIBRE_OPF.replace(

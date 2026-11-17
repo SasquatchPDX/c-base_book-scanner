@@ -12,12 +12,14 @@ from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import redis
 import structlog
 from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
+from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
@@ -55,7 +57,9 @@ from ebook_server.storage import (
 from . import (
     book_deletion,
     conversion,
+    genres,
     intake,
+    metadata_search,
     ocr,
     review_identification,
     scan_identification,
@@ -69,9 +73,11 @@ from .models import (
     Book,
     CoverImage,
     FileVariant,
+    Genre,
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ProcessingJob,
     ReviewTask,
     ScanJob,
@@ -82,6 +88,7 @@ from .models import (
     StorageLocation,
     clean_publication_year,
 )
+from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
@@ -237,6 +244,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
         "invalidated_reason": state.invalidated_reason,
+        "auto_skipped": scantailor.is_auto_skipped_split(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -254,6 +262,7 @@ def _serialize_scan_job(
         "id": str(job.id),
         "state": job.state,
         "scanner_id": job.scanner_id,
+        "capture_layout": job.capture_layout,
         "provisional_title": job.provisional_title,
         "provisional_authors": job.provisional_authors,
         "expected_page_count": job.expected_page_count,
@@ -285,6 +294,30 @@ _SCAN_SIDE_ALIASES: Final[dict[str, str]] = {
     "right": ScanPage.Side.RIGHT,
     "r": ScanPage.Side.RIGHT,
 }
+
+
+_CAPTURE_LAYOUT_ALIASES: Final[dict[str, str]] = {
+    "single_page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single-page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "spread": ScanJob.CaptureLayout.SPREAD,
+    "spreads": ScanJob.CaptureLayout.SPREAD,
+}
+
+
+def _resolve_capture_layout(raw: Any, scanner_id: str) -> str | None:
+    """Capture layout for a new scan job; ``None`` for an unrecognised value (#55).
+
+    An explicit ``capture_layout`` wins. Otherwise a scanner listed in
+    ``BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS`` gets ``spread`` and everything else the
+    configured default (``single_page``: one page per image). Page ``side`` values do
+    not imply spreads: a two-camera rig sends left and right as separate images.
+    """
+    if raw is not None and str(raw).strip():
+        return _CAPTURE_LAYOUT_ALIASES.get(str(raw).strip().lower())
+    if scanner_id and scanner_id in django_settings.BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS:
+        return str(ScanJob.CaptureLayout.SPREAD)
+    return str(django_settings.BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT)
 
 
 def _normalize_scan_side(raw_side: str | None) -> str | None:
@@ -830,6 +863,10 @@ def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None
         state = states.get(stage_name)
         if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
             break
+        if scantailor.is_auto_skipped_split(state):
+            # A "no split" passthrough shows the raw page; its full-size version
+            # makes the better thumbnail than the reduced stage preview (#55).
+            continue
         if state.preview_storage_identifier or state.output_storage_identifier:
             latest = state
     return latest
@@ -1066,13 +1103,56 @@ def _review_owner_id(task: ReviewTask) -> int | None:
 
 
 def _review_candidates(task: ReviewTask) -> Any:
-    import_job = task.import_job
-    if import_job is not None:
-        return import_job.metadata_candidates.order_by("-score")
-    scan_job = task.scan_job
-    if scan_job is not None:
-        return scan_job.metadata_candidates.order_by("-score")
-    return MetadataCandidate.objects.none()
+    """Current candidates only; superseded runs are history, not acceptable choices."""
+    return metadata_search.current_candidates(task)
+
+
+def _review_search_context(task: ReviewTask) -> dict[str, Any]:
+    """Recorded search runs plus the live/failed state of the latest search job."""
+    searches = metadata_search.searches_for_task(task)
+    active_job = metadata_search.active_search_job(task)
+    latest_job = metadata_search.latest_search_job(task)
+    # A discarded run (superseded, or finished after the review was resolved) is
+    # history only; the latest search shown is the latest one that was applied.
+    applied = [search for search in searches if search.state != MetadataSearch.State.DISCARDED]
+    latest_search = applied[0] if applied else None
+    current_ids = set(_review_candidates(task).values_list("id", flat=True))
+    # A failed job that recorded no run (dispatch failure, stale worker) must still
+    # be visible; one that did record a run is shown through that run.
+    failed_job = None
+    if (
+        active_job is None
+        and latest_job is not None
+        and latest_job.state != ProcessingJob.JobState.SUCCESS
+        and not any(search.processing_job_id == latest_job.job_id for search in searches)
+    ):
+        failed_job = latest_job
+    stale_job = (
+        latest_job is not None
+        and active_job is None
+        and latest_job.state in (metadata_search.ACTIVE_JOB_STATES)
+    )
+    return {
+        "searches": searches,
+        "latest_search": latest_search,
+        "earlier_searches": [search for search in searches if search is not latest_search],
+        "active_search_job": active_job,
+        "search_running": (
+            active_job is not None and active_job.state == ProcessingJob.JobState.RUNNING
+        ),
+        "failed_search_job": failed_job,
+        "failed_search_error": (
+            "the search did not finish (worker stopped or queue entry lost)"
+            if stale_job
+            else str((failed_job.details or {}).get("error") or "")
+            if failed_job is not None
+            else ""
+        ),
+        "latest_search_has_current_candidates": (
+            latest_search is not None
+            and any(candidate.id in current_ids for candidate in latest_search.candidates.all())
+        ),
+    }
 
 
 def _serialize_task(task: ReviewTask) -> dict[str, Any]:
@@ -1219,6 +1299,87 @@ def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
         ),
         "details": details if isinstance(details, dict) else {},
         "suggested_authors": _parse_author_list(evidence.get(intake.SUGGESTED_AUTHORS_KEY)),
+    }
+
+
+def _reviewer_genre_choice(request: HttpRequest, payload: dict[str, Any]) -> list[Genre] | None:
+    """Genres a reviewer picked, or ``None`` when they made no choice.
+
+    JSON clients send ``genre_ids`` (a list, possibly empty). The review form sends
+    ``genres_reviewed=1`` plus one ``genre_ids`` checkbox value per chosen genre, so
+    unticking every suggestion is an explicit "no genres". Raises ``ValueError`` for
+    ids that are not existing genres.
+    """
+    if isinstance(payload.get("genre_ids"), list):
+        raw_ids: list[Any] = payload["genre_ids"]
+    elif payload.get("genres_reviewed"):
+        raw_ids = request.POST.getlist("genre_ids")
+    else:
+        return None
+    ids: list[int] = []
+    for raw in raw_ids:
+        value = _coerce_int(raw, minimum=1)
+        if value is None:
+            raise ValueError("invalid genre id")
+        if value not in ids:
+            ids.append(value)
+    found = {genre.pk: genre for genre in Genre.objects.filter(pk__in=ids)}
+    if len(found) != len(ids):
+        raise ValueError("unknown genre")
+    return [found[genre_id] for genre_id in ids]
+
+
+def _apply_review_genres(
+    *,
+    book: Book,
+    task: ReviewTask,
+    reviewer_genres: list[Genre] | None,
+    provider_subjects: list[Any] | None,
+    reviewer: Any = None,
+) -> dict[str, Any]:
+    """Attach genres on a review decision; returns decision-payload additions.
+
+    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
+    """
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    if reviewer_genres is not None:
+        genres.assign_reviewer(
+            book,
+            reviewer_genres,
+            suggestion=genres.suggest(provider_subjects, embedded),
+            user=reviewer,
+        )
+        return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
+    added = genres.assign_automatic(
+        book,
+        provider_subjects=provider_subjects,
+        embedded_subjects=embedded,
+    )
+    return {"automatic_genres": [genre.name for genre in added]} if added else {}
+
+
+def _attach_genre_suggestions(task: ReviewTask, candidates: list[MetadataCandidate]) -> None:
+    """Set ``candidate.genre_suggestion`` for the review page's genre picker."""
+    index = genres.build_index()
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    for candidate in candidates:
+        candidate.genre_suggestion = genres.suggest(  # type: ignore[attr-defined]
+            candidate.subjects, embedded, index
+        )
+
+
+def _serialize_genre_suggestion(suggestion: genres.GenreSuggestion) -> dict[str, Any]:
+    return {
+        "source": suggestion.source,
+        "genre_ids": suggestion.genre_ids,
+        "tags": [
+            {
+                "tag": match.tag,
+                "genre_id": match.genre.pk if match.genre else None,
+                "genre": match.genre.name if match.genre else None,
+            }
+            for match in suggestion.matches
+        ],
     }
 
 
@@ -1527,11 +1688,15 @@ def _filtered_library_books(
             ).values("book_id"),
         )
     if genre:
-        books = books.filter(
-            pk__in=Book.genres.through.objects.filter(
-                genre__name__icontains=genre,
-            ).values("book_id"),
+        # A genre name or alias ("sci-fi") selects that genre; anything else is a
+        # substring match on genre names, as before.
+        genre_match = genres.genre_from_filter(genre)
+        genre_links = (
+            Book.genres.through.objects.filter(genre=genre_match)
+            if genre_match is not None
+            else Book.genres.through.objects.filter(genre__name__icontains=genre)
         )
+        books = books.filter(pk__in=genre_links.values("book_id"))
     if language:
         books = books.filter(language__iexact=language)
     if book_format:
@@ -1581,6 +1746,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     total = paginator.count
     serialized = [_serialize_book(book, include_variants=False) for book in page_books]
     if _wants_html(request):
+        filters = {
+            "q": query,
+            "title": title,
+            "author": author,
+            "category": category,
+            "genre": genre,
+            "language": language,
+            "format": book_format,
+            "sort": sort,
+        }
         return render(
             request,
             "core/library_books.html",
@@ -1588,16 +1763,10 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
                 "books": serialized,
                 "page_object": page_object,
                 "count": total,
-                "filters": {
-                    "q": query,
-                    "title": title,
-                    "author": author,
-                    "category": category,
-                    "genre": genre,
-                    "language": language,
-                    "format": book_format,
-                    "sort": sort,
-                },
+                "all_genres": list(Genre.objects.order_by("name")),
+                "filters": filters,
+                # Pagination links keep every active filter, not just ``q``.
+                "filter_query": urlencode({key: value for key, value in filters.items() if value}),
             },
         )
     return JsonResponse(
@@ -1702,6 +1871,12 @@ def library_book_download(
     if variant is None:
         return HttpResponseNotFound("variant not available")
 
+    try:
+        ensure_reference_intact(variant)
+    except ReferencedFileError:
+        # Indexed-in-place file is missing or changed on its share: never serve
+        # different bytes under this record. The variant is flagged for an admin.
+        return HttpResponse("file changed or missing on storage", status=409)
     try:
         storage = backend_for_location(variant.storage_location)
     except StorageConfigurationError:
@@ -2264,11 +2439,50 @@ def _apply_stage_payload_to_state(
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
                 state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         state.parameters = merged
+        if stage == "page_split":
+            # The algorithm follows the chosen mode, so switching a single-page
+            # passthrough to a manual split (or back) never keeps a stale label (#55).
+            state.algorithm = scantailor.split_algorithm_for_mode(
+                scantailor.effective_split_mode(state),
+            )
 
     _bind_stage_inputs(state, page)
     state.revision += 1
     state.last_error = ""
     state.status = ScanTailorStageState.StageStatus.QUEUED
+
+
+def _lock_stage_state(state: ScanTailorStageState) -> ScanTailorStageState:
+    """Re-read ``state`` under a row lock; call inside ``transaction.atomic()``."""
+    return (
+        ScanTailorStageState.objects.select_for_update()
+        .select_related("scan_job", "scan_page")
+        .get(pk=state.pk)
+    )
+
+
+def _apply_and_save_stage_edit(
+    state: ScanTailorStageState,
+    page: ScanPage,
+    stage: str,
+    payload: dict[str, Any],
+) -> None:
+    """Apply a user edit to a locked ``state`` and persist it as the next revision."""
+    _apply_stage_payload_to_state(state, page, stage, payload)
+    state.save(
+        update_fields=[
+            "algorithm",
+            "algorithm_version",
+            "parameters",
+            "input_stage_state",
+            "input_scan_page_version",
+            "input_storage_identifier",
+            "revision",
+            "last_error",
+            "status",
+            "updated_at",
+        ],
+    )
 
 
 @require_GET
@@ -2439,29 +2653,20 @@ def scan_page_stage(
 
     payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
-    if expected_revision is not None and expected_revision != state.revision:
-        return _conflict_response(state, expected_revision)
-
-    _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-    state.save(
-        update_fields=[
-            "algorithm",
-            "algorithm_version",
-            "parameters",
-            "input_stage_state",
-            "input_scan_page_version",
-            "input_storage_identifier",
-            "revision",
-            "last_error",
-            "status",
-            "updated_at",
-        ],
-    )
-    scantailor.invalidate_downstream_states(
-        page,
-        from_stage=state.stage,
-        reason=f"{state.stage} updated",
-    )
+    # Check and bump the revision on the locked row, not on the copy read above: a
+    # concurrent writer (another user, or the automatic single-page passthrough)
+    # either finished first, so the expected_revision check sees it, or waits for
+    # this edit and then finds a newer revision and backs off (#55).
+    with transaction.atomic():
+        state = _lock_stage_state(state)
+        if expected_revision is not None and expected_revision != state.revision:
+            return _conflict_response(state, expected_revision)
+        _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+        scantailor.invalidate_downstream_states(
+            page,
+            from_stage=state.stage,
+            reason=f"{state.stage} updated",
+        )
 
     processing_job = scantailor.request_stage_job(
         state=state,
@@ -2539,30 +2744,17 @@ def scan_job_stage_batch(
             page_id=str(page.id),
             stage=normalized_stage,
         )
-        if preserve_exceptions and _is_manual_stage_state(state):
-            skipped.append(str(page.id))
-            continue
-
-        _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-        state.save(
-            update_fields=[
-                "algorithm",
-                "algorithm_version",
-                "parameters",
-                "input_stage_state",
-                "input_scan_page_version",
-                "input_storage_identifier",
-                "revision",
-                "last_error",
-                "status",
-                "updated_at",
-            ],
-        )
-        scantailor.invalidate_downstream_states(
-            page,
-            from_stage=state.stage,
-            reason=f"{state.stage} updated via batch",
-        )
+        with transaction.atomic():
+            state = _lock_stage_state(state)
+            if preserve_exceptions and _is_manual_stage_state(state):
+                skipped.append(str(page.id))
+                continue
+            _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+            scantailor.invalidate_downstream_states(
+                page,
+                from_stage=state.stage,
+                reason=f"{state.stage} updated via batch",
+            )
         processing_job = scantailor.request_stage_job(
             state=state,
             requested_by_user_id=profile.user_id,
@@ -2704,6 +2896,10 @@ def scan_jobs(
     else:
         book = None
 
+    capture_layout = _resolve_capture_layout(payload.get("capture_layout"), scanner_id)
+    if capture_layout is None:
+        return HttpResponseBadRequest("invalid capture_layout (expected single_page or spread)")
+
     notes = _normalize_scanner_metadata(payload.get("notes"))
     initial_state = _coerce_str_or_none(payload.get("state")) or ScanJob.State.OPEN
     if initial_state not in {
@@ -2716,6 +2912,7 @@ def scan_jobs(
     job = ScanJob.objects.create(
         state=initial_state,
         scanner_id=scanner_id,
+        capture_layout=capture_layout,
         operator=profile.user,
         book=book,
         provisional_title=job_title,
@@ -3048,6 +3245,7 @@ def upload_scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     status_code = 201 if created else 200
     if _wants_html(request):
@@ -3127,6 +3325,7 @@ def scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     return JsonResponse(
         {
@@ -3686,11 +3885,29 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     payload = _serialize_task(task)
+    candidates = list(_review_candidates(task))
+    _attach_genre_suggestions(task, candidates)
     payload["candidates"] = [
-        _serialize_candidate(candidate) for candidate in _review_candidates(task)
+        {
+            **_serialize_candidate(candidate),
+            "genre_suggestion": _serialize_genre_suggestion(candidate.genre_suggestion),
+        }
+        for candidate in candidates
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    search_context = _review_search_context(task)
+    active_job = search_context["active_search_job"]
+    payload["searches"] = [
+        metadata_search.serialize_search(search) for search in search_context["searches"]
+    ]
+    payload["search_in_progress"] = active_job is not None
+    payload["active_search_job"] = (
+        {"job_id": str(active_job.job_id), "state": active_job.state}
+        if active_job is not None
+        else None
+    )
+    payload["failed_search_error"] = search_context["failed_search_error"]
     if _wants_html(request):
         return render(
             request,
@@ -3699,8 +3916,10 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
-                "candidates": _review_candidates(task),
+                "candidates": candidates,
+                "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
+                **search_context,
             },
         )
     return JsonResponse(payload)
@@ -3734,6 +3953,14 @@ def review_accept_candidate(
         return HttpResponseBadRequest("candidate not found")
     if candidate.import_job_id != task.import_job_id or candidate.scan_job_id != task.scan_job_id:
         return HttpResponseBadRequest("candidate not found")
+    if candidate.superseded_at is not None:
+        return HttpResponseBadRequest(
+            "candidate is from an earlier search; accept one of the current candidates"
+        )
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
 
     try:
         candidate_isbn13 = candidate.isbn13 or None
@@ -3816,16 +4043,28 @@ def review_accept_candidate(
         reviewer_authors = (
             [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
         )
-        decision_payload: dict[str, Any] | None = None
+        decision_additions: dict[str, Any] = {}
         if reviewer_authors and not book.authors.exists():
             for author_name in reviewer_authors:
                 author, _ = Author.objects.get_or_create(
                     full_name=intake._fit(Author, "full_name", author_name),
                 )
                 book.authors.add(author)
+            decision_additions["reviewer_authors"] = reviewer_authors
+        decision_additions.update(
+            _apply_review_genres(
+                book=book,
+                task=task,
+                reviewer_genres=reviewer_genres,
+                provider_subjects=candidate.subjects,
+                reviewer=request.user,
+            )
+        )
+        decision_payload: dict[str, Any] | None = None
+        if decision_additions:
             decision_payload = {
                 **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
-                "reviewer_authors": reviewer_authors,
+                **decision_additions,
             }
 
         variant = _resolve_review_source(
@@ -3886,12 +4125,27 @@ def review_mark_unidentified(
     return _review_action_response(request, {"task_id": str(task.id), "state": task.state})
 
 
+def _save_review_terms(task: ReviewTask, terms: dict[str, Any]) -> None:
+    """Store reviewer terms on the task and, for scans, as the scan's hints.
+
+    The task's terms are the reviewer's saved search terms; later automatic scan
+    identifications use the scan job's hints, so both are kept in step.
+    """
+    metadata_search.apply_terms(task, terms)
+    scan_job = task.scan_job if task.scan_job_id is not None else None
+    if scan_job is not None:
+        scan_job.provisional_title = task.inferred_title
+        scan_job.provisional_authors = task.inferred_authors
+        scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
+
+
 @require_POST
 @login_required
 def review_search_again(
     request: HttpRequest,
     task_id: str,
 ) -> HttpResponseBase:
+    """Save the posted search terms (if any) and queue a provider search with them."""
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
@@ -3905,18 +4159,24 @@ def review_search_again(
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
 
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
+    terms = metadata_search.task_terms(task)
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
     task.decision_notes = str(payload.get("notes", ""))
     task.decided_at = timezone.now()
-    task.decision_payload = {"search_again": True}
+    task.decision_payload = {"search_again": True, "terms": terms}
     task.save(
         update_fields=[
             "state",
             "decision",
             "decision_notes",
             "decision_payload",
+            "inferred_title",
+            "inferred_authors",
             "reviewer_id",
             "decided_at",
             "updated_at",
@@ -3927,34 +4187,40 @@ def review_search_again(
             scan_job = task.scan_job
             if scan_job is None:
                 raise scan_identification.ScanIdentificationError("scan job is unavailable")
-            scan_job.provisional_title = task.inferred_title
-            scan_job.provisional_authors = task.inferred_authors
-            scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
             processing_job = scan_identification.request_scan_identification(
                 scan_job=scan_job,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = scan_identification.job_payload(processing_job)
-            status_route = "scan-identification-job-status"
         else:
             processing_job = review_identification.request_review_identification(
                 review_task=task,
                 requested_by_user_id=profile.user_id,
+                terms=terms,
             )
             job_payload = review_identification.job_payload(processing_job)
-            status_route = "review-identification-job-status"
+    except metadata_search.SearchInProgressError as exc:
+        task.state = ReviewTask.State.OPEN
+        task.save(update_fields=["state", "updated_at"])
+        if _wants_html(request):
+            messages.warning(request, f"Search terms saved, but {exc}.")
+            return redirect("review-detail", task_id=task.id)
+        return JsonResponse({"task_id": str(task.id), "error": str(exc)}, status=409)
     except (
         review_identification.ReviewIdentificationError,
         scan_identification.ScanIdentificationError,
     ) as exc:
         task.state = ReviewTask.State.OPEN
         task.save(update_fields=["state", "updated_at"])
+        if _wants_html(request):
+            messages.error(request, f"The search could not be started: {exc}")
+            return redirect("review-detail", task_id=task.id)
         return HttpResponseBadRequest(str(exc))
 
     if _wants_html(request):
-        if processing_job.state == ProcessingJob.JobState.SUCCESS:
-            return redirect("review-detail", task_id=task.id)
-        return redirect(status_route, job_id=processing_job.job_id)
+        # The review page shows the search while it runs and its outcome afterwards.
+        return redirect("review-detail", task_id=task.id)
     return JsonResponse(
         {
             "task_id": str(task.id),
@@ -4016,19 +4282,9 @@ def review_edit_search_terms(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
-    inferred_title = payload.get("inferred_title")
-    if isinstance(inferred_title, str) and inferred_title.strip():
-        task.inferred_title = inferred_title.strip()
-
-    raw_inferred_authors = payload.get("inferred_authors")
-    if isinstance(raw_inferred_authors, str):
-        task.inferred_authors = [
-            author.strip() for author in raw_inferred_authors.split(",") if author.strip()
-        ]
-    elif isinstance(raw_inferred_authors, list):
-        task.inferred_authors = [
-            str(author).strip() for author in raw_inferred_authors if str(author).strip()
-        ]
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
 
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS
@@ -4073,7 +4329,19 @@ def review_manual_entry(
     payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
     book = _build_manual_book_from_payload(payload)
+    # A manually entered book has no provider record, so only the file's own tags apply.
+    _apply_review_genres(
+        book=book,
+        task=task,
+        reviewer_genres=reviewer_genres,
+        provider_subjects=None,
+        reviewer=request.user,
+    )
 
     variant = _resolve_review_source(
         task=task,
