@@ -170,6 +170,12 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+`--preview` lists every importable file and every skipped (unsupported-format)
+file, followed by a per-source summary such as
+`importable=108 skipped=3 (.chm=2, .lit=1)`. With `--json`, rows carry
+`"status": "importable"` or `"status": "skipped"` (plus `extension` and `reason`),
+and each source ends with a `{"source_location_id", "summary": {...}}` row.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
@@ -261,7 +267,14 @@ hash downloaded bytes while staging them on disk and remove partial temporary
 files after download failures. Changed results receive separate storage paths
 even when the service repeats a filename, preserving prior outputs.
 
-Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
+Digital intake accepts EPUB, MOBI, AZW, AZW3, PRC, RTF, PDF, TXT, HTML, FB2,
+DjVu, CBZ, and CBR. AZW/AZW3/PRC must carry a PalmDB `BOOKMOBI` header (PRC may
+also be plain PalmDOC `TEXtREAd`); RTF must start with `{
+tf`. Their metadata
+currently falls back to filename/folder signals before external verification.
+Files in any other format (for example CHM, LIT, LRF, PDB, DOC/DOCX, ZIP/RAR) are
+not imported: source discovery logs a `source_files_skipped_unsupported` warning
+with per-extension counts, and `--preview` lists them (see above).
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text
 encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP readers
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page

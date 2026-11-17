@@ -12,6 +12,8 @@ is present on the worker.
 | PDF | EPUB | Calibre | `ebook-convert` + OCR-prep if scanned PDF | mixed (scanned PDFs degrade) | yes | optional if scanned | implemented; representative digital-PDF metadata/text quality verified in CI |
 | HTML | EPUB | Pandoc | Calibre | good for structured HTML | yes | no | implemented; Pandoc 3.9.0.2 semantic-content quality verified in CI |
 | TXT | EPUB | Pandoc | Calibre | fair (formatting limited) | yes | no | implemented; Pandoc 3.9.0.2 binary-verified in CI |
+| AZW / AZW3 / PRC | EPUB | Calibre `ebook-convert` | none | good for DRM-free files | yes | no | implemented; not yet binary-verified in CI |
+| RTF | EPUB | Calibre `ebook-convert` | Pandoc | fair | yes | no | implemented; not yet binary-verified in CI |
 | FB2 | EPUB | Calibre `ebook-convert` | none | good | yes | no | researched; not advertised |
 | DjVu -> EPUB/PDF | DjVuLibre text extraction then conversion | Calibre if supported in deployment | manual fallback | uncertain | yes | maybe | researched; not advertised |
 | CBZ/CBR extraction | Standard ZIP / RarFile and configured archive tool | libarchive/7zip | n/a | good if source clean | no | no | bounded intake implemented; conversion not advertised |

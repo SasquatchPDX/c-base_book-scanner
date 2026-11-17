@@ -102,7 +102,109 @@ def test_preview_reports_supported_source_files_only(
     )
     payload = json.loads(stdout.getvalue())
 
-    assert {item["path"] for item in payload} == {str(source_file), str(text_file)}
+    importable = {item["path"] for item in payload if item.get("status") == "importable"}
+    assert importable == {str(source_file), str(text_file)}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_preview_lists_skipped_unsupported_files_with_extension_counts(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "incoming-mixed"
+    (source_root / "nested").mkdir(parents=True)
+    supported = source_root / "book.pdf"
+    supported.write_bytes(b"%PDF-1.4")
+    skipped_paths = {
+        source_root / "manual.chm",
+        source_root / "nested" / "other.chm",
+        source_root / "old.lit",
+        source_root / "README",
+    }
+    for path in skipped_paths:
+        path.write_bytes(b"unsupported")
+
+    location = _create_source_root(source_root)
+    stdout = StringIO()
+    call_command(
+        "ingest_sources",
+        "--source-id",
+        str(location.id),
+        "--preview",
+        "--json",
+        stdout=stdout,
+    )
+    payload = json.loads(stdout.getvalue())
+
+    skipped = [item for item in payload if item.get("status") == "skipped"]
+    assert {item["path"] for item in skipped} == {str(path) for path in skipped_paths}
+    assert all(item["reason"] == "unsupported format" for item in skipped)
+    summaries = [item["summary"] for item in payload if "summary" in item]
+    assert summaries == [
+        {
+            "importable": 1,
+            "skipped": 4,
+            "skipped_by_extension": {".chm": 2, "(no extension)": 1, ".lit": 1},
+        }
+    ]
+
+    text_out = StringIO()
+    call_command(
+        "ingest_sources",
+        "--source-id",
+        str(location.id),
+        "--preview",
+        stdout=text_out,
+    )
+    text = text_out.getvalue()
+    assert f"SKIPPED (unsupported format: .lit) => {source_root / 'old.lit'}" in text
+    assert "importable=1 skipped=4 (.chm=2, (no extension)=1, .lit=1)" in text
+    assert not ImportJob.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_discovery_reports_skipped_unsupported_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "incoming-skip-log"
+    source_root.mkdir()
+    (source_root / "book.pdf").write_bytes(b"%PDF-1.4")
+    (source_root / "notes.doc").write_bytes(b"legacy word file")
+    location = _create_source_root(source_root)
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingLogger:
+        def warning(self, event: str, **kwargs: object) -> None:
+            events.append((event, kwargs))
+
+    monkeypatch.setattr(intake, "logger", RecordingLogger())
+
+    jobs = discover_source_jobs_for_location(location)
+
+    assert [job.original_filename for job in jobs] == ["book.pdf"]
+    assert events == [
+        (
+            "source_files_skipped_unsupported",
+            {
+                "source_location_id": str(location.id),
+                "skipped_count": 1,
+                "skipped_by_extension": {".doc": 1},
+            },
+        )
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_kindle_and_rtf_source_files_are_discovered_for_import(tmp_path: Path) -> None:
+    source_root = tmp_path / "incoming-kindle"
+    source_root.mkdir()
+    for name in ("a.azw", "b.azw3", "c.prc", "d.rtf"):
+        (source_root / name).write_bytes(b"payload")
+    location = _create_source_root(source_root)
+
+    jobs = discover_source_jobs_for_location(location)
+
+    assert sorted(job.original_filename for job in jobs) == ["a.azw", "b.azw3", "c.prc", "d.rtf"]
 
 
 @pytest.mark.django_db(transaction=True)

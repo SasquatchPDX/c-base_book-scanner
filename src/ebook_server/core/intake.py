@@ -80,6 +80,24 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
         format_name="mobi",
         mime_type="application/x-mobipocket-ebook",
     ),
+    # Kindle/Mobipocket family (#23). These share the PalmDB container the MOBI
+    # signature check already understands; Calibre handles them downstream.
+    ".azw": SupportedFormat(
+        format_name="azw",
+        mime_type="application/vnd.amazon.ebook",
+    ),
+    ".azw3": SupportedFormat(
+        format_name="azw3",
+        mime_type="application/x-mobi8-ebook",
+    ),
+    ".prc": SupportedFormat(
+        format_name="prc",
+        mime_type="application/x-mobipocket-ebook",
+    ),
+    ".rtf": SupportedFormat(
+        format_name="rtf",
+        mime_type="application/rtf",
+    ),
     ".txt": SupportedFormat(
         format_name="txt",
         mime_type="text/plain",
@@ -112,6 +130,15 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
         format_name="cbr",
         mime_type="application/vnd.comicbook-rar",
     ),
+}
+
+# PalmDB type+creator codes (bytes 60..68) accepted per MOBI-family format.
+# Plain PalmDOC (``TEXtREAd``) is the historical ``.prc`` payload.
+PALMDB_SIGNATURES: dict[str, frozenset[bytes]] = {
+    "mobi": frozenset({b"BOOKMOBI"}),
+    "azw": frozenset({b"BOOKMOBI"}),
+    "azw3": frozenset({b"BOOKMOBI"}),
+    "prc": frozenset({b"BOOKMOBI", b"TEXtREAd"}),
 }
 
 MAX_UPLOAD_BYTES = getattr(
@@ -215,11 +242,19 @@ def validate_container_signature(file_path: str, detected_format: str) -> None:
             if "META-INF/container.xml" not in {info.filename for info in members}:
                 raise ValidationError("EPUB package metadata is missing")
         return
-    if detected_format == "mobi":
+    if detected_format in PALMDB_SIGNATURES:
         with path.open("rb") as source:
             header = source.read(68)
-        if len(header) < 68 or header[60:68] != b"BOOKMOBI":
-            raise ValidationError("file content is not a MOBI container")
+        if len(header) < 68 or header[60:68] not in PALMDB_SIGNATURES[detected_format]:
+            raise ValidationError(
+                f"file content is not a {detected_format.upper()} (PalmDB/MOBI) container"
+            )
+        return
+    if detected_format == "rtf":
+        with path.open("rb") as source:
+            header = source.read(8)
+        if not header.removeprefix(b"\xef\xbb\xbf").startswith(b"{\\rtf"):
+            raise ValidationError("file content is not RTF")
         return
     if detected_format in {"txt", "html", "fb2"}:
         sample = _read_metadata_sample(path)
@@ -443,8 +478,10 @@ def discover_source_jobs_for_location(
     uploader: Any | None = None,
 ) -> list[ImportJob]:
     jobs: list[ImportJob] = []
+    skipped: list[Path] = []
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
+            skipped.append(candidate)
             continue
         normalized = str(candidate.resolve())
         active_job_exists = ImportJob.objects.filter(
@@ -467,22 +504,74 @@ def discover_source_jobs_for_location(
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
             continue
+    if skipped:
+        # Unsupported files are never imported, but they must not vanish silently (#23).
+        logger.warning(
+            "source_files_skipped_unsupported",
+            source_location_id=str(source_location.id),
+            skipped_count=len(skipped),
+            skipped_by_extension=skipped_extension_counts(skipped),
+        )
     return jobs
+
+
+def skipped_extension_label(path: Path) -> str:
+    """Return the lowercase extension used to group unsupported files in reports."""
+    return path.suffix.lower() or "(no extension)"
+
+
+def skipped_extension_counts(paths: Iterable[Path]) -> dict[str, int]:
+    """Count unsupported files per extension, most common first."""
+    counts: dict[str, int] = {}
+    for path in paths:
+        label = skipped_extension_label(path)
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+@dataclass(frozen=True)
+class SourcePreview:
+    """Supported (importable) and skipped (unsupported-format) files for one source."""
+
+    jobs: list[dict[str, str]]
+    skipped: list[dict[str, str]]
+
+    @property
+    def skipped_by_extension(self) -> dict[str, int]:
+        return skipped_extension_counts(Path(row["path"]) for row in self.skipped)
+
+
+def preview_source_location(source_location: SourceLocation) -> SourcePreview:
+    """Classify every candidate file in a source without creating jobs."""
+    jobs: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for candidate in discover_source_paths(source_location):
+        if _is_supported_file(candidate):
+            jobs.append(
+                {
+                    "source_location_id": str(source_location.id),
+                    "path": str(candidate),
+                    "filename": candidate.name,
+                    "source_type": source_location.default_source_type,
+                }
+            )
+        else:
+            skipped.append(
+                {
+                    "source_location_id": str(source_location.id),
+                    "path": str(candidate),
+                    "filename": candidate.name,
+                    "extension": skipped_extension_label(candidate),
+                    "reason": "unsupported format",
+                }
+            )
+    return SourcePreview(jobs=jobs, skipped=skipped)
 
 
 def preview_source_jobs(
     source_location: SourceLocation,
 ) -> list[dict[str, str]]:
-    return [
-        {
-            "source_location_id": str(source_location.id),
-            "path": str(candidate),
-            "filename": candidate.name,
-            "source_type": source_location.default_source_type,
-        }
-        for candidate in discover_source_paths(source_location)
-        if _is_supported_file(candidate)
-    ]
+    return preview_source_location(source_location).jobs
 
 
 def compute_sha256(path: str) -> str:

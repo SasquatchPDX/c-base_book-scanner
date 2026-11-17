@@ -455,6 +455,24 @@ def test_unknown_converter_capability_is_not_advertised(
     assert conversion.list_conversion_targets("txt") == {}
 
 
+@pytest.mark.parametrize("source_format", ["azw", "azw3", "prc", "rtf"])
+def test_kindle_family_and_rtf_variants_convert_to_epub_via_calibre(
+    monkeypatch: pytest.MonkeyPatch,
+    source_format: str,
+) -> None:
+    class AvailableCalibre(conversion.CalibreConverter):
+        def is_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr(conversion, "CONVERTER_REGISTRY", {"calibre": AvailableCalibre()})
+
+    plan = conversion.find_conversion_plan(source_format, "epub")
+
+    assert plan is not None
+    assert [step.converter for step in plan.steps] == ["calibre"]
+    assert conversion.FORMAT_TO_MIME[source_format] != "application/octet-stream"
+
+
 def test_persisted_conversion_route_must_be_connected_and_supported() -> None:
     with pytest.raises(conversion.ConversionError, match="disconnected"):
         conversion._validate_route(
