@@ -19,7 +19,14 @@ urlpatterns = [
     path("healthz/dependencies/", views.readiness),
     path("metrics/", views.prometheus_metrics, name="prometheus-metrics"),
     path("library/", views.library_home, name="library-home"),
+    path("library/intake/", views.intake_progress_view, name="intake-progress"),
     path("library/books/", views.library_books, name="library-books"),
+    path("library/authors/", views.library_authors, name="library-authors"),
+    path(
+        "library/covers/<str:sha256>/<slug:size>.webp",
+        views.library_cover_thumbnail,
+        name="library-cover-thumbnail",
+    ),
     path("library/books/<int:book_id>/", views.library_book_detail, name="library-book-detail"),
     path(
         "library/books/<int:book_id>/download/",
@@ -72,6 +79,11 @@ urlpatterns = [
         "scan/jobs/<scan_job_id:job_id>/pages/",
         views.upload_scan_page,
         name="scan-job-upload-page",
+    ),
+    path(
+        "scan/jobs/<scan_job_id:job_id>/logs/",
+        views.upload_scan_log,
+        name="scan-job-upload-log",
     ),
     path(
         "scan/jobs/<scan_job_id:job_id>/pause/",
