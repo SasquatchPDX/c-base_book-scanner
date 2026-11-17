@@ -7,6 +7,7 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
 from ebook_server.core import intake
 from ebook_server.core.intake import IntakeError
@@ -86,19 +87,21 @@ class Command(BaseCommand):
                     continue
                 if not Path(job.source_path).exists():
                     continue
-                job.state = ImportJob.State.DISCOVERED
-                job.last_error = ""
-                job.next_retry_at = None
-                job.attempt_count = 0
-                job.save(
-                    update_fields=[
-                        "state",
-                        "last_error",
-                        "next_retry_at",
-                        "attempt_count",
-                        "updated_at",
-                    ],
+                # Conditional: a queue retry may have claimed the job since it was read.
+                reset = ImportJob.objects.filter(
+                    pk=job.pk,
+                    state=ImportJob.State.FAILED,
+                    lease_owner="",
+                ).update(
+                    state=ImportJob.State.DISCOVERED,
+                    last_error="",
+                    next_retry_at=None,
+                    attempt_count=0,
+                    lease_expires_at=None,
+                    updated_at=timezone.now(),
                 )
+                if not reset:
+                    continue
                 enqueue(intake.process_import_job, str(job.id))
                 retried.append(str(job.id))
 

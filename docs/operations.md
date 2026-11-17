@@ -304,9 +304,21 @@ To pause a source, use the "Pause imports" admin action (or set `is_paused`).
 A paused source queues nothing, and queued jobs that have not started yet are
 skipped by the worker and stay DISCOVERED. After "Resume imports", the next
 `ingest_sources` run re-queues them. Each run also re-queues DISCOVERED jobs that
-no longer have an RQ job (for example after `rq empty` or a Redis flush); a job
-that ends up queued twice is still processed only once. If the RQ queue cannot
-be inspected, re-queueing is skipped with a warning.
+no longer have an RQ job (for example after `rq empty` or a Redis flush). If the
+RQ queue cannot be inspected, re-queueing is skipped with a warning.
+
+A job that ends up queued twice is still processed only once. A worker first
+claims the job's lease (`ImportJob.lease_owner` / `lease_expires_at`) with one
+conditional update, which succeeds only for an unowned job waiting to run
+(DISCOVERED, or FAILED with a queue retry due). Any other delivery returns
+without doing anything, whichever phase it finds the job in (logged as
+`intake_duplicate_delivery_skipped`). Each later write of the job locks its row,
+checks that the worker still owns the lease, and renews it. Leaving the active
+phases (COMPLETE, LOW_CONFIDENCE, FAILED) releases the lease. The lease lasts
+`BOOK_SCANNER_INGEST_LEASE_SECONDS`; the default `0` means the RQ job timeout
+plus five minutes. A job whose lease expired is never taken over by another
+delivery. `recover_stale_jobs` handles it, see below.
+
 ### Audio files and audiobooks
 
 This system does not manage audiobooks. The decision and its research are in
@@ -522,6 +534,15 @@ uv run python manage.py recover_stale_jobs --apply  # act
 returns ScanJobs stuck in FINALIZING with no live finalization job to their
 prior state so Finish can be retried. It does not re-queue anything itself;
 re-request OCR/conversion/identification from the UI afterwards.
+
+It also lists import jobs stuck in an active phase (HASHING through ARCHIVING)
+whose lease has expired, and import jobs without a lease (left by a worker from
+before leases existed) that have not changed for one lease duration. `--apply`
+marks them FAILED (`import lease expired in <phase>`) and clears the lease. The
+update is conditional, so a worker that renewed its lease in the meantime is not
+touched, and a worker that lost its lease stops at its next write. These jobs are
+not retried automatically, because a MOVE source may be half moved. Check the
+source, then re-queue them with `ingest_sources --source-id N --retry-failed`.
 
 Do not grant a worker access to the Docker socket merely to obtain a converter.
 Bake reviewed converter binaries into its restricted image instead.

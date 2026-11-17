@@ -35,4 +35,14 @@ class Migration(migrations.Migration):
                 help_text="Paused sources queue no new imports, and queued imports that have not started stay DISCOVERED until the source is resumed.",
             ),
         ),
+        migrations.AddField(
+            model_name="importjob",
+            name="lease_owner",
+            field=models.CharField(blank=True, default="", max_length=64),
+        ),
+        migrations.AddField(
+            model_name="importjob",
+            name="lease_expires_at",
+            field=models.DateTimeField(blank=True, null=True),
+        ),
     ]

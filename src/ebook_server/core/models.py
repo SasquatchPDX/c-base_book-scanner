@@ -875,6 +875,11 @@ class ImportJob(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Exclusive ownership while a worker processes the job (HASHING through ARCHIVING).
+    # Set atomically when a delivery claims the job, renewed on every phase transition,
+    # and cleared when the job leaves the active phases. Empty means unowned.
+    lease_owner = models.CharField(max_length=64, blank=True, default="")
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
