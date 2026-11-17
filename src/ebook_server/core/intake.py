@@ -1509,11 +1509,15 @@ def _resolve_import(
 
         # Any identifying action on a multi-part review confirms the grouping: every
         # archived part becomes an ordered part FileVariant of ``book``.
-        part_variants = multipart.confirm_parts(lead_job=job, review_task=review_task, book=book)
+        part_variants, absent_parts = multipart.confirm_parts(
+            lead_job=job, review_task=review_task, book=book
+        )
         payload = dict(decision_payload if decision_payload is not None else {})
         payload["multipart_confirmed"] = {
             "import_group_id": str(job.import_group_id),
             "file_variant_ids": [part.id for part in part_variants],
+            # Detected parts the reviewer acknowledged confirming the book without.
+            "missing_parts": absent_parts,
         }
         decision_payload = payload
         job.refresh_from_db()
@@ -2096,33 +2100,39 @@ def _archive_awaiting_review(job: ImportJob) -> None:
 
 
 def _settle_multipart_part(job: ImportJob) -> None:
-    """After a grouped part settles, open the group's review once all parts have."""
+    """Exit hook of a grouped part's intake run; see ``multipart.settle_part``."""
     from . import multipart
 
-    group = multipart.pending_group_for(job)
-    if group is None:
+    if job.import_group_id is None:
         return
     try:
-        multipart.maybe_open_review(group)
-    except Exception as exc:  # the part itself is safely archived; retry on next settle
+        multipart.settle_part(job)
+    except Exception as exc:  # the part itself is safely recorded; retried on next settle
         logger.warning(
-            "multipart_review_open_failed",
-            import_group_id=str(group.id),
+            "multipart_settle_failed",
+            import_group_id=str(job.import_group_id),
+            import_job_id=str(job.id),
             error_type=type(exc).__name__,
         )
 
 
 def process_import_job(job_id: str) -> None:
     """Process one intake job from staging file to durable archive and optional matching."""
-    from . import multipart
-
-    job = ImportJob.objects.select_related("uploader", "source_location", "import_group").get(
-        pk=job_id
-    )
+    job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
     if job.state == ImportJob.State.COMPLETE:
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
+    try:
+        _run_import_job(job)
+    finally:
+        # Every exit of a run (archived, duplicate, failed, source missing, exception)
+        # settles a grouped part, so its group can never wait on it forever.
+        _settle_multipart_part(job)
+
+
+def _run_import_job(job: ImportJob) -> None:
+    from . import multipart
 
     source_path = Path(job.source_path)
     if not source_path.exists():
@@ -2206,7 +2216,6 @@ def process_import_job(job_id: str) -> None:
             # One part of a suspected multi-part work: archive it like any import
             # awaiting review, but identify the work once for the whole group.
             _archive_awaiting_review(job)
-            _settle_multipart_part(job)
             return
 
         signals = identification.build_identification_input(
@@ -2347,5 +2356,4 @@ def process_import_job(job_id: str) -> None:
             source_type=job.source_type,
             error_recorded=True,
         )
-        _settle_multipart_part(job)
         raise

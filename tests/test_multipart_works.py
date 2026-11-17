@@ -464,3 +464,261 @@ def test_preview_reports_multipart_membership(tmp_path: Path) -> None:
     assert rows["AppA.txt"]["part_label"] == "Appendix A"
     assert len({row["multipart_group"] for row in rows.values()}) == 1
     assert not ImportJob.objects.exists()
+
+
+# --- review findings on PR #101 -----------------------------------------------------
+
+
+def _process_all(jobs: list[ImportJob]) -> None:
+    for job in jobs:
+        intake.process_import_job(str(job.id))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_byte_budget_partial_discovery_waits_for_every_detected_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    location = _location(root, SourceLocation.TransferMode.COPY)
+    sizes = [path.stat().st_size for path in parts]
+
+    # The budget fits exactly one file: one job for a detected four-part work.
+    budget = intake.ByteBudget(remaining=max(sizes))
+    first = discover_source_jobs_for_location(location, byte_budget=budget)
+    assert len(first) == 1 and budget.exhausted
+    _process_all(first)
+
+    group = ImportGroup.objects.get()
+    assert len(group.detection["parts"]) == 4
+    assert all("source_path" in part for part in group.detection["parts"])
+    # Three detected files have no job yet, so nothing may be reviewed or confirmed.
+    assert not ReviewTask.objects.exists()
+
+    rest = discover_source_jobs_for_location(location)
+    assert len(rest) == 3
+    assert {job.import_group_id for job in rest} == {group.id}
+    _process_all(rest)
+
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.embedded_metadata["expected_part_count"] == 4
+    assert task.embedded_metadata["missing_parts"] == []
+    response = _admin_client().post(
+        f"/reviews/{task.id}/manual-entry/",
+        data=json.dumps({"title": "Learning Widgets", "authors": ["Ada Example"]}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+    assert Book.objects.get().file_variants.filter(part_index__isnull=False).count() == 4
+
+
+@pytest.mark.django_db(transaction=True)
+def test_detected_part_not_imported_yet_blocks_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _split_book_folder(root)
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    # A job of the group vanishes from the database (e.g. a pruned job): its file is
+    # still expected, so the group is no longer complete.
+    ImportJob.objects.filter(original_filename="ch03.txt").delete()
+
+    response = _admin_client().post(
+        f"/reviews/{task.id}/manual-entry/",
+        data=json.dumps({"title": "Learning Widgets"}),
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    assert b"ch03.txt" in response.content
+    assert not Book.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_missing_source_failure_settles_group_and_needs_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    location = _location(root, SourceLocation.TransferMode.COPY)
+    jobs = discover_source_jobs_for_location(location)
+    by_name = {job.original_filename: job for job in jobs}
+    _process_all([by_name[name] for name in ("ch01.txt", "ch02.txt", "ch03.txt")])
+    assert not ReviewTask.objects.exists()
+
+    # The last source disappears before its job runs: the job FAILS on the
+    # missing-source path, which must still settle the group.
+    appendix = next(path for path in parts if path.name == "AppA.txt")
+    appendix.unlink()
+    intake.process_import_job(str(by_name["AppA.txt"].id))
+    assert ImportJob.objects.get(pk=by_name["AppA.txt"].pk).state == ImportJob.State.FAILED
+
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.state == ReviewTask.State.OPEN
+    assert [part["filename"] for part in task.embedded_metadata["missing_parts"]] == ["AppA.txt"]
+    client = _admin_client()
+    detail = client.get(f"/reviews/{task.id}/").json()["multipart"]
+    assert [part["filename"] for part in detail["missing_parts"]] == ["AppA.txt"]
+    assert detail["incomplete_acknowledged"] is False
+
+    manual = {"title": "Learning Widgets", "authors": ["Ada Example"]}
+    response = client.post(
+        f"/reviews/{task.id}/manual-entry/",
+        data=json.dumps(manual),
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    assert b"acknowledge" in response.content
+    assert not Book.objects.exists()
+
+    response = client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/")
+    assert response.status_code == 200, response.content
+    response = client.post(
+        f"/reviews/{task.id}/manual-entry/",
+        data=json.dumps(manual),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+    book = Book.objects.get()
+    assert sorted(book.file_variants.values_list("original_filename", flat=True)) == [
+        "ch01.txt",
+        "ch02.txt",
+        "ch03.txt",
+    ]
+    task.refresh_from_db()
+    assert task.decision_payload["multipart_confirmed"]["missing_parts"] == ["AppA.txt"]
+
+    # The file shows up again later: an independent import, not a new one-file group.
+    appendix.write_text("Learning Widgets, AppA.txt: found again.\n")
+    _ingest(location)
+    late = ImportJob.objects.filter(original_filename="AppA.txt").latest("created_at")
+    assert late.import_group_id is None
+    assert ImportGroup.objects.count() == 1
+    assert ReviewTask.objects.filter(
+        import_job=late, task_type=ReviewTask.TaskType.NEEDS_ATTENTION
+    ).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_new_missing_part_needs_a_fresh_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    jobs = discover_source_jobs_for_location(_location(root, SourceLocation.TransferMode.COPY))
+    next(path for path in parts if path.name == "AppA.txt").unlink()
+    _process_all(jobs)
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    client = _admin_client()
+    assert client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/").status_code == 200
+
+    ImportJob.objects.filter(original_filename="ch03.txt").update(
+        state=ImportJob.State.FAILED, last_error="archive lost"
+    )
+    response = client.post(
+        f"/reviews/{task.id}/manual-entry/",
+        data=json.dumps({"title": "Learning Widgets"}),
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    assert b"ch03.txt" in response.content
+
+
+def _reject_during(
+    monkeypatch: pytest.MonkeyPatch, name: str, task: ReviewTask, done: list[bool]
+) -> None:
+    from ebook_server.core import multipart
+
+    original = getattr(intake, name)
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        if not done:
+            done.append(True)
+            multipart.reject_grouping(review_task=task, reviewer=None, notes="anthology")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(intake, name, wrapped)
+
+
+@pytest.mark.parametrize("window", ["extract_metadata", "_archive_awaiting_review"])
+@pytest.mark.django_db(transaction=True)
+def test_rejecting_while_a_new_part_is_processing_identifies_it_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, window: str
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Unrelated Title", authors=["Someone Else"])
+    root = tmp_path / "share"
+    folder, parts = _split_book_folder(root)
+    location = _location(root, SourceLocation.TransferMode.COPY)
+    _process_all(discover_source_jobs_for_location(location))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.import_job is not None
+
+    # A newly added chapter joins the pending group; the reviewer rejects the grouping
+    # while that part's job is running (before or after its group check).
+    (folder / "ch04.txt").write_text("Learning Widgets, ch04.txt: a late chapter.\n")
+    [new_job] = discover_source_jobs_for_location(location)
+    assert new_job.import_group_id == task.import_job.import_group_id
+    done: list[bool] = []
+    _reject_during(monkeypatch, window, task, done)
+    intake.process_import_job(str(new_job.id))
+    assert done
+
+    assert ImportGroup.objects.get().state == ImportGroup.State.REJECTED
+    per_file = ReviewTask.objects.filter(task_type=ReviewTask.TaskType.NEEDS_ATTENTION)
+    assert sorted(t.source_filename for t in per_file) == sorted(
+        [path.name for path in parts] + ["ch04.txt"]
+    )
+    # Exactly one individual review per file, the late part included.
+    assert per_file.filter(import_job=new_job).count() == 1
+    new_job.refresh_from_db()
+    assert new_job.state == ImportJob.State.LOW_CONFIDENCE
+    assert new_job.storage_identifier
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reorder_rejects_a_position_held_by_an_unsubmitted_part(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _split_book_folder(root)
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    jobs = {job.original_filename: job for job in ImportJob.objects.all()}
+    client = _admin_client()
+
+    # ch02 holds position 2; moving only the appendix there would duplicate it.
+    response = client.post(
+        f"/reviews/{task.id}/multipart/order/",
+        data=json.dumps({"parts": [{"import_job_id": str(jobs["AppA.txt"].id), "part_index": 2}]}),
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    assert ImportJob.objects.get(pk=jobs["AppA.txt"].pk).part_index == 4
+
+    # Swapping two parts in one submission is fine.
+    response = client.post(
+        f"/reviews/{task.id}/multipart/order/",
+        data=json.dumps(
+            {
+                "parts": [
+                    {"import_job_id": str(jobs["AppA.txt"].id), "part_index": 2},
+                    {"import_job_id": str(jobs["ch02.txt"].id), "part_index": 4},
+                ]
+            }
+        ),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+    positions = dict(ImportJob.objects.values_list("original_filename", "part_index"))
+    assert positions == {"ch01.txt": 1, "AppA.txt": 2, "ch03.txt": 3, "ch02.txt": 4}

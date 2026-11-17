@@ -4228,6 +4228,24 @@ def review_multipart_order(request: HttpRequest, task_id: str) -> HttpResponseBa
 
 @require_POST
 @login_required
+def review_multipart_acknowledge_incomplete(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Accept confirming a multi-part work without its missing (failed/absent) parts."""
+    task, profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None or profile is None:
+        return error or HttpResponseBadRequest("invalid request")
+    try:
+        absent = multipart.acknowledge_incomplete(review_task=task, reviewer=profile.user)
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "acknowledged_missing_parts": absent},
+        task_id=task.id,
+    )
+
+
+@require_POST
+@login_required
 def review_multipart_reject(request: HttpRequest, task_id: str) -> HttpResponseBase:
     """Not one work: close the group and identify every file as its own import."""
     task, profile, error = _multipart_review_task(request, task_id)

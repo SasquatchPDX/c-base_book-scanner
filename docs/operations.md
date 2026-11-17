@@ -420,6 +420,15 @@ settled, one review task of type `multipart_work` is opened for the whole folder
 searched by the folder name. `ingest_sources --preview --json` shows
 `multipart_group`/`part_label` for files that would be grouped.
 
+"All of them" is the membership detected from the folder listing (stored on the
+group with each file's source path), not only the jobs created so far: if a byte
+budget stopped discovery after some parts, the group waits until a later run
+imports the rest. A part whose import failed, whose source disappeared, or which was
+imported on its own is shown as *missing*; confirming the group then requires the
+reviewer to acknowledge the incomplete set first (**Confirm without the missing
+files**), and the decision records which files were left out. A file of an already
+confirmed or rejected group that turns up later is imported on its own.
+
 The reviewer can fix the proposed order and labels, then either
 
 - accept a candidate, enter metadata, or link an existing book: every part becomes
@@ -428,7 +437,8 @@ The reviewer can fix the proposed order and labels, then either
   or
 - choose **Not one book**: the group is rejected and every file is identified as an
   independent import in the background (auto-accepted only under the normal rules,
-  otherwise an ordinary review task).
+  otherwise an ordinary review task). A part still being processed when the grouping
+  is rejected is identified on its own as soon as its job finishes.
 
 Originals are never merged, rewritten or deleted by either path. Completeness cannot
 be verified automatically; gaps in the numbering are shown on the review page.
