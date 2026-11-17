@@ -19,11 +19,9 @@ leaves no version row; the ``finally`` blocks remove the staged and published fi
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import re
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,7 +53,7 @@ from ebook_server.storage import (
     ensure_path_storage_ready,
 )
 
-from . import scan_pipeline, scantailor
+from . import scan_events, scan_pipeline, scantailor
 from .models import (
     ScanCover,
     ScanJob,
@@ -487,25 +485,6 @@ def _delete_quietly(storage: LocalFilesystemStorage, destination: str | None) ->
         logger.warning("scanner_upload_cleanup_failed", storage_identifier=destination)
 
 
-# --- S5 hook ------------------------------------------------------------------------------
-
-
-def project_page_from_events(page: ScanPage) -> None:
-    """Apply a ``page`` event that arrived before the image (S5, #129).
-
-    S5 adds ``core.scan_events.project_page_from_events``; it lives on a parallel
-    branch (PR #140). Until both are merged (S7 integration) this is a no-op.
-    TODO(S7): call ``scan_events.project_page_from_events(page)`` directly.
-    """
-    try:
-        module = importlib.import_module("ebook_server.core.scan_events")
-    except ImportError:
-        return
-    projector: Callable[[ScanPage], Any] | None = getattr(module, "project_page_from_events", None)
-    if projector is not None:
-        projector(page)
-
-
 # --- pages (§6.5) -------------------------------------------------------------------------
 
 
@@ -607,7 +586,8 @@ def store_page(
             page.recognized_page_number = metadata.recognized_page_number
             page.status = metadata.status
             page.save(update_fields=["recognized_page_number", "status", "updated_at"])
-            project_page_from_events(page)
+            # A ``page`` event that arrived before the image wins (S5, #129).
+            scan_events.project_page_from_events(page)
             if locked.state == ScanJob.State.OPEN:
                 locked.state = ScanJob.State.CAPTURING
                 locked.save(update_fields=["state", "updated_at"])

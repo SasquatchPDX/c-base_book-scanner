@@ -26,12 +26,20 @@ from typing import Any, Final
 import structlog
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.http import HttpRequest, JsonResponse
+from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
+from django.http.response import HttpResponseBase
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from . import scan_events, scan_lifecycle, scan_manifest, scanner_opf, scanner_uploads
+from . import (
+    scan_events,
+    scan_lifecycle,
+    scan_manifest,
+    scanner_opf,
+    scanner_rescans,
+    scanner_uploads,
+)
 from .models import ScanCover, ScanJob, ScanTodo
 from .scan_job_ids import is_device_job_id
 from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
@@ -43,7 +51,7 @@ MAX_EVENT_BATCH_LINES: Final = scan_events.MAX_EVENT_BATCH_LINES
 
 logger = structlog.get_logger(__name__)
 
-ScannerView = Callable[..., JsonResponse]
+ScannerView = Callable[..., HttpResponseBase]
 
 
 def iso_utc(value: datetime) -> str:
@@ -124,7 +132,7 @@ def _refusal(request: HttpRequest, allowed: tuple[str, ...]) -> JsonResponse | N
 
 def scanner_api_view(
     methods: Iterable[str],
-) -> Callable[[ScannerView], Callable[..., JsonResponse]]:
+) -> Callable[[ScannerView], Callable[..., HttpResponseBase]]:
     """Wrap a scanner view: API switch, Bearer authentication, method check, logging.
 
     The wrapped view is called as ``view(request, *args, **kwargs)`` once the scanner
@@ -132,13 +140,13 @@ def scanner_api_view(
     """
     allowed = tuple(method.upper() for method in methods)
 
-    def decorator(view: ScannerView) -> Callable[..., JsonResponse]:
+    def decorator(view: ScannerView) -> Callable[..., HttpResponseBase]:
         @csrf_exempt
         @wraps(view)
-        def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> JsonResponse:
+        def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponseBase:
             job_id = kwargs.get("job_id")
             try:
-                response = _refusal(request, allowed)
+                response: HttpResponseBase | None = _refusal(request, allowed)
                 if response is None:
                     response = view(request, *args, **kwargs)
                     response.setdefault("Cache-Control", "no-store")
@@ -762,6 +770,126 @@ def job_events(request: HttpRequest, job_id: str) -> JsonResponse:
     except scan_events.ScanEventError as exc:
         return error_response(exc.status, exc.code, exc.message, exc.details)
     return JsonResponse({"sans_last_line_no": result.sans_last_line_no}, status=200)
+
+
+# --- rescans (§6.11) -------------------------------------------------------------------
+
+
+def _rescan_job(job_id: str) -> ScanJob | None:
+    """The scanner's job for the rescan routes, else ``None`` (answered ``404``, §6.1)."""
+    return scanner_job(job_id)
+
+
+@scanner_api_view(["GET"])
+def rescans(request: HttpRequest) -> JsonResponse:
+    """Scanner jobs with open rescan todos, in any state except ``cancelled`` (§6.11)."""
+    return JsonResponse({"items": scanner_rescans.rescan_list()})
+
+
+@scanner_api_view(["GET"])
+def job_rescans(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Page numbers, crop and open todos for the scanner's prompt loop (§6.11, sans#56)."""
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    current = _rescan_job(job_id)
+    if current is None:
+        return _not_found()
+    return JsonResponse(scanner_rescans.job_rescans_payload(current))
+
+
+@scanner_api_view(["GET"])
+def page_thumbnail(request: HttpRequest, job_id: str, sequence_number: str) -> HttpResponseBase:
+    """A JPEG of the page's active version, longest edge <= ``max`` (§6.11), with ETag."""
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    try:
+        number = scanner_uploads.parse_sequence_number(sequence_number)
+    except scanner_uploads.UploadError as exc:
+        return _upload_error(exc)
+    current = _rescan_job(job_id)
+    if current is None:
+        return _not_found()
+    try:
+        edge = scanner_rescans.thumbnail_edge(request.GET.get("max"))
+    except scanner_rescans.ThumbnailError as exc:
+        return error_response(exc.status, exc.code, str(exc), {"field": "max"})
+    version = scanner_rescans.active_page_version(current, number)
+    if version is None:
+        return error_response(
+            404, "not_found", "No such page.", {"job_id": job_id, "sequence_number": number}
+        )
+    etag = scanner_rescans.thumbnail_etag(version, edge)
+    # The URL stays while a rescan replaces the image: revalidate (ETag -> 304) each time.
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
+    if etag in [tag.strip() for tag in request.headers.get("If-None-Match", "").split(",")]:
+        return HttpResponse(status=304, headers=headers)
+    try:
+        path = scanner_rescans.thumbnail_path(version, edge)
+    except scanner_rescans.ThumbnailError as exc:
+        return error_response(exc.status, exc.code, str(exc))
+    response = FileResponse(path.open("rb"), content_type="image/jpeg")
+    for name, value in headers.items():
+        response[name] = value
+    return response
+
+
+def _todo_id(raw: str) -> int | None:
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 18:
+        return None
+    return int(raw)
+
+
+@scanner_api_view(["POST"])
+def rescan_replacement(request: HttpRequest, job_id: str, todo_id: str) -> JsonResponse:
+    """Upload the replacement for a rescan todo (§6.11), atomically on serif's side.
+
+    ``201`` new active version (the old one kept), todo ``completed``, a
+    ``rescan_replace`` event, downstream invalidation, and ``complete`` -> ``captured``.
+    ``200`` when the same checksum already fulfilled the todo. ``409 todo_state`` for a
+    cancelled todo (or one completed with another image); ``422`` as for a page upload.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    current = _rescan_job(job_id)
+    if current is None:
+        return _not_found()
+    number = _todo_id(todo_id)
+    todo = (
+        ScanTodo.objects.select_related("scan_page")
+        .filter(pk=number, scan_job=current, todo_type=ScanTodo.TodoType.RESCAN)
+        .first()
+        if number is not None
+        else None
+    )
+    if todo is None:
+        return error_response(
+            404, "not_found", "No such rescan for this job.", {"todo_id": todo_id[:24]}
+        )
+    try:
+        # Refuse before reading the body; everything is re-checked under the row locks.
+        scanner_rescans.precheck_replacement(current, todo)
+        upload = scanner_uploads.receive_upload(request)
+        try:
+            metadata = scanner_rescans.replacement_metadata(
+                upload.metadata, todo.scan_page.logical_sequence_number
+            )
+            scanner_uploads.verify_checksum(upload, metadata.sha256)
+            assert upload.image_path is not None
+            mime_type, extension = scanner_uploads.sniff_image(upload.image_path)
+            result = scanner_rescans.store_replacement(
+                job=current,
+                todo=todo,
+                upload=upload,
+                metadata=metadata,
+                mime_type=mime_type,
+                extension=extension,
+            )
+        finally:
+            upload.discard()
+    except scanner_uploads.UploadError as exc:
+        return _upload_error(exc)
+    scanner_rescans.after_replacement(result)
+    return JsonResponse(result.payload(), status=201 if result.created else 200)
 
 
 @scanner_api_view(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])

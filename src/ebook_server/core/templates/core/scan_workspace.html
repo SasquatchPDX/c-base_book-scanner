@@ -151,6 +151,7 @@
       <article class="scan-page-card" id="page-{{ page.id }}">
         <header>
           <label class="page-select"><input type="checkbox" data-page-select data-page-id="{{ page.id }}">Page {{ page.logical_sequence_number }} · {{ page.side }}{% if page.recognized_page_number %} · printed {{ page.recognized_page_number }}{% endif %}</label>
+          {% if page.page_number_verified is False %}<span class="status status-failed" data-page-number-unverified title="The scanner could not confirm the printed page number of this rescan; the operator kept the image anyway.">Page number not verified</span>{% elif page.page_number_verified %}<span class="status status-success" data-page-number-verified>Page number verified</span>{% endif %}
           {% if page.open_rescan_todos %}<span class="status status-failed">Rescan requested</span>{% endif %}
         </header>
         {% if page.thumbnail %}<img src="{{ page.thumbnail }}" alt="Captured page {{ page.logical_sequence_number }}">{% endif %}

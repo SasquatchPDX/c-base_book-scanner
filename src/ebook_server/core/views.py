@@ -80,7 +80,9 @@ from . import (
     scan_lifecycle,
     scan_logs,
     scan_pipeline,
+    scan_thumbnails,
     scanner_opf,
+    scanner_rescans,
     scantailor,
     search,
 )
@@ -191,6 +193,7 @@ def _serialize_scan_page_version(version: ScanPageVersion | None) -> dict[str, A
             version.capture_timestamp.isoformat() if version.capture_timestamp else None
         ),
         "scanner_metadata": version.scanner_metadata,
+        "page_number_verified": version.page_number_verified,
         "is_active": version.is_active,
         "storage_identifier": version.storage_identifier,
         "created_at": version.created_at.isoformat(),
@@ -238,6 +241,10 @@ def _serialize_scan_page(
         "logical_sequence_number": page.logical_sequence_number,
         "side": page.side,
         "recognized_page_number": page.recognized_page_number,
+        # The scanner's page-number check of the active version (rescan, #131).
+        "page_number_verified": (
+            active_version.page_number_verified if active_version is not None else None
+        ),
         "scanner_status": page.status,
         "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
@@ -947,25 +954,9 @@ def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
 
 def _render_scan_thumbnail(source_artifact: _ThumbnailSource, cache_path: Path) -> None:
     """Generate a downscaled, browser-displayable JPEG for a page artifact."""
-    from PIL import Image, ImageOps
-
-    storage = source_artifact.storage
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = cache_path.with_name(f"{cache_path.name}.{uuid4().hex}.tmp")
-    try:
-        with storage.open(source_artifact.identifier) as stream, Image.open(stream) as source:
-            image = ImageOps.exif_transpose(source) or source
-            if image.mode in {"I;16", "I;16L", "I;16B", "I"}:
-                image = image.convert("I").point(lambda value: value * (1 / 256)).convert("L")
-            elif image.mode == "F":
-                image = image.point(lambda value: value * 255).convert("L")
-            elif image.mode not in {"RGB", "L"}:
-                image = image.convert("RGB")
-            image.thumbnail((SCAN_THUMBNAIL_MAX_EDGE, SCAN_THUMBNAIL_MAX_EDGE))
-            image.convert("RGB").save(temp_path, format="JPEG", quality=85)
-        temp_path.replace(cache_path)
-    finally:
-        temp_path.unlink(missing_ok=True)
+    scan_thumbnails.render_jpeg_thumbnail(
+        source_artifact.storage, source_artifact.identifier, cache_path, SCAN_THUMBNAIL_MAX_EDGE
+    )
 
 
 def _stage_scan_page_from_existing_version(page: ScanPage) -> tuple[str, int]:
@@ -3588,42 +3579,21 @@ def scan_page_request_rescan(
     payload = _scan_page_request_payload(request)
     reason = _coerce_str_or_none(payload.get("reason")) or ""
 
-    existing_todo = (
-        page.todos.filter(
-            todo_type=ScanTodo.TodoType.RESCAN,
-            state=ScanTodo.State.OPEN,
-        )
-        .order_by("-created_at")
-        .first()
-    )
-    if existing_todo is not None:
-        if _wants_html(request):
-            return redirect("scan-job-workspace", job_id=page.scan_job_id)
-        return JsonResponse(
-            {
-                "todo": _serialize_scan_todo(existing_todo),
-                "created": False,
-                "scan_job_id": str(page.scan_job_id),
-            },
-            status=200,
-        )
-
-    todo = ScanTodo.objects.create(
-        scan_job=page.scan_job,
-        scan_page=page,
-        todo_type=ScanTodo.TodoType.RESCAN,
-        reason=reason,
-        creator=profile.user,
-    )
+    # Creates the todo and, for a scanner job, appends ``rescan_flag`` to scan.jsonl in
+    # the same transaction (#131, contract §6.11); the state is re-checked under lock.
+    try:
+        flagged = scanner_rescans.flag_page(page, reason=reason, user=profile.user)
+    except scan_lifecycle.LifecycleError:
+        return HttpResponseBadRequest("scan job is not accepting rescan requests")
     if _wants_html(request):
         return redirect("scan-job-workspace", job_id=page.scan_job_id)
     return JsonResponse(
         {
-            "todo": _serialize_scan_todo(todo),
-            "created": True,
+            "todo": _serialize_scan_todo(flagged.todo),
+            "created": flagged.created,
             "scan_job_id": str(page.scan_job_id),
         },
-        status=201,
+        status=201 if flagged.created else 200,
     )
 
 

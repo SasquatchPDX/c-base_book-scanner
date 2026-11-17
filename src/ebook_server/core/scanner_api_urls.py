@@ -36,6 +36,22 @@ urlpatterns = [
         scanner_api.job_events,
         name="scanner-api-job-events",
     ),
+    re_path(r"^rescans/?$", scanner_api.rescans, name="scanner-api-rescans"),
+    re_path(
+        r"^jobs/(?P<job_id>[^/]+)/rescans/?$",
+        scanner_api.job_rescans,
+        name="scanner-api-job-rescans",
+    ),
+    re_path(
+        r"^jobs/(?P<job_id>[^/]+)/rescans/(?P<todo_id>[^/]+)/replacement/?$",
+        scanner_api.rescan_replacement,
+        name="scanner-api-rescan-replacement",
+    ),
+    re_path(
+        r"^jobs/(?P<job_id>[^/]+)/pages/(?P<sequence_number>[^/]+)/thumbnail/?$",
+        scanner_api.page_thumbnail,
+        name="scanner-api-page-thumbnail",
+    ),
     # Must stay last: everything else under the namespace is a JSON 404 (after auth).
     re_path(r"^(?P<path>.*)$", scanner_api.not_found, name="scanner-api-not-found"),
 ]
