@@ -1,4 +1,4 @@
-"""Scanner logs (libreflip ``scan.jsonl``) kept next to the book they belong to (#7).
+"""Scanner logs (libreflip ``scan.log``) kept next to the book they belong to (#7).
 
 Uploading a log only stages it: the request writes the (size-bounded) bytes into scan
 staging, records a ``ScanLog`` in state ``queued`` together with a ``ProcessingJob``
@@ -9,7 +9,7 @@ log's ``state`` (``queued`` -> ``stored`` / ``duplicate`` / ``failed``) is repor
 the scan job's API.
 
 When the scan job is already linked to a Book the worker writes the log straight into
-that book's archive folder on the attached storage (``<Author>/<Title>/scan.jsonl`` under
+that book's archive folder on the attached storage (``<Author>/<Title>/scan.log`` under
 the default layout). Otherwise it waits in scan storage and
 ``place_scan_logs_in_book_folder`` moves it there during finalization, deleting the
 scan-storage copy only after the archive copy's SHA-256 is verified.
@@ -39,7 +39,7 @@ logger = structlog.get_logger(__name__)
 # Logs are small text files; anything bigger is not a scanner log.
 MAX_SCAN_LOG_BYTES = 8 * 1024 * 1024
 SCAN_STORAGE_DIRNAME = "scan-artifacts"
-SCAN_LOG_FILENAME = "scan.jsonl"
+SCAN_LOG_FILENAME = "scan.log"
 # Staged uploads live in scan storage under this namespace until the worker runs.
 STAGING_NAMESPACE = "uploads/scan-logs"
 
@@ -87,7 +87,7 @@ def _stage_bounded(uploaded_file: Any) -> tuple[str, int]:
     here; nothing is hashed or parsed.
     """
     storage = _scan_storage()
-    identifier = storage.generate_destination(STAGING_NAMESPACE, f"{uuid.uuid4().hex}.jsonl")
+    identifier = storage.generate_destination(STAGING_NAMESPACE, f"{uuid.uuid4().hex}.log")
     target = storage.resolve_location(identifier)
     ensure_path_storage_ready(target)
     target.parent.mkdir(parents=True, exist_ok=True)

@@ -56,7 +56,7 @@ def test_identical_logs_processed_concurrently_store_one_file(
     book.authors.add(Author.objects.create(full_name="Jane Austen"))
     job = ScanJob.objects.create(book=book)
     logs = [
-        scan_logs.stage_scan_log(job, SimpleUploadedFile("scan.jsonl", LOG), None) for _ in range(2)
+        scan_logs.stage_scan_log(job, SimpleUploadedFile("scan.log", LOG), None) for _ in range(2)
     ]
 
     # Both workers hash before either stores, so neither sees the other's row early.

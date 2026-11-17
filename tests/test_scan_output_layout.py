@@ -41,7 +41,7 @@ def _book() -> Book:
     return book
 
 
-def _post_log(client: Client, job: ScanJob, payload: bytes, name: str = "scan.jsonl") -> Any:
+def _post_log(client: Client, job: ScanJob, payload: bytes, name: str = "scan.log") -> Any:
     return client.post(
         f"/scan/jobs/{job.id}/logs/",
         data={"file": SimpleUploadedFile(name, payload, content_type="text/plain")},
@@ -127,7 +127,7 @@ def test_log_upload_only_stages_and_queues_work(
     assert log.processing_job.job_type == ProcessingJob.JobType.SCAN_LOG
     assert log.processing_job.state == ProcessingJob.JobState.QUEUED
     assert (tmp_path / "scan-artifacts" / log.staging_identifier).read_bytes() == LOG
-    assert not (tmp_path / "library-artifacts" / FOLDER / "scan.jsonl").exists()
+    assert not (tmp_path / "library-artifacts" / FOLDER / "scan.log").exists()
     assert len(log_queue.calls) == 1  # enqueued once the request transaction committed
 
     _run_log_jobs(log_queue)
@@ -154,8 +154,8 @@ def test_log_for_linked_job_goes_straight_into_the_book_folder(
     _run_log_jobs(log_queue)
     log = ScanLog.objects.get(scan_job=job)
     assert log.state == ScanLog.State.STORED
-    assert log.storage_identifier == f"{FOLDER}/scan.jsonl"
-    assert (tmp_path / "library-artifacts" / FOLDER / "scan.jsonl").read_bytes() == LOG
+    assert log.storage_identifier == f"{FOLDER}/scan.log"
+    assert (tmp_path / "library-artifacts" / FOLDER / "scan.log").read_bytes() == LOG
 
     again = _post_log(client, job, LOG)
     assert again.status_code == 202
@@ -169,7 +169,7 @@ def test_log_for_linked_job_goes_straight_into_the_book_folder(
     assert second.status_code == 202
     _run_log_jobs(log_queue)
     names = sorted(p.name for p in (tmp_path / "library-artifacts" / FOLDER).iterdir())
-    assert names[0] == "scan-" + names[0][5:] and names[1] == "scan.jsonl"
+    assert names[0] == "scan-" + names[0][5:] and names[1] == "scan.log"
     # Every staged upload was cleaned up by its worker.
     assert not list((tmp_path / "scan-artifacts" / scan_logs.STAGING_NAMESPACE).iterdir())
 
@@ -196,8 +196,8 @@ def test_log_before_book_link_moves_into_folder_on_finalization(
     waiting.refresh_from_db()
     assert waiting.storage_location is not None
     assert waiting.storage_location.identifier == "default"
-    assert waiting.storage_identifier == f"{FOLDER}/scan.jsonl"
-    assert (tmp_path / "library-artifacts" / FOLDER / "scan.jsonl").read_bytes() == LOG
+    assert waiting.storage_identifier == f"{FOLDER}/scan.log"
+    assert (tmp_path / "library-artifacts" / FOLDER / "scan.log").read_bytes() == LOG
     assert not staged.exists()
 
 
@@ -245,9 +245,9 @@ def test_scan_log_upload_ignores_client_path_in_filename(
     tmp_path: Path, log_queue: _DeferredQueue
 ) -> None:
     client, job = _create_scan_job_with_book("scan-log-path", book_id=_book().id)
-    response = _post_log(client, job, LOG, name="../../etc/scan.jsonl")
+    response = _post_log(client, job, LOG, name="../../etc/scan.log")
     assert response.status_code == 202
     _run_log_jobs(log_queue)
     log = ScanLog.objects.get(scan_job=job)
-    assert log.original_filename == "scan.jsonl"
-    assert log.storage_identifier == f"{FOLDER}/scan.jsonl"
+    assert log.original_filename == "scan.log"
+    assert log.storage_identifier == f"{FOLDER}/scan.log"
