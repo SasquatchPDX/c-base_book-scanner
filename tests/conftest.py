@@ -42,3 +42,15 @@ def _relaxed_storage_root_and_source_age() -> Iterator[None]:
         django_settings.BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS,
         django_settings.BOOK_SCANNER_STORAGE_MIN_FREE_BYTES,
     ) = original
+
+
+@pytest.fixture(autouse=True)
+def _no_book_opf_writes() -> Iterator[None]:
+    """Metadata edits in unrelated tests must not write metadata.opf files.
+
+    ``tests/test_book_opf.py`` opts back in.
+    """
+    original = getattr(django_settings, "BOOK_SCANNER_WRITE_BOOK_OPF", True)
+    django_settings.BOOK_SCANNER_WRITE_BOOK_OPF = False
+    yield
+    django_settings.BOOK_SCANNER_WRITE_BOOK_OPF = original

@@ -1,36 +1,66 @@
 {% extends "core/base.html" %}
 {% block title %}Library · Hackerspace Library{% endblock %}
 {% block content %}
-  <section class="hero">
+  <section class="hero landing-hero">
     <div>
       <p class="eyebrow">Shared collection</p>
       <h1>Books for curious people.</h1>
-      <p>Search the hackerspace collection, download an available format, or contribute another book.</p>
+      <p>Search {{ book_count_display }} book{{ book_count|pluralize }} by title, author, ISBN or description, or start from a shelf, a facet or the author index.</p>
     </div>
-    <form class="hero-search" action="{% url 'library-books' %}" method="get">
+    <form class="hero-search" action="{% url 'library-books' %}" method="get" role="search">
       <input type="hidden" name="view" value="html">
-      <label for="home-search">Search title, author, or description</label>
+      <label for="home-search">Search the library</label>
       <div class="input-row">
-        <input id="home-search" name="q" type="search" autofocus>
+        <input id="home-search" name="q" type="search" autocomplete="off" placeholder="Title, author, ISBN…">
         <button type="submit">Search</button>
       </div>
+      <p class="muted search-links"><a href="{% url 'library-books' %}?view=html">All books, newest first</a> · <a href="{% url 'library-authors' %}?view=html">Authors A–Z</a></p>
     </form>
   </section>
-  <section class="stats" aria-label="Collection statistics">
-    <div><strong>{{ book_count }}</strong><span>canonical books</span></div>
-    <div><strong>{{ variant_count }}</strong><span>ready file variants</span></div>
-  </section>
-  <section>
-    <div class="section-heading"><h2>Recent additions</h2><a href="{% url 'library-books' %}?view=html">Browse all</a></div>
-    <div class="book-grid">
-      {% for book in recent_books %}
-        <article class="book-card">
-          {% if book.cover_front %}<img class="cover-thumb" src="{{ book.cover_front.url }}" alt="Front cover of {{ book.title }}" loading="lazy" decoding="async">{% else %}<div class="cover-placeholder" aria-hidden="true">{{ book.title|slice:":1" }}</div>{% endif %}
-          <h3><a href="{% url 'library-book-detail' book.id %}?view=html">{{ book.title }}</a></h3>
-          <p>{% for author in book.authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
-          <div class="badges">{% for format in book.formats_available %}<span>{{ format|upper }}</span>{% endfor %}</div>
-        </article>
-{% empty %}<p class="empty-state">The collection is empty. Upload the first book.</p>{% endfor %}
+  <div class="landing-layout">
+    <div class="landing-main">
+      {% for shelf in shelves %}
+        <section class="shelf" aria-labelledby="shelf-{{ shelf.id }}">
+          <div class="section-heading">
+            <h2 id="shelf-{{ shelf.id }}">{{ shelf.title }}</h2>
+            {% if shelf.see_all %}<a href="{% url 'library-books' %}?{{ shelf.see_all }}">See all<span class="visually-hidden"> {{ shelf.title|lower }}</span></a>{% endif %}
+          </div>
+          <ul class="shelf-row">
+            {% for book in shelf.books %}
+              <li class="shelf-card">
+                <a href="{% url 'library-book-detail' book.id %}?view=html">
+                  {% include "core/_cover_image.html" with book=book size="medium" %}
+                  <span class="shelf-title">{{ book.title }}</span>
+                </a>
+                <span class="shelf-meta">{% for author in book.authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}{% if book.year %} · {{ book.year }}{% endif %}</span>
+              </li>
+            {% endfor %}
+          </ul>
+        </section>
+      {% empty %}
+        <p class="empty-state">The collection is empty. <a href="{% url 'imports-upload' %}">Upload the first book.</a></p>
+      {% endfor %}
+      <section class="author-index-teaser" aria-labelledby="author-index-heading">
+        <h2 id="author-index-heading">Authors A–Z</h2>
+        <nav aria-label="Authors by first letter" class="letter-nav">
+          {% for letter in letters %}<a href="{% url 'library-authors' %}?view=html&amp;letter={{ letter }}">{{ letter }}</a>{% endfor %}
+        </nav>
+      </section>
+    </div>
+    {% if facet_groups %}
+      <nav class="facet-sidebar" aria-label="Browse by facet">
+        <h2 class="facet-sidebar-title">Browse by</h2>
+        {% for group in facet_groups %}
+          <section class="facet-group" aria-labelledby="facet-{{ group.name }}">
+            <h3 id="facet-{{ group.name }}">{{ group.heading }}</h3>
+            <ul>
+              {% for item in group.items %}
+                <li><a href="{% url 'library-books' %}?{{ item.query }}">{{ item.label }}</a> <span class="facet-count" aria-label="{{ item.count }} book{{ item.count|pluralize }}">{{ item.count }}</span></li>
+              {% endfor %}
+            </ul>
+          </section>
+        {% endfor %}
+      </nav>
+    {% endif %}
   </div>
-  </section>
 {% endblock %}

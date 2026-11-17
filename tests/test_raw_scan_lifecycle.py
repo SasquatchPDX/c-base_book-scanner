@@ -468,10 +468,11 @@ class _FakeCoverSource:
 def fake_extensions() -> Iterator[_FakeCoverSource]:
     source = _FakeCoverSource({"front": "a" * 64})
     scan_manifest.register_manifest_source(source)
+    real_high_water_mark = scan_manifest._event_high_water_mark  # S5's, from apps.ready
     scan_manifest.register_event_high_water_mark(lambda job: 812)
     yield source
     scan_manifest.unregister_manifest_source("covers")
-    scan_manifest.register_event_high_water_mark(None)
+    scan_manifest.register_event_high_water_mark(real_high_water_mark)
 
 
 @pytest.mark.django_db
@@ -650,7 +651,6 @@ def test_captured_scan_book_is_invisible_until_finished(
     home = member.get("/library/?view=html")
     assert "Raw Scan Book" not in home.content.decode()
     assert home.context["book_count"] == 1
-    assert home.context["variant_count"] == 1
     assert member.get(f"/library/books/{raw.id}/").status_code == 404
     assert member.get(f"/library/books/{raw.id}/download/").status_code == 404
     assert member.get(f"/library/books/{raw.id}/covers/front/").status_code == 404
