@@ -6,13 +6,14 @@ from datetime import datetime
 from typing import Any
 
 import structlog
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
 from ebook_server.jobs import get_queue
 
-from . import identification, intake, metadata_search
+from . import identification, intake, metadata_search, review_accept
 from .models import ImportJob, MetadataSearch, ProcessingJob, ReviewTask
 
 logger = structlog.get_logger(__name__)
@@ -206,6 +207,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
     task: ReviewTask | None = None
+    mode = "text"
     signals: identification.IdentificationInput | None = None
     outcomes: list[identification.ProviderOutcome] | None = None
     search_started_at = timezone.now()
@@ -216,7 +218,12 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         import_job = task.import_job
         if import_job is None:
             raise ReviewIdentificationError("review task is not for an import")
-        signals = _review_signals(task, import_job, details.get("terms"))
+        terms = details.get("terms")
+        if metadata_search.is_isbn_terms(terms):
+            mode = "isbn"
+            signals = metadata_search.isbn_signals(str(terms["isbn"]))
+        else:
+            signals = _review_signals(task, import_job, terms)
         candidates, outcomes = identification.resolve_candidates_with_report(signals)
         discard_reason = _publish(
             processing_job=processing_job,
@@ -228,7 +235,17 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             outcomes=outcomes,
             candidates=candidates,
             started_at=search_started_at,
+            mode=mode,
         )
+        auto_accepted = None
+        if not discard_reason and mode == "isbn":
+            auto_accepted = _auto_accept_isbn_match(
+                processing_job=processing_job,
+                task=task,
+                import_job=import_job,
+                isbn=str(details["terms"]["isbn"]),
+                requested_by_id=details.get("requested_by_user_id"),
+            )
         logger.info(
             "review_identification_succeeded",
             processing_job_id=str(processing_job.job_id),
@@ -237,6 +254,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             candidate_count=len(candidates),
             published=not discard_reason,
             discarded=discard_reason,
+            auto_accepted_candidate_id=auto_accepted,
         )
     except Exception as exc:
         rq_job = get_current_job() if raise_on_error else None
@@ -263,6 +281,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
                 started_at=search_started_at,
                 exc=exc,
                 discarded=discarded,
+                mode=mode,
             )
         logger.exception(
             "review_identification_failed",
@@ -285,6 +304,7 @@ def _publish(
     outcomes: list[identification.ProviderOutcome],
     candidates: list[identification.IdentificationCandidate],
     started_at: datetime,
+    mode: str,
 ) -> str:
     """Store the run; make it current only if still allowed. Returns the discard reason."""
     with transaction.atomic():
@@ -312,6 +332,7 @@ def _publish(
             requested_by_id=details.get("requested_by_user_id"),
             started_at=started_at,
             discarded=reason,
+            mode=mode,
         )
         metadata_search.save_candidates(
             search=search,
@@ -358,6 +379,62 @@ def _publish(
         processing_job.state = locked_job.state
         processing_job.details = locked_job.details
     return ""
+
+
+def _auto_accept_isbn_match(
+    *,
+    processing_job: ProcessingJob,
+    task: ReviewTask,
+    import_job: ImportJob,
+    isbn: str,
+    requested_by_id: int | None,
+) -> int | None:
+    """Accept the one book whose provider record carries the reviewer's ISBN (#59).
+
+    The reviewer found the ISBN in the actual ebook, so a provider record that
+    itself lists that ISBN, with exactly one distinct book among such records, is
+    accepted through the normal accept path. Fenced like publication: only while
+    this job is still the import's current search and the review is unresolved.
+    Returns the accepted candidate's id, or ``None`` (the reviewer then chooses).
+    """
+    try:
+        with transaction.atomic():
+            locked_task = ReviewTask.objects.select_for_update().get(pk=task.pk)
+            locked_import = ImportJob.objects.select_for_update().get(pk=import_job.pk)
+            if (
+                locked_task.state not in {ReviewTask.State.OPEN, ReviewTask.State.CLAIMED}
+                or locked_import.state == ImportJob.State.COMPLETE
+                or locked_import.current_search_job_id != processing_job.job_id
+            ):
+                return None
+            candidate = review_accept.auto_acceptable_isbn_candidate(
+                metadata_search.current_candidates(locked_task), isbn
+            )
+            if candidate is None:
+                return None
+            locked_task.import_job = locked_import
+            review_accept.accept_candidate(
+                task=locked_task,
+                candidate=candidate,
+                reviewer=_user_or_none(requested_by_id),
+                isbn=isbn,
+                decision_notes=f"Accepted candidate {candidate.id}: ISBN {isbn} verified",
+                extra_payload={"resolution_source": "reviewer_isbn", "isbn": isbn},
+            )
+            return candidate.id
+    except Exception:  # the review stays open with the verified candidate shown
+        logger.exception(
+            "review_isbn_auto_accept_failed",
+            processing_job_id=str(processing_job.job_id),
+            review_task_id=task.id,
+        )
+        return None
+
+
+def _user_or_none(user_id: int | None) -> Any:
+    if user_id is None:
+        return None
+    return get_user_model().objects.filter(pk=user_id).first()
 
 
 def _record_job_failure(
@@ -414,6 +491,7 @@ def _record_failed_search(
     started_at: datetime,
     exc: Exception,
     discarded: str = "",
+    mode: str = "text",
 ) -> None:
     stage = "saving the results failed" if outcomes is not None else "the search failed"
     try:
@@ -427,6 +505,7 @@ def _record_failed_search(
             started_at=started_at,
             error=f"{stage}: {type(exc).__name__}",
             discarded=discarded,
+            mode=mode,
         )
     except Exception:  # never mask the original failure
         logger.exception(
