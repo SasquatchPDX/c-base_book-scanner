@@ -200,6 +200,11 @@ urlpatterns = [
         name="review-search-again",
     ),
     path(
+        "reviews/<int:task_id>/isbn-lookup/",
+        views.review_isbn_lookup,
+        name="review-isbn-lookup",
+    ),
+    path(
         "reviews/<int:task_id>/edit-search-terms/",
         views.review_edit_search_terms,
         name="review-edit-search-terms",
