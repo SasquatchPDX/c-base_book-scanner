@@ -1,0 +1,22 @@
+{% extends "core/base.html" %}
+{% block title %}Leaderboard · Hackerspace Library{% endblock %}
+{% block content %}
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Members only · opt-in</p>
+      <h1>{% if period == "all" %}All-time leaderboard{% else %}This {{ season_kind }}'s leaderboard{% endif %}</h1>
+    </div>
+    {% if period == "all" %}<a href="{% url 'contributions-leaderboard' %}?view=html">This {{ season_kind }}</a>{% else %}<a href="{% url 'contributions-leaderboard' %}?view=html&amp;period=all">All time</a>{% endif %}
+  </div>
+  <p class="muted">Only members who chose to join appear here, under the handle they picked. {% if period != "all" %}The season started {{ season_start|date:"Y-m-d" }}.{% endif %} Join or leave on <a href="{% url 'my-contributions' %}?view=html">your contributions page</a>.</p>
+  <div class="list-stack">
+    {% for row in rows %}
+      <article class="review-row">
+        <div class="grow"><h2>{{ row.rank }}. {{ row.handle }}</h2>{% if row.accuracy_percent is not None %}<p class="muted">decisions held up: {{ row.accuracy_percent }}%</p>{% endif %}</div>
+        <span class="status">{{ row.points }} points</span>
+      </article>
+    {% empty %}
+      <p class="empty-state">Nobody on the board yet.</p>
+    {% endfor %}
+  </div>
+{% endblock %}

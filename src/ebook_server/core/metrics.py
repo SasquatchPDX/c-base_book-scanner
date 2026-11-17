@@ -14,12 +14,15 @@ from prometheus_client.core import GaugeMetricFamily
 from redis import Redis
 from rq import Queue
 
+from ebook_server.jobs import llm_queue_name
+
 from .models import (
     Book,
     CoverImage,
     CoverThumbnail,
     FileVariant,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     ProcessingJob,
     ReviewTask,
@@ -216,6 +219,62 @@ class PersistentStateCollector:
         yield confidence_metric
 
         yield self._queue_metric()
+        yield from self._llm_metrics(now)
+
+    @staticmethod
+    def _llm_metrics(now: datetime) -> Iterator[GaugeMetricFamily]:
+        """LLM identification assist (#26): request outcomes and whether it helps."""
+        yield _group_count_metrics(
+            name="ebook_server_llm_requests",
+            documentation="LLM identification requests by trigger and outcome.",
+            rows=LLMSuggestion.objects.values("trigger", "outcome").annotate(total=Count("id")),
+            label_names=("trigger", "outcome"),
+        )
+        recent = GaugeMetricFamily(
+            "ebook_server_llm_requests_recent",
+            "LLM identification requests within a bounded recent window, by outcome.",
+            labels=["outcome", "window"],
+        )
+        for window, delta in RECENT_WINDOWS:
+            rows = (
+                LLMSuggestion.objects.filter(created_at__gte=now - delta)
+                .values("outcome")
+                .annotate(total=Count("id"))
+            )
+            for row in rows:
+                recent.add_metric([str(row["outcome"]), window], float(row["total"]))
+        yield recent
+
+        # Did the assist help? Resolution of review tasks the LLM was asked about.
+        resolutions: dict[str, int] = defaultdict(int)
+        tasks = (
+            ReviewTask.objects.filter(
+                llm_suggestions__isnull=False,
+                state=ReviewTask.State.RESOLVED,
+            )
+            .distinct()
+            .select_related("selected_candidate")
+        )
+        for task in tasks.iterator():
+            if task.decision == ReviewTask.Decision.ACCEPT_CANDIDATE:
+                candidate = task.selected_candidate
+                raw = candidate.raw_payload if candidate is not None else None
+                llm_found = isinstance(raw, dict) and raw.get("_hint_source") == "llm"
+                resolutions["accepted_llm_candidate" if llm_found else "accepted_other"] += 1
+            elif task.decision == ReviewTask.Decision.MANUAL_ENTRY:
+                resolutions["manual_entry"] += 1
+            elif task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED:
+                resolutions["unidentified"] += 1
+            else:
+                resolutions["other"] += 1
+        assisted = GaugeMetricFamily(
+            "ebook_server_llm_assisted_reviews",
+            "Resolved review tasks that had an LLM suggestion, by how they were resolved.",
+            labels=["resolution"],
+        )
+        for resolution, total in sorted(resolutions.items()):
+            assisted.add_metric([resolution], float(total))
+        yield assisted
 
     @staticmethod
     def _oldest_active_processing_job_metric(now: datetime) -> GaugeMetricFamily:
@@ -309,17 +368,31 @@ class PersistentStateCollector:
             labels=["queue", "measure"],
         )
         queue_url = settings.BOOK_SCANNER_QUEUE_URL
-        queue_name = settings.BOOK_SCANNER_QUEUE_NAME
+        queue_names = [settings.BOOK_SCANNER_QUEUE_NAME]
+        if getattr(settings, "BOOK_SCANNER_LLM_ENABLED", False):
+            llm_queue = llm_queue_name()
+            if llm_queue not in queue_names:
+                queue_names.append(llm_queue)
+        for queue_name in queue_names:
+            PersistentStateCollector._add_queue_samples(metric, queue_url, queue_name)
+        return metric
+
+    @staticmethod
+    def _add_queue_samples(
+        metric: GaugeMetricFamily,
+        queue_url: str | None,
+        queue_name: str,
+    ) -> None:
         if not queue_url:
             metric.add_metric([queue_name, "enabled"], 0)
             metric.add_metric([queue_name, "up"], 0)
             metric.add_metric([queue_name, "depth"], 0)
-            return metric
+            return
         if queue_url.startswith("inline://"):
             metric.add_metric([queue_name, "enabled"], 0)
             metric.add_metric([queue_name, "up"], 1)
             metric.add_metric([queue_name, "depth"], 0)
-            return metric
+            return
         try:
             connection = Redis.from_url(queue_url)
             queue = Queue(name=queue_name, connection=connection)
@@ -328,8 +401,7 @@ class PersistentStateCollector:
             metric.add_metric([queue_name, "enabled"], 1)
             metric.add_metric([queue_name, "up"], 0)
             metric.add_metric([queue_name, "depth"], 0)
-            return metric
+            return
         metric.add_metric([queue_name, "enabled"], 1)
         metric.add_metric([queue_name, "up"], 1)
         metric.add_metric([queue_name, "depth"], depth)
-        return metric

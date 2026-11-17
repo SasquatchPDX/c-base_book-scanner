@@ -20,7 +20,7 @@ from rq import get_current_job
 from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import conversion, intake, ocr
+from . import contributions, conversion, intake, ocr
 from .models import (
     FileVariant,
     ProcessingJob,
@@ -709,6 +709,8 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
             scan_job.state = ScanJob.State.COMPLETE
             scan_job.finished_at = finished_at
             scan_job.save(update_fields=["state", "finished_at", "updated_at"])
+        # Pending recognition for the members whose pages made the final set (#27).
+        contributions.record_scan_completion(scan_job)
         logger.info(
             "scan_finalization_succeeded",
             processing_job_id=str(processing_job.job_id),
