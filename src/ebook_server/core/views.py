@@ -1238,6 +1238,10 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
     ),
+    "ambiguous_tie": (
+        "Several different books tied for the best score, so none was accepted "
+        "automatically. Pick the right one below."
+    ),
     "edition_conflict": (
         "The best match scored high enough to be accepted automatically, but it "
         "describes another edition than the file: its ISBN, language or publisher "
