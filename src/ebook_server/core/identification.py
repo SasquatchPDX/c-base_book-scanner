@@ -240,6 +240,10 @@ class IdentificationCandidate:
     work_isbns: tuple[str, ...] = ()
     work_languages: tuple[str, ...] = ()
     work_publishers: tuple[str, ...] = ()
+    # The candidate stands for one concrete edition (an edition record, or the edition
+    # selected from a work search hit). Its missing edition fields are then unknown:
+    # the work lists are never used in their place, neither for bonuses nor conflicts.
+    concrete_edition: bool = False
 
 
 def _normalize_identifier(value: str | None) -> str | None:
@@ -841,6 +845,13 @@ def _normalize_candidate(
     # A search hit describes a *work*; ``editions`` adds the one edition that best
     # matches the query. Edition values describe something concrete, work lists do not.
     edition = _best_edition(payload, signals)
+    # An Open Library search hit describes a work; anything else (an /isbn/ edition
+    # record, a Hardcover/DNB/Google Books volume) is itself one edition. A work hit
+    # stands for a concrete edition only when one of its editions was selected.
+    work_hit = isinstance(payload.get("editions"), dict) or str(
+        payload.get("key") or ""
+    ).startswith("/works/")
+    concrete_edition = bool(edition) or not work_hit
     if isbn10 is None and isbn13 is None and edition:
         # Prefer the file's own ISBN when this edition lists several.
         edition_values = _as_str_list(edition.get("isbn"))
@@ -865,12 +876,13 @@ def _normalize_candidate(
     # Edition publisher: search ``editions`` doc, edition record ``publishers``, or a
     # plain-string ``publisher`` (single-edition shape, e.g. Hardcover). The search
     # ``publisher`` *list* spans all editions, so its first entry is arbitrary (#37);
-    # it is used for comparison only.
+    # it is used for comparison only. A payload that is not a work hit is one edition,
+    # so its ``publisher`` (string or list) is that edition's.
     raw_publisher = payload.get("publisher")
     edition_publishers = (
         _as_str_list(edition.get("publisher"))
         or _as_str_list(payload.get("publishers"))
-        or (_as_str_list(raw_publisher) if isinstance(raw_publisher, str) else [])
+        or (_as_str_list(raw_publisher) if isinstance(raw_publisher, str) or not work_hit else [])
     )
     publisher = next(
         (normalize_text(value) for value in edition_publishers if normalize_text(value)),
@@ -900,13 +912,22 @@ def _normalize_candidate(
 
     # Languages, edition first: search edition doc ["eng"] or edition record
     # [{"key": "/languages/eng"}] (#36), then the work's list ["und", "eng", "fre"].
-    edition_language_values = _as_language_values(edition.get("language")) or (
-        _as_language_values(payload.get("languages"))
+    # The ``language`` of a payload that is not a work hit is its own edition's.
+    edition_language_values = (
+        _as_language_values(edition.get("language"))
+        or _as_language_values(payload.get("languages"))
+        or ([] if work_hit else _as_language_values(payload.get("language")))
     )
-    work_language_values = _as_language_values(payload.get("language"))
+    work_language_values = _as_language_values(payload.get("language")) if work_hit else []
     edition_languages = tuple(normalize_languages(edition_language_values))
     work_languages = tuple(normalize_languages(edition_language_values + work_language_values))
-    language = _pick_language(edition_language_values, work_language_values, signals.language)
+    # A concrete edition without a language has an unknown language: the work's list
+    # (which may hold the file's language through another edition) must not fill it.
+    language = _pick_language(
+        edition_language_values,
+        [] if concrete_edition else work_language_values,
+        signals.language,
+    )
 
     candidate = IdentificationCandidate(
         provider_id=provider_id,
@@ -937,6 +958,7 @@ def _normalize_candidate(
         work_isbns=tuple(sorted(work_isbns)),
         work_languages=work_languages,
         work_publishers=work_publisher_names,
+        concrete_edition=concrete_edition,
     )
     return _apply_scoring(signals, candidate)
 
@@ -1238,9 +1260,16 @@ def _edition_isbn13s(candidate: IdentificationCandidate) -> set[str]:
 
 
 def _candidate_languages(candidate: IdentificationCandidate) -> set[str]:
-    """Normalised languages of the edition, else of the work, else the stored one."""
+    """Normalised languages to compare the file's language with.
+
+    The edition's own languages. For a concrete edition that names none the language
+    is unknown (empty set): no bonus and no conflict. Only a candidate that names no
+    edition falls back to the work's list, then to its stored language.
+    """
     if candidate.edition_languages:
         return set(candidate.edition_languages)
+    if candidate.concrete_edition:
+        return set()
     if candidate.work_languages:
         return set(candidate.work_languages)
     language = normalize_language(candidate.language)
@@ -1251,6 +1280,14 @@ def _edition_publishers(candidate: IdentificationCandidate) -> tuple[str, ...]:
     if candidate.edition_publishers:
         return candidate.edition_publishers
     return (candidate.publisher,) if candidate.publisher else ()
+
+
+def _candidate_publishers(candidate: IdentificationCandidate) -> tuple[str, ...]:
+    """Publishers to compare the file's publisher with (same rule as the languages)."""
+    publishers = _edition_publishers(candidate)
+    if publishers or candidate.concrete_edition:
+        return publishers
+    return candidate.work_publishers
 
 
 def edition_conflicts(
@@ -1265,7 +1302,8 @@ def edition_conflicts(
     nothing. A file language must be the edition's (or the work's, when the candidate
     names no edition). A file publisher must match the edition's unless the ISBN
     already confirms the edition (ebook metadata often names a distributor or imprint).
-    Values missing on either side are no contradiction.
+    Values missing on either side are no contradiction, and no agreement either: a
+    concrete edition's missing field is never filled from the work lists.
     """
     reasons: list[str] = []
     file_isbns = _isbn13_set(signals.isbns)
@@ -1326,14 +1364,12 @@ def _apply_scoring(
     score += 0.3 * author_score
 
     # Language and publisher are compared with the selected edition; the work's lists
-    # count only for a candidate that names no edition (#37).
+    # count only for a candidate that names no edition (#37). A field a concrete edition
+    # lacks is unknown and earns nothing.
     if signals.language and signals.language in _candidate_languages(candidate):
         score += 0.05
 
-    if _publisher_match(
-        signals.publisher,
-        _edition_publishers(candidate) or candidate.work_publishers,
-    ):
+    if _publisher_match(signals.publisher, _candidate_publishers(candidate)):
         score += 0.05
 
     if signals.description and candidate.description:

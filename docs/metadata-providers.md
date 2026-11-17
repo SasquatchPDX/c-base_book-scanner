@@ -70,7 +70,11 @@ A Book record stands for the edition it was matched to:
   the edition, and adds `BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS` (default
   0.3);
 - the language and publisher bonuses compare with the edition; the work's lists
-  count only for a candidate that names no edition.
+  count only for a candidate that names no edition. A concrete edition (an
+  edition record, a single-edition provider record, or the edition selected from
+  a search hit) that lacks a language or publisher has that field *unknown*: it
+  earns no bonus, raises no conflict, and is never filled from the work's lists
+  (a French or Gollancz file does not match a sparse Ace edition through them).
 
 The ISBN path (`/isbn/<isbn>.json`) runs first whenever the file has an ISBN, so
 in practice the work-level comparison matters only when that lookup misses.

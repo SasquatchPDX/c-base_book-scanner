@@ -24,6 +24,7 @@ from ebook_server.core.identification import (
     _normalize_candidate,
     build_identification_input,
     edition_conflicts,
+    edition_evidence,
     resolve_candidates,
 )
 from ebook_server.core.languages import normalize_language, normalize_languages
@@ -409,6 +410,104 @@ def test_isbn_confirmed_edition_tolerates_an_imprint_publisher() -> None:
     assert edition_conflicts(candidate, signals) == []
 
 
+# --- Sparse concrete editions (#37 review on 3e71293) -----------------------------
+#
+# The selected Ace edition lacks one field. The work lists (en/fr, Gollancz/Ace) must
+# not stand in for it: the field is unknown, worth no bonus and no conflict.
+
+
+def _sparse_search_doc(missing: str) -> dict[str, Any]:
+    edition = {
+        key: value for key, value in SEARCH_DOC["editions"]["docs"][0].items() if key != missing
+    }
+    return {**SEARCH_DOC, "editions": {"numFound": 10, "docs": [edition]}}
+
+
+def _decide_with_search_doc(
+    doc: dict[str, Any], signals: IdentificationInput
+) -> intake.AutoAcceptDecision:
+    with (
+        patch(
+            "ebook_server.core.identification.urlopen",
+            _fake_urlopen({"search.json": {"docs": [doc]}}, []),
+        ),
+        patch(
+            "ebook_server.core.identification._provider_instances",
+            lambda: [OpenLibraryMetadataProvider()],
+        ),
+    ):
+        candidates = resolve_candidates(signals)
+    return intake.decide_auto_accept(candidates, ["Alastair Reynolds"], file_evidence=signals)
+
+
+def test_sparse_edition_without_language_does_not_borrow_the_work_languages() -> None:
+    doc = _sparse_search_doc("language")
+    signals = _signals(**ABSOLUTION_GAP, language="fr")
+    candidate = _normalize_candidate("openlibrary", doc, signals)
+    assert candidate.concrete_edition
+    assert candidate.isbn13 == "9780441011582"
+    assert candidate.edition_languages == ()
+    # "fre" exists only in the work list; the edition's language stays unknown.
+    assert candidate.language is None
+    assert candidate.score == pytest.approx(0.85)
+    assert edition_evidence(candidate, signals)["edition_languages"] == []
+    decision = _decide_with_search_doc(doc, signals)
+    assert decision.candidate is None
+    assert decision.blocked_reason is None  # below the threshold, not a conflict
+
+
+def test_sparse_edition_without_publisher_does_not_borrow_the_work_publishers() -> None:
+    doc = _sparse_search_doc("publisher")
+    signals = _signals(**ABSOLUTION_GAP, publisher="gollancz")
+    candidate = _normalize_candidate("openlibrary", doc, signals)
+    assert candidate.concrete_edition
+    assert candidate.isbn13 == "9780441011582"
+    assert candidate.publisher is None
+    assert candidate.score == pytest.approx(0.85)
+    decision = _decide_with_search_doc(doc, signals)
+    assert decision.candidate is None
+    assert decision.blocked_reason is None  # below the threshold, not a conflict
+
+
+def test_work_hit_without_edition_still_compares_with_the_work_lists() -> None:
+    work_only = {key: value for key, value in SEARCH_DOC.items() if key != "editions"}
+    signals = _signals(**ABSOLUTION_GAP, language="fr", publisher="gollancz")
+    candidate = _normalize_candidate("openlibrary", work_only, signals)
+    assert not candidate.concrete_edition
+    assert candidate.score == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize(
+    ("missing", "opf_extra"),
+    [
+        ("language", "<dc:language>fr</dc:language>"),
+        ("publisher", "<dc:publisher>Gollancz</dc:publisher>"),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_intake_routes_sparse_edition_probes_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str, opf_extra: str
+) -> None:
+    client = Client()
+    job = _upload_epub(
+        monkeypatch,
+        tmp_path,
+        client,
+        doc=_sparse_search_doc(missing),
+        metadata_xml=opf_extra,
+        auto_accept_score=None,
+    )
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert intake.AUTO_ACCEPT_BLOCKED_KEY not in job.evidence  # below the threshold
+    top = job.metadata_candidates.order_by("-score").first()
+    assert top is not None
+    assert top.isbn13 == "9780441011582"
+    assert float(top.score) == pytest.approx(0.85)
+    assert not Book.objects.exists()
+    assert not Identifier.objects.filter(normalized_value="9780441011582").exists()
+
+
 class _StubProvider:
     def __init__(self, provider_id: str, payload: dict[str, Any]) -> None:
         self.provider_id = provider_id
@@ -459,7 +558,7 @@ def test_browser_fixture_digital_scenario_is_held_for_edition_review() -> None:
     assert decision.details["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
 
 
-def _write_isbn_epub(path: Path, *, isbn: str) -> None:
+def _write_absolution_epub(path: Path, metadata_xml: str) -> None:
     with ZipFile(path, "w") as archive:
         archive.writestr(
             "META-INF/container.xml",
@@ -474,13 +573,31 @@ def _write_isbn_epub(path: Path, *, isbn: str) -> None:
             '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
             'xmlns:opf="http://www.idpf.org/2007/opf">'
             "<dc:title>Absolution Gap</dc:title><dc:creator>Alastair Reynolds</dc:creator>"
-            f'<dc:identifier opf:scheme="ISBN">{isbn}</dc:identifier>'
-            "</metadata></package>",
+            f"{metadata_xml}</metadata></package>",
         )
 
 
 def _upload_isbn_epub(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: Client, *, isbn: str
+) -> ImportJob:
+    return _upload_epub(
+        monkeypatch,
+        tmp_path,
+        client,
+        doc=SEARCH_DOC,
+        metadata_xml=f'<dc:identifier opf:scheme="ISBN">{isbn}</dc:identifier>',
+        auto_accept_score=0.86,
+    )
+
+
+def _upload_epub(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    client: Client,
+    *,
+    doc: dict[str, Any],
+    metadata_xml: str,
+    auto_accept_score: float | None,
 ) -> ImportJob:
     StorageLocation.objects.get_or_create(
         identifier="default",
@@ -492,16 +609,17 @@ def _upload_isbn_epub(
     )
     monkeypatch.setattr(
         "ebook_server.core.identification.urlopen",
-        _fake_urlopen({"search.json": {"docs": [SEARCH_DOC]}}, []),
+        _fake_urlopen({"search.json": {"docs": [doc]}}, []),
     )
     monkeypatch.setattr(
         "ebook_server.core.identification._provider_instances",
         lambda: [OpenLibraryMetadataProvider()],
     )
-    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.86)
+    if auto_accept_score is not None:
+        monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", auto_accept_score)
     client.force_login(get_or_create_profile("edition-user").user)
     epub = tmp_path / "absolution.epub"
-    _write_isbn_epub(epub, isbn=isbn)
+    _write_absolution_epub(epub, metadata_xml)
     response = client.post(
         "/imports/upload/",
         {
