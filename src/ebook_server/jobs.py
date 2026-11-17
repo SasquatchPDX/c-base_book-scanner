@@ -115,9 +115,33 @@ def ocr_job_timeout_seconds() -> int:
     )
 
 
+DEFAULT_LLM_JOB_TIMEOUT_SECONDS = 5 * 60
+
+
+def llm_job_timeout_seconds() -> int:
+    """RQ per-job timeout for LLM identification jobs (one request plus a provider pass)."""
+    return max(
+        60,
+        int(
+            float(
+                tunable_setting(
+                    "BOOK_SCANNER_LLM_JOB_TIMEOUT_SECONDS", DEFAULT_LLM_JOB_TIMEOUT_SECONDS
+                )
+            )
+        ),
+    )
+
+
+def llm_queue_name() -> str:
+    """RQ queue for LLM jobs, kept apart so a bulk import cannot starve OCR (#26)."""
+    return str(tunable_setting("BOOK_SCANNER_LLM_QUEUE_NAME", "llm"))
+
+
 def job_timeout_seconds(job_type: str) -> int:
     if job_type == "ocr":
         return ocr_job_timeout_seconds()
+    if job_type == "llm_identification":
+        return llm_job_timeout_seconds()
     return int(settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS)
 
 
@@ -148,14 +172,15 @@ def scheduler_active(queue: Queue) -> bool:
         return False
 
 
-def get_queue() -> QueueLike | None:
+def get_queue(name: str | None = None) -> QueueLike | None:
+    """The configured queue; ``name`` selects another RQ queue on the same Redis."""
     if not settings.BOOK_SCANNER_QUEUE_URL:
         return None
     if settings.BOOK_SCANNER_QUEUE_URL.startswith("inline://"):
         return InlineQueue()
     connection = Redis.from_url(settings.BOOK_SCANNER_QUEUE_URL)
     queue = Queue(
-        name=settings.BOOK_SCANNER_QUEUE_NAME,
+        name=name or settings.BOOK_SCANNER_QUEUE_NAME,
         connection=connection,
         default_timeout=settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS,
     )

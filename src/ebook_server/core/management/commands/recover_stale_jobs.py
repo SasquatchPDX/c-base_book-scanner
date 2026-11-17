@@ -10,7 +10,13 @@ from django.utils import timezone
 
 from ebook_server.core import scan_pipeline
 from ebook_server.core.models import ProcessingJob, ScanJob
-from ebook_server.jobs import get_queue, is_stale_running, scheduler_active, stale_after
+from ebook_server.jobs import (
+    get_queue,
+    is_stale_running,
+    llm_queue_name,
+    scheduler_active,
+    stale_after,
+)
 
 
 def _queued_rq_job_ids() -> tuple[set[str] | None, bool | None]:
@@ -29,11 +35,18 @@ def _queued_rq_job_ids() -> tuple[set[str] | None, bool | None]:
         StartedJobRegistry,
     )
 
+    # LLM identification jobs run on their own queue (#26); inspect it too.
+    rq_queues = [rq_queue]
+    llm_queue = getattr(get_queue(llm_queue_name()), "queue", None)
+    if llm_queue is not None and llm_queue.name != rq_queue.name:
+        rq_queues.append(llm_queue)
     try:
-        jobs = list(rq_queue.get_jobs())
-        for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
-            registry = registry_cls(queue=rq_queue)
-            jobs.extend(rq_queue.fetch_job(job_id) for job_id in registry.get_job_ids())
+        jobs = []
+        for inspected in rq_queues:
+            jobs.extend(inspected.get_jobs())
+            for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
+                registry = registry_cls(queue=inspected)
+                jobs.extend(inspected.fetch_job(job_id) for job_id in registry.get_job_ids())
         scheduler = scheduler_active(rq_queue)
     except Exception:
         return None, None

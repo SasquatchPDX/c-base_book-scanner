@@ -177,3 +177,111 @@ every automated writer stored a year that way; other dates are kept. The book AP
 year of a full date) next to `publication_date`, which is now `null` for year-only
 books. Clients that read the year from `publication_date` must switch to
 `publication_year`.
+
+## Local LLM identification assist (#26)
+
+Design: `docs/design/26-local-llm-identification-signal.md`. **Off by default**
+(`BOOK_SCANNER_LLM_ENABLED=false`). The MVP is text-only.
+
+What it does: for an import that went to review with **zero candidates** or a top
+score below `BOOK_SCANNER_IDENTIFICATION_REVIEW` (0.55), or when a reviewer presses
+**Ask the AI server** on the review page, a `ProcessingJob` of type
+`llm_identification` runs on its own RQ queue (`BOOK_SCANNER_LLM_QUEUE_NAME`,
+default `llm`). It sends a bounded evidence bundle to a local OpenAI-compatible
+`/v1/chat/completions` endpoint (Ollama, vLLM or llama.cpp's server) and asks for a
+JSON object with `title_hints`, `author_hints`, `isbn_hints`, `language`,
+`publication_year`, `is_single_book`, `evidence_refs`, `confidence` and a short
+`rationale` (`core/llm.py`).
+
+The bundle holds the path relative to the source root (at most 5 segments), the
+filename, up to 20 sibling filenames from the same source folder's import records,
+embedded metadata, `path_layout` hints, the titles and authors of up to 5 candidates
+that did not match well, and the first `BOOK_SCANNER_LLM_TEXT_SAMPLE_CHARS` (4,000)
+characters of the file's text. Text is read only for TXT, HTML, EPUB and FB2 through
+the review reader's bounded readers; PDFs, MOBI and scans contribute path and
+metadata only (OCR-then-LLM and vision are later phases, see below).
+
+How the answer is used (`core/llm_identification.py`):
+
+1. It is validated with Pydantic against a strict schema (no extra fields, at most 3
+   hints per list, length caps, ISO 639-1 language, no control characters or
+   markup). Invalid output fails the job as `llm_output_invalid`; the import stays in
+   review exactly as before.
+2. Grounding: an ISBN hint is **discarded** unless it is a valid ISBN whose
+   characters appear verbatim (ignoring separators) in the evidence. Title and author
+   hints that share no token with the evidence are kept for the search but flagged
+   `grounded=false` for the reviewer.
+3. The hints go first in a merged `IdentificationInput` (the file's own signals
+   follow), the **existing providers** are queried with it, and the **existing
+   scorer** ranks the results. New candidates (deduplicated by provider and ref) are
+   added to the open review task with `raw_payload["_hint_source"] = "llm"`, always in
+   `review` state.
+4. `intake.decide_auto_accept` returns `BLOCK_LLM_DERIVED` (`llm_derived`) for any
+   LLM-found candidate, even at a score of 1.0: these candidates **never
+   auto-accept**. The review page explains the block, labels the candidates "Found
+   with AI-suggested search terms (unverified)", and shows an "AI suggestion
+   (unverified)" panel with the hints, grounding flags, discarded ISBNs, the model's
+   own (uncalibrated) confidence, the rationale, and model/version. Nothing is
+   pre-selected; "Use as search terms" copies the hints into the search fields only
+   when the reviewer clicks it.
+5. Each request stores an `LLMSuggestion`: trigger, requester, model, model version
+   (`system_fingerprint`), `prompt_template_version`, the SHA-256 of the bundle (not
+   the bundle), the validated output, the grounding report and the outcome
+   (`hints_used`, `no_new_candidates`, `invalid_output`, `failed`).
+   `ImportJob.evidence["llm"]` points at the latest one.
+
+Safety properties: the output has no authority (it only becomes search terms and a
+displayed suggestion; no tools are offered; nothing is accepted or written to a
+Book), untrusted evidence is wrapped in `<untrusted_evidence>` with those delimiters
+stripped from the evidence itself, and the service URL must be loopback, RFC 1918 or
+ULA, or a host listed in `BOOK_SCANNER_LLM_ALLOWED_HOSTS`; otherwise the client
+refuses to start and `manage.py check --deploy` reports `ebook_server.E101`. Logs
+carry job id, model, prompt template version, input size and hash, duration, schema
+validity, grounded/ungrounded hint counts and outcome, never the prompt, the
+response or the text sample.
+
+Budget: at most one request per import attempt plus one per reviewer click, one
+attempt each (no automatic retries), `BOOK_SCANNER_LLM_DAILY_CAP` automatic requests
+per source location per rolling 24 hours (uploads share one bucket; `0` turns the
+automatic trigger off; reviewer requests are not counted), and
+`BOOK_SCANNER_LLM_REQUEST_TIMEOUT`, `BOOK_SCANNER_LLM_MAX_TOKENS` and
+`BOOK_SCANNER_LLM_JOB_TIMEOUT_SECONDS` per request. A source opts out with
+`SourceLocation.default_metadata = {"llm_assist": false}` (for example a Calibre
+library with good OPF data).
+
+Metrics: `ebook_server_llm_requests{trigger,outcome}`,
+`ebook_server_llm_requests_recent{outcome,window}`,
+`ebook_server_llm_assisted_reviews{resolution}` (did reviewers accept an LLM-found
+candidate, another one, enter metadata manually, or mark the file unidentified), the
+`llm` queue depth in `ebook_server_queue` while the assist is enabled, and the usual
+processing-job duration buckets for `job_type="llm_identification"`. The
+`BookScannerLLMAssistFailing` alert fires when more than half of the last hour's
+requests failed, for 30 minutes.
+
+### Offline evaluation
+
+`docs/design/data/llm-eval-labels.csv` holds 66 hand-labelled weak-name rows from
+`tests/fixtures/real_world_samples/ebooks-share-filetree.csv` (title, author,
+`is_single_book`, notes; an empty author means it was not verified). Add rows freely;
+the design target is about 200. Run it against the real AI server by hand:
+
+```bash
+uv run python manage.py evaluate_llm_identification
+uv run python manage.py evaluate_llm_identification --with-providers --json
+```
+
+It reports title and author hint precision and coverage, the share of ungrounded
+hints, discarded ISBNs, chapter-detection precision and recall for `is_single_book`,
+p50/p95 latency, and with `--with-providers` the provider hit rate and top-1/top-5
+correctness of today's pipeline against the pipeline plus LLM hints. It runs in
+path-only mode (the fixture has no content), which is the hardest case. The test
+suite runs it against a fake client; CI never calls a model.
+
+**Go/no-go before enabling the automatic trigger in a deployment:** a clear gain in
+hit rate over the current pipeline, ungrounded hints that rarely become accepted
+candidates, and p95 latency within budget. Record the numbers here. No run against
+the c-base AI server has been recorded yet.
+
+Not in the MVP: vision models and OCR-then-LLM for image-only PDFs (they depend on
+what the AI server offers), grounded-ISBN auto-accept (a separate decision, behind a
+setting), and tie-breaking help (#46).

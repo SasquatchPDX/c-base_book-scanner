@@ -454,6 +454,14 @@ lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
 Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
 no scheduler lock is present.
 
+If the local LLM identification assist is enabled (`BOOK_SCANNER_LLM_ENABLED`,
+see `docs/metadata-providers.md`), its jobs go to a separate queue
+(`BOOK_SCANNER_LLM_QUEUE_NAME`, default `llm`) so a bulk import cannot flood the AI
+server or starve OCR. Run one or two workers for it, for example
+`rq worker --config ebook_server.rq_settings --url redis://localhost:6379/0 llm`,
+or add `llm` to an existing worker's queue list. Without such a worker, LLM jobs
+stay queued and `recover_stale_jobs` reports them.
+
 ### Worker concurrency (ScanTailor-Web batches)
 
 One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
@@ -666,3 +674,14 @@ appropriate. Never include document contents in incident notes or metrics labels
 Break the backlog down by task type and age, confirm metadata providers are
 healthy, and assign reviewers. Do not lower confidence thresholds merely to clear
 the queue; uncertain matches must remain explicit human-review work.
+
+### Book Scanner LLM assist failing
+
+More than half of the LLM identification requests in the last hour failed or
+returned invalid output. Check that the AI server is up and reachable from the
+workers, that `BOOK_SCANNER_LLM_MODEL` still exists on it (a renamed or swapped
+model is the usual cause of `invalid_output`), and the `llm_identification_failed`
+log events (they carry the error class and model, never book content). Imports are
+unaffected: they stay in review without AI hints. Disable the assist with
+`BOOK_SCANNER_LLM_ENABLED=false` if the server will be down for long, and re-run
+`evaluate_llm_identification` after any model change.
