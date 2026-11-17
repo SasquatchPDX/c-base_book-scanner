@@ -231,6 +231,8 @@ REVIEW_SCORE = identification.REVIEW_SCORE
 AUTO_ACCEPT_TIE_MARGIN = identification.TIE_MARGIN
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+# Bound for short OPF evidence values (publisher, date) copied into job evidence.
+MAX_EPUB_TEXT_FIELD = 255
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -255,9 +257,14 @@ BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
 # Several different books tie for the best score and pass the author checks.
 BLOCK_AMBIGUOUS_TIE = "ambiguous_tie"
+# The provider record stands for another edition than the file: its ISBNs, language or
+# publisher contradict the file's (see identification.edition_conflicts).
+BLOCK_EDITION_CONFLICT = "edition_conflict"
 # ImportJob.evidence key recording that a tied candidate was accepted instead of the
 # first-ranked one, and why the others were passed over.
 AUTO_ACCEPT_TIE_BREAK_KEY = "auto_accept_tie_break"
+# Floating-point slack for the tie margin: 1.0 - 0.98 is 0.020000000000000018.
+_TIE_MARGIN_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
@@ -288,6 +295,23 @@ def _author_block_reason(
     return None
 
 
+def _block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+    file_evidence: identification.IdentificationInput,
+) -> tuple[str | None, list[str]]:
+    """Why ``candidate`` may not be accepted automatically (author, then edition checks).
+
+    Returns the block reason (``None`` when it may be accepted) and the edition
+    conflicts found, which are reported even when an author check blocks first.
+    """
+    conflicts = identification.edition_conflicts(candidate, file_evidence)
+    reason = _author_block_reason(candidate, file_authors)
+    if reason is None and conflicts:
+        reason = BLOCK_EDITION_CONFLICT
+    return reason, conflicts
+
+
 def _candidate_summary(candidate: identification.IdentificationCandidate) -> dict[str, Any]:
     return {
         "provider_id": candidate.provider_id,
@@ -314,39 +338,52 @@ def _block_details(
 def decide_auto_accept(
     candidates: list[identification.IdentificationCandidate],
     file_authors: list[str],
+    *,
+    file_evidence: identification.IdentificationInput,
 ) -> AutoAcceptDecision:
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
-    is no evidence about authorship.
+    is no evidence about authorship. The candidate must also be the file's edition:
+    ``file_evidence`` (the normalised file signals: ISBNs, language, publisher) is
+    checked with ``identification.edition_conflicts``, so a file ISBN must be one of the
+    edition's own ISBNs and the file's language/publisher must not contradict it.
 
     Candidates within ``AUTO_ACCEPT_TIE_MARGIN`` of the best score count as tied (two
     providers often both score an ISBN match at 1.0, and their order is only the
     configured provider order). Among tied candidates the first one that passes the
-    author checks is accepted. If tied candidates that pass describe different books,
-    the choice is ambiguous and goes to review.
+    author *and* edition checks is accepted, so a tied fallback whose identifiers
+    contradict the file's is never eligible. If tied candidates that pass describe
+    different books, the choice is ambiguous and goes to review.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
         return AutoAcceptDecision(candidate=None)
+    above_threshold = [c for c in candidates if c.score >= AUTO_ACCEPT_SCORE]
     tied = [
         candidate
-        for candidate in candidates
-        if candidate.score >= AUTO_ACCEPT_SCORE
-        and top.score - candidate.score <= AUTO_ACCEPT_TIE_MARGIN
+        for candidate in above_threshold
+        if top.score - candidate.score <= AUTO_ACCEPT_TIE_MARGIN + _TIE_MARGIN_EPSILON
     ]
-    block_reasons = [_author_block_reason(candidate, file_authors) for candidate in tied]
+    checks = [_block_reason(candidate, file_authors, file_evidence) for candidate in tied]
     eligible = [
-        candidate for candidate, reason in zip(tied, block_reasons, strict=True) if reason is None
+        candidate for candidate, (reason, _) in zip(tied, checks, strict=True) if reason is None
     ]
-    above_threshold = [c for c in candidates if c.score >= AUTO_ACCEPT_SCORE]
     if not eligible:
+        top_reason, top_conflicts = checks[0]
+        details = _block_details(top, file_authors)
+        if top_conflicts:
+            details = {
+                **details,
+                "edition_conflicts": top_conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            }
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=block_reasons[0],
-            details=_block_details(top, file_authors),
+            blocked_reason=top_reason,
+            details=details,
             passed_over=tuple(above_threshold),
         )
     chosen = eligible[0]
@@ -364,14 +401,15 @@ def decide_auto_accept(
         )
     tie_break: dict[str, Any] | None = None
     if chosen is not top:
-        tie_break = {
-            "chosen": _candidate_summary(chosen),
-            "passed_over": [
-                {**_candidate_summary(candidate), "reason": reason}
-                for candidate, reason in zip(tied, block_reasons, strict=True)
-                if reason is not None
-            ],
-        }
+        passed_over_summaries: list[dict[str, Any]] = []
+        for candidate, (reason, conflicts) in zip(tied, checks, strict=True):
+            if reason is None:
+                continue
+            summary = {**_candidate_summary(candidate), "reason": reason}
+            if conflicts:
+                summary["edition_conflicts"] = conflicts
+            passed_over_summaries.append(summary)
+        tie_break = {"chosen": _candidate_summary(chosen), "passed_over": passed_over_summaries}
     eligible_ids = {id(candidate) for candidate in eligible}
     return AutoAcceptDecision(
         candidate=chosen,
@@ -1303,6 +1341,9 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        # Publisher and date are evidence for the publisher bonus and later review (#37).
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
         subjects = identification.normalize_subjects(
             [
                 "".join(element.itertext())
@@ -1322,6 +1363,8 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "description": description,
             "subjects": subjects,
             "identifier": identifier,
+            "publisher": publisher[:MAX_EPUB_TEXT_FIELD] if publisher else None,
+            "date": raw_date[:MAX_EPUB_TEXT_FIELD] if raw_date else None,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },
@@ -2648,7 +2691,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_job(job, update_fields=["state", "updated_at"])
         candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
-        decision = decide_auto_accept(candidates, file_authors)
+        decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
             metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details

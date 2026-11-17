@@ -106,6 +106,7 @@ class Settings(BaseSettings):
     identification_review: float = 0.55
     # Candidates within this score margin of the best one count as tied for auto-accept.
     identification_tie_margin: float = 0.02
+    identification_work_isbn_bonus: float = 0.3
     ocr_service_url: str = "http://localhost:8020"
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
@@ -323,6 +324,7 @@ BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonu
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
+BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts

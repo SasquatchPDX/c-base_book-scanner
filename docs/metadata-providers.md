@@ -24,8 +24,8 @@ metadata. The previous threshold correction is protected by upload and COPY/MOVE
 regression tests.
 
 The scorer is not yet tuned for ISBN-less imports: title and author alone
-contribute at most 0.85, author hints can dilute the score, and language/publisher
-comparisons need normalization. `BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
+contribute at most 0.85 and author hints can dilute the score.
+`BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
 does not affect intake acceptance. Task D must give that setting a tested role or
 remove it; do not lower auto-accept merely to reduce the review queue.
 
@@ -43,6 +43,60 @@ over punctuation-normalized titles. `token_set_ratio` alone gives full marks whe
 title's words are a subset of the other's ("Foundation" vs "Foundation and Earth"),
 so the sort ratio is blended in to make unmatched words cost score. Only titles with
 the same words reach a full title score.
+
+Language codes are normalized before comparison (`core/languages.py`, using
+`pycountry`): ISO 639-1 (`en`, `de-DE`), ISO 639-2/B and 639-3 (`eng`, `ger`,
+`deu`), Open Library keys (`/languages/ger`) and English names all map to the
+ISO 639-1 code, or the 639-3 code when no two-letter code exists. `UND`, `mul`,
+`zxx`, `mis` and unrecognized values mean "no language signal", never a mismatch.
+Normalization is for comparison only; the Book keeps the provider's code form.
+Publisher comparison ignores case, punctuation and noise words such as "Books",
+"Press", "Ltd", "Verlag", and then needs a rapidfuzz `token_set_ratio` of at least 90.
+
+### Work versus edition
+
+An Open Library search hit is a *work*; its `isbn`, `publisher` and `language`
+lists cover every edition. Search requests ask for these lists and for
+`editions` (the one edition that best matches the query) through `fields=`.
+A Book record stands for the edition it was matched to:
+
+- the candidate's ISBN, publisher and language come from that edition, or from
+  the edition record of an `/isbn/` lookup. When Open Library lists several
+  editions, the one carrying the file's ISBN wins, then one agreeing with the
+  file's language and publisher. Only edition ISBNs become `Identifier` rows; the
+  work-level lists are comparison evidence only;
+- a file ISBN equal to one of the edition's ISBNs (ISBN-10 or -13) adds 0.95;
+- a file ISBN found only among the work's other editions proves the work, not
+  the edition, and adds `BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS` (default
+  0.3);
+- the language and publisher bonuses compare with the edition; the work's lists
+  count only for a candidate that names no edition.
+
+The ISBN path (`/isbn/<isbn>.json`) runs first whenever the file has an ISBN, so
+in practice the work-level comparison matters only when that lookup misses.
+`publication_year` is still the work's `first_publish_year` (see "Publication year").
+
+### Edition checks before auto-accept
+
+Scores identify the work; accepting a candidate stores its *edition* on the Book.
+`identification.edition_conflicts(candidate, signals)` therefore compares the
+normalised file evidence with the candidate's edition, and `intake.decide_auto_accept`
+(which receives the file signals as `file_evidence`) routes any conflict to review as
+`edition_conflict`, with the reasons and both sides' values in
+`auto_accept_block_details`:
+
+- `edition_isbn_mismatch`: the file has an ISBN that is not one of the edition's
+  (for example an ISBN of another edition of the same work);
+- `edition_isbn_unconfirmed`: the file has an ISBN and the candidate none;
+- `edition_language_mismatch`: the file's language is not the edition's (or the
+  work's, when no edition language is known);
+- `edition_publisher_mismatch`: the file's publisher does not match the edition's,
+  and no file ISBN confirms the edition (with a confirmed ISBN a differing publisher
+  is usually an imprint or distributor and is tolerated).
+
+Missing values on either side are no conflict. Among equally scored candidates, one
+without edition conflicts ranks first, so an `/isbn/` edition record wins a tie with
+a search hit for another edition.
 
 ### Author checks before auto-accept
 
@@ -71,15 +125,21 @@ authors of its own, and only to a Book without authors; provider authors always 
 
 **Ties.** Candidates at or above the threshold whose score is within
 `BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN` (default 0.02) of the best one count as
-tied. With several providers an ISBN match often scores 1.0 at each of them, and
-their order is only the configured provider order. Intake therefore applies the author
-checks to every tied candidate and accepts the first one that passes, recording
-`auto_accept_tie_break` (the chosen candidate and the ones passed over, with their
-block reasons) in the evidence. Passed-over candidates stay in `REVIEW` state. If
-tied candidates that pass describe different books (no shared ISBN, and not the same
-title with agreeing authors), the import goes to review as `ambiguous_tie`. If none
-passes, the first-ranked candidate's block reason applies. A candidate outside the
-margin is never accepted in place of a blocked better one.
+tied (the comparison allows for floating-point rounding, so 1.0 and 0.98 tie). With
+several providers an ISBN match often scores 1.0 at each of them, and their order is
+only the configured provider order. Intake therefore applies the author checks *and*
+the edition checks (see "Edition checks before auto-accept"; `decide_auto_accept`
+receives the normalised file ISBNs, language and publisher as `file_evidence`) to every
+tied candidate and accepts the first one that passes, recording `auto_accept_tie_break`
+(the chosen candidate and the ones passed over, with their block reasons and edition
+conflicts) in the evidence. A tied fallback whose ISBN contradicts the file's, or that
+has no ISBN when the file has one, is never eligible. Passed-over candidates stay in
+`REVIEW` state. If tied candidates that pass describe different books, the import
+goes to review as `ambiguous_tie`. Two records are the same book when they share an
+ISBN; otherwise they need the same title and agreeing authors, and neither disjoint
+ISBN lists (two editions) nor disjoint languages. If none passes, the first-ranked
+candidate's block reason applies. A candidate outside the margin is never accepted in
+place of a blocked better one.
 
 For Open Library ISBN lookups, an edition record without `authors` falls back to the
 authors of its first work record (`works[0]`), where Open Library usually keeps them.
