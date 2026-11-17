@@ -36,6 +36,10 @@ urlpatterns = [
         views.library_book_delete,
         name="library-book-delete",
     ),
+    # The scanner's QR code (#127, contract §9); portal_url is built from this route.
+    path("j/<scan_job_id:job_id>", views.scan_job_portal_link, name="scan-job-portal-link"),
+    path("j/<scan_job_id:job_id>/", views.scan_job_portal_link),
+    path("scan/raw/", views.raw_scans, name="scan-raw-scans"),
     path("scan/jobs/", views.scan_jobs, name="scan-jobs"),
     path("scan/jobs/<scan_job_id:job_id>/", views.scan_job_detail, name="scan-job-detail"),
     path(

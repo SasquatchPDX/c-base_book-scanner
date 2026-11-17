@@ -146,9 +146,74 @@ Devices authenticate with their own key (`Authorization: Bearer`, see `docs/oper
   - `400 invalid_json` / `invalid_request`: the body is not a JSON object, or
     `scan_started_at` lacks a time zone, or the layout is unknown.
 
-  The response body is the job status (`job_id`, `state`, `portal_url`,
-  `scan_started_at`, `capture_layout`, `pages`, `open_rescans`). `portal_url` is built
-  from `BOOK_SCANNER_PUBLIC_BASE_URL`.
+  The response body is the job status (see `GET` below). `portal_url` is built from
+  `BOOK_SCANNER_PUBLIC_BASE_URL` as `<base>j/<job_id>`.
+- `GET /api/scanner/v1/jobs/{job_id}` (§6.4) returns the job status: `job_id`, `state`,
+  `portal_url`, `scan_started_at`, `capture_layout`, `events.sans_last_line_no`, `pages`
+  (`sequence_number`, `sha256`, `version` of each active version), `open_rescans`, and
+  `note: "re-finish needed"` while a complete job waits for a re-finish. Another
+  device's job, a web job or an unknown ID is `404`.
+- `POST /api/scanner/v1/jobs/{job_id}/capture-complete` (§6.9) takes the full manifest
+  (`finished_at`, `sans_last_line_no`, `pages`, `covers`, `metadata_opf`):
+  - `200 {"verified": true, "state": "captured", "portal_url"}`: every listed item is
+    held with exactly that active checksum and the event high-water marks agree. The job
+    moves `open`/`capturing` -> `captured`. Repeating it, or calling it once the job is
+    `captured`, `finalizing` or `complete`, answers `200` again and changes nothing.
+  - `409 incomplete`: `details.missing` and `details.mismatched` list item keys
+    (`page:<n>`, `cover:<position>`, `metadata_opf`, `events`); `details.sans_last_line_no`
+    is serif's high-water mark. The job stays where it was.
+  - `409 job_state`: the job is `cancelled` (or a web job in `paused`).
+  - `400 invalid_request`: a malformed manifest (`details.field` names the part).
+- `POST /api/scanner/v1/jobs/{job_id}/abort` (§6.10) moves `open`/`capturing` to
+  `cancelled` and keeps every uploaded file. Repeating it is `200`; from `captured` or
+  later it is `409 job_state`.
+
+### Manifest sources: what exists now and how later tickets extend it
+
+`GET jobs/{id}` and `capture-complete` are built from *manifest sources* in
+`core/scan_manifest.py`. Each source owns one field (`pages`, `covers`, `metadata_opf`):
+what serif holds, its JSON status and how the request's field is parsed. Only pages exist
+so far. Until a feature is stored on serif it is "nothing expected":
+
+- a field with no registered source is left out of `GET jobs/{id}` and ignored in a
+  `capture-complete` request (covers until S4, `metadata_opf` until S6). `metadata_opf`
+  may be `null` either way;
+- the event high-water mark is `0` until S5 stores `scan.jsonl` lines, and
+  `capture-complete` compares the request's `sans_last_line_no` with that `0`.
+
+S4 and S6 call `scan_manifest.register_manifest_source(...)`; S5 calls
+`scan_manifest.register_event_high_water_mark(...)`.
+
+## Raw scans (#127, contract §5)
+
+```
+open -> capturing -> captured -> finalizing -> complete
+open, capturing --abort--> cancelled
+complete --replacement page--> captured ("re-finish needed")
+```
+
+- `captured` is a **raw scan**: capture is verified, ScanTailor-Web processing and a
+  human finish are still to come. The portal lists these jobs under **Raw scans**
+  (`/scan/raw/`) with title, page count, completeness flags and open rescans, and the
+  workspace says "Raw scan, being processed".
+- ScanTailor stages, rescan requests and page replacements are allowed in `captured`;
+  new pages are not. Rescans and replacements are also allowed after `complete` (D7).
+- `POST /scan/jobs/{job_id}/finish/` accepts `captured` jobs. It still requires processed
+  ScanTailor output unless `allow_raw_pages`. A job without a book first asks the
+  registered book linkers (`scan_lifecycle.register_book_linker`; S6/#130 links from the
+  OPF) and otherwise queues scan identification, as before.
+- A replacement page for a `complete` job puts it back to `captured` with
+  `refinish_needed` (note "re-finish needed"). Its library variants stay until the next
+  finish, which retires them in favour of the new cleaned output.
+- `/j/<job_id>` (the scanner's QR code) requires login and redirects to the job's
+  workspace.
+
+**Raw scans never appear in the library.** `core/library_visibility.py` hides, at the
+query level, every book that is linked only to unfinished (or cancelled) scan jobs and has
+no uploaded/imported variant of its own, and every cleaned variant built by an unfinished
+scan job. Library browse, search (both backends; such books are never in the search
+index), home, book detail, download and covers use it. A raw scan never hides a book that
+is already in the library for another reason.
 
 ### Upgrade note: migration `0038_scanjob_string_pk`
 

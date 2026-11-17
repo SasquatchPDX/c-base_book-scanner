@@ -41,6 +41,7 @@ from django.http import (
 )
 from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
@@ -64,6 +65,7 @@ from . import (
     conversion,
     genres,
     intake,
+    library_visibility,
     llm,
     llm_identification,
     metadata_search,
@@ -73,6 +75,7 @@ from . import (
     review_batch,
     review_identification,
     scan_identification,
+    scan_lifecycle,
     scan_pipeline,
     scantailor,
     search,
@@ -740,7 +743,15 @@ def _store_scan_page(
     capture_timestamp: datetime | None,
     requested_checksum: str | None = None,
     force_new_version: bool = False,
+    accepting_states: frozenset[str] = scan_lifecycle.CAPTURE_STATES,
 ) -> tuple[ScanPage, ScanPageVersion, bool]:
+    """Store one page image as a new (or the matching existing) version.
+
+    ``accepting_states`` are the job states this upload is allowed in, checked under
+    the row lock. A new version for a ``complete`` job (a replacement, §5) puts the
+    job back to ``captured`` with "re-finish needed"; its library variants stay until
+    the next finish instead of being invalidated.
+    """
     staged_path, size_bytes = _stage_scan_upload(uploaded_file)
     storage = _default_scan_storage()
     destination: str | None = None
@@ -772,11 +783,7 @@ def _store_scan_page(
 
         with transaction.atomic():
             locked_job = ScanJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.state not in {
-                ScanJob.State.OPEN,
-                ScanJob.State.CAPTURING,
-                ScanJob.State.PAUSED,
-            }:
+            if locked_job.state not in accepting_states:
                 raise ValueError("job not accepting pages")
 
             page, _ = ScanPage.objects.get_or_create(
@@ -815,6 +822,7 @@ def _store_scan_page(
                 )
                 storage.store(staged_path, destination)
 
+            scan_lifecycle.reopen_for_refinish(locked_job)
             version = _append_version(
                 page=page,
                 uploader_id=uploader_id,
@@ -831,7 +839,8 @@ def _store_scan_page(
                 page_id=str(page.id),
                 reason="source changed",
             )
-            scan_pipeline.invalidate_scan_job_library_artifacts(page.scan_job)
+            if not locked_job.refinish_needed:
+                scan_pipeline.invalidate_scan_job_library_artifacts(locked_job)
             destination = None  # The DB row now owns the stored file.
             return page, version, True
     finally:
@@ -1445,7 +1454,8 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
         return JsonResponse({"detail": "forbidden"}, status=403)
     if _wants_html(request):
         recent_books = (
-            Book.objects.select_related("front_cover", "back_cover")
+            library_visibility.visible_books()
+            .select_related("front_cover", "back_cover")
             .prefetch_related(*_book_list_prefetches())
             .order_by("-created_at", "-id")[:12]
         )
@@ -1457,9 +1467,11 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
                 "recent_books": [
                     _serialize_book(book, include_variants=False) for book in recent_books
                 ],
-                "book_count": Book.objects.count(),
-                "variant_count": FileVariant.objects.filter(
-                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                "book_count": library_visibility.visible_books().count(),
+                "variant_count": library_visibility.library_variants(
+                    FileVariant.objects.filter(
+                        processing_state=FileVariant.ProcessingState.COMPLETE,
+                    )
                 ).count(),
             },
         )
@@ -1484,8 +1496,10 @@ def _book_list_prefetches() -> list[str | Prefetch[Any]]:
         "genres",
         Prefetch(
             "file_variants",
-            queryset=FileVariant.objects.filter(
-                processing_state=FileVariant.ProcessingState.COMPLETE,
+            queryset=library_visibility.without_pending_scan_variants(
+                FileVariant.objects.filter(
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                )
             ).only("id", "book_id", "format", "processing_state"),
             to_attr=_COMPLETE_VARIANTS_ATTR,
         ),
@@ -1498,11 +1512,27 @@ def _complete_variants(book: Book) -> list[FileVariant]:
         return prefetched
     # `.all()` reuses a plain `file_variants` prefetch when there is one; a
     # `.filter()` here would bypass it and cost one query per book (#28).
+    variants = list(book.file_variants.all())
+    hidden = _pending_scan_variant_ids(book, variants)
     return [
         variant
-        for variant in book.file_variants.all()
+        for variant in variants
         if variant.processing_state == FileVariant.ProcessingState.COMPLETE
+        and variant.id not in hidden
     ]
+
+
+def _pending_scan_variant_ids(book: Book, variants: list[FileVariant]) -> set[int]:
+    """Cleaned variants of ``book`` built by a scan job that is not finished (#127)."""
+    cleaned = {
+        variant.id for variant in variants if variant.source_type == FileVariant.SourceType.CLEANED
+    }
+    if not cleaned:
+        return set()
+    shown = library_visibility.without_pending_scan_variants(
+        FileVariant.objects.filter(pk__in=cleaned)
+    ).values_list("id", flat=True)
+    return cleaned - set(shown)
 
 
 def _serialize_book(
@@ -1679,7 +1709,8 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     except search.InvalidCursorError:
         return JsonResponse({"detail": "invalid_cursor"}, status=400)
     books_by_id = (
-        Book.objects.select_related("front_cover", "back_cover")
+        library_visibility.visible_books()
+        .select_related("front_cover", "back_cover")
         .prefetch_related(*_book_list_prefetches())
         .in_bulk(result.book_ids)
     )
@@ -1761,15 +1792,19 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
     if profile is None:
         return HttpResponseForbidden()
     try:
-        book = Book.objects.prefetch_related(
-            "authors",
-            "categories",
-            "genres",
-            "identifiers",
-            "file_variants",
-            "front_cover",
-            "back_cover",
-        ).get(pk=book_id)
+        book = (
+            library_visibility.visible_books()
+            .prefetch_related(
+                "authors",
+                "categories",
+                "genres",
+                "identifiers",
+                "file_variants",
+                "front_cover",
+                "back_cover",
+            )
+            .get(pk=book_id)
+        )
     except Book.DoesNotExist:
         return HttpResponseNotFound()
 
@@ -1814,36 +1849,31 @@ def library_book_download(
         return HttpResponseForbidden()
 
     try:
-        book = Book.objects.prefetch_related("file_variants__storage_location").get(pk=book_id)
+        book = (
+            library_visibility.visible_books()
+            .prefetch_related("file_variants__storage_location")
+            .get(pk=book_id)
+        )
     except Book.DoesNotExist:
         return HttpResponseNotFound()
+    servable = library_visibility.library_variants(
+        book.file_variants.filter(processing_state=FileVariant.ProcessingState.COMPLETE)
+    )
 
     variant = None
     variant_id = request.GET.get("variant_id")
     requested_format = request.GET.get("format", "").strip()
     if variant_id:
         try:
-            variant = book.file_variants.get(
-                pk=int(variant_id),
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            )
+            variant = servable.get(pk=int(variant_id))
         except (ValueError, FileVariant.DoesNotExist):
             return HttpResponseBadRequest("variant_id invalid")
     elif requested_format:
-        variant = (
-            book.file_variants.filter(
-                format__iexact=requested_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            )
-            .order_by("id")
-            .first()
-        )
+        variant = servable.filter(format__iexact=requested_format).order_by("id").first()
     if variant is None and requested_format:
         return HttpResponseNotFound("requested format not available")
     if variant is None:
-        variant = book.file_variants.filter(
-            processing_state=FileVariant.ProcessingState.COMPLETE,
-        ).first()
+        variant = servable.order_by("id").first()
 
     if variant is None:
         return HttpResponseNotFound("variant not available")
@@ -1886,6 +1916,7 @@ def library_book_cover(
     try:
         cover = CoverImage.objects.select_related("storage_location").get(
             book_id=book_id,
+            book__in=library_visibility.visible_books(),
             position=position,
         )
     except CoverImage.DoesNotExist:
@@ -2208,7 +2239,7 @@ def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
 
 def _scan_job_transition_allowed(job: ScanJob, target_state: str) -> bool:
     if target_state == ScanJob.State.CANCELLED:
-        return job.state in {ScanJob.State.OPEN, ScanJob.State.CAPTURING, ScanJob.State.PAUSED}
+        return job.state in scan_lifecycle.PROCESSING_STATES
     if target_state == ScanJob.State.PAUSED:
         return job.state in {ScanJob.State.OPEN, ScanJob.State.CAPTURING}
     if target_state == ScanJob.State.CAPTURING:
@@ -2671,11 +2702,7 @@ def scan_page_stage(
         )
         return JsonResponse(_serialize_workspace_page(page))
 
-    if page.scan_job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
 
     payload = _request_payload(request)
@@ -2730,11 +2757,7 @@ def scan_job_stage_batch(
         job = ScanJob.objects.prefetch_related("pages").get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    if job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
 
     payload = _json_body(request)
@@ -2872,6 +2895,7 @@ def scan_jobs(
             ScanJob.State.OPEN,
             ScanJob.State.CAPTURING,
             ScanJob.State.PAUSED,
+            ScanJob.State.CAPTURED,
             ScanJob.State.FINALIZING,
         ]
         queryset = _scan_job_queryset(with_open_todo_count=include_open_todos)
@@ -3163,11 +3187,7 @@ def scan_page_request_rescan(
         page = ScanPage.objects.select_related("scan_job").get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    if page.scan_job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if page.scan_job.state not in scan_lifecycle.RESCAN_STATES:
         return HttpResponseBadRequest("scan job is not accepting rescan requests")
 
     payload = _scan_page_request_payload(request)
@@ -3326,11 +3346,7 @@ def scan_page(
     scanner_metadata = _normalize_scanner_metadata(payload.get("scanner_metadata"))
     job = page.scan_job
 
-    if job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if job.state not in scan_lifecycle.RESCAN_STATES:
         return HttpResponseBadRequest("job not accepting pages")
 
     try:
@@ -3343,6 +3359,7 @@ def scan_page(
             scanner_metadata=scanner_metadata,
             capture_timestamp=capture_timestamp,
             requested_checksum=requested_checksum,
+            accepting_states=scan_lifecycle.RESCAN_STATES,
         )
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
@@ -3484,6 +3501,54 @@ def scan_page_thumbnail(
     return response
 
 
+@require_GET
+@login_required
+def scan_job_portal_link(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """``/j/<job_id>`` (contract §9): the scanner's QR code. Login, then the workspace.
+
+    It answers as soon as the job is registered (§8.4); an unknown ID is a 404.
+    """
+    if normalize_scan_job_id(job_id) is None:
+        return HttpResponseNotFound()
+    if _active_library_profile(request) is None:
+        return HttpResponseForbidden()
+    if not ScanJob.objects.filter(pk=job_id).exists():
+        return HttpResponseNotFound()
+    return redirect(reverse("scan-job-workspace", kwargs={"job_id": job_id}) + "?view=html")
+
+
+@require_GET
+@scan_api_login_required
+def raw_scans(request: HttpRequest) -> HttpResponseBase:
+    """Portal list of raw scans (``captured``, contract §9): not in the library yet."""
+    if _active_library_profile(request) is None:
+        return HttpResponseForbidden()
+    summaries = scan_lifecycle.raw_scan_summaries()
+    if _wants_html(request):
+        return render(request, "core/raw_scans.html", {"summaries": summaries})
+    return JsonResponse(
+        {
+            "items": [
+                {
+                    "job_id": str(summary.job.pk),
+                    "title": summary.title,
+                    "page_count": summary.page_count,
+                    "open_rescans": summary.open_rescans,
+                    "refinish_needed": summary.refinish_needed,
+                    "completeness": summary.completeness,
+                    "metadata": summary.metadata,
+                    "scanner_id": summary.job.scanner_id,
+                    "captured_at": (
+                        summary.job.captured_at.isoformat() if summary.job.captured_at else None
+                    ),
+                }
+                for summary in summaries
+            ],
+            "count": len(summaries),
+        }
+    )
+
+
 @require_POST
 @scan_api_login_required
 def scan_job_pause(
@@ -3538,6 +3603,10 @@ def scan_job_finish(
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
+    if job.book_id is None and job.state in scan_lifecycle.PROCESSING_STATES:
+        # S6 (#130) links from the job's OPF here; without a linker (or when it
+        # finds nothing to link) scan identification and the review queue run.
+        scan_lifecycle.link_book_for_finish(job)
     if job.book_id is None:
         try:
             identification_job = scan_identification.request_scan_identification(

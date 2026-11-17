@@ -43,7 +43,7 @@ from django.db.models import Count, F, Q, QuerySet
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 
-from . import genres
+from . import genres, library_visibility
 from .models import (
     Author,
     Book,
@@ -55,6 +55,7 @@ from .models import (
     FileVariant,
     Genre,
     Identifier,
+    ScanJob,
 )
 
 logger = structlog.get_logger(__name__)
@@ -241,10 +242,13 @@ def content_digest(weighted_text: Sequence[str]) -> str:
 
 
 def _book_sources(book_ids: Sequence[int]) -> list[BookSource]:
-    """Read everything `build_document` needs for these books in six queries."""
+    """Read everything `build_document` needs for these books in a few queries.
+
+    Raw-scan books (#127) are left out, so `index_books` removes their rows.
+    """
     sources = {
         row[0]: BookSource(*row)
-        for row in Book.objects.filter(pk__in=book_ids)
+        for row in library_visibility.visible_books(Book.objects.filter(pk__in=book_ids))
         .order_by()
         .values_list(
             "id",
@@ -285,8 +289,10 @@ def _book_sources(book_ids: Sequence[int]) -> list[BookSource]:
     ):
         sources[book_id].identifiers.append((kind, value, normalized))
     for book_id, book_format in (
-        FileVariant.objects.filter(
-            book_id__in=ids, processing_state=FileVariant.ProcessingState.COMPLETE
+        library_visibility.without_pending_scan_variants(
+            FileVariant.objects.filter(
+                book_id__in=ids, processing_state=FileVariant.ProcessingState.COMPLETE
+            )
         )
         .order_by()
         .values_list("book_id", "format")
@@ -310,6 +316,8 @@ _DOCUMENT_UPDATE_FIELDS: Final = [
 
 def index_books(book_ids: Iterable[int]) -> int:
     """(Re)write the search rows of these books; rows of deleted books are removed.
+
+    So are the rows of raw-scan books (#127): they are never in the search index.
 
     Idempotent and safe to call for any id. Returns the number of books indexed.
     """
@@ -451,7 +459,9 @@ def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
 def rebuild_search_index(*, batch_size: int = INDEX_BATCH_SIZE) -> int:
     """Rebuild every search row (management command and nightly job)."""
     del batch_size  # index_books batches internally; kept for the command's interface.
-    BookSearchDocument.objects.exclude(book_id__in=Book.objects.values("pk")).delete()
+    BookSearchDocument.objects.exclude(
+        book_id__in=library_visibility.visible_books().values("pk")
+    ).delete()
     total = 0
     last_id = 0
     while True:
@@ -532,11 +542,15 @@ def verify_search_index(*, sample: int = 500) -> IndexReport:
     PostgreSQL the stored `tsvector` is also compared with a freshly computed one.
     """
     missing = list(
-        Book.objects.filter(search_document__isnull=True)
+        library_visibility.visible_books()
+        .filter(search_document__isnull=True)
         .order_by("pk")
         .values_list("pk", flat=True)[:1000]
     )
-    orphan_count = BookSearchDocument.objects.exclude(book_id__in=Book.objects.values("pk")).count()
+    # A row of a deleted or raw-scan (#127) book is an orphan.
+    orphan_count = BookSearchDocument.objects.exclude(
+        book_id__in=library_visibility.visible_books().values("pk")
+    ).count()
     sample_ids = list(
         BookSearchDocument.objects.order_by("?").values_list("book_id", flat=True)[:sample]
     )
@@ -576,7 +590,7 @@ def search_index_ready() -> bool:
     """
     ready = cache.get(_READY_CACHE_KEY)
     if ready is None:
-        ready = not Book.objects.filter(search_document__isnull=True).exists()
+        ready = not library_visibility.visible_books().filter(search_document__isnull=True).exists()
         cache.set(_READY_CACHE_KEY, ready, GLOBAL_CACHE_SECONDS if ready else 60)
         if not ready:
             logger.warning("library_search_index_incomplete", backend="fallback")
@@ -660,6 +674,11 @@ def _on_book_child_changed(sender: type[Any], instance: Any, **kwargs: Any) -> N
     schedule_reindex([instance.book_id])
 
 
+def _on_scan_job_saved(sender: type[ScanJob], instance: ScanJob, **kwargs: Any) -> None:
+    # A scan job's state decides whether its book is in the library (#127).
+    schedule_reindex([instance.book_id])
+
+
 def connect_signals() -> None:
     """Keep search rows current on every ORM write (called from `CoreConfig.ready`).
 
@@ -685,6 +704,8 @@ def connect_signals() -> None:
         )
     # `BookGenre` is the explicit genre link model (#50): `genres.assign_*` and the
     # admin inline create, re-source and delete its rows directly, without m2m_changed.
+    post_save.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-save-ScanJob")
+    post_delete.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-delete-ScanJob")
     for child in (FileVariant, Identifier, CoverImage, BookGenre):
         post_save.connect(
             _on_book_child_changed, sender=child, dispatch_uid=f"{uid}-save-{child.__name__}"
@@ -915,7 +936,7 @@ def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
     `COUNT(*)` over `core_book`. Each relation filter matches on its own:
     `?q=` and `?author=` may match different authors of the same book.
     """
-    books = Book.objects.all()
+    books = library_visibility.visible_books()
     if request.query:
         books = books.filter(
             Q(title__icontains=request.query)
@@ -943,9 +964,11 @@ def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
         books = books.filter(language__iexact=request.language)
     if request.book_format:
         books = books.filter(
-            pk__in=FileVariant.objects.filter(
-                format__iexact=request.book_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
+            pk__in=library_visibility.without_pending_scan_variants(
+                FileVariant.objects.filter(
+                    format__iexact=request.book_format,
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                )
             ).values("book_id"),
         )
     return books
@@ -1008,9 +1031,11 @@ class DatabaseFallbackSearchBackend:
                 )
             elif facet == "format":
                 rows = (
-                    FileVariant.objects.filter(
-                        book_id__in=book_ids,
-                        processing_state=FileVariant.ProcessingState.COMPLETE,
+                    library_visibility.without_pending_scan_variants(
+                        FileVariant.objects.filter(
+                            book_id__in=book_ids,
+                            processing_state=FileVariant.ProcessingState.COMPLETE,
+                        )
                     )
                     .values_list("format")
                     .annotate(n=Count("book_id", distinct=True))
@@ -1072,7 +1097,11 @@ class PostgresSearchBackend:
     name = "postgresql"
 
     def _filtered(self, request: SearchRequest) -> QuerySet[BookSearchDocument]:
-        documents = BookSearchDocument.objects.all()
+        # Raw-scan books have no row (`index_books`); excluding them here as well keeps
+        # them out even while a reindex is still pending (#127).
+        documents = BookSearchDocument.objects.exclude(
+            book_id__in=library_visibility.raw_scan_book_ids()
+        )
         if request.title:
             documents = documents.filter(title_sort__contains=fold(request.title))
         if request.author:

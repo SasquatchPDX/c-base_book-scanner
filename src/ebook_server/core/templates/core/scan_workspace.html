@@ -25,6 +25,10 @@
     <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
   </div>
 
+  {% if job.state == 'captured' %}
+    <p class="review-notice" data-raw-scan>Raw scan, being processed. It joins the library after ScanTailor processing and finish.{% if job.refinish_needed %} A page was replaced after the book was finished: re-finish needed.{% endif %}</p>
+  {% endif %}
+
   {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}
     <section class="finish-panel">
       <div>
@@ -56,7 +60,7 @@
   <div
     class="scantailor-shell"
     data-scantailor-workspace
-    data-editable="{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}true{% else %}false{% endif %}"
+    data-editable="{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}true{% else %}false{% endif %}"
     data-events-url="{% url 'scan-job-workspace-events' job.id %}"
     data-workspace-url="{% url 'scan-job-workspace' job.id %}"
   >
@@ -133,7 +137,7 @@
                 data-input-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}?input=true"
               >Edit</button>
               <a data-stage-preview-link {% if not stage.preview_storage_identifier and not stage.output_storage_identifier %}hidden{% endif %} href="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}">Preview</a>
-              {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
+              {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}
                 <form method="post" action="{% url 'scan-job-page-stage' job.id page.id stage.stage %}">
                   {% csrf_token %}
                   <input type="hidden" name="expected_revision" value="{{ stage.revision }}">
@@ -144,7 +148,7 @@
             </div>
           {% endfor %}
         </div>
-        {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
+        {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' or job.state == 'complete' %}
           <form method="post" action="{% url 'scan-page-rescan' page.id %}">
             {% csrf_token %}
             <input name="reason" placeholder="Why is a rescan needed?">
