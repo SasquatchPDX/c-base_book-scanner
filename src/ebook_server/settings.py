@@ -166,6 +166,13 @@ class Settings(BaseSettings):
     # project's own scanner) or ``spread`` (one photo holds two facing pages).
     scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
     scan_spread_scanner_ids: list[str] = []
+    # Scanner device API v1 (/api/scanner/v1/, libreflip contract §7.2). The public base
+    # URL builds portal links handed to the scanner; it is required (https://) in
+    # production. Device keys are records (manage.py scanner_device), not settings.
+    public_base_url: str = ""
+    scanner_api_enabled: bool = True
+    scanner_max_image_bytes: int = 50 * 1024 * 1024
+    scanner_max_opf_bytes: int = 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -173,10 +180,30 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def validate_scanner_api(self) -> Settings:
+        errors: list[str] = []
+        if self.scanner_max_image_bytes <= 0:
+            errors.append("scanner_max_image_bytes must be positive")
+        if self.scanner_max_opf_bytes <= 0:
+            errors.append("scanner_max_opf_bytes must be positive")
+        if self.public_base_url.strip():
+            parsed = urlparse(self.public_base_url.strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                errors.append("public_base_url must be an absolute http(s):// URL")
+            elif parsed.query or parsed.fragment:
+                errors.append("public_base_url must not carry a query or fragment")
+        if errors:
+            raise ValueError("invalid scanner API configuration: " + "; ".join(errors))
+        return self
+
+    @model_validator(mode="after")
     def validate_production_safety(self) -> Settings:
         if self.environment != "production":
             return self
         errors: list[str] = []
+        public_base_url = urlparse(self.public_base_url.strip())
+        if public_base_url.scheme != "https" or not public_base_url.hostname:
+            errors.append("public_base_url must be set to an https:// URL")
         if self.secret_key.get_secret_value() == DEV_SECRET_KEY:
             errors.append("secret_key must be changed")
         if not self.allowed_hosts or "*" in self.allowed_hosts:
@@ -247,6 +274,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # Device keys are refused outside /api/scanner/v1/ before any session is loaded.
+    "ebook_server.core.middleware.ScannerDeviceKeyMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -404,6 +433,13 @@ BOOK_SCANNER_CONTRIBUTIONS_RETENTION_MONTHS = settings.contributions_retention_m
 BOOK_SCANNER_CONTRIBUTIONS_SEASON = settings.contributions_season
 BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
 BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
+# Normalised to end in "/" so links are built as PUBLIC_BASE_URL + "j/<job_id>".
+BOOK_SCANNER_PUBLIC_BASE_URL = (
+    settings.public_base_url.strip().rstrip("/") + "/" if settings.public_base_url.strip() else ""
+)
+BOOK_SCANNER_SCANNER_API_ENABLED = settings.scanner_api_enabled
+BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES = settings.scanner_max_image_bytes
+BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = settings.scanner_max_opf_bytes
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds

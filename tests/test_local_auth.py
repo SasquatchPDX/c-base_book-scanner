@@ -39,6 +39,7 @@ def _production(**overrides: object) -> Settings:
         "csrf_cookie_secure": True,
         "secure_hsts_seconds": 31536000,
         "metrics_bearer_token": SecretStr("metrics-monitoring-token"),
+        "public_base_url": "https://library.example.test/",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]

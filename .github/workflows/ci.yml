@@ -68,6 +68,7 @@ jobs:
           BOOK_SCANNER_SECURE_HSTS_SECONDS: "31536000"
           BOOK_SCANNER_SECURE_HSTS_PRELOAD: "true"
           BOOK_SCANNER_METRICS_BEARER_TOKEN: ci-only-monitoring-token
+          BOOK_SCANNER_PUBLIC_BASE_URL: https://library.example.test/
         run: uv run python manage.py check --deploy --fail-level WARNING
       - name: Dependency audit
         run: uv run pip-audit --skip-editable

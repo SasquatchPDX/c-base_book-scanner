@@ -773,6 +773,30 @@ class FileVariant(models.Model):
         return f"{self.book_id}:{self.format}:{self.original_filename}"
 
 
+class ScannerDevice(models.Model):
+    """A physical scanner (libreflip ``sans``) that talks to ``/api/scanner/v1/``.
+
+    A device authenticates with its own API key, never with a member's session. Only the
+    SHA-256 of the key is stored: the key is 32 random bytes, so it needs no slow hash.
+    Keys are issued, rotated and revoked with ``manage.py scanner_device`` (see
+    ``core.scanner_devices``), and they authorise nothing outside the device API.
+    """
+
+    scanner_id = models.SlugField(max_length=64, unique=True)
+    name = models.CharField(max_length=255, blank=True)
+    key_sha256 = models.CharField(max_length=64, unique=True, editable=False)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    rotated_at = models.DateTimeField(null=True, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("scanner_id",)
+
+    def __str__(self) -> str:
+        return self.scanner_id
+
+
 class ScanJob(models.Model):
     """Persistent scan job for physical book capture."""
 

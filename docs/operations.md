@@ -140,12 +140,38 @@ Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
 - explicit allowed hosts are configured;
 - PostgreSQL and Redis URLs are supplied;
 - the authentication mode is `ldap` or `local` (`stub` is rejected);
-- HTTPS redirect, secure cookies, and HSTS are enabled.
+- HTTPS redirect, secure cookies, and HSTS are enabled;
+- `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
 
 When TLS terminates at a trusted reverse proxy, set
 `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` and ensure that untrusted clients
 cannot inject `X-Forwarded-Proto`. HSTS preload is optional and should only be
 enabled after its long-lived operational consequences are understood.
+
+## Scanner devices
+
+The libreflip scanner authenticates to the device API `/api/scanner/v1/` with its own
+API key (`Authorization: Bearer`), never with a member session. Manage devices with:
+
+```bash
+uv run python manage.py scanner_device create libreflip-01 --name "libreflip at c-base"
+uv run python manage.py scanner_device rotate libreflip-01   # old key stops working at once
+uv run python manage.py scanner_device revoke libreflip-01
+uv run python manage.py scanner_device list
+```
+
+`create` and `rotate` print the key exactly once; the database keeps only its SHA-256.
+`rotate` also re-activates a revoked device. Admins can list devices and revoke them in
+`/admin/`. A device key authorises nothing outside `/api/scanner/v1/`, and a browser
+session cannot use that namespace (it answers `401`).
+
+Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP example listener in
+`deploy/nginx/book-scanner.conf` (and any lab install without TLS) must not expose it,
+because the key travels in every request header; block the prefix there (for example
+`location ^~ /api/scanner/ { return 403; }`). `BOOK_SCANNER_SCANNER_API_ENABLED=false`
+switches the whole namespace off (`503`). `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and
+`BOOK_SCANNER_SCANNER_MAX_OPF_BYTES` are the upload limits reported to the scanner by
+`GET /api/scanner/v1/ping`.
 
 ## Authentication modes
 
