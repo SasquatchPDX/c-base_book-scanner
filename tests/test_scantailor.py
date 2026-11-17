@@ -1660,8 +1660,9 @@ def test_oversized_image_is_an_image_load_error(
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
     with pytest.raises(scantailor.ImageLoadError):
         scantailor._load_image(source)
-    image, loaded = scantailor._as_image_if_available(source)
-    assert image is None and loaded is False
+    # The replacement dimension path observes the same limit without decoding.
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) is None
 
 
 @pytest.mark.django_db(transaction=True)

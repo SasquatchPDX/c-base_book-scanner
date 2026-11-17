@@ -770,6 +770,11 @@ def _oriented_size(path: Path) -> tuple[int, int] | None:
     """
     layout = _read_png_layout(path)
     if layout is not None and b"iTXt" not in layout.chunk_types:
+        if (
+            Image.MAX_IMAGE_PIXELS is not None
+            and layout.width * layout.height > 2 * Image.MAX_IMAGE_PIXELS
+        ):
+            return None
         orientation = _orientation_from_exif_bytes(layout.exif) if layout.exif else 1
         if orientation in _TRANSPOSED_ORIENTATIONS:
             return layout.height, layout.width
@@ -780,7 +785,7 @@ def _oriented_size(path: Path) -> tuple[int, int] | None:
             if _exif_orientation(opened) in _TRANSPOSED_ORIENTATIONS:
                 return height, width
             return width, height
-    except (OSError, UnidentifiedImageError, ValueError, SyntaxError):
+    except (OSError, UnidentifiedImageError, ValueError, SyntaxError, Image.DecompressionBombError):
         return None
 
 
