@@ -323,6 +323,36 @@ Check a layout before importing; each preview row shows
 uv run python manage.py ingest_sources --source-id 1 --preview
 ```
 
+### Formats of one book (`group_sibling_formats`)
+
+Opt-in per source (admin → Source locations → "Formats of one book"), because
+generic same-name pairs such as `notes.txt` / `notes.pdf` are not one book in every
+collection. When enabled, files in the same folder with the same file name and
+different extensions (`Dune.epub`, `Dune.mobi`, `Dune.txt`; names compared
+case-insensitively) are *siblings*. Once one sibling is linked to a Book (automatic
+match, exact duplicate, or review decision), that Book becomes a strong candidate
+for the others. It never replaces verification:
+
+- every file is still looked up externally, and its provider candidates are stored;
+- the sibling's Book is scored like a provider candidate, plus
+  `BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS` (default 0.35), and must reach the
+  auto-accept threshold. An equal title is enough; the shared name alone is not;
+- the file goes to review instead when its embedded ISBN conflicts with the Book's
+  ISBNs (`conflicting_isbn`), when its embedded authors name different people than
+  the Book's (`author_conflict`), when a provider candidate confidently matches a
+  different book (`provider_match_differs`), or when the score stays below the
+  threshold (`below_threshold`);
+- siblings already waiting in review are re-assessed with the same rule when another
+  format is linked. An OPEN task that passes is resolved as "Merged with existing
+  book" without a reviewer, with `rule: group_sibling_formats` and the score in its
+  decision payload. A task a reviewer has CLAIMED is never resolved automatically;
+  it only gets a note under `decision_payload.format_sibling`.
+
+The assessment (sibling job, Book, score, accepted, reason) is stored in the import
+evidence under `format_sibling_of`. Decisions within one source are serialised with a
+row lock on the source, so two formats finishing at the same time cannot create two
+Books.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
