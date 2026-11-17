@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     csrf_trusted_origins: list[str] = []
     scantailor_event_stream_interval_seconds: float = 1.0
     scantailor_event_stream_max_events: int = 45
+    # How scanners deliver pages (#55): ``single_page`` (one page per image, the
+    # project's own scanner) or ``spread`` (one photo holds two facing pages).
+    scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
+    scan_spread_scanner_ids: list[str] = []
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -325,6 +329,8 @@ BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds
 SCANTAILOR_EVENT_STREAM_MAX_EVENTS = settings.scantailor_event_stream_max_events
+BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
+BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds

@@ -57,6 +57,7 @@ from ebook_server.storage import (
 from . import (
     book_deletion,
     conversion,
+    genres,
     intake,
     ocr,
     review_batch,
@@ -72,6 +73,7 @@ from .models import (
     Book,
     CoverImage,
     FileVariant,
+    Genre,
     Identifier,
     ImportJob,
     MetadataCandidate,
@@ -241,6 +243,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
         "invalidated_reason": state.invalidated_reason,
+        "auto_skipped": scantailor.is_auto_skipped_split(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -258,6 +261,7 @@ def _serialize_scan_job(
         "id": str(job.id),
         "state": job.state,
         "scanner_id": job.scanner_id,
+        "capture_layout": job.capture_layout,
         "provisional_title": job.provisional_title,
         "provisional_authors": job.provisional_authors,
         "expected_page_count": job.expected_page_count,
@@ -289,6 +293,30 @@ _SCAN_SIDE_ALIASES: Final[dict[str, str]] = {
     "right": ScanPage.Side.RIGHT,
     "r": ScanPage.Side.RIGHT,
 }
+
+
+_CAPTURE_LAYOUT_ALIASES: Final[dict[str, str]] = {
+    "single_page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single-page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "spread": ScanJob.CaptureLayout.SPREAD,
+    "spreads": ScanJob.CaptureLayout.SPREAD,
+}
+
+
+def _resolve_capture_layout(raw: Any, scanner_id: str) -> str | None:
+    """Capture layout for a new scan job; ``None`` for an unrecognised value (#55).
+
+    An explicit ``capture_layout`` wins. Otherwise a scanner listed in
+    ``BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS`` gets ``spread`` and everything else the
+    configured default (``single_page``: one page per image). Page ``side`` values do
+    not imply spreads: a two-camera rig sends left and right as separate images.
+    """
+    if raw is not None and str(raw).strip():
+        return _CAPTURE_LAYOUT_ALIASES.get(str(raw).strip().lower())
+    if scanner_id and scanner_id in django_settings.BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS:
+        return str(ScanJob.CaptureLayout.SPREAD)
+    return str(django_settings.BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT)
 
 
 def _normalize_scan_side(raw_side: str | None) -> str | None:
@@ -834,6 +862,10 @@ def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None
         state = states.get(stage_name)
         if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
             break
+        if scantailor.is_auto_skipped_split(state):
+            # A "no split" passthrough shows the raw page; its full-size version
+            # makes the better thumbnail than the reduced stage preview (#55).
+            continue
         if state.preview_storage_identifier or state.output_storage_identifier:
             latest = state
     return latest
@@ -1226,6 +1258,87 @@ def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
     }
 
 
+def _reviewer_genre_choice(request: HttpRequest, payload: dict[str, Any]) -> list[Genre] | None:
+    """Genres a reviewer picked, or ``None`` when they made no choice.
+
+    JSON clients send ``genre_ids`` (a list, possibly empty). The review form sends
+    ``genres_reviewed=1`` plus one ``genre_ids`` checkbox value per chosen genre, so
+    unticking every suggestion is an explicit "no genres". Raises ``ValueError`` for
+    ids that are not existing genres.
+    """
+    if isinstance(payload.get("genre_ids"), list):
+        raw_ids: list[Any] = payload["genre_ids"]
+    elif payload.get("genres_reviewed"):
+        raw_ids = request.POST.getlist("genre_ids")
+    else:
+        return None
+    ids: list[int] = []
+    for raw in raw_ids:
+        value = _coerce_int(raw, minimum=1)
+        if value is None:
+            raise ValueError("invalid genre id")
+        if value not in ids:
+            ids.append(value)
+    found = {genre.pk: genre for genre in Genre.objects.filter(pk__in=ids)}
+    if len(found) != len(ids):
+        raise ValueError("unknown genre")
+    return [found[genre_id] for genre_id in ids]
+
+
+def _apply_review_genres(
+    *,
+    book: Book,
+    task: ReviewTask,
+    reviewer_genres: list[Genre] | None,
+    provider_subjects: list[Any] | None,
+    reviewer: Any = None,
+) -> dict[str, Any]:
+    """Attach genres on a review decision; returns decision-payload additions.
+
+    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
+    """
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    if reviewer_genres is not None:
+        genres.assign_reviewer(
+            book,
+            reviewer_genres,
+            suggestion=genres.suggest(provider_subjects, embedded),
+            user=reviewer,
+        )
+        return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
+    added = genres.assign_automatic(
+        book,
+        provider_subjects=provider_subjects,
+        embedded_subjects=embedded,
+    )
+    return {"automatic_genres": [genre.name for genre in added]} if added else {}
+
+
+def _attach_genre_suggestions(task: ReviewTask, candidates: list[MetadataCandidate]) -> None:
+    """Set ``candidate.genre_suggestion`` for the review page's genre picker."""
+    index = genres.build_index()
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    for candidate in candidates:
+        candidate.genre_suggestion = genres.suggest(  # type: ignore[attr-defined]
+            candidate.subjects, embedded, index
+        )
+
+
+def _serialize_genre_suggestion(suggestion: genres.GenreSuggestion) -> dict[str, Any]:
+    return {
+        "source": suggestion.source,
+        "genre_ids": suggestion.genre_ids,
+        "tags": [
+            {
+                "tag": match.tag,
+                "genre_id": match.genre.pk if match.genre else None,
+                "genre": match.genre.name if match.genre else None,
+            }
+            for match in suggestion.matches
+        ],
+    }
+
+
 def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     from . import identification
 
@@ -1531,11 +1644,15 @@ def _filtered_library_books(
             ).values("book_id"),
         )
     if genre:
-        books = books.filter(
-            pk__in=Book.genres.through.objects.filter(
-                genre__name__icontains=genre,
-            ).values("book_id"),
+        # A genre name or alias ("sci-fi") selects that genre; anything else is a
+        # substring match on genre names, as before.
+        genre_match = genres.genre_from_filter(genre)
+        genre_links = (
+            Book.genres.through.objects.filter(genre=genre_match)
+            if genre_match is not None
+            else Book.genres.through.objects.filter(genre__name__icontains=genre)
         )
+        books = books.filter(pk__in=genre_links.values("book_id"))
     if language:
         books = books.filter(language__iexact=language)
     if book_format:
@@ -1585,6 +1702,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     total = paginator.count
     serialized = [_serialize_book(book, include_variants=False) for book in page_books]
     if _wants_html(request):
+        filters = {
+            "q": query,
+            "title": title,
+            "author": author,
+            "category": category,
+            "genre": genre,
+            "language": language,
+            "format": book_format,
+            "sort": sort,
+        }
         return render(
             request,
             "core/library_books.html",
@@ -1592,16 +1719,10 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
                 "books": serialized,
                 "page_object": page_object,
                 "count": total,
-                "filters": {
-                    "q": query,
-                    "title": title,
-                    "author": author,
-                    "category": category,
-                    "genre": genre,
-                    "language": language,
-                    "format": book_format,
-                    "sort": sort,
-                },
+                "all_genres": list(Genre.objects.order_by("name")),
+                "filters": filters,
+                # Pagination links keep every active filter, not just ``q``.
+                "filter_query": urlencode({key: value for key, value in filters.items() if value}),
             },
         )
     return JsonResponse(
@@ -2268,11 +2389,50 @@ def _apply_stage_payload_to_state(
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
                 state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         state.parameters = merged
+        if stage == "page_split":
+            # The algorithm follows the chosen mode, so switching a single-page
+            # passthrough to a manual split (or back) never keeps a stale label (#55).
+            state.algorithm = scantailor.split_algorithm_for_mode(
+                scantailor.effective_split_mode(state),
+            )
 
     _bind_stage_inputs(state, page)
     state.revision += 1
     state.last_error = ""
     state.status = ScanTailorStageState.StageStatus.QUEUED
+
+
+def _lock_stage_state(state: ScanTailorStageState) -> ScanTailorStageState:
+    """Re-read ``state`` under a row lock; call inside ``transaction.atomic()``."""
+    return (
+        ScanTailorStageState.objects.select_for_update()
+        .select_related("scan_job", "scan_page")
+        .get(pk=state.pk)
+    )
+
+
+def _apply_and_save_stage_edit(
+    state: ScanTailorStageState,
+    page: ScanPage,
+    stage: str,
+    payload: dict[str, Any],
+) -> None:
+    """Apply a user edit to a locked ``state`` and persist it as the next revision."""
+    _apply_stage_payload_to_state(state, page, stage, payload)
+    state.save(
+        update_fields=[
+            "algorithm",
+            "algorithm_version",
+            "parameters",
+            "input_stage_state",
+            "input_scan_page_version",
+            "input_storage_identifier",
+            "revision",
+            "last_error",
+            "status",
+            "updated_at",
+        ],
+    )
 
 
 @require_GET
@@ -2443,29 +2603,20 @@ def scan_page_stage(
 
     payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
-    if expected_revision is not None and expected_revision != state.revision:
-        return _conflict_response(state, expected_revision)
-
-    _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-    state.save(
-        update_fields=[
-            "algorithm",
-            "algorithm_version",
-            "parameters",
-            "input_stage_state",
-            "input_scan_page_version",
-            "input_storage_identifier",
-            "revision",
-            "last_error",
-            "status",
-            "updated_at",
-        ],
-    )
-    scantailor.invalidate_downstream_states(
-        page,
-        from_stage=state.stage,
-        reason=f"{state.stage} updated",
-    )
+    # Check and bump the revision on the locked row, not on the copy read above: a
+    # concurrent writer (another user, or the automatic single-page passthrough)
+    # either finished first, so the expected_revision check sees it, or waits for
+    # this edit and then finds a newer revision and backs off (#55).
+    with transaction.atomic():
+        state = _lock_stage_state(state)
+        if expected_revision is not None and expected_revision != state.revision:
+            return _conflict_response(state, expected_revision)
+        _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+        scantailor.invalidate_downstream_states(
+            page,
+            from_stage=state.stage,
+            reason=f"{state.stage} updated",
+        )
 
     processing_job = scantailor.request_stage_job(
         state=state,
@@ -2543,30 +2694,17 @@ def scan_job_stage_batch(
             page_id=str(page.id),
             stage=normalized_stage,
         )
-        if preserve_exceptions and _is_manual_stage_state(state):
-            skipped.append(str(page.id))
-            continue
-
-        _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-        state.save(
-            update_fields=[
-                "algorithm",
-                "algorithm_version",
-                "parameters",
-                "input_stage_state",
-                "input_scan_page_version",
-                "input_storage_identifier",
-                "revision",
-                "last_error",
-                "status",
-                "updated_at",
-            ],
-        )
-        scantailor.invalidate_downstream_states(
-            page,
-            from_stage=state.stage,
-            reason=f"{state.stage} updated via batch",
-        )
+        with transaction.atomic():
+            state = _lock_stage_state(state)
+            if preserve_exceptions and _is_manual_stage_state(state):
+                skipped.append(str(page.id))
+                continue
+            _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+            scantailor.invalidate_downstream_states(
+                page,
+                from_stage=state.stage,
+                reason=f"{state.stage} updated via batch",
+            )
         processing_job = scantailor.request_stage_job(
             state=state,
             requested_by_user_id=profile.user_id,
@@ -2708,6 +2846,10 @@ def scan_jobs(
     else:
         book = None
 
+    capture_layout = _resolve_capture_layout(payload.get("capture_layout"), scanner_id)
+    if capture_layout is None:
+        return HttpResponseBadRequest("invalid capture_layout (expected single_page or spread)")
+
     notes = _normalize_scanner_metadata(payload.get("notes"))
     initial_state = _coerce_str_or_none(payload.get("state")) or ScanJob.State.OPEN
     if initial_state not in {
@@ -2720,6 +2862,7 @@ def scan_jobs(
     job = ScanJob.objects.create(
         state=initial_state,
         scanner_id=scanner_id,
+        capture_layout=capture_layout,
         operator=profile.user,
         book=book,
         provisional_title=job_title,
@@ -3052,6 +3195,7 @@ def upload_scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     status_code = 201 if created else 200
     if _wants_html(request):
@@ -3131,6 +3275,7 @@ def scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     return JsonResponse(
         {
@@ -3840,8 +3985,14 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     payload = _serialize_task(task)
+    candidates = list(_review_candidates(task))
+    _attach_genre_suggestions(task, candidates)
     payload["candidates"] = [
-        _serialize_candidate(candidate) for candidate in _review_candidates(task)
+        {
+            **_serialize_candidate(candidate),
+            "genre_suggestion": _serialize_genre_suggestion(candidate.genre_suggestion),
+        }
+        for candidate in candidates
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
@@ -3853,7 +4004,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
-                "candidates": _review_candidates(task),
+                "candidates": candidates,
+                "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
             },
         )
@@ -3941,19 +4093,37 @@ def _accept_review_candidate(
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
     reviewer_authors: list[str] | None = None,
+    reviewer_genres: list[Genre] | None = None,
 ) -> tuple[Book, FileVariant | None]:
-    """Resolve ``task`` with ``candidate``; shared by single and batch accept."""
+    """Resolve ``task`` with ``candidate``; shared by single and batch accept.
+
+    ``reviewer_authors`` only fill a Book that has no authors yet (provider authors
+    always win). ``reviewer_genres`` is an explicit reviewer choice; ``None`` assigns
+    genres automatically from provider/embedded subjects.
+    """
     book = _book_for_candidate(candidate)
+    decision_additions: dict[str, Any] = {}
     if reviewer_authors and not book.authors.exists():
         for author_name in reviewer_authors:
             author, _ = Author.objects.get_or_create(
                 full_name=intake._fit(Author, "full_name", author_name),
             )
             book.authors.add(author)
+        decision_additions["reviewer_authors"] = reviewer_authors
+    decision_additions.update(
+        _apply_review_genres(
+            book=book,
+            task=task,
+            reviewer_genres=reviewer_genres,
+            provider_subjects=candidate.subjects,
+            reviewer=reviewer,
+        )
+    )
+    if decision_additions:
         decision_payload = {
             **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
             **(decision_payload or {}),
-            "reviewer_authors": reviewer_authors,
+            **decision_additions,
         }
     variant = _resolve_review_source(
         task=task,
@@ -3995,6 +4165,10 @@ def review_accept_candidate(
         return HttpResponseBadRequest("candidate not found")
     if candidate.import_job_id != task.import_job_id or candidate.scan_job_id != task.scan_job_id:
         return HttpResponseBadRequest("candidate not found")
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
 
     try:
         # A candidate without authors (the provider record names none) can be accepted
@@ -4011,6 +4185,7 @@ def review_accept_candidate(
             candidate=candidate,
             reviewer=profile.user,
             reviewer_authors=reviewer_authors,
+            reviewer_genres=reviewer_genres,
         )
         return _review_action_response(
             request,
@@ -4389,7 +4564,19 @@ def review_manual_entry(
     payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
     book = _build_manual_book_from_payload(payload)
+    # A manually entered book has no provider record, so only the file's own tags apply.
+    _apply_review_genres(
+        book=book,
+        task=task,
+        reviewer_genres=reviewer_genres,
+        provider_subjects=None,
+        reviewer=request.user,
+    )
 
     variant = _resolve_review_source(
         task=task,
