@@ -247,9 +247,54 @@ def verified_isbn_candidates(
     return verified
 
 
-def distinct_books(candidates: Iterable[MetadataCandidate]) -> set[str]:
-    """Distinct books among records for one ISBN (several providers may agree)."""
-    return {identification.normalize_text(candidate.title) for candidate in candidates}
+def isbn_forms(isbn: str) -> list[str]:
+    """``[isbn13, isbn10]`` for a valid ISBN-10/13 (the ISBN-10 only for 978-),
+    or ``[]``. The order is the lookup order for library identifiers."""
+    isbn13 = canonical_isbn13(isbn)
+    if isbn13 is None:
+        return []
+    isbn10 = isbnlib.to_isbn10(isbn13) if isbn13.startswith("978") else ""
+    return [isbn13, isbn10] if isbn10 else [isbn13]
+
+
+def _named_authors(candidate: MetadataCandidate) -> list[str]:
+    authors = candidate.authors if isinstance(candidate.authors, list) else []
+    return [name for name in authors if isinstance(name, str) and name.strip()]
+
+
+def same_book(left: MetadataCandidate, right: MetadataCandidate) -> bool:
+    """True when two provider records can describe the same book.
+
+    They are different books when their normalized titles differ, when both name
+    authors and none of them is the same person (``identification.authors_conflict``:
+    "Selected Poems" by Emily Dickinson vs by William Blake), or when both list
+    ISBNs and share none (different editions). Missing authors or ISBNs on one
+    side are no conflict.
+    """
+    if identification.normalize_text(left.title) != identification.normalize_text(right.title):
+        return False
+    if identification.authors_conflict(_named_authors(left), _named_authors(right)):
+        return False
+    left_isbns = record_isbns(left.raw_payload)
+    right_isbns = record_isbns(right.raw_payload)
+    return not (left_isbns and right_isbns and left_isbns.isdisjoint(right_isbns))
+
+
+def distinct_books(candidates: Iterable[MetadataCandidate]) -> list[list[MetadataCandidate]]:
+    """Group records into distinct books (several providers may agree on one).
+
+    A record joins a group only when it is :func:`same_book` as every member, so a
+    single group means every pair of records agrees on title, authors and ISBNs.
+    """
+    groups: list[list[MetadataCandidate]] = []
+    for candidate in candidates:
+        for group in groups:
+            if all(same_book(candidate, member) for member in group):
+                group.append(candidate)
+                break
+        else:
+            groups.append([candidate])
+    return groups
 
 
 def isbn_lookup_result(
@@ -261,8 +306,9 @@ def isbn_lookup_result(
     A candidate is *verified* when the provider's own record lists the looked-up
     ISBN (either form, see :func:`record_carries_isbn`); neither the typed value
     nor a query echoed into normalization is trusted. The lookup is *unambiguous*
-    when all verified current records name the same book, so several providers
-    agreeing on one book still count as a single match.
+    when all verified current records describe the same book (title and authors,
+    :func:`distinct_books`), so several providers agreeing on one book still count
+    as a single match.
     """
     if search is None or not isinstance(search.query, dict) or search.query.get("mode") != "isbn":
         return None
@@ -271,16 +317,36 @@ def isbn_lookup_result(
         [candidate for candidate in search.candidates.all() if candidate.id in current_ids],
         queried,
     )
-    titles = distinct_books(verified)
+    books = distinct_books(verified)
     return {
         "isbn": (search.query.get("isbns") or [""])[0],
         "state": search.state,
         "provider_errors": len(search.provider_errors),
         "verified": verified,
         "verified_candidate_ids": [candidate.id for candidate in verified],
-        "unambiguous": len(titles) == 1,
-        "best": verified[0] if len(titles) == 1 else None,
+        "distinct_books": len(books),
+        "unambiguous": len(books) == 1,
+        "best": verified[0] if len(books) == 1 else None,
     }
+
+
+def bound_isbn(candidate: MetadataCandidate) -> str | None:
+    """The searched ISBN this candidate's own record carries, as ISBN-13, or ``None``.
+
+    A record can list several ISBNs (other editions, print and ebook). When the
+    search that found it asked for one of them (an intake search with the file's
+    ISBN, or a reviewer's ISBN lookup) and the provider record itself lists it,
+    that ISBN identifies the edition being accepted, not the record's first one.
+    """
+    search = candidate.search
+    query = search.query if search is not None and isinstance(search.query, dict) else {}
+    raw_queried = query.get("isbns")
+    queried: list[Any] = raw_queried if isinstance(raw_queried, list) else []
+    carried = record_isbns(candidate.raw_payload)
+    for value in queried:
+        if (isbn13 := canonical_isbn13(value)) is not None and isbn13 in carried:
+            return isbn13
+    return None
 
 
 # ----------------------------------------------------------------------- recording

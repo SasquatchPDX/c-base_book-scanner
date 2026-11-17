@@ -425,6 +425,7 @@ def _auto_accept_isbn_match(
                 task=task,
                 candidate=candidate,
                 reviewer=reviewer,
+                isbn=isbn,
                 decision_notes=f"Accepted candidate {candidate.id}: ISBN {isbn} verified",
                 extra_payload={"resolution_source": "reviewer_isbn", "isbn": isbn},
             )

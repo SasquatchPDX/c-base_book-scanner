@@ -220,8 +220,8 @@ starting with `_` are ours, so the `_queried_isbn` that Open Library's ISBN
 lookup echoes into the payload is never evidence, and normalization no longer
 copies it onto a record that does not list it.
 
-- **Exactly one distinct book verified** (one provider, or several naming the
-  same title): the review is resolved automatically by accepting the best such
+- **Exactly one distinct book verified** (one provider, or several describing
+  the same book): the review is resolved automatically by accepting the best such
   record through the normal accept path (`ReviewTask.Decision.ACCEPT_CANDIDATE`,
   `selected_candidate`, the record's metadata used fully), with
   `decision_payload.resolution_source = "reviewer_isbn"` and `decision_payload.isbn`;
@@ -231,9 +231,31 @@ copies it onto a record that does not list it.
   authors; an authorless record is offered for one-click "Accept ISBN match"
   with an authors field instead (#42).
 - **Several distinct books carry the ISBN:** nothing is accepted; the page shows
-  the verified records for the reviewer to choose.
+  the verified records for the reviewer to choose. Records are different books
+  when their normalized titles differ, when both name authors and none of them is
+  the same person (the scorer's name matching: "Dickinson, Emily" and "Emily
+  Dickinson" agree, Emily Dickinson and William Blake do not, so two "Selected
+  Poems" are two books), or when both list ISBNs and share none. A record only
+  joins a book when it agrees with every record already in it.
 - **Nothing verified, or providers failed:** the task stays open with its
   earlier candidates.
+
+**Identifiers on the accepted Book.** A provider record can list several ISBNs
+(other editions, print and ebook), and the candidate's normalized `isbn13` is the
+record's first one. When a candidate is accepted, the ISBN that identifies the
+edition is:
+
+- the reviewer-entered ISBN, for an automatic acceptance; or
+- the searched ISBN that the record itself lists (an ISBN lookup's query, or the
+  file's ISBN used by an intake search), for any other accept of such a candidate.
+
+That ISBN, in both forms (ISBN-13 and, for `978` ISBNs, ISBN-10), is used to
+find an existing Book and is always written to the Book, including an existing
+Book matched by title and author. The record's other ISBNs are neither looked up
+nor written, so a multi-ISBN record never merges into a Book that only holds one
+of its other ISBNs. Without a searched ISBN, the candidate's ISBN-13 is used,
+together with its ISBN-10 only when that is the same ISBN (a record's first
+ISBN-10 and first ISBN-13 can belong to different editions).
 
 ## Subject / genre evidence
 

@@ -110,16 +110,53 @@ def apply_review_genres(
     return {"automatic_genres": [genre.name for genre in added]} if added else {}
 
 
-def book_for_candidate(candidate: MetadataCandidate) -> Book:
-    """The library Book a candidate describes: by ISBN, then title+author, else new."""
+def _identifier_kind(value: str) -> str:
+    if len(value) == 10:
+        return cast(str, Identifier.IdentifierType.ISBN10)
+    return cast(str, Identifier.IdentifierType.ISBN13)
+
+
+def candidate_isbns(
+    candidate: MetadataCandidate, isbn: str | None = None
+) -> tuple[list[str], bool]:
+    """The ISBNs that identify the accepted edition, and whether they are *bound*.
+
+    An ISBN is bound when it is authoritative for this acceptance: ``isbn`` (the
+    reviewer-entered ISBN a provider record verified), else the searched ISBN the
+    record itself carries (:func:`metadata_search.bound_isbn`). It is returned in
+    both forms (ISBN-13, then ISBN-10). Otherwise the candidate's own ISBN-13 and
+    only an ISBN-10 that is the same ISBN: a record's first ISBN-10 and first
+    ISBN-13 can belong to different editions and must not be paired.
+    """
+    bound = (metadata_search.canonical_isbn13(isbn) if isbn else None) or (
+        metadata_search.bound_isbn(candidate)
+    )
+    if bound is not None:
+        return metadata_search.isbn_forms(bound), True
+    isbn13 = candidate.isbn13 or ""
+    isbn10 = candidate.isbn10 or ""
+    canonical13 = metadata_search.canonical_isbn13(isbn13)
+    canonical10 = metadata_search.canonical_isbn13(isbn10)
+    if canonical13 and canonical10 and canonical13 != canonical10:
+        isbn10 = ""
+    return [value for value in (isbn13, isbn10) if value], False
+
+
+def book_for_candidate(candidate: MetadataCandidate, *, isbn: str | None = None) -> Book:
+    """The library Book a candidate describes: by ISBN, then title+author, else new.
+
+    Only the ISBNs from :func:`candidate_isbns` are looked up and written, so a
+    multi-ISBN record never merges into a Book that holds one of its *other*
+    ISBNs. A bound ISBN (a verified reviewer-entered or searched ISBN) is always
+    written to the Book, including an existing one matched by title and author.
+    """
+    isbns, bound = candidate_isbns(candidate, isbn)
     book: Book | None = None
-    for value in (candidate.isbn13, candidate.isbn10):
-        if book is None and value:
-            existing_identifier = (
-                Identifier.objects.filter(value=value).select_related("book").first()
-            )
-            if existing_identifier is not None:
-                book = existing_identifier.book
+    for value in isbns:
+        existing_identifier = Identifier.objects.filter(value=value).select_related("book").first()
+        if existing_identifier is not None:
+            book = existing_identifier.book
+            break
     if book is None:
         candidate_author_set = {name.lower() for name in candidate.authors if isinstance(name, str)}
         for existing_book in Book.objects.filter(title__iexact=candidate.title):
@@ -128,6 +165,8 @@ def book_for_candidate(candidate: MetadataCandidate) -> Book:
                 book = existing_book
                 break
     if book is not None:
+        if bound:
+            _add_isbn_identifiers(book, isbns)
         return book
 
     candidate_edition = getattr(candidate, "edition", "")
@@ -145,22 +184,19 @@ def book_for_candidate(candidate: MetadataCandidate) -> Book:
         author, _ = Author.objects.get_or_create(full_name=author_name.strip())
         if author_name.strip():
             book.authors.add(author)
-    if candidate.isbn10:
-        Identifier.objects.get_or_create(
-            book=book,
-            kind=Identifier.IdentifierType.ISBN10,
-            value=candidate.isbn10,
-            defaults={"normalized_value": candidate.isbn10},
-        )
-    if candidate.isbn13:
-        Identifier.objects.get_or_create(
-            book=book,
-            kind=Identifier.IdentifierType.ISBN13,
-            value=candidate.isbn13,
-            defaults={"normalized_value": candidate.isbn13},
-        )
+    _add_isbn_identifiers(book, isbns)
     book.save()
     return book
+
+
+def _add_isbn_identifiers(book: Book, isbns: list[str]) -> None:
+    for value in isbns:
+        Identifier.objects.get_or_create(
+            book=book,
+            kind=_identifier_kind(value),
+            value=value,
+            defaults={"normalized_value": value},
+        )
 
 
 def accept_candidate(
@@ -170,6 +206,7 @@ def accept_candidate(
     reviewer: Any,
     reviewer_authors: list[str] | None = None,
     reviewer_genres: list[Genre] | None = None,
+    isbn: str | None = None,
     decision_notes: str = "",
     extra_payload: dict[str, Any] | None = None,
 ) -> tuple[Book, FileVariant | None]:
@@ -179,9 +216,11 @@ def accept_candidate(
     confirmed; they only fill a Book that has no authors yet (provider authors
     always win). Genres follow the review page's rules (:func:`apply_review_genres`):
     an explicit ``reviewer_genres`` choice, else automatic genres from the
-    candidate's subjects. ``extra_payload`` is merged into the task's decision payload.
+    candidate's subjects. ``isbn`` is a verified reviewer-entered ISBN: it decides
+    the Book's identifiers (:func:`candidate_isbns`). ``extra_payload`` is merged
+    into the task's decision payload.
     """
-    book = book_for_candidate(candidate)
+    book = book_for_candidate(candidate, isbn=isbn)
     candidate_has_authors = any(
         isinstance(name, str) and name.strip() for name in candidate.authors
     )
@@ -232,10 +271,13 @@ def auto_acceptable_isbn_candidate(
 
     Only records whose own provider identifiers carry the ISBN count
     (:func:`metadata_search.record_carries_isbn`); they must all describe one
-    distinct book, and the chosen record must name its authors (an authorless
-    ISBN match is left for the reviewer to confirm, as at intake, #42).
+    distinct book (:func:`metadata_search.same_book`: title, authors and ISBN
+    lists), and the chosen record must name its authors (an authorless ISBN match
+    is left for the reviewer to confirm, as at intake, #42).
     """
     verified = metadata_search.verified_isbn_candidates(candidates, isbn)
+    # Distinct by title *and* authors (and disjoint ISBN lists): two "Selected
+    # Poems" by different poets carrying one ISBN are left for the reviewer.
     if not verified or len(metadata_search.distinct_books(verified)) != 1:
         return None
     best = verified[0]
