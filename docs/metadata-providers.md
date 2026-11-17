@@ -160,3 +160,20 @@ are not yet written to `Book.categories` / `Book.genres`.
 
 Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
 whether review gates it) is an open owner decision tracked in issue #50.
+
+## Publication year
+
+Providers report a publication *year*, never a reliable day: Open Library's
+`first_publish_year` (the work's first publication, not necessarily the edition on
+file, and sometimes simply wrong) or Hardcover's `release_year`. It is stored in
+`Book.publication_year`. `Book.publication_date` is kept only for a genuinely known
+full date (for example entered in the admin) and is otherwise empty, so the book
+page shows "2003" instead of a fabricated "Jan. 1, 2003".
+
+Migration `0020_book_publication_year` copies the year of every existing
+`publication_date` into `publication_year` and clears dates on 1 January, because
+every automated writer stored a year that way; other dates are kept. The book API
+(`GET /library/books/<id>/`) gains `publication_year` (from the year field, or the
+year of a full date) next to `publication_date`, which is now `null` for year-only
+books. Clients that read the year from `publication_date` must switch to
+`publication_year`.

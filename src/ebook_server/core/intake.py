@@ -9,7 +9,7 @@ import shutil
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -50,6 +50,7 @@ from .models import (
     ReviewTask,
     SourceLocation,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import backend_for_location
 
@@ -1289,11 +1290,7 @@ def _provision_book_from_manual_metadata(
         description=description or "",
         edition=_fit(Book, "edition", edition),
     )
-    if publication_year:
-        try:
-            book.publication_date = date(publication_year, 1, 1)
-        except ValueError:
-            pass
+    book.publication_year = clean_publication_year(publication_year)
     for raw_author in authors or []:
         author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
@@ -1432,11 +1429,9 @@ def _provision_book_from_metadata(
             book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
-        if candidate.publication_year:
-            try:
-                book.publication_date = date(candidate.publication_year, 1, 1)
-            except ValueError:
-                pass
+        year = clean_publication_year(candidate.publication_year)
+        if year is not None:
+            book.publication_year = year
         book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book
