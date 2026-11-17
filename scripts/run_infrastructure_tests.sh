@@ -87,6 +87,11 @@ export BOOK_SCANNER_LDAP_EMAIL_ATTRIBUTE="mail"
 export BOOK_SCANNER_CSRF_TRUSTED_ORIGINS="[\"http://127.0.0.1:${book_scanner_proxy_port}\"]"
 export BOOK_SCANNER_RUN_INFRASTRUCTURE_TESTS="true"
 export BOOK_SCANNER_METADATA_PROVIDERS='["tests.browser_fixtures.BrowserMetadataProvider"]'
+# BrowserMetadataProvider echoes the searched title and author, i.e. an exact title +
+# strong author match that the #9 rule would auto-accept. The digital-library browser
+# scenario exercises the manual review workflow, so keep that rule off here; it is
+# covered by tests/test_identification.py and tests/test_intake.py.
+export BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED="false"
 export BOOK_SCANNER_OCR_SERVICE_URL="http://127.0.0.1:${book_scanner_ocr_port}"
 export BOOK_SCANNER_OCR_REQUEST_TIMEOUT="10"
 export BOOK_SCANNER_OCR_MAX_ATTEMPTS="5"
