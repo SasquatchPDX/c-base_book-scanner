@@ -1,0 +1,39 @@
+{% load static %}
+<link rel="stylesheet" href="{% static 'core/review-reader.css' %}">
+<aside class="review-reader" data-review-reader data-pdf-worker="{% static 'core/dist/pdf.worker.min.js' %}" aria-label="Book reader">
+  <button type="button" class="review-reader-toggle" data-reader-toggle aria-expanded="false" aria-controls="review-reader-body">Read the book</button>
+  <section class="review-reader-body" id="review-reader-body" data-reader-body hidden>
+    <header class="review-reader-header">
+      <h2>Reader</h2>
+      <button type="button" class="secondary small-button" data-reader-close>Close</button>
+    </header>
+    {% if entries %}
+      <div class="review-reader-tabs" role="tablist" aria-label="Attached files">
+        {% for entry in entries %}
+          <button type="button" role="tab" aria-selected="false" class="review-reader-tab"
+            data-reader-source="{{ entry.source.key }}"
+            data-kind="{{ entry.kind }}"
+            data-format="{{ entry.source.file_format }}"
+            data-filename="{{ entry.source.original_filename }}"
+            data-size="{{ entry.source.size_bytes|filesizeformat }}"
+            data-base-url="{{ entry.base_url }}"
+            data-download-url="{{ entry.download_url }}"
+            data-book-url="{{ entry.book_url }}"
+            data-hint="{{ entry.hint }}">{{ entry.source.label }}</button>
+        {% endfor %}
+      </div>
+      <p class="review-reader-meta muted" data-reader-meta aria-live="polite"></p>
+      <div class="review-reader-viewer" data-reader-viewer tabindex="0">
+        <p class="muted">Choose a file above to read it.</p>
+      </div>
+    {% else %}
+      <p class="muted">No files are attached to this review yet.</p>
+    {% endif %}
+  </section>
+  <noscript>
+    <ul class="review-reader-fallback">
+      {% for entry in entries %}<li><a href="{{ entry.download_url }}">Download {{ entry.source.label }}</a></li>{% endfor %}
+    </ul>
+  </noscript>
+  <script type="module" src="{% static 'core/dist/review-reader.js' %}"></script>
+</aside>

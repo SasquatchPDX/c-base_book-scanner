@@ -15,7 +15,7 @@
       <p class="byline">{% for author in book.authors.all %}{{ author.full_name }}{% if not forloop.last %}, {% endif %}{% empty %}Unknown author{% endfor %}</p>
       <dl class="metadata">
         {% if book.publisher %}<div><dt>Publisher</dt><dd>{{ book.publisher }}</dd></div>{% endif %}
-        {% if book.publication_date %}<div><dt>Published</dt><dd>{{ book.publication_date }}</dd></div>{% endif %}
+        {% if book.publication_date %}<div><dt>Published</dt><dd>{{ book.publication_date }}</dd></div>{% elif book.publication_year %}<div><dt>Published</dt><dd>{{ book.publication_year }}</dd></div>{% endif %}
         {% if book.edition %}<div><dt>Edition</dt><dd>{{ book.edition }}</dd></div>{% endif %}
         {% for identifier in identifiers %}<div><dt>{{ identifier.kind|upper }}</dt><dd>{{ identifier.value }}</dd></div>{% endfor %}
       </dl>
