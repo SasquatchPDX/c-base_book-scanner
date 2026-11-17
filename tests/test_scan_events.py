@@ -397,6 +397,63 @@ def test_page_event_before_the_page_is_applied_when_the_page_appears(
     assert scan_events.project_page_from_events(_page(job, 6)) is False
 
 
+def test_late_page_replays_the_latest_value_of_each_field(job: ScanJob, post: Any) -> None:
+    """PDXDJN #140 finding 3: a later status-only event keeps the earlier number."""
+    post(1, [page_line(5, "7")])
+    post(2, ['{"type":"page","sequence_number":5,"status":"manual"}'])
+    post(3, ['{"type":"page","sequence_number":6,"recognized_page_number":"9"}'])
+    page = _page(job, 5)
+    assert scan_events.project_page_from_events(page) is True
+    fresh = ScanPage.objects.get(pk=page.pk)
+    assert (fresh.recognized_page_number, fresh.status) == ("7", "manual")
+    # Same result as the live projection for a page that existed all along.
+    live = _page(job, 7)
+    post(4, [page_line(7, "10"), '{"type":"page","sequence_number":7,"status":"blurred"}'])
+    live.refresh_from_db()
+    assert (live.recognized_page_number, live.status) == ("10", "blurred")
+    # An explicit null is a value, and the latest one wins.
+    post(6, ['{"type":"page","sequence_number":5,"recognized_page_number":null}'])
+    ScanPage.objects.filter(pk=page.pk).update(recognized_page_number="stale")
+    assert scan_events.project_page_from_events(ScanPage.objects.get(pk=page.pk)) is True
+    late = ScanPage.objects.get(pk=page.pk)
+    assert (late.recognized_page_number, late.status) == (None, "manual")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"type":"job","page_width_mm":' + "9" * 400 + "}",
+        '{"type":"job","page_width_mm":-' + "9" * 400 + "}",
+        '{"type":"job","page_width_mm":1e400}',
+        '{"type":"job","page_width_mm":NaN}',
+        '{"type":"job","page_number_crop":{"x":NaN}}',
+        '{"type":"completeness_check","flags":[Infinity]}',
+        '{"type":"page","sequence_number":' + "9" * 400 + ',"status":"ok"}',
+        '{"type":"page","sequence_number":2147483648,"status":"ok"}',
+    ],
+)
+def test_out_of_range_numbers_are_malformed_fields_not_errors(
+    job: ScanJob, post: Any, line: str
+) -> None:
+    """PDXDJN #140 finding 4: the event is stored, the field is not projected."""
+    post(1, [JOB_LINE])
+    response = post(2, [line])
+    assert response.status_code == 200, response.content
+    assert response.json() == {"sans_last_line_no": 2}
+    assert ScanEvent.objects.filter(scan_job=job).count() == 2
+    job.refresh_from_db()
+    assert job.page_width_mm == 148.0
+    assert job.page_number_crop == json.loads(JOB_LINE)["page_number_crop"]
+    assert job.completeness_flags is None
+
+
+def test_deeply_nested_line_is_an_invalid_event(job: ScanJob, post: Any) -> None:
+    response = post(1, ['{"type":"x","a":' + "[" * 30000 + "]" * 30000 + "}"])
+    assert response.status_code == 422
+    assert _code(response) == "invalid_event"
+    assert ScanEvent.objects.count() == 0
+
+
 def test_completeness_check_projects_flags(job: ScanJob, post: Any) -> None:
     flags = [
         {
@@ -507,13 +564,13 @@ def test_render_skips_when_nothing_is_new(
 ) -> None:
     post(1, [JOB_LINE])
     writes: list[str] = []
-    original = LocalFilesystemStorage.replace_bytes
+    original = LocalFilesystemStorage.stage_bytes
 
     def counting(self: LocalFilesystemStorage, destination: str, data: bytes) -> str:
         writes.append(destination)
         return original(self, destination, data)
 
-    monkeypatch.setattr(LocalFilesystemStorage, "replace_bytes", counting)
+    monkeypatch.setattr(LocalFilesystemStorage, "stage_bytes", counting)
     scan_events.write_scan_jsonl(JOB_ID)
     assert writes == []
 
@@ -522,11 +579,11 @@ def test_render_catches_up_with_events_stored_while_writing(
     job: ScanJob, post: Any, app_data: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     post(1, [JOB_LINE])
-    original = LocalFilesystemStorage.replace_bytes
+    original = LocalFilesystemStorage.commit_staged
     injected: list[bool] = []
 
-    def racing(self: LocalFilesystemStorage, destination: str, data: bytes) -> str:
-        result = original(self, destination, data)
+    def racing(self: LocalFilesystemStorage, staged: str, destination: str) -> str:
+        result = original(self, staged, destination)
         if not injected:
             injected.append(True)
             # A batch commits after this render took its snapshot.
@@ -535,8 +592,8 @@ def test_render_catches_up_with_events_stored_while_writing(
             )
         return result
 
-    monkeypatch.setattr(LocalFilesystemStorage, "replace_bytes", racing)
-    ScanJob.objects.filter(pk=job.pk).update(scan_jsonl_job_rendered_through=None)
+    monkeypatch.setattr(LocalFilesystemStorage, "commit_staged", racing)
+    _job_file(app_data).unlink()
     scan_events.write_scan_jsonl(JOB_ID)
     assert _job_file(app_data).read_text(encoding="utf-8") == f"{JOB_LINE}\n{attempt(0)}\n"
 
@@ -550,6 +607,99 @@ def test_render_rewrites_a_file_a_stale_render_replaced(
     post(3, [attempt(1)])
     assert _job_file(app_data).read_text(encoding="utf-8") == (
         f"{JOB_LINE}\n{attempt(0)}\n{attempt(1)}\n"
+    )
+
+
+def test_an_older_render_never_replaces_a_newer_snapshot(
+    job: ScanJob, post: Any, app_data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PDXDJN #140 finding 2: the older worker is fenced out instead of renaming its
+    stale snapshot over the newer file (and then possibly dying before repairing it)."""
+    post(1, [JOB_LINE])
+    _job_file(app_data).unlink()  # force the next render to write
+    original = LocalFilesystemStorage.stage_bytes
+    interleaved: list[bool] = []
+
+    def older_worker_stalls(self: LocalFilesystemStorage, destination: str, data: bytes) -> str:
+        staged = original(self, destination, data)
+        if not interleaved:
+            interleaved.append(True)
+            # While the older worker sits between staging and renaming, a new line is
+            # stored and a newer worker renders and publishes it completely.
+            scan_events.append_sans_lines(JOB_ID, 2, [attempt(0)])
+            scan_events.write_scan_jsonl(JOB_ID)
+        return staged
+
+    monkeypatch.setattr(LocalFilesystemStorage, "stage_bytes", older_worker_stalls)
+    commits: list[str] = []
+    original_commit = LocalFilesystemStorage.commit_staged
+
+    def counting(self: LocalFilesystemStorage, staged: str, destination: str) -> str:
+        commits.append(destination)
+        return original_commit(self, staged, destination)
+
+    monkeypatch.setattr(LocalFilesystemStorage, "commit_staged", counting)
+    scan_events.write_scan_jsonl(JOB_ID)  # the older worker
+    expected = f"{JOB_LINE}\n{attempt(0)}\n"
+    assert _job_file(app_data).read_text(encoding="utf-8") == expected
+    assert len(commits) == 1  # only the newer worker renamed its snapshot into place
+    job.refresh_from_db()
+    assert job.scan_jsonl_job_rendered_through == ScanEvent.objects.latest("id").pk
+    assert not list(_job_file(app_data).parent.glob("*.partial"))
+
+
+def test_a_failed_write_is_not_recorded_and_a_retry_repairs_it(
+    job: ScanJob, post: Any, app_data: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    post(1, [JOB_LINE])
+
+    def broken(self: LocalFilesystemStorage, staged: str, destination: str) -> str:
+        raise OSError("share went away")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(LocalFilesystemStorage, "commit_staged", broken)
+        with pytest.raises(OSError, match="share went away"):
+            scan_events.append_sans_lines(JOB_ID, 2, [attempt(0)])
+            scan_events.write_scan_jsonl(JOB_ID)
+    job.refresh_from_db()
+    first_id = ScanEvent.objects.order_by("id").first()
+    assert first_id is not None
+    assert job.scan_jsonl_job_rendered_through == first_id.pk  # line 2 never recorded
+    assert _job_file(app_data).read_text(encoding="utf-8") == f"{JOB_LINE}\n"
+    assert not list(_job_file(app_data).parent.glob("*.partial"))
+    scan_events.write_scan_jsonl(JOB_ID)  # the retry
+    assert _job_file(app_data).read_text(encoding="utf-8") == f"{JOB_LINE}\n{attempt(0)}\n"
+
+
+def test_a_retry_verifies_the_file_instead_of_trusting_the_mark(
+    job: ScanJob, post: Any, app_data: Path
+) -> None:
+    """The mark says everything is rendered, but the file lost a line: rewrite it."""
+    post(1, [JOB_LINE, attempt(0)])
+    job.refresh_from_db()
+    assert job.scan_jsonl_job_rendered_through == ScanEvent.objects.latest("id").pk
+    _job_file(app_data).write_text(f"{JOB_LINE}\n", encoding="utf-8")
+    scan_events.write_scan_jsonl(JOB_ID)
+    assert _job_file(app_data).read_text(encoding="utf-8") == f"{JOB_LINE}\n{attempt(0)}\n"
+    # Same size, different bytes: still repaired (hash, not just size).
+    _job_file(app_data).write_bytes(b"x" * len(scan_events.render_scan_jsonl(job)))
+    scan_events.write_scan_jsonl(JOB_ID)
+    assert _job_file(app_data).read_bytes() == scan_events.render_scan_jsonl(job)
+
+
+def test_a_foreign_file_in_the_job_folder_is_not_overwritten(
+    job: ScanJob, post: Any, app_data: Path
+) -> None:
+    foreign = _job_file(app_data)
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("not serif's\n")
+    post(1, [JOB_LINE])
+    post(2, [attempt(0)])
+    assert foreign.read_text() == "not serif's\n"
+    job.refresh_from_db()
+    assert job.scan_jsonl_job_identifier == f"scan-jobs/{JOB_ID}/scan-{JOB_ID}.jsonl"
+    assert (foreign.parent / f"scan-{JOB_ID}.jsonl").read_text(encoding="utf-8") == (
+        f"{JOB_LINE}\n{attempt(0)}\n"
     )
 
 
@@ -661,6 +811,58 @@ def test_a_foreign_scan_jsonl_in_the_book_folder_is_not_overwritten(
     )
 
 
+def test_both_names_taken_in_the_book_folder_are_preserved(
+    job: ScanJob,
+    post: Any,
+    library_root: Path,
+    django_capture_on_commit_callbacks: Callable[..., Any],
+) -> None:
+    """PDXDJN #140 finding 1: with scan.jsonl and scan-<job>.jsonl both present (e.g.
+    logs uploaded through #113 or another tool), a third, free name is claimed."""
+    book = Book.objects.create(title="Crowded Folder")
+    folder = "Unknown author/Crowded Folder"
+    Book.objects.filter(pk=book.pk).update(archive_folder=folder)
+    (library_root / folder).mkdir(parents=True)
+    (library_root / folder / "scan.jsonl").write_text("first foreign\n")
+    (library_root / folder / f"scan-{JOB_ID}.jsonl").write_text("second foreign\n")
+    post(1, [JOB_LINE])
+    _finish(job, book, django_capture_on_commit_callbacks)
+    post(2, [attempt(0)])
+    assert (library_root / folder / "scan.jsonl").read_text() == "first foreign\n"
+    assert (library_root / folder / f"scan-{JOB_ID}.jsonl").read_text() == "second foreign\n"
+    job.refresh_from_db()
+    claimed = job.scan_jsonl_book_identifier
+    assert claimed.startswith(f"{folder}/scan-{JOB_ID}-") and claimed.endswith(".jsonl")
+    assert (library_root / claimed).read_text(encoding="utf-8") == f"{JOB_LINE}\n{attempt(0)}\n"
+
+
+def test_a_name_taken_between_check_and_create_is_not_replaced(
+    job: ScanJob,
+    post: Any,
+    library_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    django_capture_on_commit_callbacks: Callable[..., Any],
+) -> None:
+    """Another writer creates scan.jsonl after serif staged its bytes: the exclusive
+    create refuses that name instead of replacing the newcomer."""
+    book = Book.objects.create(title="Racing Upload")
+    folder = "Unknown author/Racing Upload"
+    Book.objects.filter(pk=book.pk).update(archive_folder=folder)
+    post(1, [JOB_LINE])
+    original = LocalFilesystemStorage.commit_staged_exclusive
+
+    def racing(self: LocalFilesystemStorage, staged: str, destination: str) -> str:
+        if destination == f"{folder}/scan.jsonl":
+            (library_root / destination).write_text("arrived first\n")
+        return original(self, staged, destination)
+
+    monkeypatch.setattr(LocalFilesystemStorage, "commit_staged_exclusive", racing)
+    _finish(job, book, django_capture_on_commit_callbacks)
+    assert (library_root / folder / "scan.jsonl").read_text() == "arrived first\n"
+    job.refresh_from_db()
+    assert job.scan_jsonl_book_identifier == f"{folder}/scan-{JOB_ID}.jsonl"
+
+
 def test_unfinished_job_writes_nothing_into_the_book_folder(
     job: ScanJob, post: Any, library_root: Path
 ) -> None:
@@ -688,3 +890,31 @@ def test_replace_bytes_refused_on_read_only_storage(tmp_path: Path) -> None:
 
     with pytest.raises(ReadOnlyStorageError):
         ReadOnlyFilesystemStorage(str(tmp_path)).replace_bytes("scan.jsonl", b"x")
+
+
+def test_commit_staged_exclusive_never_replaces(tmp_path: Path) -> None:
+    storage = LocalFilesystemStorage(str(tmp_path))
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "scan.jsonl").write_bytes(b"theirs\n")
+    staged = storage.stage_bytes("a/scan.jsonl", b"ours\n")
+    assert staged.startswith("a/.") and staged.endswith(".partial")
+    with pytest.raises(FileExistsError):
+        storage.commit_staged_exclusive(staged, "a/scan.jsonl")
+    assert (tmp_path / "a" / "scan.jsonl").read_bytes() == b"theirs\n"
+    assert storage.commit_staged_exclusive(staged, "a/scan-2.jsonl") == "a/scan-2.jsonl"
+    assert (tmp_path / "a" / "scan-2.jsonl").read_bytes() == b"ours\n"
+    assert sorted(path.name for path in (tmp_path / "a").iterdir()) == [
+        "scan-2.jsonl",
+        "scan.jsonl",
+    ]
+    storage.discard_staged(staged)  # already gone: fine
+
+
+def test_staging_refused_on_read_only_storage(tmp_path: Path) -> None:
+    from ebook_server.storage import ReadOnlyStorageError
+
+    storage = ReadOnlyFilesystemStorage(str(tmp_path))
+    with pytest.raises(ReadOnlyStorageError):
+        storage.stage_bytes("scan.jsonl", b"x")
+    with pytest.raises(ReadOnlyStorageError):
+        storage.commit_staged_exclusive(".x.partial", "scan.jsonl")

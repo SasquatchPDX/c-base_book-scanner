@@ -268,6 +268,15 @@ def job(request: HttpRequest, device: ScannerDevice, job_id: str) -> JsonRespons
     return _conflict(job_id)
 
 
+def scanner_owns_job(device: ScannerDevice, job_id: str) -> bool:
+    """Whether the job routes of the device API may act on ``job_id`` (§6.1).
+
+    Any other job (unknown, or not this scanner's) is answered with ``404``, so the
+    API never reveals jobs it does not serve. The one place that rule lives.
+    """
+    return ScanJob.objects.filter(pk=job_id, device=device).exists()
+
+
 # --- events (§6.7) ----------------------------------------------------------------------
 
 # The JSON body escapes the raw lines (every quote gains a backslash), so it may be
@@ -358,7 +367,7 @@ def job_events(request: HttpRequest, device: ScannerDevice, job_id: str) -> Json
         return problem
     assert batch is not None
     first_line_no, lines = batch
-    if not ScanJob.objects.filter(pk=job_id, device=device).exists():
+    if not scanner_owns_job(device, job_id):
         return error_response(404, "not_found", "No such job.", {"job_id": job_id})
     try:
         result = scan_events.append_sans_lines(job_id, first_line_no, lines)

@@ -37,6 +37,16 @@ class Migration(migrations.Migration):
         ),
         migrations.AddField(
             model_name="scanjob",
+            name="scan_jsonl_job_identifier",
+            field=models.CharField(blank=True, editable=False, max_length=1024),
+        ),
+        migrations.AddField(
+            model_name="scanjob",
+            name="scan_jsonl_render_generation",
+            field=models.BigIntegerField(default=0, editable=False),
+        ),
+        migrations.AddField(
+            model_name="scanjob",
             name="scan_jsonl_book_rendered_through",
             field=models.BigIntegerField(blank=True, editable=False, null=True),
         ),
