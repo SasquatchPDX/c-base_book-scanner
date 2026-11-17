@@ -440,6 +440,13 @@ handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
 extraction still requires an explicitly configured external archive tool in a
 restricted worker environment.
 
+MOBI (and other Kindle-family formats once intake accepts them) metadata is read
+with Calibre's `ebook-meta --to-opf` when it is on `PATH`. It runs through the
+conversion runner with a 30 s timeout that kills the whole process group, and its
+OPF output (capped at 2 MiB) is parsed with defusedxml. A missing tool, timeout,
+failure, or unusable output falls back to filename signals and does not fail the
+import (`ebook_meta_unavailable` / `ebook_meta_failed` are logged).
+
 EPUB, PDF, and CBZ intake attempts front-cover extraction in the ingestion worker.
 PDF pages are rendered by liberal-licensed PDFium bindings; archive images are
 read with member size/compression limits; Pillow warnings for decompression bombs
