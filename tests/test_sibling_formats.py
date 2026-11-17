@@ -85,11 +85,14 @@ def _job(
     *,
     title: str = "Neuromancer",
     isbn: str | None = None,
+    author: str | None = None,
 ) -> ImportJob:
     path = env["root"] / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix in {".htm", ".html"}:
         meta = f'<meta name="isbn" content="{isbn}">' if isbn else ""
+        if author:
+            meta += f'<meta name="author" content="{author}">'
         path.write_text(
             f"<html><head><title>{title}</title>{meta}</head><body>{text}</body></html>"
         )
@@ -160,6 +163,24 @@ def test_matching_embedded_isbn_joins(env: dict[str, Any]) -> None:
     first = _run(_job(env, "Gibson/Neuromancer.txt"))
     env["provider"].score = 0.1
     second = _run(_job(env, "Gibson/Neuromancer.htm", isbn=NEUROMANCER_ISBN))
+    assert second.book_id == first.book_id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_conflicting_embedded_author_goes_to_review(env: dict[str, Any]) -> None:
+    _run(_job(env, "Gibson/Neuromancer.txt"))
+    env["provider"].score = 0.1
+    second = _run(_job(env, "Gibson/Neuromancer.htm", author="Bruce Sterling"))
+
+    assert second.state == ImportJob.State.LOW_CONFIDENCE
+    assert _evidence(second)["reason"] == intake.BLOCK_AUTHOR_CONFLICT
+
+
+@pytest.mark.django_db(transaction=True)
+def test_matching_embedded_author_joins(env: dict[str, Any]) -> None:
+    first = _run(_job(env, "Gibson/Neuromancer.txt"))
+    env["provider"].score = 0.1
+    second = _run(_job(env, "Gibson/Neuromancer.htm", author="Gibson, William"))
     assert second.book_id == first.book_id
 
 
