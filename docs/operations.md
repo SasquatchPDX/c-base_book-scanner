@@ -265,12 +265,11 @@ application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
 
-<<<<<<< HEAD
 Imported variants record their origin in `FileVariant.source_type`: `upload` for
 web uploads, otherwise the source location's `default_source_type`
 (`incoming_folder` or `network_source`). An exact duplicate reuses the existing
 variant and keeps that variant's original origin.
-=======
+
 ### Metadata provider rate limits
 
 Every outbound metadata-provider request waits for a client-side slot before it is
@@ -297,7 +296,6 @@ this appears during bulk imports. New providers call
 `BOOK_SCANNER_METADATA_USER_AGENT` defaults to a project identifier with the
 repository URL; an empty value uses that default. Override it to add a contact
 address for your deployment.
->>>>>>> origin/master
 
 ## Workers and external tools
 
