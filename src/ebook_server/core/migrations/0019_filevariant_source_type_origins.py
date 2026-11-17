@@ -26,7 +26,7 @@ def backfill_import_origins(apps: Any, schema_editor: Any) -> None:
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0016_storage_identifier_lengths_and_source_stat"),
+        ("core", "0018_stage_state_invalidated_reason"),
     ]
 
     operations = [

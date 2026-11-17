@@ -113,7 +113,7 @@ def test_variant_source_type_mapping_keeps_uploads() -> None:
 @pytest.mark.django_db
 def test_migration_backfills_origin_from_first_import_job() -> None:
     migration = importlib.import_module(
-        "ebook_server.core.migrations.0017_filevariant_source_type_origins"
+        "ebook_server.core.migrations.0019_filevariant_source_type_origins"
     )
     user = get_user_model().objects.create(username="importer")
     from ebook_server.core.models import StorageLocation
