@@ -205,6 +205,11 @@ urlpatterns = [
         name="review-manual-entry",
     ),
     path(
+        "reviews/<int:task_id>/scanner-opf/",
+        views.review_scanner_opf,
+        name="review-scanner-opf",
+    ),
+    path(
         "reviews/<int:task_id>/merge/",
         views.review_merge_existing,
         name="review-merge-existing",

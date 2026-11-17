@@ -25,6 +25,23 @@
     <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
   </div>
 
+  {% if opf_metadata %}
+    <section class="review-notice" data-scanner-opf="{{ opf_metadata.version }}">
+      <h2>Scanner metadata</h2>
+      {% if opf_metadata.ignored %}
+        <p class="muted">The scanner sent this application's own generated metadata.opf (version {{ opf_metadata.version }}); it is not used as metadata.</p>
+      {% else %}
+        <dl class="metadata">
+          <div><dt>Title</dt><dd data-opf-title>{{ opf_metadata.title|default:"(none: identification runs at finish)" }}</dd></div>
+          <div><dt>Authors</dt><dd data-opf-authors>{{ opf_metadata.authors|join:", "|default:"Unknown" }}</dd></div>
+          <div><dt>ISBN</dt><dd class="mono" data-opf-isbn>{{ opf_metadata.isbn|default:"None" }}</dd></div>
+          <div><dt>Language</dt><dd data-opf-language>{{ opf_metadata.language|default:"Unknown" }}</dd></div>
+        </dl>
+        <p class="muted">From the scanner's metadata.opf, version {{ opf_metadata.version }}.{% if not job.book_id %} No library book exists yet: finish links or creates it.{% endif %}{% if opf_metadata.provider_check.status %} External check: {{ opf_metadata.provider_check.status }}.{% endif %}</p>
+      {% endif %}
+    </section>
+  {% endif %}
+
   {% if job.state == 'captured' %}
     <p class="review-notice" data-raw-scan>Raw scan, being processed. It joins the library after ScanTailor processing and finish.{% if job.refinish_needed %} A page was replaced after the book was finished: re-finish needed.{% endif %}</p>
   {% endif %}

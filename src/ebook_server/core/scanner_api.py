@@ -14,7 +14,10 @@ Every request writes one log line (route, status, job ID); the key is never logg
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import re
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import wraps
@@ -28,7 +31,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from . import scan_events, scan_lifecycle, scan_manifest, scanner_uploads
+from . import scan_events, scan_lifecycle, scan_manifest, scanner_opf, scanner_uploads
 from .models import ScanCover, ScanJob, ScanTodo
 from .scan_job_ids import is_device_job_id
 from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
@@ -444,6 +447,112 @@ def abort(request: HttpRequest, job_id: str) -> JsonResponse:
     except scan_lifecycle.LifecycleError as exc:
         return error_response(409, "job_state", str(exc), {"state": exc.state})
     return JsonResponse(job_status_payload(request, aborted))
+
+
+# --- metadata.opf (§6.8, #130) -----------------------------------------------------------
+
+# Multipart framing around the OPF part and the small ``metadata`` JSON part.
+MULTIPART_OVERHEAD_BYTES: Final = 64 * 1024
+MAX_METADATA_PART_BYTES: Final = 4 * 1024
+
+
+def _multipart(request: HttpRequest) -> tuple[Any, Any] | None:
+    """``(fields, files)`` of a multipart body; ``None`` when it is not one.
+
+    Django only parses multipart for POST, so the PUT body (already bounded by the
+    caller's Content-Length check) is parsed here.
+    """
+    from django.http.multipartparser import MultiPartParser, MultiPartParserError
+
+    try:
+        parser = MultiPartParser(
+            request.META,
+            io.BytesIO(request.body),
+            request.upload_handlers,
+            request.encoding,
+        )
+        return parser.parse()
+    except (MultiPartParserError, ValueError):
+        return None
+
+
+def _part_bytes(fields: Any, files: Any, name: str, limit: int) -> bytes | None:
+    """A part's bytes (file part or plain field), read at most ``limit + 1`` bytes."""
+    upload = files.get(name)
+    if upload is not None:
+        return bytes(upload.read(limit + 1))
+    value = fields.get(name)
+    if isinstance(value, str):
+        return value.encode("utf-8")[: limit + 1]
+    return None
+
+
+@scanner_api_view(["PUT"])
+def metadata(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Upload the job's ``metadata.opf`` (§6.8, §4.5).
+
+    Multipart with a ``metadata`` part ``{"sha256"}`` and an ``opf`` part. ``201`` stores
+    a new version, ``200`` repeats the current checksum. ``422 checksum_mismatch``,
+    ``422 invalid_opf`` (not well-formed, no ``package/metadata``, or hostile XML such as
+    entity expansion or external entities), ``413 payload_too_large`` above
+    ``BOOK_SCANNER_SCANNER_MAX_OPF_BYTES``, ``409 job_state`` for a cancelled job.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    max_opf = int(settings.BOOK_SCANNER_SCANNER_MAX_OPF_BYTES)
+    try:
+        content_length = int(request.META.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        content_length = 0
+    if content_length > max_opf + MULTIPART_OVERHEAD_BYTES:
+        return error_response(
+            413, "payload_too_large", "The OPF is too large.", {"max_opf_bytes": max_opf}
+        )
+    parts = _multipart(request)
+    if parts is None:
+        return _invalid_request("opf", "The body must be multipart/form-data.")
+    fields, files = parts
+    raw_metadata = _part_bytes(fields, files, "metadata", MAX_METADATA_PART_BYTES)
+    try:
+        part = json.loads(raw_metadata) if raw_metadata is not None else None
+    except (UnicodeDecodeError, ValueError):
+        part = None
+    if not isinstance(part, dict):
+        return _invalid_request("metadata", 'The metadata part must be JSON {"sha256": "…"}.')
+    sha256 = part.get("sha256")
+    if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        return _invalid_request("metadata.sha256", "sha256 must be a lowercase hex SHA-256.")
+    payload = _part_bytes(fields, files, "opf", max_opf)
+    if payload is None:
+        return _invalid_request("opf", "The opf part is missing.")
+    if len(payload) > max_opf:
+        return error_response(
+            413, "payload_too_large", "The OPF is too large.", {"max_opf_bytes": max_opf}
+        )
+    if hashlib.sha256(payload).hexdigest() != sha256:
+        return error_response(
+            422, "checksum_mismatch", "The OPF does not match its sha256.", {"part": "opf"}
+        )
+    try:
+        parsed = scanner_opf.parse_opf(payload)
+    except scanner_opf.InvalidOpf as exc:
+        return error_response(422, "invalid_opf", str(exc))
+    with transaction.atomic():
+        current = scanner_job(job_id, lock=True)
+        if current is None:
+            return _not_found()
+        if current.state == ScanJob.State.CANCELLED:
+            return _job_state_error(current, "The job is cancelled.")
+        result = scanner_opf.store_opf(current, payload, sha256=sha256, parsed=parsed)
+    return JsonResponse(
+        {
+            "job_id": current.pk,
+            "state": current.state,
+            "metadata_opf": {"sha256": result.opf.sha256, "version": result.opf.version},
+            "metadata": scanner_opf.display_metadata(current),
+        },
+        status=201 if result.created else 200,
+    )
 
 
 # --- page (§6.5) and cover (§6.6) uploads -------------------------------------------------

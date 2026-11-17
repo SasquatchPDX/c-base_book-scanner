@@ -80,6 +80,7 @@ from . import (
     scan_lifecycle,
     scan_logs,
     scan_pipeline,
+    scanner_opf,
     scantailor,
     search,
 )
@@ -2943,12 +2944,14 @@ def scan_job_workspace(
         return HttpResponseNotFound()
 
     pages = _serialize_workspace_pages(job)
+    opf_metadata = scanner_opf.display_metadata(job)
     payload = {
         "job_id": str(job.id),
         "state": job.state,
         "pages": pages,
         "count": len(pages),
         "stage_order": list(scantailor.stage_order()),
+        "metadata_opf": opf_metadata,
     }
     if _wants_html(request):
         stage_navigation = [
@@ -2958,7 +2961,12 @@ def scan_job_workspace(
         return render(
             request,
             "core/scan_workspace.html",
-            {"job": job, "pages": pages, "stage_navigation": stage_navigation},
+            {
+                "job": job,
+                "pages": pages,
+                "stage_navigation": stage_navigation,
+                "opf_metadata": opf_metadata,
+            },
         )
     return JsonResponse(payload)
 
@@ -4608,6 +4616,24 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         else None
     )
     payload["failed_search_error"] = search_context["failed_search_error"]
+    scanner_opf_review = scanner_opf.review_context(task)
+    payload["scanner_opf"] = (
+        {
+            "kind": scanner_opf_review["kind"],
+            "rows": scanner_opf_review.get("rows", []),
+            "preselected": scanner_opf_review.get("preselected"),
+            "reason": scanner_opf_review.get("reason"),
+            # Send back with action=resolve; a review whose evidence changed is rejected.
+            "revision": scanner_opf_review.get("revision"),
+            "open": scanner_opf_review.get("open"),
+            "obsolete": scanner_opf_review.get("obsolete"),
+            "possible_duplicate_book_ids": [
+                book.pk for book in scanner_opf_review.get("duplicates", [])
+            ],
+        }
+        if scanner_opf_review is not None
+        else None
+    )
     isbn_lookup = search_context["isbn_lookup"]
     payload["isbn_lookup"] = (
         {
@@ -4641,6 +4667,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "books": Book.objects.order_by("title")[:250],
                 "llm_panel": llm_panel,
                 "llm_candidate_ids": _llm_candidate_ids(task),
+                "scanner_opf_review": scanner_opf_review,
                 **search_context,
             },
         )
@@ -5382,6 +5409,73 @@ def review_manual_entry(
             "book_id": str(book.id),
             "variant_id": str(variant.id) if variant is not None else None,
         },
+    )
+
+
+@require_POST
+@login_required
+def review_scanner_opf(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Scanner-OPF review actions (#130).
+
+    ``action=resolve`` with ``choice`` decides a metadata conflict (provider record vs
+    scanner OPF: ``scanner``/``provider``; hand-edited field vs OPF:
+    ``current``/``scanner``). ``action=create_book`` creates a Book from the scanner's
+    OPF for a scan that finish handed to identification (ambiguous ISBN, likely
+    duplicate).
+    """
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return HttpResponseForbidden()
+    try:
+        task = ReviewTask.objects.select_related("scan_job").get(pk=task_id)
+    except (ReviewTask.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    payload = _request_payload(request)
+    action = str(payload.get("action") or "")
+    try:
+        if action == "resolve":
+            revision = str(payload.get("revision") or "")
+            if not revision:
+                return HttpResponseBadRequest(
+                    "revision is required: send the scanner_opf.revision of the review you "
+                    "decided on"
+                )
+            book = scanner_opf.resolve_conflict(
+                task,
+                choice=str(payload.get("choice") or ""),
+                user=profile.user,
+                revision=revision,
+            )
+        elif action == "create_book":
+            book = scanner_opf.create_book_from_review(task, user=profile.user)
+            contributions.record_review_resolution(task)
+        else:
+            return HttpResponseBadRequest("action must be resolve or create_book")
+    except scanner_opf.StaleReview as exc:
+        # The decision was made on evidence that no longer applies: reject it and show
+        # the refreshed review (form error on the page, 409 for API clients).
+        if _wants_html(request):
+            messages.error(request, str(exc))
+            return redirect("review-detail", task_id=task.id)
+        task.refresh_from_db()
+        context = scanner_opf.review_context(task)
+        return JsonResponse(
+            {
+                "task_id": str(task.id),
+                "error": str(exc),
+                "state": task.state,
+                "revision": context["revision"] if context is not None else None,
+            },
+            status=409,
+        )
+    except scanner_opf.ScannerOpfError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "book_id": str(book.pk), "state": ReviewTask.State.RESOLVED},
+        task_id=task.id,
     )
 
 

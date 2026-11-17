@@ -1320,6 +1320,103 @@ class ScanTodo(models.Model):
         return f"{self.scan_job_id}:{self.scan_page_id}:{self.todo_type}:{self.state}"
 
 
+class ScanJobOpf(models.Model):
+    """One immutable upload of a scan job's ``metadata.opf`` (#130, contract §4.5/§6.8).
+
+    Every upload with a new checksum is a new version; the newest is current. The raw
+    bytes are kept as received (at most ``BOOK_SCANNER_SCANNER_MAX_OPF_BYTES``), next to
+    the fields parsed from them. An OPF that carries the application's own
+    ``ebook-server:generated`` marker is stored but never used as metadata.
+    """
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="opf_versions")
+    version = models.PositiveIntegerField()
+    sha256 = models.CharField(max_length=64)
+    size_bytes = models.PositiveIntegerField()
+    content = models.BinaryField()
+    # title, authors, isbns (ISBN-13 forms), isbn (as given), language, publisher,
+    # description, subjects: see core.scanner_opf.parse_opf.
+    fields = models.JSONField(default=dict, blank=True)
+    app_generated = models.BooleanField(default=False)
+    # Who sent this version. Only the scanner uploads OPFs today (one scanner, no
+    # device registry); kept as a plain value so other origins can be added.
+    source = models.CharField(max_length=16, default="scanner")
+    # What applying this version to the linked Book did (updated fields, conflicts), and
+    # the result of the background provider check (core.scanner_opf).
+    application = models.JSONField(default=dict, blank=True)
+    provider_check = models.JSONField(default=dict, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("scan_job", "-version")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan_job", "version"], name="uniq_scan_job_opf_version"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.scan_job_id}:opf:v{self.version}"
+
+
+class BookMetadataProvenance(models.Model):
+    """History of where a Book's bibliographic fields came from (#130).
+
+    One row per change (``action=set``) or event (``provider_check``, ``conflict``,
+    ``confirmed``). The newest ``set`` row of a field is its current provenance: a field
+    last set by a ``reviewer`` is never overwritten by a later scanner OPF.
+    """
+
+    class Source(models.TextChoices):
+        SCANNER_OPF = "scanner_opf", "Scanner OPF"
+        REVIEWER = "reviewer", "Reviewer"
+        PROVIDER_CHECK = "provider_check", "External provider check"
+
+    class Action(models.TextChoices):
+        SET = "set", "Set"
+        CONFIRMED = "confirmed", "Confirmed"
+        CONFLICT = "conflict", "Conflict"
+        PROVIDER_CHECK = "provider_check", "Provider check"
+
+    book = models.ForeignKey(Book, on_delete=models.CASCADE, related_name="metadata_provenance")
+    # title, authors, isbn, language, publisher, description; empty for record events.
+    field = models.CharField(max_length=32, blank=True)
+    source = models.CharField(max_length=32, choices=Source.choices)
+    action = models.CharField(max_length=32, choices=Action.choices, default=Action.SET)
+    value = models.JSONField(null=True, blank=True)
+    previous_value = models.JSONField(null=True, blank=True)
+    details = models.JSONField(default=dict, blank=True)
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="metadata_provenance",
+    )
+    opf = models.ForeignKey(
+        ScanJobOpf,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="provenance",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("book", "-created_at", "-id")
+        indexes = [models.Index(fields=["book", "field", "action"])]
+
+    def __str__(self) -> str:
+        return f"{self.book_id}:{self.field or '*'}:{self.source}:{self.action}"
+
+
 class ScanEvent(models.Model):
     """One line of a scan job's ``scan.jsonl`` process log (#129, contract §4.4/§6.7).
 
@@ -1476,6 +1573,7 @@ class ProcessingJob(models.Model):
         LLM_IDENTIFICATION = "llm_identification", "LLM identification assist"
         COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
+        SCANNER_OPF_CHECK = "scanner_opf_check", "Scanner OPF provider check"
         SCAN_LOG = "scan_log", "Scanner log"
         ARCHIVE_REORGANIZE = "archive_reorganize", "Archive reorganize"
 
@@ -1902,6 +2000,8 @@ class ReviewTask(models.Model):
         MERGED_BOOK = "merged_book", "Merged with existing book"
         MARK_UNIDENTIFIED = "mark_unidentified", "Mark unidentified"
         SPLIT_PARTS = "split_parts", "Not one work: import parts separately"
+        # A scanner-OPF conflict (#130): keep or replace the Book's field values.
+        METADATA_CONFLICT = "metadata_conflict", "Resolved a metadata conflict"
 
     import_job = models.ForeignKey(
         ImportJob,

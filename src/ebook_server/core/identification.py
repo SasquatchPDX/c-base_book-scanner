@@ -1940,6 +1940,36 @@ def author_similarity(left: list[str], right: list[str]) -> float:
     return _author_match_score(left, right)
 
 
+def titles_agree(left: str, right: str) -> bool:
+    """Whether two titles name the same book, tolerating subtitles and annotations.
+
+    "Foundation" agrees with "Foundation: A Novel"; "Foundation" and "Foundation and
+    Earth" do not (see :func:`_title_match_score`).
+    """
+    if not normalize_text(left) or not normalize_text(right):
+        return False
+    return any(
+        _title_match_score(a, b) >= SAME_BOOK_TITLE_MIN_SCORE
+        for a in _title_variants(left)
+        for b in _title_variants(right)
+    )
+
+
+def author_lists_agree(left: list[str], right: list[str]) -> bool:
+    """Whether two author lists name the same people (every name has a match).
+
+    Names are matched like :func:`authors_conflict` does ("Banks, Iain" and "Iain M.
+    Banks" agree). Two empty lists agree; an empty and a non-empty list do not.
+    """
+    left_names = [name for name in left if normalize_text(name)]
+    right_names = [name for name in right if normalize_text(name)]
+    if not left_names or not right_names:
+        return not left_names and not right_names
+    return all(
+        any(_author_names_agree(name, other) for other in right_names) for name in left_names
+    ) and all(any(_author_names_agree(name, other) for other in left_names) for name in right_names)
+
+
 # Creator values that say nothing about who wrote the book: office-suite and PDF
 # tool defaults, account names, and "unknown" in a few languages. Compared after
 # normalize_text().

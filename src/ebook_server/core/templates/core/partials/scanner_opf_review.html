@@ -1,0 +1,62 @@
+<section class="review-notice" data-scanner-opf-review="{{ scanner_opf_review.kind }}">
+  {% if scanner_opf_review.kind == "provider_conflict" %}
+    <h2>Scanner metadata contradicted by a provider</h2>
+    <p>The scanner's metadata.opf is the book's metadata. A confident record from <strong>{{ scanner_opf_review.review.provider.provider_id }}</strong> disagrees with it. Nothing was changed: decide which values the book keeps.</p>
+  {% elif scanner_opf_review.kind == "field_conflict" %}
+    <h2>Scanner metadata differs from edited values</h2>
+    <p>A newer metadata.opf from the scanner (version {{ scanner_opf_review.review.opf_version }}) differs from values that were edited by hand or come from another source. They were not overwritten.</p>
+  {% else %}
+    <h2>Scanner metadata</h2>
+    <p>
+      {% if scanner_opf_review.reason == "possible_duplicate" %}The scanner's metadata.opf has no ISBN, and the library already has a book with the same title and authors. Link the scan to it, or create a new book from the scanner metadata.
+      {% elif scanner_opf_review.reason == "ambiguous_isbn" %}Several books in the library carry the scanner's ISBN. Link the scan to the right one, or create a new book from the scanner metadata.
+      {% else %}The scanner's metadata.opf has no title, so the providers were searched instead.{% endif %}
+    </p>
+    <dl class="metadata">
+      <div><dt>Title</dt><dd>{{ scanner_opf_review.opf.title|default:"None" }}</dd></div>
+      <div><dt>Authors</dt><dd>{{ scanner_opf_review.opf.authors|join:", "|default:"Unknown" }}</dd></div>
+      <div><dt>ISBN</dt><dd class="mono">{{ scanner_opf_review.opf.isbn|default:"None" }}</dd></div>
+      <div><dt>Language</dt><dd>{{ scanner_opf_review.opf.language|default:"Unknown" }}</dd></div>
+    </dl>
+    {% for book in scanner_opf_review.duplicates %}
+      <form method="post" action="{% url 'review-merge-existing' task.id %}" data-possible-duplicate="{{ book.id }}">
+        {% csrf_token %}<input type="hidden" name="book_id" value="{{ book.id }}">
+        <button class="secondary" type="submit">Link to existing book: {{ book.title }}</button>
+      </form>
+    {% endfor %}
+    {% if scanner_opf_review.can_create %}
+      <form method="post" action="{% url 'review-scanner-opf' task.id %}">
+        {% csrf_token %}<input type="hidden" name="action" value="create_book">
+        <button type="submit">Create a new book from the scanner metadata</button>
+      </form>
+    {% endif %}
+  {% endif %}
+  {% if scanner_opf_review.is_conflict %}
+    {% if scanner_opf_review.book %}<p>Book: <a href="{% url 'library-book-detail' scanner_opf_review.book.id %}?view=html">{{ scanner_opf_review.book.title }}</a></p>{% endif %}
+    <table>
+      <thead><tr><th>Field</th><th>Scanner OPF</th><th>{% if scanner_opf_review.kind == "provider_conflict" %}Provider record{% else %}Current value{% endif %}</th></tr></thead>
+      <tbody>
+        {% for row in scanner_opf_review.rows %}
+          <tr data-field="{{ row.field }}"><td>{{ row.label }}</td><td>{{ row.scanner }}</td><td>{{ row.other }}{% if row.other_source %} <span class="muted">({{ row.other_source }})</span>{% endif %}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if scanner_opf_review.open %}
+      <form method="post" action="{% url 'review-scanner-opf' task.id %}">
+        {% csrf_token %}<input type="hidden" name="action" value="resolve"><input type="hidden" name="revision" value="{{ scanner_opf_review.revision }}">
+        {% if scanner_opf_review.kind == "provider_conflict" %}
+          <label><input type="radio" name="choice" value="scanner"{% if scanner_opf_review.preselected == "scanner" %} checked{% endif %}> Keep the scanner metadata</label>
+          <label><input type="radio" name="choice" value="provider"{% if scanner_opf_review.preselected == "provider" %} checked{% endif %}> Use the provider record</label>
+        {% else %}
+          <label><input type="radio" name="choice" value="current"{% if scanner_opf_review.preselected == "current" %} checked{% endif %}> Keep the current values</label>
+          <label><input type="radio" name="choice" value="scanner"{% if scanner_opf_review.preselected == "scanner" %} checked{% endif %}> Use the scanner metadata</label>
+        {% endif %}
+        <button type="submit">Decide</button>
+      </form>
+    {% elif scanner_opf_review.obsolete %}
+      <p data-scanner-opf-obsolete="{{ scanner_opf_review.obsolete.reason }}">This review is obsolete: {% if scanner_opf_review.obsolete.reason == "opf_superseded" %}the scanner sent a newer metadata.opf{% if scanner_opf_review.obsolete.effective_opf_version %} (version {{ scanner_opf_review.obsolete.effective_opf_version }}){% endif %} after it was opened{% else %}the scan is no longer linked to this book{% endif %}. It cannot be decided; the current metadata gets its own review if it needs one.</p>
+    {% else %}
+      <p class="muted">Decided: {{ scanner_opf_review.choice|default:task.get_decision_display }}.</p>
+    {% endif %}
+  {% endif %}
+</section>
