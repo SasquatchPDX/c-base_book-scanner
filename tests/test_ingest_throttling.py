@@ -191,21 +191,18 @@ def test_discovered_job_can_be_claimed_only_once(
     job = intake.create_source_import_job(next(Path(location.root_path).iterdir()), location)
     stale_copy = ImportJob.objects.get(pk=job.pk)
 
-    assert intake._claim_discovered_job(job) is True
-    assert intake._claim_discovered_job(stale_copy) is False
+    assert intake.claim_import_job(job) is True
+    assert intake.claim_import_job(stale_copy) is False
 
-    # A delivery that loaded the job as DISCOVERED but lost the claim does no work.
-    job.state = ImportJob.State.DISCOVERED
-    job.save(update_fields=["state"])
-    monkeypatch.setattr(intake, "_claim_discovered_job", lambda _job: False)
-
+    # A delivery that loads the job after the claim (now HASHING) does no work either;
+    # tests/test_import_job_lease.py covers every active phase.
     def _must_not_hash(_path: str) -> str:
         raise AssertionError("lost the claim but processed anyway")
 
     monkeypatch.setattr(intake, "compute_sha256", _must_not_hash)
     intake.process_import_job(str(job.id))
     job.refresh_from_db()
-    assert job.state == ImportJob.State.DISCOVERED
+    assert job.state == ImportJob.State.HASHING
 
 
 @pytest.mark.django_db(transaction=True)

@@ -40,6 +40,7 @@ from ebook_server.core.models import (
     StorageLocation,
     get_or_create_profile,
 )
+from ebook_server.core.rate_limit import RedisRateLimiter
 from ebook_server.jobs import ConfiguredQueue, get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
@@ -130,7 +131,7 @@ def _running_uvicorn() -> Iterator[subprocess.Popen[str]]:
             "--host",
             "0.0.0.0",
             "--port",
-            "58081",
+            "18081",
             "--log-level",
             "warning",
             "--no-access-log",
@@ -143,7 +144,7 @@ def _running_uvicorn() -> Iterator[subprocess.Popen[str]]:
         text=True,
     )
     try:
-        _wait_for_http("http://127.0.0.1:58081/healthz/", process)
+        _wait_for_http("http://127.0.0.1:18081/healthz/", process)
         yield process
     finally:
         if process.poll() is None:
@@ -218,6 +219,27 @@ def test_redis_queue_is_consumed_by_real_rq_worker() -> None:
     finally:
         redis_connection.flushdb()
         redis_connection.close()
+
+
+def test_redis_rate_limiter_reserves_slots_across_clients() -> None:
+    redis_url = os.environ["BOOK_SCANNER_REDIS_URL"]
+    key = "metadata:integration-test"
+    first_client = Redis.from_url(redis_url)
+    second_client = Redis.from_url(redis_url)
+    first_client.delete(f"ebook-server:ratelimit:{key}")
+    slept: list[float] = []
+    try:
+        worker_a = RedisRateLimiter(first_client, max_wait=5.0, sleep=slept.append)
+        worker_b = RedisRateLimiter(second_client, max_wait=5.0, sleep=slept.append)
+        assert worker_a.acquire(key, 2.0) == 0
+        # No real sleep happened, so the second "process" must queue ~2s behind.
+        assert 1.5 < worker_b.acquire(key, 2.0) <= 2.0
+        ttl_ms = cast(int, first_client.pttl(f"ebook-server:ratelimit:{key}"))
+        assert 0 < ttl_ms <= 6000
+    finally:
+        first_client.delete(f"ebook-server:ratelimit:{key}")
+        first_client.close()
+        second_client.close()
 
 
 @pytest.mark.parametrize(

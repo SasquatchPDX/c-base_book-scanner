@@ -7,6 +7,7 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
 from ebook_server.core import intake
 from ebook_server.core.intake import IntakeError
@@ -86,19 +87,21 @@ class Command(BaseCommand):
                     continue
                 if not Path(job.source_path).exists():
                     continue
-                job.state = ImportJob.State.DISCOVERED
-                job.last_error = ""
-                job.next_retry_at = None
-                job.attempt_count = 0
-                job.save(
-                    update_fields=[
-                        "state",
-                        "last_error",
-                        "next_retry_at",
-                        "attempt_count",
-                        "updated_at",
-                    ],
+                # Conditional: a queue retry may have claimed the job since it was read.
+                reset = ImportJob.objects.filter(
+                    pk=job.pk,
+                    state=ImportJob.State.FAILED,
+                    lease_owner="",
+                ).update(
+                    state=ImportJob.State.DISCOVERED,
+                    last_error="",
+                    next_retry_at=None,
+                    attempt_count=0,
+                    lease_expires_at=None,
+                    updated_at=timezone.now(),
                 )
+                if not reset:
+                    continue
                 enqueue(intake.process_import_job, str(job.id))
                 retried.append(str(job.id))
 
@@ -123,15 +126,37 @@ class Command(BaseCommand):
             if output_json:
                 self.stdout.write(json.dumps(payload, indent=2))
             else:
+                audio_rows = 0
                 for row in payload:
                     if "error" in row:
                         self.stdout.write(
                             f"source {row['source_location_id']} error: {row['error']}"
                         )
                         continue
-                    self.stdout.write(
+                    if row.get("skipped") == "audio":
+                        audio_rows += 1
+                        self.stdout.write(
+                            f"skipped [{row['reason']}] => {row['path']} (source "
+                            f"#{row['source_location_id']})"
+                        )
+                        continue
+                    line = (
                         f"{row['source_type']} => {row['path']} (source "
                         f"#{row['source_location_id']})"
+                    )
+                    if "path_layout" in row:
+                        hints = row["path_layout"]
+                        line += (
+                            " [layout: no match]"
+                            if hints is None
+                            else f" [layout: author={hints['authors']!r} "
+                            f"title={hints['title']!r} series={hints['series']!r}]"
+                        )
+                    self.stdout.write(line)
+                if audio_rows:
+                    self.stdout.write(
+                        f"skipped_audio={audio_rows} (audiobooks are not managed here; "
+                        "see docs/design/32-audiobooks.md)"
                     )
             return
 
@@ -149,18 +174,24 @@ class Command(BaseCommand):
         created_job_ids: list[str] = []
         requeued_job_ids: list[str] = []
         throttled = False
+        skipped_audio: list[int] = []
+        budget = intake.archive_space_budget()
         for location in locations:
             if location.is_paused:
                 self.stdout.write(f"source {location.id} paused; skipped")
                 continue
             if requeue_orphans:
                 requeued_job_ids.extend(self._requeue_orphans(location, pending_rq_ids))
+            if budget is not None and budget.exhausted:
+                continue
             capacity = intake.source_ingest_capacity(location, batch_size=limit)
             try:
                 jobs = intake.discover_source_jobs_for_location(
                     source_location=location,
                     uploader=user,
                     limit=capacity,
+                    byte_budget=budget,
+                    skipped_audio=skipped_audio,
                 )
             except IntakeError as exc:
                 self.stdout.write(f"source {location.id} error: {exc}")
@@ -175,10 +206,19 @@ class Command(BaseCommand):
                 enqueue(intake.process_import_job, str(job.id))
                 created_job_ids.append(str(job.id))
 
-        self.stdout.write(
-            f"ingest queued={len(created_job_ids)} requeued={len(requeued_job_ids)} "
-            f"throttled={'yes' if throttled else 'no'}"
+        summary = (
+            f"ingest queued={len(created_job_ids)} total_files={len(created_job_ids)} "
+            f"requeued={len(requeued_job_ids)} throttled={'yes' if throttled else 'no'}"
         )
+        if sum(skipped_audio):
+            summary += f" skipped_audio={sum(skipped_audio)}"
+        self.stdout.write(summary)
+        if budget is not None and budget.exhausted:
+            self.stderr.write(
+                "insufficient free space on the archive volume: stopped queueing new "
+                "imports to keep BOOK_SCANNER_STORAGE_MIN_FREE_BYTES free. Free space "
+                "(or enlarge the volume) and run ingest_sources again.",
+            )
 
     def _requeue_orphans(
         self,
@@ -190,8 +230,8 @@ class Command(BaseCommand):
         They are left behind when the queue is emptied, Redis is flushed, or a job was
         skipped while its source was paused. With no RQ queue (inline or none
         configured) nothing waits in a queue, so every DISCOVERED job is an orphan.
-        ``process_import_job`` claims DISCOVERED jobs atomically, so a job that ends up
-        queued twice is still processed once.
+        ``process_import_job`` takes an exclusive ownership lease before doing any
+        work, so a job that ends up queued twice is still processed once.
         """
         requeued: list[str] = []
         orphans = ImportJob.objects.filter(

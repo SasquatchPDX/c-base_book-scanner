@@ -8,7 +8,7 @@ from typing import Any
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from ebook_server.core import scan_pipeline
+from ebook_server.core import intake, scan_pipeline
 from ebook_server.core.models import ProcessingJob, ScanJob
 from ebook_server.jobs import is_stale_running, rq_pending_job_args, stale_after
 
@@ -16,8 +16,8 @@ from ebook_server.jobs import is_stale_running, rq_pending_job_args, stale_after
 class Command(BaseCommand):
     help = (
         "Find ProcessingJobs stuck RUNNING (worker killed) or QUEUED with no RQ job "
-        "(Redis flushed, enqueue lost), and ScanJobs stuck FINALIZING. Dry-run unless "
-        "--apply is given."
+        "(Redis flushed, enqueue lost), ImportJobs whose worker lease expired in an "
+        "active phase, and ScanJobs stuck FINALIZING. Dry-run unless --apply is given."
     )
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
@@ -90,8 +90,32 @@ class Command(BaseCommand):
                 scan_pipeline._restore_scan_after_failure(scan, details)
                 self.stdout.write(f"  -> scan {scan.id} returned to retryable state")
 
+        recovered_imports = self._recover_imports(apply)
+
         verb = "recovered" if apply else "would recover"
         self.stdout.write(self.style.SUCCESS(f"{verb} {len(stale)} stale job(s)"))
+        self.stdout.write(
+            self.style.SUCCESS(f"{verb} {recovered_imports} stale import job(s)"),
+        )
+
+    def _recover_imports(self, apply: bool) -> int:
+        """Fail ImportJobs stuck in an active phase after their lease expired.
+
+        The lease outlives the RQ job timeout, so its worker was killed. The job becomes
+        FAILED without an automatic retry; ``ingest_sources --retry-failed`` re-queues it.
+        """
+        recovered = 0
+        for job in intake.stale_import_jobs():
+            reason = f"import lease expired in {job.state} (worker likely killed)"
+            self.stdout.write(f"stale import {job.id}: {reason}")
+            if not apply:
+                recovered += 1
+            elif intake.recover_stale_import_job(job, reason):
+                recovered += 1
+                self.stdout.write(f"  -> import {job.id} marked FAILED")
+            else:
+                self.stdout.write(f"  -> import {job.id} changed meanwhile; left alone")
+        return recovered
 
     def _fail(self, job: ProcessingJob, reason: str) -> None:
         details = dict(job.details) if isinstance(job.details, dict) else {}

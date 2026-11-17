@@ -24,7 +24,22 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are:
    plus draggable text/picture zones with independent algorithms.
 
 The current dewarping stage corrects perspective on flat pages; it does not
-correct book-spine curvature. Text/picture separation is manual only:
+correct book-spine curvature. The four control points only define the correction
+(which quadrilateral becomes an upright rectangle); the output canvas holds the
+whole transformed input, so content outside the points and the Margins padding
+are kept (`opencv-v2`). A near-degenerate quad (a corner at or beyond the
+vanishing line, a canvas reaching more than one input size past the quad, or a
+canvas over twice the input's pixel count) is not rendered: the page is passed
+through unchanged with `dewarp_correction="rejected_degenerate_quad"` and the
+reason in `dewarp_warning`. Every run records `dewarp_applied`
+(`perspective` or `passthrough`) and resets the warp-geometry parameters it did
+not produce, so a passthrough never leaves an earlier warp looking current. In `auto` mode (`opencv-v3`) the quad comes from the
+text: the fitted topmost and bottommost text lines give the top/bottom edges and
+robust fits through the outer line ends give the sides (a ragged side mirrors the
+aligned one). A page outline contour is the fallback. An already-upright page is
+passed through without resampling (`dewarp_correction="none_needed"`). When
+nothing is found, the result records `dewarp_mode="auto_fallback"` with a
+`dewarp_warning`. Text/picture separation is manual only:
 `zone_mode="auto"` currently applies one algorithm to the whole page. The output
 option named `fox` uses scikit-image's Niblack implementation, and `wolf` uses a
 local-contrast approximation. Correcting those advertised names and establishing
