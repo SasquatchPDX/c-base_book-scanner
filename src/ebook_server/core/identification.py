@@ -2213,6 +2213,40 @@ def _strong_match_settings() -> StrongMatchSettings:
     )
 
 
+# The matched title is only one part of a multi-part file name whose other parts are
+# neither numbers nor the candidate's authors: "Dune - House Harkonnen" names a series
+# and a book, "Gold - 03 - Frustration" a collection and one of its stories.
+PARTIAL_TITLE_HINT = "partial_title_hint"
+_FILENAME_PART_SEPARATOR = re.compile(r"\s+-\s+")
+
+
+def _is_partial_title_hint(
+    signals: IdentificationInput, title_hint: str, candidate_authors: list[str]
+) -> bool:
+    """Whether ``title_hint`` is one segment of a longer file-name title hint.
+
+    The other segments make it partial unless each one is a bare number or names one of
+    ``candidate_authors`` ("Foundation - Isaac Asimov" is a whole title plus its author).
+    """
+    if not title_hint:
+        return False
+    hint = default_process(title_hint)
+    for whole in signals.title_hints:
+        parts = [part for part in _FILENAME_PART_SEPARATOR.split(whole.strip()) if part.strip()]
+        if len(parts) < 2 or hint not in {default_process(part) for part in parts}:
+            continue
+        others = [
+            part
+            for part in parts
+            if default_process(part) != hint
+            and not re.fullmatch(r"\d+", part.strip())
+            and _author_match_score([part], candidate_authors) < AUTHOR_VARIANT_MATCH_SCORE
+        ]
+        if others:
+            return True
+    return False
+
+
 def _strong_match_assessment(
     signals: IdentificationInput,
     candidate: IdentificationCandidate,
@@ -2252,6 +2286,10 @@ def _strong_match_assessment(
         blocked_by.append("author_evidence_conflict")
     if title_hint and default_process(title_hint) == default_process(author_hint):
         blocked_by.append("title_and_author_from_same_hint")
+    if title_source == EVIDENCE_FILENAME and _is_partial_title_hint(
+        signals, title_hint, candidate.authors
+    ):
+        blocked_by.append(PARTIAL_TITLE_HINT)
 
     # ISBN, language and publisher are compared with the candidate's own edition, as
     # in edition_conflicts (#37): a work-level value proves the work, not the edition.

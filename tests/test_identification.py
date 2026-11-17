@@ -747,3 +747,40 @@ def test_build_identification_input_reads_publication_year() -> None:
     )
 
     assert signals.publication_year == 1951
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("Dune - House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        ("Gold - 03 - Frustration.txt", {"title": "Gold", "author_name": ["Isaac Asimov"]}),
+        ("Gold - 01 - cal.txt", {"title": "Gold", "author_name": ["Isaac Asimov"]}),
+    ],
+)
+def test_one_part_of_a_multi_part_file_name_is_not_auto_accepted(
+    filename: str, payload: dict[str, Any]
+) -> None:
+    # The folder names the author, so the author check passes; the title only matches the
+    # series/collection part of the file name.
+    author = payload["author_name"][0]
+    signals = build_identification_input(
+        source_path=f"/library/{author}/{filename}",
+        original_filename=filename,
+        extracted_metadata={"path_layout": {"authors": [author], "title": None}},
+    )
+    candidates = _resolve(signals, [payload])
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert "partial_title_hint" in _rule_evidence(candidates[0])["blocked_by"]
+
+
+def test_title_plus_author_file_name_is_not_partial() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Foundation - Isaac Asimov.txt",
+        original_filename="Foundation - Isaac Asimov.txt",
+        extracted_metadata={},
+    )
+    candidates = _resolve(signals, [{"title": "Foundation", "author_name": ["Isaac Asimov"]}])
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    assert "partial_title_hint" not in _rule_evidence(candidates[0])["blocked_by"]
