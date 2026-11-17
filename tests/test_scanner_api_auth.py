@@ -1,4 +1,8 @@
-"""Scanner device identity and the ``/api/scanner/v1/`` skeleton (#125, contract §3/§6.1/§6.2)."""
+"""The scanner API key and the ``/api/scanner/v1/`` skeleton (#125, contract §3/§6.1/§6.2).
+
+There is one scanner with one key; the server only knows the key's SHA-256
+(``BOOK_SCANNER_SCANNER_API_KEY_SHA256``).
+"""
 
 from __future__ import annotations
 
@@ -8,19 +12,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+import structlog
 from django.contrib.auth import get_user_model
-from django.core.management import CommandError, call_command
+from django.core.management import call_command
 from django.test import Client
 from pydantic import SecretStr, ValidationError
 
-from ebook_server.core.models import ScannerDevice, get_or_create_profile
-from ebook_server.core.scanner_devices import (
-    authenticate_key,
-    create_device,
-    hash_key,
-    revoke_device,
-    rotate_key,
-)
+from ebook_server.core.models import AppUserProfile, get_or_create_profile
+from ebook_server.core.scanner_auth import generate_key, hash_key, is_scanner_key
 from ebook_server.settings import Settings
 
 PING = "/api/scanner/v1/ping"
@@ -32,6 +31,7 @@ def _bearer(key: str) -> dict[str, str]:
 
 def _assert_error(response: Any, status: int, code: str) -> dict[str, Any]:
     assert response.status_code == status
+    assert response["Content-Type"] == "application/json"
     body = response.json()
     assert set(body) == {"error"}
     assert set(body["error"]) == {"code", "message", "details"}
@@ -40,123 +40,89 @@ def _assert_error(response: Any, status: int, code: str) -> dict[str, Any]:
 
 
 @pytest.fixture
-def device_key(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01", name="libreflip at c-base")
+def scanner_key(settings: Any) -> str:
+    key = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(key)
+    return key
 
 
-# --- keys and the device record -------------------------------------------------------
+def _member_client(username: str = "member", *, disabled: bool = False) -> Client:
+    profile = get_or_create_profile(username)
+    client = Client()
+    client.force_login(get_user_model().objects.get(pk=profile.user_id))
+    if disabled:
+        AppUserProfile.objects.filter(pk=profile.pk).update(is_disabled=True)
+    return client
 
 
-@pytest.mark.django_db
-def test_key_is_random_urlsafe_and_only_its_sha256_is_stored(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    device, key = device_key
+# --- the key ---------------------------------------------------------------------------
+
+
+def test_key_is_random_urlsafe_and_matches_only_its_configured_sha256(settings: Any) -> None:
+    key = generate_key()
     assert len(key) == 43  # 32 bytes, base64url without padding
     assert "=" not in key
-    device.refresh_from_db()
-    assert device.key_sha256 == hashlib.sha256(key.encode()).hexdigest()
-    assert key not in device.key_sha256
-    assert authenticate_key(key) == device
+    assert generate_key() != key
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hashlib.sha256(key.encode()).hexdigest()
+    assert is_scanner_key(key)
+    assert not is_scanner_key(generate_key())
 
 
-@pytest.mark.django_db
-def test_two_devices_get_different_keys() -> None:
-    _, first = create_device("scanner-a")
-    _, second = create_device("scanner-b")
-    assert first != second
+def test_unknown_and_malformed_keys_do_not_match(scanner_key: str) -> None:
+    assert not is_scanner_key(None)
+    assert not is_scanner_key("")
+    assert not is_scanner_key("not-a-key")
+    assert not is_scanner_key("x" * 1000)
+    assert not is_scanner_key("bad key with spaces")
+    assert not is_scanner_key(hash_key(scanner_key))  # the hash itself is not a key
 
 
-@pytest.mark.django_db
-def test_unknown_and_malformed_keys_do_not_authenticate(
-    device_key: tuple[ScannerDevice, str],
+def test_no_key_matches_while_the_api_is_disabled(settings: Any) -> None:
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = ""
+    assert not is_scanner_key("")
+    assert not is_scanner_key(generate_key())
+
+
+# --- management command ----------------------------------------------------------------
+
+
+def test_generate_scanner_key_prints_key_and_settings_line_and_stores_nothing(
+    settings: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert authenticate_key("") is None
-    assert authenticate_key("not-a-key") is None
-    assert authenticate_key("x" * 1000) is None
-    assert authenticate_key("bad key with spaces") is None
-
-
-# --- management command ---------------------------------------------------------------
-
-
-@pytest.mark.django_db
-def test_management_command_create_prints_key_once_and_list_never_shows_it() -> None:
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = ""
+    monkeypatch.chdir(tmp_path)
     out = io.StringIO()
-    call_command("scanner_device", "create", "libreflip-01", "--name", "Lab scanner", stdout=out)
-    lines = out.getvalue().strip().splitlines()
-    key = lines[-1]
-    device = ScannerDevice.objects.get(scanner_id="libreflip-01")
-    assert device.name == "Lab scanner"
-    assert device.key_sha256 == hash_key(key)
+    call_command("generate_scanner_key", stdout=out)
+    lines = [line for line in out.getvalue().splitlines() if line.strip()]
+    key = lines[1]
+    assert len(key) == 43
+    env_line = lines[-1]
+    assert env_line == f"BOOK_SCANNER_SCANNER_API_KEY_SHA256={hash_key(key)}"
     assert out.getvalue().count(key) == 1
+    # Nothing written: not the working directory, not the running settings.
+    assert list(tmp_path.iterdir()) == []
+    assert settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 == ""
 
-    listing = io.StringIO()
-    call_command("scanner_device", "list", stdout=listing)
-    assert "libreflip-01" in listing.getvalue()
-    assert "active" in listing.getvalue()
-    assert key not in listing.getvalue()
-    assert device.key_sha256 not in listing.getvalue()
-
-
-@pytest.mark.django_db
-def test_management_command_rotate_and_revoke() -> None:
-    _, old_key = create_device("libreflip-01")
-    out = io.StringIO()
-    call_command("scanner_device", "rotate", "libreflip-01", stdout=out)
-    new_key = out.getvalue().strip().splitlines()[-1]
-    assert new_key != old_key
-    assert authenticate_key(old_key) is None
-    assert authenticate_key(new_key) is not None
-    assert ScannerDevice.objects.get().rotated_at is not None
-
-    call_command("scanner_device", "revoke", "libreflip-01", stdout=io.StringIO())
-    assert authenticate_key(new_key) is None
-    listing = io.StringIO()
-    call_command("scanner_device", "list", stdout=listing)
-    assert "revoked" in listing.getvalue()
-
-
-@pytest.mark.django_db
-def test_management_command_errors() -> None:
-    create_device("libreflip-01")
-    with pytest.raises(CommandError, match="already exists"):
-        call_command("scanner_device", "create", "libreflip-01", stdout=io.StringIO())
-    with pytest.raises(CommandError, match="unknown"):
-        call_command("scanner_device", "rotate", "nope", stdout=io.StringIO())
-    with pytest.raises(CommandError, match="unknown"):
-        call_command("scanner_device", "revoke", "nope", stdout=io.StringIO())
-    with pytest.raises(CommandError):
-        call_command("scanner_device", "create", "not a slug!", stdout=io.StringIO())
-    assert ScannerDevice.objects.count() == 1
-
-
-@pytest.mark.django_db
-def test_rotate_reactivates_a_revoked_device() -> None:
-    create_device("libreflip-01")
-    revoke_device("libreflip-01")
-    _, key = rotate_key("libreflip-01")
-    assert authenticate_key(key) is not None
+    again = io.StringIO()
+    call_command("generate_scanner_key", stdout=again)
+    assert key not in again.getvalue()
 
 
 # --- authentication on /api/scanner/v1/ ------------------------------------------------
 
 
-@pytest.mark.django_db
-def test_ping_with_valid_key(device_key: tuple[ScannerDevice, str], settings: Any) -> None:
+def test_ping_with_valid_key(scanner_key: str, settings: Any) -> None:
     settings.BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES = 1234
     settings.BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = 567
-    device, key = device_key
-    assert device.last_seen_at is None
     before = datetime.now(UTC).replace(microsecond=0)
 
-    response = Client().get(PING, headers=_bearer(key))
+    response = Client().get(PING, headers=_bearer(scanner_key))
 
     assert response.status_code == 200
     assert response["Cache-Control"] == "no-store"
     body = response.json()
+    assert set(body) == {"api_version", "server_time", "limits"}
     assert body["api_version"] == 1
-    assert body["scanner_id"] == "libreflip-01"
     assert body["server_time"].endswith("Z")
     server_time = datetime.fromisoformat(body["server_time"].replace("Z", "+00:00"))
     assert before <= server_time <= datetime.now(UTC) + timedelta(seconds=1)
@@ -166,21 +132,14 @@ def test_ping_with_valid_key(device_key: tuple[ScannerDevice, str], settings: An
         "max_event_batch_bytes": 1048576,
         "max_event_batch_lines": 1000,
     }
-    device.refresh_from_db()
-    assert device.last_seen_at is not None
 
 
-@pytest.mark.django_db
-def test_ping_accepts_trailing_slash_and_case_insensitive_scheme(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    _, key = device_key
-    response = Client().get(PING + "/", HTTP_AUTHORIZATION=f"bearer {key}")
+def test_ping_accepts_trailing_slash_and_case_insensitive_scheme(scanner_key: str) -> None:
+    response = Client().get(PING + "/", HTTP_AUTHORIZATION=f"bearer {scanner_key}")
     assert response.status_code == 200
 
 
-@pytest.mark.django_db
-def test_without_key_is_401(device_key: tuple[ScannerDevice, str]) -> None:
+def test_without_key_is_401(scanner_key: str) -> None:
     response = Client().get(PING)
     _assert_error(response, 401, "authentication_required")
     assert response["WWW-Authenticate"].startswith("Bearer")
@@ -189,32 +148,34 @@ def test_without_key_is_401(device_key: tuple[ScannerDevice, str]) -> None:
     )
 
 
-@pytest.mark.django_db
-def test_wrong_revoked_and_rotated_keys_are_401(device_key: tuple[ScannerDevice, str]) -> None:
-    device, key = device_key
-    _assert_error(Client().get(PING, headers=_bearer(key + "x")), 401, "invalid_api_key")
+def test_wrong_key_is_401(scanner_key: str) -> None:
+    _assert_error(Client().get(PING, headers=_bearer(scanner_key + "x")), 401, "invalid_api_key")
+    _assert_error(Client().get(PING, headers=_bearer(generate_key())), 401, "invalid_api_key")
 
-    _, new_key = rotate_key(device.scanner_id)
-    _assert_error(Client().get(PING, headers=_bearer(key)), 401, "invalid_api_key")
+
+def test_old_key_is_401_after_the_setting_changes(scanner_key: str, settings: Any) -> None:
+    assert Client().get(PING, headers=_bearer(scanner_key)).status_code == 200
+    new_key = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(new_key)  # new line + restart
+    _assert_error(Client().get(PING, headers=_bearer(scanner_key)), 401, "invalid_api_key")
     assert Client().get(PING, headers=_bearer(new_key)).status_code == 200
 
-    revoke_device(device.scanner_id)
-    _assert_error(Client().get(PING, headers=_bearer(new_key)), 401, "invalid_api_key")
+
+def test_empty_setting_answers_503_for_every_request(settings: Any) -> None:
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = ""
+    key = generate_key()
+    _assert_error(Client().get(PING, headers=_bearer(key)), 503, "scanner_api_disabled")
+    _assert_error(Client().get(PING), 503, "scanner_api_disabled")
+    _assert_error(
+        Client().put("/api/scanner/v1/jobs/20261117T143201Z", headers=_bearer(key)),
+        503,
+        "scanner_api_disabled",
+    )
+    _assert_error(Client().get("/api/scanner/v1/nope"), 503, "scanner_api_disabled")
 
 
 @pytest.mark.django_db
-def test_failed_authentication_does_not_touch_last_seen(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    device, key = device_key
-    revoke_device(device.scanner_id)
-    Client().get(PING, headers=_bearer(key))
-    device.refresh_from_db()
-    assert device.last_seen_at is None
-
-
-@pytest.mark.django_db
-def test_logged_in_browser_session_gets_401_on_scanner_api() -> None:
+def test_logged_in_browser_session_gets_401_on_scanner_api(scanner_key: str) -> None:
     profile = get_or_create_profile("member")
     user = get_user_model().objects.get(pk=profile.user_id)
     user.is_staff = True
@@ -230,16 +191,42 @@ def test_logged_in_browser_session_gets_401_on_scanner_api() -> None:
 
 
 @pytest.mark.django_db
-def test_session_cookie_does_not_rescue_an_invalid_key() -> None:
-    profile = get_or_create_profile("member")
-    client = Client()
-    client.force_login(get_user_model().objects.get(pk=profile.user_id))
+def test_session_cookie_does_not_rescue_an_invalid_key(scanner_key: str) -> None:
+    client = _member_client()
     _assert_error(client.get(PING, headers=_bearer("forged-key")), 401, "invalid_api_key")
 
 
 @pytest.mark.django_db
-def test_scanner_api_is_csrf_exempt(device_key: tuple[ScannerDevice, str]) -> None:
-    _, key = device_key
+def test_valid_key_with_a_disabled_members_session_gets_the_scanner_api_response(
+    scanner_key: str,
+) -> None:
+    """Mixed credentials: member-session state never decides a scanner API response."""
+    client = _member_client("banned", disabled=True)
+
+    response = client.get(PING, headers=_bearer(scanner_key))
+    assert response.status_code == 200
+    assert response.json()["api_version"] == 1
+
+    _assert_error(
+        client.get("/api/scanner/v1/nope", headers=_bearer(scanner_key)), 404, "not_found"
+    )
+    _assert_error(client.get(PING, headers=_bearer("forged-key")), 401, "invalid_api_key")
+    _assert_error(client.get(PING), 401, "authentication_required")
+    # Outside the namespace the ban still applies to the same session.
+    assert client.get("/library/").status_code == 403
+
+
+@pytest.mark.django_db
+def test_disabled_members_session_still_gets_json_503_when_the_api_is_off(
+    settings: Any,
+) -> None:
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = ""
+    client = _member_client("banned", disabled=True)
+    _assert_error(client.get(PING), 503, "scanner_api_disabled")
+
+
+@pytest.mark.django_db
+def test_scanner_api_is_csrf_exempt(scanner_key: str) -> None:
     client = Client(enforce_csrf_checks=True)
     # No CSRF token and no cookie: the request reaches the API (404 envelope, not 403).
     _assert_error(
@@ -247,114 +234,70 @@ def test_scanner_api_is_csrf_exempt(device_key: tuple[ScannerDevice, str]) -> No
             "/api/scanner/v1/unknown",
             data=b"{}",
             content_type="application/json",
-            headers=_bearer(key),
+            headers=_bearer(scanner_key),
         ),
         404,
         "not_found",
     )
 
 
-@pytest.mark.django_db
-def test_unknown_route_and_wrong_method_use_the_error_envelope(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    _, key = device_key
-    _assert_error(Client().get("/api/scanner/v1/nope", headers=_bearer(key)), 404, "not_found")
+def test_unknown_route_and_wrong_method_use_the_error_envelope(scanner_key: str) -> None:
+    _assert_error(
+        Client().get("/api/scanner/v1/nope", headers=_bearer(scanner_key)), 404, "not_found"
+    )
     _assert_error(Client().get("/api/scanner/v1/nope"), 401, "authentication_required")
-    response = Client().post(PING, headers=_bearer(key))
+    response = Client().post(PING, headers=_bearer(scanner_key))
     body = _assert_error(response, 405, "method_not_allowed")
     assert body["error"]["details"] == {"allowed": ["GET"]}
     assert response["Allow"] == "GET"
 
 
-@pytest.mark.django_db
-def test_disabled_api_answers_503(device_key: tuple[ScannerDevice, str], settings: Any) -> None:
-    settings.BOOK_SCANNER_SCANNER_API_ENABLED = False
-    _, key = device_key
-    _assert_error(Client().get(PING, headers=_bearer(key)), 503, "scanner_api_disabled")
-    _assert_error(Client().get(PING), 503, "scanner_api_disabled")
+def test_every_request_logs_one_line_without_the_key(scanner_key: str) -> None:
+    with structlog.testing.capture_logs() as logs:
+        Client().get(PING, headers=_bearer(scanner_key))
+        Client().get(PING, headers=_bearer("wrong-key"))
+        Client().get("/api/scanner/v1/jobs/20261117T143201Z", headers=_bearer(scanner_key))
+    lines = [entry for entry in logs if entry["event"] == "scanner_api_request"]
+    assert [(line["route"], line["status"]) for line in lines] == [
+        ("scanner-api-ping", 200),
+        ("scanner-api-ping", 401),
+        ("scanner-api-not-found", 404),
+    ]
+    assert all("job_id" in line for line in lines)
+    rendered = repr(logs)
+    assert scanner_key not in rendered
+    assert hash_key(scanner_key) not in rendered
+    assert "wrong-key" not in rendered
 
 
-# --- device keys never authenticate anywhere else --------------------------------------
+# --- the scanner key never authenticates anywhere else ---------------------------------
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("path", ["/library/", "/reviews/", "/admin/", "/scan/jobs/"])
-def test_valid_device_key_is_refused_outside_the_scanner_api(
-    device_key: tuple[ScannerDevice, str], path: str
-) -> None:
-    _, key = device_key
-    response = Client().get(path, headers=_bearer(key))
-    assert response.status_code in {401, 403}
+def test_valid_scanner_key_is_refused_outside_the_scanner_api(scanner_key: str, path: str) -> None:
+    response = Client().get(path, headers=_bearer(scanner_key))
     assert response.status_code == 403
-    assert response.json()["error"]["code"] == "device_key_not_allowed"
+    assert response.json()["error"]["code"] == "scanner_key_not_allowed"
 
 
 @pytest.mark.django_db
-def test_revoked_device_key_is_also_refused_outside_the_scanner_api(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    device, key = device_key
-    revoke_device(device.scanner_id)
-    assert Client().get("/library/", headers=_bearer(key)).status_code == 403
-
-
-@pytest.mark.django_db
-def test_device_key_does_not_upgrade_a_member_session_elsewhere(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    _, key = device_key
-    profile = get_or_create_profile("member")
-    client = Client()
-    client.force_login(get_user_model().objects.get(pk=profile.user_id))
+def test_scanner_key_does_not_upgrade_a_member_session_elsewhere(scanner_key: str) -> None:
+    client = _member_client()
     assert client.get("/library/").status_code == 200
-    assert client.get("/library/", headers=_bearer(key)).status_code == 403
+    assert client.get("/library/", headers=_bearer(scanner_key)).status_code == 403
 
 
 @pytest.mark.django_db
-def test_other_bearer_tokens_are_unaffected(settings: Any) -> None:
+def test_other_bearer_tokens_are_unaffected(scanner_key: str, settings: Any) -> None:
     settings.BOOK_SCANNER_METRICS_BEARER_TOKEN = "metrics-token"
     response = Client().get("/metrics/", HTTP_AUTHORIZATION="Bearer metrics-token")
     assert response.status_code == 200
 
 
-# --- admin -----------------------------------------------------------------------------
-
-
-@pytest.mark.django_db
-def test_admin_lists_devices_read_only_and_can_revoke(
-    device_key: tuple[ScannerDevice, str],
-) -> None:
-    device, key = device_key
-    user = get_user_model().objects.create_superuser("root", "root@example.test", "pw")
-    client = Client()
-    client.force_login(user)
-
-    listing = client.get("/admin/core/scannerdevice/")
-    assert listing.status_code == 200
-    assert b"libreflip-01" in listing.content
-    assert device.key_sha256.encode() not in listing.content
-    assert client.get("/admin/core/scannerdevice/add/").status_code == 403
-    detail = client.get(f"/admin/core/scannerdevice/{device.pk}/change/")
-    assert detail.status_code == 200
-    assert device.key_sha256.encode() not in detail.content
-    client.post(
-        f"/admin/core/scannerdevice/{device.pk}/change/", {"name": "renamed", "is_active": ""}
-    )
-    device.refresh_from_db()
-    assert device.name == "libreflip at c-base"
-
-    response = client.post(
-        "/admin/core/scannerdevice/",
-        {"action": "revoke_devices", "_selected_action": [str(device.pk)]},
-    )
-    assert response.status_code == 302
-    device.refresh_from_db()
-    assert not device.is_active
-    assert authenticate_key(key) is None
-
-
 # --- settings --------------------------------------------------------------------------
+
+KEY_HASH = hash_key("example-scanner-key")
 
 
 def _production(**overrides: object) -> Settings:
@@ -372,27 +315,53 @@ def _production(**overrides: object) -> Settings:
         "csrf_cookie_secure": True,
         "secure_hsts_seconds": 31536000,
         "metrics_bearer_token": SecretStr("metrics-monitoring-token"),
+        "scanner_api_key_sha256": KEY_HASH,
         "public_base_url": "https://serif.c-base.lan/",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
 
 
-def test_production_accepts_https_public_base_url() -> None:
-    assert _production().public_base_url == "https://serif.c-base.lan/"
+def test_production_accepts_https_public_base_url_with_a_scanner_key() -> None:
+    configured = _production()
+    assert configured.public_base_url == "https://serif.c-base.lan/"
+    assert configured.scanner_api_key_sha256 == KEY_HASH
+
+
+def test_production_without_scanner_key_needs_no_public_base_url() -> None:
+    """Regression (PDXDJN on #135): deployments without the scanner keep starting."""
+    configured = _production(scanner_api_key_sha256="", public_base_url="")
+    assert configured.scanner_api_key_sha256 == ""
+    assert configured.public_base_url == ""
 
 
 @pytest.mark.parametrize("url", ["", "   ", "http://serif.c-base.lan/", "https://", "serif.lan"])
-def test_production_rejects_missing_or_insecure_public_base_url(url: str) -> None:
+def test_production_with_scanner_key_rejects_missing_or_insecure_public_base_url(
+    url: str,
+) -> None:
     with pytest.raises(ValidationError, match="public_base_url"):
         _production(public_base_url=url)
 
 
+def test_production_rejects_an_http_public_base_url_even_without_a_scanner_key() -> None:
+    with pytest.raises(ValidationError, match="public_base_url"):
+        _production(scanner_api_key_sha256="", public_base_url="http://serif.c-base.lan/")
+
+
 def test_scanner_settings_defaults() -> None:
     configured = Settings()
-    assert configured.scanner_api_enabled is True
+    assert configured.scanner_api_key_sha256 == ""
     assert configured.scanner_max_image_bytes == 52428800
     assert configured.scanner_max_opf_bytes == 1048576
+
+
+def test_scanner_key_hash_is_normalised_and_validated() -> None:
+    assert Settings(scanner_api_key_sha256=f"  {KEY_HASH.upper()} ").scanner_api_key_sha256 == (
+        KEY_HASH
+    )
+    for bad in ("abc", "g" * 64, KEY_HASH + "0", "example-scanner-key"):
+        with pytest.raises(ValidationError, match="scanner_api_key_sha256"):
+            Settings(scanner_api_key_sha256=bad)
 
 
 def test_scanner_settings_reject_bad_values() -> None:
