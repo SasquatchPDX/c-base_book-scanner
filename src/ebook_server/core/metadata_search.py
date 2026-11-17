@@ -16,6 +16,7 @@ open. Anything else is stored as a DISCARDED run whose candidates are history.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -173,12 +174,15 @@ def save_candidates(
     candidates: list[identification.IdentificationCandidate],
     match_threshold: float | None,
     current: bool = True,
+    passed_over: Iterable[identification.IdentificationCandidate] = (),
 ) -> None:
     """Make ``candidates`` the current ones, keeping earlier ones as history.
 
     Must run inside a transaction. With no candidates nothing is superseded: an
     empty or failed repeat search leaves the earlier candidates acceptable.
-    ``match_threshold`` of ``None`` keeps every candidate in REVIEW state.
+    ``match_threshold`` of ``None`` keeps every candidate in REVIEW state, and
+    ``passed_over`` candidates (not accepted automatically) stay in REVIEW whatever
+    their score.
     ``current=False`` stores them as already superseded history (a discarded run).
     """
     if not candidates:
@@ -199,6 +203,7 @@ def save_candidates(
         MetadataCandidate.objects.filter(**source, superseded_at__isnull=True).exclude(
             search=search
         ).update(superseded_at=stored_at)
+    passed_over_ids = {id(candidate) for candidate in passed_over}
     seen: set[tuple[str, str]] = set()
     for index, candidate in enumerate(candidates, start=1):
         # Records without a provider key must not collide with each other.
@@ -207,7 +212,11 @@ def save_candidates(
             continue
         seen.add((candidate.provider_id, provider_ref))
         state = MetadataCandidate.CandidateState.REVIEW
-        if match_threshold is not None and candidate.score >= match_threshold:
+        if (
+            match_threshold is not None
+            and candidate.score >= match_threshold
+            and id(candidate) not in passed_over_ids
+        ):
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             **source,

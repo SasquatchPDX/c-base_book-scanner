@@ -149,6 +149,24 @@ authors without placeholder creators such as "Microsoft Office User", "Owner" or
 authors. They are applied only when a reviewer accepts a candidate that has no
 authors of its own, and only to a Book without authors; provider authors always win.
 
+**Ties.** Candidates at or above the threshold whose score is within
+`BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN` (default 0.02) of the best one count as
+tied (the comparison allows for floating-point rounding, so 1.0 and 0.98 tie). With
+several providers an ISBN match often scores 1.0 at each of them, and their order is
+only the configured provider order. Intake therefore applies the author checks *and*
+the edition checks (see "Edition checks before auto-accept"; `decide_auto_accept`
+receives the normalised file ISBNs, language and publisher as `file_evidence`) to every
+tied candidate and accepts the first one that passes, recording `auto_accept_tie_break`
+(the chosen candidate and the ones passed over, with their block reasons and edition
+conflicts) in the evidence. A tied fallback whose ISBN contradicts the file's, or that
+has no ISBN when the file has one, is never eligible. Passed-over candidates stay in
+`REVIEW` state. If tied candidates that pass describe different books, the import
+goes to review as `ambiguous_tie`. Two records are the same book when they share an
+ISBN; otherwise they need the same title and agreeing authors, and neither disjoint
+ISBN lists (two editions) nor disjoint languages. If none passes, the first-ranked
+candidate's block reason applies. A candidate outside the margin is never accepted in
+place of a blocked better one.
+
 For Open Library ISBN lookups, an edition record without `authors` falls back to the
 authors of its first work record (`works[0]`), where Open Library usually keeps them.
 
