@@ -193,15 +193,19 @@ see `docs/operations.md`).
     (`details.sha256`). Replacements go through the rescan flow only.
   - `409 job_state`: the job is not `open`/`capturing` (`details.state`).
   - `422 camera_role_parity` (even numbers are `left`, odd `right`),
-    `422 checksum_mismatch`, `422 invalid_image` (not a decodable JPEG/PNG/TIFF/WebP).
+    `422 checksum_mismatch`, `422 invalid_image`: not a JPEG/PNG/TIFF/WebP whose pixels
+    fully decode within Pillow's decompression-bomb limit (`Image.MAX_IMAGE_PIXELS`).
+    Valid headers and PNG chunk checksums are not enough; the staged file is decoded
+    before anything is published, so no version is created.
   - `413 payload_too_large`: the image is above `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES`
     (the `max_image_bytes` that `ping` reports), or `Content-Length` is above that plus
     1 MiB of multipart overhead. `415` for a body that is not `multipart/form-data`;
-    `400` for malformed metadata (`details.field`) or a missing part;
+    `400` for malformed metadata (`details.field`) or a missing part, including a
+    `captured_at` that is not a real ISO 8601 timestamp with a zone (`2026-02-30T...`);
     `400 upload_interrupted` when the body ends early.
   - `507 insufficient_storage` / `503 storage_unavailable`: transient, retry.
 - `PUT /api/scanner/v1/jobs/{job_id}/covers/{front|back}` (§6.6) has the same shape with
-  `metadata` `{"sha256", "captured_at"}`. The active checksum is `200`; a new checksum
+  `metadata` `{"sha256", "captured_at"}` (same `400`/`422` rules). The active checksum is `200`; a new checksum
   adds a version (`201`) and keeps the earlier ones (`ScanCover`). Allowed in `open`,
   `capturing` and `captured`; a cover does not move the job to `capturing`. At finish
   (scan finalization) the active covers become the Book's front/back `CoverImage`s with

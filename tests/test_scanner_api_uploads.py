@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import struct
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -76,6 +78,27 @@ def _jpeg(label: bytes, size: tuple[int, int] = (64, 48)) -> bytes:
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + kind
+        + data
+        + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    )
+
+
+def _png_with_undecodable_pixels(idat: bytes) -> bytes:
+    """A 64x48 RGB PNG whose headers and chunk CRCs are valid (``verify()`` passes) but
+    whose IDAT does not decode to the image's pixels."""
+    header = struct.pack(">IIBBBBB", 64, 48, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def _multipart(
@@ -145,8 +168,15 @@ def _put_page(
     )
 
 
-def _put_cover(api_key: str, position: str, image: bytes, *, sha256: str | None = None) -> Any:
-    metadata = {"sha256": sha256 or _sha(image), "captured_at": "2026-11-17T14:32:30Z"}
+def _put_cover(
+    api_key: str,
+    position: str,
+    image: bytes,
+    *,
+    sha256: str | None = None,
+    captured_at: Any = "2026-11-17T14:32:30Z",
+) -> Any:
+    metadata = {"sha256": sha256 or _sha(image), "captured_at": captured_at}
     return Client().put(
         f"/api/scanner/v1/jobs/{JOB_ID}/covers/{position}",
         data=_multipart(metadata, image, image_filename=f"cover-{position}.jpg"),
@@ -276,11 +306,67 @@ def test_undecodable_image_is_invalid_image(key: str, tmp_path: Path) -> None:
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
+    "idat",
+    [
+        pytest.param(b"not a zlib stream" * 4, id="broken-zlib"),
+        pytest.param(zlib.compress(b"\x00" * 50), id="too-few-pixels"),
+    ],
+)
+@pytest.mark.parametrize("target", ["page", "cover"])
+def test_png_with_valid_checksums_but_undecodable_pixels_is_invalid_image(
+    key: str, tmp_path: Path, idat: bytes, target: str
+) -> None:
+    image = _png_with_undecodable_pixels(idat)
+    with Image.open(io.BytesIO(image)) as probe:
+        probe.verify()  # the structure and the chunk CRCs are fine
+
+    response = _put_page(key, 0, image) if target == "page" else _put_cover(key, "front", image)
+
+    assert response.status_code == 422, response.content
+    assert _error_code(response) == "invalid_image"
+    assert not ScanPageVersion.objects.exists()
+    assert not ScanCover.objects.exists()
+    assert _scan_files(tmp_path) == []
+    assert ScanJob.objects.get(pk=JOB_ID).state == ScanJob.State.OPEN
+
+
+@pytest.mark.django_db
+def test_decompression_bomb_is_invalid_image(
+    key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)  # 64x48 = 3072 pixels > limit
+
+    response = _put_page(key, 0, _jpeg(b"bomb"))
+
+    assert response.status_code == 422
+    assert _error_code(response) == "invalid_image"
+    assert not ScanPageVersion.objects.exists()
+    assert _scan_files(tmp_path) == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "captured_at", ["2026-02-30T14:32:30Z", "2026-13-01T14:32:30Z", "yesterday", 12]
+)
+def test_malformed_cover_captured_at_is_400(key: str, captured_at: Any) -> None:
+    response = _put_cover(key, "front", _jpeg(b"cover"), captured_at=captured_at)
+
+    assert response.status_code == 400, response.content
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert response.json()["error"]["details"]["field"] == "captured_at"
+    assert not ScanCover.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
     ("overrides", "field"),
     [
         ({"sha256": "ABC"}, "sha256"),
         ({"camera_role": "top"}, "camera_role"),
         ({"captured_at": "yesterday"}, "captured_at"),
+        # ISO-shaped but not a calendar date: 400, never 500.
+        ({"captured_at": "2026-02-30T14:33:12Z"}, "captured_at"),
+        ({"captured_at": "2026-11-17T25:00:00Z"}, "captured_at"),
         ({"recognized_page_number": 23}, "recognized_page_number"),
         ({"status": "not ok!"}, "status"),
     ],

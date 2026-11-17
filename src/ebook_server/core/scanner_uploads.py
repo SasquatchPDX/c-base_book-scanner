@@ -342,7 +342,11 @@ def captured_at(metadata: dict[str, Any]) -> datetime | None:
     value = metadata.get("captured_at")
     if value is None:
         return None
-    parsed = parse_datetime(value) if isinstance(value, str) else None
+    try:
+        # A well-formed but impossible date (2026-02-30) raises ValueError.
+        parsed = parse_datetime(value) if isinstance(value, str) else None
+    except ValueError:
+        parsed = None
     if parsed is None or parsed.tzinfo is None:
         raise _invalid("captured_at", "captured_at must be an ISO 8601 timestamp with a zone.")
     return parsed.astimezone(UTC)
@@ -406,24 +410,31 @@ def verify_checksum(upload: ReceivedUpload, expected: str) -> None:
 def sniff_image(path: Path) -> tuple[str, str]:
     """``(mime_type, extension)`` of a decodable image, else ``422 invalid_image``.
 
-    ``verify()`` checks the structure; a JPEG is then decoded at 1/8 scale, which reads
-    every scan line (so a truncated file fails) at a fraction of the memory.
+    Runs on the staged file, before anything is published. ``verify()`` checks the
+    structure (and PNG chunk checksums); then the pixels are decoded, because valid
+    headers and checksums do not mean the data decompresses. A JPEG is decoded at 1/8
+    scale, which still reads every scan line (so a truncated file fails) at a fraction
+    of the memory; other formats are decoded in full. Pillow's decompression-bomb limit
+    (``Image.MAX_IMAGE_PIXELS``) is enforced as an error before any decoding, and
+    truncated data is never accepted (``LOAD_TRUNCATED_IMAGES`` stays off).
     """
     import warnings
 
-    from PIL import Image
+    from PIL import Image, ImageFile
 
     try:
+        if ImageFile.LOAD_TRUNCATED_IMAGES:
+            raise OSError("Pillow is configured to accept truncated images.")
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(path) as probe:
                 image_format = probe.format or ""
                 probe.verify()
-            if image_format == "JPEG":
-                with Image.open(path) as image:
+            with Image.open(path) as image:
+                if image_format == "JPEG":
                     width, height = image.size
                     image.draft(image.mode, (max(width // 8, 1), max(height // 8, 1)))
-                    image.load()
+                image.load()
     except Exception as exc:  # Pillow raises many types for corrupt input.
         raise UploadError(422, "invalid_image", "The image cannot be decoded.") from exc
     known = _IMAGE_FORMATS.get(image_format)
