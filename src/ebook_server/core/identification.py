@@ -242,6 +242,11 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+# Evidence key holding hints from the source's configured folder layout (#35); written
+# by intake from ``core.source_layout``, read here when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -264,6 +269,10 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    title_hints, author_hints = _apply_path_layout_hints(
+        extracted_metadata, list(title_hints), list(author_hints)
+    )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -292,6 +301,45 @@ def build_identification_input(
         if isinstance(extracted_metadata.get("description"), str)
         else None,
     )
+
+
+def _apply_path_layout_hints(
+    extracted_metadata: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge folder-layout hints (evidence, not truth) into the title/author hints.
+
+    A layout title goes after an embedded title (usually the best signal) and before
+    the raw filename guesses. A layout author replaces the filename "A - B" split
+    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    """
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if not isinstance(layout, dict):
+        return title_hints, author_hints
+
+    metadata_title = extracted_metadata.get("title")
+    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
+    layout_title = layout.get("title")
+    if isinstance(layout_title, str) and layout_title.strip():
+        title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
+
+    raw_layout_authors = layout.get("authors")
+    layout_authors = [
+        author.strip()
+        for author in (raw_layout_authors if isinstance(raw_layout_authors, list) else [])
+        if isinstance(author, str) and author.strip()
+    ]
+    if layout_authors:
+        raw_embedded = extracted_metadata.get("authors")
+        embedded = [
+            author.strip()
+            for author in (raw_embedded if isinstance(raw_embedded, list) else [])
+            if isinstance(author, str) and author.strip()
+        ]
+        known = {normalize_text(author) for author in embedded}
+        author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+    return title_hints, author_hints
 
 
 class OpenLibraryMetadataProvider:

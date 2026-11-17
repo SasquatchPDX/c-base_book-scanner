@@ -38,7 +38,7 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import identification
+from . import identification, source_layout
 from .models import (
     Author,
     Book,
@@ -540,17 +540,23 @@ def discover_source_jobs_for_location(
 
 def preview_source_jobs(
     source_location: SourceLocation,
-) -> list[dict[str, str]]:
-    return [
-        {
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for candidate in discover_source_paths(source_location):
+        if not _is_supported_file(candidate):
+            continue
+        row: dict[str, Any] = {
             "source_location_id": str(source_location.id),
             "path": str(candidate),
             "filename": candidate.name,
             "source_type": source_location.default_source_type,
         }
-        for candidate in discover_source_paths(source_location)
-        if _is_supported_file(candidate)
-    ]
+        if source_location.path_layouts:
+            # Lets an admin check a folder layout before importing anything.
+            hints = source_layout.hints_for_source_file(source_location, str(candidate))
+            row["path_layout"] = hints.as_evidence() if hints is not None else None
+        rows.append(row)
+    return rows
 
 
 def compute_sha256(path: str) -> str:
@@ -1346,6 +1352,10 @@ def process_import_job(job_id: str) -> None:
             detected_format,
             original_filename=job.original_filename,
         )
+        if job.source_location is not None:
+            path_hints = source_layout.hints_for_source_file(job.source_location, job.source_path)
+            if path_hints is not None:
+                metadata[identification.PATH_LAYOUT_EVIDENCE_KEY] = path_hints.as_evidence()
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
         job.save(

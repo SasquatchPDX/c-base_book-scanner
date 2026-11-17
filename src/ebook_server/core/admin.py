@@ -137,6 +137,33 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "default_source_type",
         "is_active",
     )
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "name",
+                    "root_path",
+                    "transfer_mode",
+                    "recursive",
+                    "default_source_type",
+                    "is_active",
+                    "default_metadata",
+                ),
+            },
+        ),
+        (
+            "Folder layout (identification hints)",
+            {
+                "description": (
+                    "Describe how this collection is organised so folder and file names "
+                    "become author/title hints for the external lookup. Check the result "
+                    "with <code>manage.py ingest_sources --source-id N --preview</code>."
+                ),
+                "fields": ("path_layouts", "author_name_order", "layout_ignore_values"),
+            },
+        ),
+    )
 
 
 @admin.register(ProcessingJob)
