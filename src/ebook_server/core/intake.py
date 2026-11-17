@@ -26,6 +26,7 @@ from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.db import models as django_models
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
 
@@ -34,6 +35,7 @@ from ebook_server.storage import (
     StorageBackend,
     cap_filename,
     ensure_path_storage_ready,
+    min_free_bytes,
 )
 
 from . import identification
@@ -437,11 +439,64 @@ def _already_handled(source_location: SourceLocation, path: Path, normalized: st
     return False
 
 
+@dataclass
+class ByteBudget:
+    """Archive bytes that may still be queued before the free-space reserve is reached."""
+
+    remaining: int
+    exhausted: bool = False
+
+    def take(self, size: int) -> bool:
+        if size > self.remaining:
+            self.exhausted = True
+            return False
+        self.remaining -= size
+        return True
+
+
+# Jobs whose source file has not been archived yet; their size is still owed to
+# the archive volume.
+PENDING_ARCHIVE_STATES = (
+    ImportJob.State.DISCOVERED,
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+
+def archive_space_budget() -> ByteBudget | None:
+    """Bytes that new imports may add to the archive before hitting the reserve.
+
+    Free space on the archive volume, minus ``BOOK_SCANNER_STORAGE_MIN_FREE_BYTES``,
+    minus the (approximate) size of imports already queued but not yet archived.
+    ``None`` when the check is disabled or free space cannot be determined.
+    """
+    reserve = min_free_bytes()
+    if reserve <= 0:
+        return None
+    free = _default_storage().free_bytes()
+    if free is None:
+        return None
+    pending = ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES).aggregate(
+        total=django_models.Sum(Coalesce("source_size", "size_bytes")),
+    )["total"]
+    return ByteBudget(remaining=max(free - reserve - int(pending or 0), 0))
+
+
 def discover_source_jobs_for_location(
     source_location: SourceLocation,
     *,
     uploader: Any | None = None,
+    byte_budget: ByteBudget | None = None,
 ) -> list[ImportJob]:
+    """Create DISCOVERED jobs for new files.
+
+    With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
+    would not fit, so a bulk import cannot queue more than the archive can hold.
+    """
     jobs: list[ImportJob] = []
     for candidate in discover_source_paths(source_location):
         if not _is_supported_file(candidate):
@@ -463,6 +518,18 @@ def discover_source_jobs_for_location(
         ).exists()
         if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
+        if byte_budget is not None:
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            if not byte_budget.take(size):
+                logger.warning(
+                    "intake_space_budget_exhausted",
+                    source_location_id=source_location.pk,
+                    queued=len(jobs),
+                )
+                break
         try:
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
@@ -928,6 +995,7 @@ def _create_or_reuse_file_variant(
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
             storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+            storage.ensure_free_space(Path(job.source_path).stat().st_size)
             storage.store(job.source_path, storage_id)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
@@ -1160,6 +1228,8 @@ def _provision_book_from_metadata(
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
     storage_location = _default_storage_location()
     destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    # Checked per file, so a bulk import already queued still stops before the disk fills.
+    storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):
         storage.copy(job.source_path, destination)
     else:

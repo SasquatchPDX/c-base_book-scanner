@@ -141,6 +141,25 @@ The hash mode is I/O intensive and should run off peak. The command is read-only
 and exits non-zero for missing artifacts, hash mismatches, path errors, or an
 unsupported backend.
 
+### Free-space reserve
+
+Intake keeps `BOOK_SCANNER_STORAGE_MIN_FREE_BYTES` (default 2 GiB; `0`
+disables the check) free on the archive volume. This matters most when the volume
+also holds PostgreSQL or Redis data.
+
+- `ingest_sources` estimates the space it has left: free space, minus the
+  reserve, minus the source size of imports that are queued but not yet
+  archived. It queues files only while they fit. When it stops early it prints
+  `insufficient free space on the archive volume` to stderr; files not queued
+  are picked up by a later run once there is room.
+- Every import, including web uploads and jobs that were already queued, checks
+  free space again right before archiving. If the copy would breach the reserve,
+  the job fails with a clear `insufficient free space ...` error. The MOVE source
+  is left untouched. After freeing space, run `ingest_sources --retry-failed`.
+- `/healthz/dependencies/` reports `free_bytes` and `min_free_bytes` for the
+  storage root. The storage status becomes `degraded` (not `down`, so readiness
+  stays green) while free space is below the reserve.
+
 Confirmed book deletion is available only to local application admins. It checks
 artifact hashes, moves files into backend-local quarantine, commits the database
 deletion, and purges quarantine. A failed database operation restores moved files.

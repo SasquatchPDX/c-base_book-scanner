@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     storage_root: str = str(BASE_DIR / "data" / "storage")
     storage_require_existing_root: bool = True
     storage_sentinel_file: str = ""
+    # Free space to keep on the archive volume (bytes); 0 disables the check.
+    storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     redis_url: str | None = None
@@ -232,6 +234,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 APP_DATA_DIR = Path(settings.storage_root)
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
+BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
 if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
     # Development convenience only: production must never create the root itself,
     # because that is how an unmounted share silently fills the local disk.
