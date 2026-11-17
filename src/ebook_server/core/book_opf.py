@@ -3,11 +3,12 @@
 The OPF is a **derived artifact**. The database stays authoritative, and the file is
 never edited by hand: whenever canonical Book metadata changes (title, subtitle,
 authors, identifiers, publisher, publication date, language, description, genres and
-categories, covers) the book is marked dirty (``Book.opf_dirty_at``) and one
-background job per book rewrites the file. Marking a book that is already dirty does
-not queue a second job, so a burst of edits (a review that sets the title, the
-authors and three identifiers) produces one write. A job that finds the marker moved
-while it was writing runs again, so the last edit always reaches the file.
+categories, covers; also deleting an attached author, genre or category) the book's
+``BookOpfState.requested_generation`` is incremented and, after the commit, one
+background job per book rewrites the file. A book whose job is queued but has not
+started gets no second job, so a burst of edits (a review that sets the title, the
+authors and three identifiers) produces one write. A job that finds the generation
+moved while it was writing runs again, so the last edit always reaches the file.
 
 The file is written atomically through the storage service (temporary file in the
 same folder, then rename), into the book folder on every writable location that holds
@@ -46,6 +47,7 @@ import structlog
 from defusedxml import ElementTree as DefusedET
 from django.conf import settings
 from django.db import transaction
+from django.db.models import F, Q, QuerySet
 from django.utils import timezone
 
 from ebook_server import jobs
@@ -55,6 +57,7 @@ from . import archive_layout
 from .models import (
     Author,
     Book,
+    BookOpfState,
     Category,
     CoverImage,
     FileVariant,
@@ -276,40 +279,78 @@ def is_generated_book_opf(payload: bytes) -> bool:
 
 
 # --- dirty marking and dispatch ----------------------------------------------------
+#
+# Protocol. All state lives in ``BookOpfState``, never in ``Book`` itself, so a stale
+# Book instance saved later cannot roll it back:
+#
+# 1. A change increments ``requested_generation`` with an F() expression inside the
+#    changing transaction and, after that transaction commits, tries to claim the
+#    book's job slot (``job_queued_at``). Only the caller that claims it enqueues;
+#    every other caller relies on that queued, not yet started job.
+# 2. The job releases the claim **before** it reads the generation. A change that
+#    commits after that point finds the slot free and queues a new job, so no change
+#    can land between "the job has read" and "nobody will run again".
+# 3. The job renders generation ``g`` and records it with
+#    ``UPDATE ... SET written_generation = g WHERE requested_generation = g``. When the
+#    generation moved meanwhile it renders again (bounded), then queues itself again.
 
 
 def mark_book_opf_dirty(book_ids: Iterable[int | None], *, force: bool = False) -> list[int]:
-    """Record that these books' OPF is stale and queue one job per newly dirty book.
+    """Record that these books' OPF is stale; queue their jobs after the commit.
 
-    The job is queued after the surrounding transaction commits. A book that is already
-    dirty only gets its marker moved forward: its queued (or running) job picks the
-    change up. ``force`` queues a job even then (backfill). Returns the queued ids.
+    Bursts coalesce: a book whose job is queued and has not started yet gets no second
+    job, because that job reads the latest generation when it starts. ``force`` queues
+    a job even then (backfill). Returns the ids of the existing books that were marked.
     """
     if not opf_writing_enabled():
         return []
     ids = sorted({int(pk) for pk in book_ids if pk is not None})
     if not ids:
         return []
-    queryset = Book.objects.filter(pk__in=ids)
-    if force:
-        to_queue = list(queryset.values_list("pk", flat=True))
-    else:
-        to_queue = list(queryset.filter(opf_dirty_at__isnull=True).values_list("pk", flat=True))
-    queryset.update(opf_dirty_at=timezone.now())
-    if to_queue:
-        transaction.on_commit(partial(_dispatch, to_queue))
-    return to_queue
+    existing = list(Book.objects.filter(pk__in=ids).values_list("pk", flat=True))
+    if not existing:
+        return []
+    with transaction.atomic():
+        BookOpfState.objects.bulk_create(
+            [BookOpfState(book_id=pk) for pk in existing], ignore_conflicts=True
+        )
+        BookOpfState.objects.filter(book_id__in=existing).update(
+            requested_generation=F("requested_generation") + 1
+        )
+    transaction.on_commit(partial(_dispatch, existing, force=force))
+    return existing
 
 
-def _dispatch(book_ids: list[int]) -> None:
+def _dispatch(book_ids: list[int], *, force: bool = False) -> list[int]:
+    """Queue one job per stale book unless one is already queued and not yet started."""
+    queued: list[int] = []
     for book_id in book_ids:
+        now = timezone.now()
+        claim = BookOpfState.objects.filter(
+            book_id=book_id, requested_generation__gt=F("written_generation")
+        )
+        if not force:
+            # A claim older than the job timeout belongs to a lost job (worker killed,
+            # queue flushed); it no longer blocks a new one.
+            claim = claim.filter(
+                Q(job_queued_at__isnull=True) | Q(job_queued_at__lt=now - jobs.stale_after("opf"))
+            )
+        if not claim.update(job_queued_at=now):
+            continue
         try:
             jobs.enqueue(write_book_opf, book_id)
         except Exception as exc:  # metadata edits must never fail on the queue
-            # The marker stays set, so ``write_book_opfs`` picks the book up later.
+            # Release the claim. The book stays stale, so the next change or
+            # ``write_book_opfs`` queues it again.
+            BookOpfState.objects.filter(book_id=book_id, job_queued_at=now).update(
+                job_queued_at=None
+            )
             logger.warning(
                 "book_opf_dispatch_failed", book_id=book_id, error_type=type(exc).__name__
             )
+            continue
+        queued.append(book_id)
+    return queued
 
 
 # --- the job -----------------------------------------------------------------------
@@ -424,21 +465,31 @@ def _write_once(book_id: int) -> str:
 
 
 def write_book_opf(book_id: int) -> str:
-    """Worker entry point: (re)write ``book_id``'s ``metadata.opf`` and clear its marker.
+    """Worker entry point: (re)write ``book_id``'s ``metadata.opf``.
 
-    Idempotent. The marker is cleared only if no edit arrived while writing; otherwise
-    the job writes again (bounded), then leaves the book dirty and re-queues itself.
+    Idempotent. The written generation is recorded only if no change arrived while
+    writing; otherwise the job writes again (bounded), then queues itself again.
     """
     if not opf_writing_enabled():
         return "disabled"
+    # Release the queue claim before reading anything: a change committed from here on
+    # queues a new job instead of relying on this one.
+    BookOpfState.objects.filter(book_id=book_id).update(job_queued_at=None)
     outcome = "missing"
     for _ in range(_MAX_PASSES):
-        row = Book.objects.filter(pk=book_id).values_list("opf_dirty_at").first()
-        if row is None:
-            return "missing"
-        marker = row[0]
+        generation = (
+            BookOpfState.objects.filter(book_id=book_id)
+            .values_list("requested_generation", flat=True)
+            .first()
+        )
         outcome = _write_once(book_id)
-        if Book.objects.filter(pk=book_id, opf_dirty_at=marker).update(opf_dirty_at=None):
+        if generation is None or outcome == "missing":
+            # Never marked (a direct call) or deleted: nothing to record.
+            return outcome
+        recorded = BookOpfState.objects.filter(
+            book_id=book_id, requested_generation=generation
+        ).update(written_generation=generation)
+        if recorded:
             logger.info("book_opf_job_done", book_id=book_id, outcome=outcome)
             return outcome
     logger.info("book_opf_requeued", book_id=book_id)
@@ -453,16 +504,11 @@ def _book_ids_of(instance: Any) -> list[int]:
     return list(instance.books.values_list("pk", flat=True))
 
 
-def _on_book_pre_save(sender: Any, instance: Book, update_fields: Any = None, **_: Any) -> None:
-    # ``opf_dirty_at`` is owned by queryset updates here; an instance loaded earlier
-    # must not write a stale marker back (that could hide a pending change).
-    if instance.pk is None or instance._state.adding:
-        return
-    if update_fields is not None and "opf_dirty_at" not in update_fields:
-        return
-    instance.opf_dirty_at = (
-        Book.objects.filter(pk=instance.pk).values_list("opf_dirty_at", flat=True).first()
-    )
+def _deleting_book(origin: Any) -> bool:
+    """True when a delete cascades from deleting a Book (its OPF state goes with it)."""
+    if isinstance(origin, Book):
+        return True
+    return isinstance(origin, QuerySet) and origin.model is Book
 
 
 def _on_book_saved(
@@ -492,8 +538,23 @@ def _on_book_relation_changed(
         mark_book_opf_dirty(_book_ids_of(instance))
 
 
-def _on_book_child_changed(sender: Any, instance: Any, **_: Any) -> None:
+def _on_book_child_saved(sender: Any, instance: Any, **_: Any) -> None:
     mark_book_opf_dirty([instance.book_id])
+
+
+def _on_book_child_deleted(sender: Any, instance: Any, origin: Any = None, **_: Any) -> None:
+    if not _deleting_book(origin):
+        mark_book_opf_dirty([instance.book_id])
+
+
+def _on_book_link_saved(
+    sender: Any, instance: Any, created: bool, update_fields: Any = None, **_: Any
+) -> None:
+    # Link rows written directly (``BookGenre.objects.get_or_create``) bypass
+    # m2m_changed. A provenance-only update (BookGenre ``source``) changes no OPF.
+    links = {field.name for field in sender._meta.concrete_fields if field.is_relation}
+    if created or update_fields is None or links & set(update_fields):
+        mark_book_opf_dirty([instance.book_id])
 
 
 def _on_file_variant_saved(
@@ -514,29 +575,50 @@ def _on_named_entity_saved(sender: Any, instance: Any, created: bool, **_: Any) 
         mark_book_opf_dirty(_book_ids_of(instance))
 
 
+def _on_named_entity_pre_delete(sender: Any, instance: Any, **_: Any) -> None:
+    # The delete cascade removes the link rows without m2m_changed, and by post_delete
+    # they are gone: remember the affected books now.
+    instance._book_opf_book_ids = _book_ids_of(instance)
+
+
+def _on_named_entity_deleted(sender: Any, instance: Any, **_: Any) -> None:
+    # Marked inside the deleting transaction; the jobs are queued after it commits.
+    mark_book_opf_dirty(getattr(instance, "_book_opf_book_ids", []))
+
+
 def connect_signals() -> None:
     """Hook metadata changes to OPF regeneration (called from ``CoreConfig.ready``)."""
-    from django.db.models.signals import m2m_changed, post_delete, post_save, pre_save
+    from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 
-    pre_save.connect(_on_book_pre_save, sender=Book, dispatch_uid="book_opf_book_pre")
     post_save.connect(_on_book_saved, sender=Book, dispatch_uid="book_opf_book")
     for relation in (Book.authors.through, Book.genres.through, Book.categories.through):
+        uid = relation._meta.label_lower
         m2m_changed.connect(
-            _on_book_relation_changed,
-            sender=relation,
-            dispatch_uid=f"book_opf_m2m_{relation._meta.label_lower}",
+            _on_book_relation_changed, sender=relation, dispatch_uid=f"book_opf_m2m_{uid}"
+        )
+        # Rows of an explicit through model (BookGenre) are also written directly and
+        # send post_save/post_delete (Django sends none for auto-created through models;
+        # ``add()``/``remove()`` send m2m_changed either way).
+        post_save.connect(_on_book_link_saved, sender=relation, dispatch_uid=f"book_opf_ls_{uid}")
+        post_delete.connect(
+            _on_book_child_deleted, sender=relation, dispatch_uid=f"book_opf_ld_{uid}"
         )
     for child in (Identifier, CoverImage):
         uid = child._meta.label_lower
-        post_save.connect(_on_book_child_changed, sender=child, dispatch_uid=f"book_opf_s_{uid}")
-        post_delete.connect(_on_book_child_changed, sender=child, dispatch_uid=f"book_opf_d_{uid}")
+        post_save.connect(_on_book_child_saved, sender=child, dispatch_uid=f"book_opf_s_{uid}")
+        post_delete.connect(_on_book_child_deleted, sender=child, dispatch_uid=f"book_opf_d_{uid}")
     post_save.connect(_on_file_variant_saved, sender=FileVariant, dispatch_uid="book_opf_fv")
-    post_delete.connect(_on_book_child_changed, sender=FileVariant, dispatch_uid="book_opf_fv_d")
+    post_delete.connect(_on_book_child_deleted, sender=FileVariant, dispatch_uid="book_opf_fv_d")
     for named in (Author, Genre, Category):
+        uid = named._meta.label_lower
         post_save.connect(
-            _on_named_entity_saved,
-            sender=named,
-            dispatch_uid=f"book_opf_named_{named._meta.label_lower}",
+            _on_named_entity_saved, sender=named, dispatch_uid=f"book_opf_named_{uid}"
+        )
+        pre_delete.connect(
+            _on_named_entity_pre_delete, sender=named, dispatch_uid=f"book_opf_named_pd_{uid}"
+        )
+        post_delete.connect(
+            _on_named_entity_deleted, sender=named, dispatch_uid=f"book_opf_named_d_{uid}"
         )
 
 

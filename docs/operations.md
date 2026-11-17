@@ -285,11 +285,16 @@ cover image is in the same folder. Calibre, e-readers and file managers can read
 
 - **It is derived, never edited by hand.** The database is authoritative. Any change
   to a book's metadata (title, subtitle, authors, identifiers, publisher, dates,
-  language, description, genres/categories, covers, or a file joining/leaving the
-  folder) marks the book (`Book.opf_dirty_at`) and queues one background job, after
-  the database commit. Further edits while that job is pending do not queue more
-  jobs, so a review that changes ten fields writes the file once. A hand edit is
-  overwritten by the next regeneration.
+  language, description, genres/categories, covers, a file joining/leaving the
+  folder, or deleting an attached author, genre or category) advances the book's
+  requested generation (`BookOpfState`, a separate table so an ordinary `Book.save()`
+  can never roll it back) and queues one background job after the database commit.
+  Further edits while that job is queued and not yet started do not queue more jobs,
+  so a review that changes ten fields writes the file once; an edit that commits once
+  the job has started queues a new one. The job records the generation it wrote only
+  if it is still the requested one, otherwise it writes again. A queued job lost with
+  its worker stops blocking new ones after the job timeout. A hand edit is overwritten
+  by the next regeneration.
 - **Atomic:** the job writes a hidden temporary file in the folder and renames it over
   `metadata.opf`, so a reader never sees a half-written file. An unchanged file is not
   rewritten.

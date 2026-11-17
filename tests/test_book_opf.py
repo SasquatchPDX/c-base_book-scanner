@@ -12,6 +12,8 @@ import pytest
 from defusedxml import ElementTree as DefusedET
 from django.core.management import CommandError, call_command
 from django.db import transaction
+from django.db.models.signals import pre_save
+from django.utils import timezone
 
 from ebook_server.core import archive_reorganize, book_opf
 from ebook_server.core.archive_reorganize import request_reorganize
@@ -20,6 +22,7 @@ from ebook_server.core.intake import parse_opf_metadata
 from ebook_server.core.models import (
     Author,
     Book,
+    BookOpfState,
     Category,
     CoverImage,
     FileVariant,
@@ -76,6 +79,16 @@ def _variant(tmp_path: Path, book: Book, identifier: str, payload: bytes = b"epu
 
 def _opf_path(tmp_path: Path, folder: str) -> Path:
     return _archive(tmp_path) / folder / "metadata.opf"
+
+
+def _opf_title(tmp_path: Path, folder: str) -> Any:
+    return parse_opf_metadata(_opf_path(tmp_path, folder).read_bytes())["title"]
+
+
+def _is_current(book: Book) -> bool:
+    """No pending regeneration: the written generation caught up with the requested."""
+    state = BookOpfState.objects.get(book_id=book.pk)
+    return state.written_generation == state.requested_generation
 
 
 # --- content ------------------------------------------------------------------------
@@ -234,8 +247,7 @@ def test_written_into_book_folder_with_cover_and_regenerated_on_metadata_change(
     book.genres.add(Genre.objects.create(name="Romance"))
     assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance"]
     Author.objects.filter(full_name="Fiona Stafford").get().save()  # rename path: no crash
-    book.refresh_from_db()
-    assert book.opf_dirty_at is None
+    assert _is_current(book)
     # Only metadata.opf and the book's own files: no temporary files left behind.
     assert sorted(p.name for p in opf.parent.iterdir()) == [
         "Emma - Jane Austen.epub",
@@ -265,16 +277,14 @@ def test_irrelevant_saves_do_not_queue_and_bursts_coalesce(
         assert queued == []  # nothing before commit
     assert queued == [book.pk]  # one job for the whole burst
 
-    # Still dirty (job not run yet): further edits only move the marker forward.
+    # Job queued, not started: further edits only advance the requested generation.
     book.subtitle = "A Novel"
     book.save()
     assert queued == [book.pk]
-    book.refresh_from_db()
-    assert book.opf_dirty_at is not None
+    assert not _is_current(book)
 
     assert book_opf.write_book_opf(book.pk) == "written"
-    book.refresh_from_db()
-    assert book.opf_dirty_at is None
+    assert _is_current(book)
     assert parse_opf_metadata(_opf_path(tmp_path, "Jane Austen/Emma").read_bytes())["title"] == (
         "Emma!: A Novel"
     )
@@ -294,19 +304,212 @@ def test_edit_during_write_is_picked_up_by_another_pass(
         if not passes:
             edited = Book.objects.get(pk=book_id)
             edited.title = "Persuasion"
-            edited.save()  # marker moves; the queued job is this one
+            edited.save()  # the generation moves while this job writes
         passes.append(outcome)
         return outcome
 
     monkeypatch.setattr(book_opf, "_write_once", write_once_with_concurrent_edit)
     monkeypatch.setattr("ebook_server.jobs.enqueue", lambda func, book_id: None)
-    Book.objects.filter(pk=book.pk).update(opf_dirty_at=None)
     book_opf.write_book_opf(book.pk)
     assert len(passes) == 2
     assert parse_opf_metadata(_opf_path(tmp_path, "Jane Austen/Emma").read_bytes())["title"] == (
         "Persuasion"
     )
-    assert Book.objects.get(pk=book.pk).opf_dirty_at is None
+    assert _is_current(book)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_job_finishing_between_book_pre_save_and_update_loses_no_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #119 review: the only queued job runs while a stale Book instance is saved.
+
+    The job runs after the save's pre_save and before its UPDATE. The save must neither
+    write old regeneration state back nor end up without a job that renders it.
+    """
+    book = _book("First", "Jane Austen", folder="Jane Austen/Emma")
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+    queued: list[int] = []
+    monkeypatch.setattr("ebook_server.jobs.enqueue", lambda func, book_id: queued.append(book_id))
+    stale = Book.objects.get(pk=book.pk)  # loaded before the next edits
+
+    second = Book.objects.get(pk=book.pk)
+    second.title = "Second"
+    second.save()
+    assert queued == [book.pk]  # the sole queued job, not yet run
+
+    def run_queued_job_mid_save(sender: Any, instance: Book, **kwargs: Any) -> None:
+        if instance.pk == book.pk and queued:
+            book_opf.write_book_opf(queued.pop())
+
+    pre_save.connect(run_queued_job_mid_save, sender=Book, dispatch_uid="test_opf_mid_save")
+    try:
+        stale.title = "Third"
+        stale.save()
+    finally:
+        pre_save.disconnect(sender=Book, dispatch_uid="test_opf_mid_save")
+
+    # The job ran between pre_save and UPDATE: it rendered "Second".
+    assert _opf_title(tmp_path, "Jane Austen/Emma") == "Second"
+    assert Book.objects.get(pk=book.pk).title == "Third"
+    # The save queued a replacement job, and running it brings the file up to date.
+    assert queued == [book.pk]
+    assert not _is_current(book)
+    assert book_opf.write_book_opf(queued.pop()) == "written"
+    assert _opf_title(tmp_path, "Jane Austen/Emma") == "Third"
+    assert _is_current(book)
+    assert queued == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_book_instance_save_does_not_roll_back_regeneration_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    book = _book("First", "Jane Austen", folder="Jane Austen/Emma")
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+    queued: list[int] = []
+    monkeypatch.setattr("ebook_server.jobs.enqueue", lambda func, book_id: queued.append(book_id))
+    stale = Book.objects.get(pk=book.pk)
+    Identifier.objects.create(book=book, kind="isbn13", value="9780141439587")
+    before = BookOpfState.objects.get(book_id=book.pk).requested_generation
+
+    stale.description = "Saved from an old instance"
+    stale.save()  # every Book column, none of the regeneration state
+
+    assert BookOpfState.objects.get(book_id=book.pk).requested_generation == before + 1
+    assert queued == [book.pk]
+    book_opf.write_book_opf(queued.pop())
+    assert (
+        parse_opf_metadata(_opf_path(tmp_path, "Jane Austen/Emma").read_bytes())["identifier"]
+        == "9780141439587"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_lost_queued_job_does_not_block_regeneration_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    book = _book("First", "Jane Austen", folder="Jane Austen/Emma")
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+    queued: list[int] = []
+    monkeypatch.setattr("ebook_server.jobs.enqueue", lambda func, book_id: queued.append(book_id))
+    book.title = "Second"
+    book.save()
+    assert queued == [book.pk]
+    queued.clear()  # the worker died with the job
+
+    book.title = "Third"
+    book.save()
+    assert queued == []  # the claim is still fresh: assume the job is coming
+    BookOpfState.objects.filter(book_id=book.pk).update(
+        job_queued_at=timezone.now() - datetime.timedelta(days=1)
+    )
+    book.title = "Fourth"
+    book.save()
+    assert queued == [book.pk]  # stale claim: queued again
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failed_enqueue_releases_the_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    book = _book("First", "Jane Austen", folder="Jane Austen/Emma")
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+
+    def broken_enqueue(func: Any, book_id: int) -> None:
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr("ebook_server.jobs.enqueue", broken_enqueue)
+    book.title = "Second"
+    book.save()  # does not raise
+    state = BookOpfState.objects.get(book_id=book.pk)
+    assert state.job_queued_at is None
+    assert state.requested_generation > state.written_generation
+
+    queued: list[int] = []
+    monkeypatch.setattr("ebook_server.jobs.enqueue", lambda func, book_id: queued.append(book_id))
+    book.title = "Third"
+    book.save()
+    assert queued == [book.pk]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("bulk", [False, True], ids=["instance", "queryset"])
+def test_deleting_attached_author_genre_or_category_regenerates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bulk: bool
+) -> None:
+    """PR #119 review: the delete cascade removes link rows without m2m_changed."""
+    book = _book("Emma", "Jane Austen", folder="Jane Austen/Emma")
+    removed = Author.objects.create(full_name="Removed Author")
+    book.authors.add(removed)
+    genre = Genre.objects.create(name="Romance")
+    category = Category.objects.create(name="Classics")
+    book.genres.add(genre)
+    book.categories.add(category)
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+    opf = _opf_path(tmp_path, "Jane Austen/Emma")
+    fields = parse_opf_metadata(opf.read_bytes())
+    assert fields["authors"] == ["Jane Austen", "Removed Author"]
+    assert fields["subjects"] == ["Romance", "Classics"]
+
+    queued: list[int] = []
+    real_enqueue = book_opf.jobs.enqueue
+
+    def recording_enqueue(func: Any, book_id: int) -> Any:
+        queued.append(book_id)
+        return real_enqueue(func, book_id)
+
+    monkeypatch.setattr("ebook_server.jobs.enqueue", recording_enqueue)
+    with transaction.atomic():
+        if bulk:
+            Author.objects.filter(pk=removed.pk).delete()
+        else:
+            removed.delete()
+        assert queued == []  # only after the commit
+    assert queued == [book.pk]
+    assert parse_opf_metadata(opf.read_bytes())["authors"] == ["Jane Austen"]
+
+    if bulk:
+        Genre.objects.filter(pk=genre.pk).delete()
+    else:
+        genre.delete()
+    assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Classics"]
+    if bulk:
+        Category.objects.filter(pk=category.pk).delete()
+    else:
+        category.delete()
+    assert not parse_opf_metadata(opf.read_bytes())["subjects"]
+    Identifier.objects.create(book=book, kind="isbn13", value="9780141439587")
+    assert parse_opf_metadata(opf.read_bytes())["identifier"] == "9780141439587"
+    if bulk:
+        Identifier.objects.filter(book=book).delete()
+    else:
+        Identifier.objects.get(book=book).delete()
+    assert b"9780141439587" not in opf.read_bytes()
+    assert _is_current(book)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    Book.genres.through._meta.auto_created is not False,
+    reason="needs the explicit BookGenre through model (master); auto-created ones send none",
+)
+def test_link_rows_written_directly_regenerate(tmp_path: Path) -> None:
+    """Genre links written through the through model (``BookGenre``) bypass m2m_changed."""
+    book = _book("Emma", "Jane Austen", folder="Jane Austen/Emma")
+    _variant(tmp_path, book, "Jane Austen/Emma/Emma - Jane Austen.epub")
+    opf = _opf_path(tmp_path, "Jane Austen/Emma")
+    link_model = Book.genres.through
+    link = link_model.objects.create(book=book, genre=Genre.objects.create(name="Romance"))
+    assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance"]
+    link_model.objects.get_or_create(book=book, genre=Genre.objects.create(name="Satire"))
+    assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Romance", "Satire"]
+    link.delete()
+    assert parse_opf_metadata(opf.read_bytes())["subjects"] == ["Satire"]
+    link_model.objects.filter(book=book).delete()
+    assert not parse_opf_metadata(opf.read_bytes())["subjects"]
+    Identifier.objects.create(book=book, kind="isbn13", value="9780141439587")
+    Identifier.objects.filter(book=book).delete()
+    assert b"9780141439587" not in opf.read_bytes()
+    assert _is_current(book)
 
 
 def test_atomic_overwrite_replaces_whole_file_and_keeps_old_one_on_failure(
@@ -367,7 +570,7 @@ def test_read_only_index_in_place_folders_are_never_written(tmp_path: Path) -> N
     assert book_opf.write_book_opf(book.pk) == "no_target"
     assert sorted(os.listdir(share / "Jane Austen/Emma")) == ["emma.epub"]
     assert not _opf_path(tmp_path, "Jane Austen/Emma").exists()
-    assert Book.objects.get(pk=book.pk).opf_dirty_at is None
+    assert _is_current(book)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -384,7 +587,7 @@ def test_disabled_setting_and_job_layout_write_nothing(
     monkeypatch.setattr("django.conf.settings.BOOK_SCANNER_ARCHIVE_LAYOUT", "job")
     book.title = "Changed"
     book.save()
-    assert Book.objects.get(pk=book.pk).opf_dirty_at is None
+    assert not BookOpfState.objects.filter(book_id=book.pk).exists()
     assert not _opf_path(tmp_path, "Jane Austen/Emma").exists()
     with pytest.raises(CommandError, match="off"):
         call_command("write_book_opfs")
@@ -447,3 +650,5 @@ def test_reorganize_moves_opf_with_the_book_and_deletion_removes_it(tmp_path: Pa
 
     delete_book_safely(Book.objects.get(pk=book.pk))
     assert not (_archive(tmp_path) / "Jane Austen/Persuasion").exists()
+    # The cascade (files, covers, links) marks no deleted book; its state row is gone.
+    assert not BookOpfState.objects.filter(book_id=book.pk).exists()

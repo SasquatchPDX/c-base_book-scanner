@@ -299,10 +299,6 @@ class Book(models.Model):
     # later, so existing files stay where they are; only an explicit reorganize moves
     # them (see core.archive_layout). Empty until assigned and under the ``job`` layout.
     archive_folder = models.CharField(max_length=512, blank=True, default="")
-    # Set when canonical metadata changed and the book folder's generated metadata.opf
-    # is out of date; cleared by the background job that rewrites it. Coalesces bursts
-    # of edits into one job per book (see core.book_opf).
-    opf_dirty_at = models.DateTimeField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -358,6 +354,31 @@ class Book(models.Model):
 
     def __str__(self) -> str:
         return self.title
+
+
+class BookOpfState(models.Model):
+    """Regeneration state of a book folder's generated ``metadata.opf`` (see core.book_opf).
+
+    Kept out of ``Book`` on purpose: an ordinary ``Book.save()`` writes every column of
+    a possibly stale instance, and must never roll this state back. Both counters only
+    move through queryset updates. The OPF is stale while ``requested_generation`` is
+    ahead of ``written_generation``.
+    """
+
+    book = models.OneToOneField(
+        Book, on_delete=models.CASCADE, primary_key=True, related_name="opf_state"
+    )
+    # Incremented (F() + 1) on every metadata change that affects the OPF.
+    requested_generation = models.PositiveBigIntegerField(default=0)
+    # The requested generation the worker last rendered and wrote, set only while that
+    # generation is still the requested one.
+    written_generation = models.PositiveBigIntegerField(default=0)
+    # Set when a job was queued and not yet started; the job clears it when it starts.
+    # Dedupes queued jobs per book; a claim older than the job timeout is ignored.
+    job_queued_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.book_id}: {self.written_generation}/{self.requested_generation}"
 
 
 class Identifier(models.Model):
