@@ -16,6 +16,11 @@ class Migration(migrations.Migration):
         ),
         migrations.AddField(
             model_name="scanjob",
+            name="capture_manifest_sha256",
+            field=models.CharField(blank=True, default="", max_length=64),
+        ),
+        migrations.AddField(
+            model_name="scanjob",
             name="captured_at",
             field=models.DateTimeField(blank=True, null=True),
         ),

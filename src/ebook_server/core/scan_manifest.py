@@ -10,14 +10,22 @@ Only pages exist so far (``ScanPage``/``ScanPageVersion``). The tickets that sto
 the stored ``scan.jsonl`` events (S5) register the event high-water mark with
 :func:`register_event_high_water_mark`. Until then:
 
-* a field with no registered source is omitted from ``GET jobs/{id}`` and ignored in a
-  ``capture-complete`` request, so nothing is expected for it;
+* a field with no registered source is omitted from ``GET jobs/{id}``. In a
+  ``capture-complete`` request it fails closed: an empty value (``null``, ``[]``) is
+  accepted, but any declared item is reported ``missing`` because serif cannot have
+  stored it, so the scanner never deletes data serif does not hold;
 * the event high-water mark is ``0``, and ``capture-complete`` compares the request's
-  ``sans_last_line_no`` with that ``0``.
+  ``sans_last_line_no`` with that ``0`` (any later line is ``mismatched``).
+
+:attr:`ManifestCheck.digest` identifies a request manifest. ``capture-complete`` stores
+the digest it verified, so an identical retry answers ``200`` again while any different
+manifest is checked against what serif holds now.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -27,6 +35,10 @@ from .models import ScanJob, ScanPageVersion
 
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
 EVENTS_ITEM_KEY: Final = "events"
+#: Manifest fields of the contract that a later ticket stores (covers: S4, OPF: S6).
+#: Until a source is registered for one, a declared item in it cannot be verified.
+CONTRACT_ITEM_FIELDS: Final = ("covers", "metadata_opf")
+_COVER_POSITIONS: Final = ("front", "back")
 
 
 class ManifestError(ValueError):
@@ -166,6 +178,8 @@ class ManifestCheck:
     missing: list[str] = field(default_factory=list)
     mismatched: list[str] = field(default_factory=list)
     sans_last_line_no: int = 0
+    #: SHA-256 of the normalized request manifest (items and event high-water mark).
+    digest: str = ""
 
     @property
     def verified(self) -> bool:
@@ -182,8 +196,54 @@ def parse_last_line_no(payload: Mapping[str, Any]) -> int:
 
 
 def expected_items(payload: Mapping[str, Any]) -> dict[str, dict[str, str]]:
-    """Parse every registered field of the request; fields with no source are ignored."""
+    """Parse every registered field of the request (contract fields with no source are
+    handled by :func:`unverifiable_items`)."""
     return {source.name: source.expected(payload.get(source.name)) for source in _sources.values()}
+
+
+def _is_empty(value: Any) -> bool:
+    return value is None or value == [] or value == {} or value == ""
+
+
+def unverifiable_items(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Contract fields with no registered source that declare something.
+
+    Maps the field name to its raw value. serif cannot hold such an item, so it fails
+    closed as ``missing`` (see :func:`_unverifiable_keys`).
+    """
+    return {
+        name: payload.get(name)
+        for name in CONTRACT_ITEM_FIELDS
+        if name not in _sources and not _is_empty(payload.get(name))
+    }
+
+
+def _unverifiable_keys(name: str, value: Any) -> list[str]:
+    """Item keys for a declared but unverifiable field, e.g. ``cover:front``."""
+    if name == "covers" and isinstance(value, list):
+        keys: list[str] = []
+        for entry in value:
+            position = entry.get("position") if isinstance(entry, dict) else None
+            key = f"cover:{position}" if position in _COVER_POSITIONS else name
+            if key not in keys:
+                keys.append(key)
+        return keys or [name]
+    return [name]
+
+
+def manifest_digest(
+    expected: Mapping[str, Mapping[str, str]],
+    unverifiable: Mapping[str, Any],
+    sans_last_line_no: int,
+) -> str:
+    """SHA-256 of a normalized manifest: equal for equal item sets in any order."""
+    document = {
+        "items": {name: dict(sorted(items.items())) for name, items in expected.items()},
+        "unverifiable": dict(unverifiable),
+        "sans_last_line_no": sans_last_line_no,
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def check_manifest(job: ScanJob, payload: Mapping[str, Any]) -> ManifestCheck:
@@ -192,11 +252,16 @@ def check_manifest(job: ScanJob, payload: Mapping[str, Any]) -> ManifestCheck:
     Validate the whole request first (raises :class:`ManifestError`), then report every
     listed item that is absent (``missing``) or whose active checksum differs
     (``mismatched``). Items serif holds but the manifest does not list are not checked.
-    The ``events`` key is mismatched when the high-water marks differ.
+    A declared item of a contract field serif cannot store yet is ``missing``. The
+    ``events`` key is mismatched when the high-water marks differ.
     """
     expected_last_line_no = parse_last_line_no(payload)
     expected = expected_items(payload)
-    check = ManifestCheck(sans_last_line_no=event_high_water_mark(job))
+    unverifiable = unverifiable_items(payload)
+    check = ManifestCheck(
+        sans_last_line_no=event_high_water_mark(job),
+        digest=manifest_digest(expected, unverifiable, expected_last_line_no),
+    )
     for name, items in expected.items():
         received = _sources[name].received(job)
         for key, sha256 in items.items():
@@ -205,6 +270,8 @@ def check_manifest(job: ScanJob, payload: Mapping[str, Any]) -> ManifestCheck:
                 check.missing.append(key)
             elif held.sha256 != sha256:
                 check.mismatched.append(key)
+    for name, value in unverifiable.items():
+        check.missing.extend(_unverifiable_keys(name, value))
     if expected_last_line_no != check.sans_last_line_no:
         check.mismatched.append(EVENTS_ITEM_KEY)
     return check
