@@ -3382,7 +3382,10 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         return render(
             request,
             "core/upload.html",
-            {"max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES},
+            {
+                "max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES,
+                "audiobook_service_url": intake.audiobook_service_url(),
+            },
         )
 
     uploaded_file = request.FILES.get("file")
@@ -3396,6 +3399,18 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         normalized_filename = intake.normalize_filename(original_name)
     except intake.ValidationError as exc:
         return HttpResponseBadRequest(str(exc))
+    if intake.is_audio_filename(original_name, uploaded_file.content_type):
+        # Audiobooks live on a separate service (docs/design/32-audiobooks.md); the
+        # file is rejected before it is staged, so no ImportJob is ever created.
+        logger.info(
+            "upload_audio_rejected",
+            drm_protected=intake.is_drm_audio_filename(original_name),
+        )
+        return HttpResponse(
+            intake.audio_upload_rejection_message(original_name),
+            status=415,
+            content_type="text/plain; charset=utf-8",
+        )
     try:
         detected_format, detected_mime = intake.detect_format(
             original_name,
