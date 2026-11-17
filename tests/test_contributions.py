@@ -38,6 +38,97 @@ from ebook_server.core.models import (
 AFTER_HOLD = timedelta(days=15)
 
 
+@pytest.mark.django_db(transaction=True)
+def test_shared_candidate_accept_and_batch_emit_human_review_events(enabled: Any) -> None:
+    from tests.test_review_queue_batch import _make_task
+
+    owner = _member("workflow-upload-owner")
+    reviewer = _admin("workflow-reviewer")
+    direct = _make_task(owner.user, "workflow-direct", [0.95])
+    batched = _make_task(owner.user, "workflow-batch", [0.95])
+    client = _client(reviewer)
+    assert direct.import_job is not None
+    candidate = direct.import_job.metadata_candidates.get()
+
+    accepted = client.post(
+        f"/reviews/{direct.pk}/accept-candidate/", {"candidate_id": candidate.pk}
+    )
+    batch_result = client.post(
+        "/reviews/batch-accept/", {"task_ids": [batched.pk]}, content_type="application/json"
+    )
+
+    assert accepted.status_code == 200
+    assert batch_result.status_code == 200
+    assert batch_result.json()["accepted"] == 1
+    events = ContributionEvent.objects.filter(review_task_id__in=[direct.pk, batched.pk])
+    assert events.count() == 2
+    assert set(events.values_list("review_task_id", flat=True)) == {direct.pk, batched.pk}
+    assert set(events.values_list("user_id", flat=True)) == {reviewer.user_id}
+    assert set(events.values_list("kind", flat=True)) == {ContributionKind.REVIEW_RESOLVED}
+    assert set(events.values_list("state", flat=True)) == {ContributionEvent.State.PENDING}
+    repeated = client.post(
+        "/reviews/batch-accept/", {"task_ids": [batched.pk]}, content_type="application/json"
+    )
+    assert repeated.json()["accepted"] == 0
+    assert events.count() == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_multipart_confirmation_credits_one_review_not_each_part(
+    enabled: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ebook_server.core.models import SourceLocation
+    from tests.test_multipart_works import (
+        _ingest,
+        _library,
+        _location,
+        _split_book_folder,
+        _stub_provider,
+    )
+
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "contribution-source"
+    _split_book_folder(root)
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.import_job is not None
+    candidate = task.import_job.metadata_candidates.get()
+    reviewer = _admin("workflow-multipart-reviewer")
+
+    response = _client(reviewer).post(
+        f"/reviews/{task.pk}/accept-candidate/", {"candidate_id": candidate.pk}
+    )
+
+    assert response.status_code == 200
+    task.refresh_from_db()
+    assert task.resolved_book is not None
+    assert task.resolved_book.file_variants.count() == 4
+    assert ContributionEvent.objects.count() == 1
+    event = ContributionEvent.objects.get(review_task=task)
+    assert event.user_id == reviewer.user_id
+    assert event.kind == ContributionKind.REVIEW_RESOLVED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_automatic_reviewer_isbn_worker_does_not_award_points(
+    enabled: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_review_isbn_lookup import DUNE_13, _edition
+    from tests.test_review_search import _import_review, _RecordingProvider, _use_providers
+
+    client, task, _job = _import_review(monkeypatch, tmp_path, "workflow-isbn")
+    _use_providers(monkeypatch, _RecordingProvider("stub", [_edition("Dune")]))
+
+    response = client.post(f"/reviews/{task.pk}/isbn-lookup/", {"isbn": DUNE_13})
+
+    assert response.status_code == 202
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.RESOLVED
+    assert task.reviewer_id is not None  # Request attribution is not human confirmation.
+    assert not ContributionEvent.objects.exists()
+
+
 @pytest.fixture
 def enabled(settings: Any) -> Iterator[Any]:
     settings.BOOK_SCANNER_CONTRIBUTIONS_ENABLED = True
