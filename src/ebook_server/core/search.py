@@ -39,11 +39,22 @@ from django.contrib.postgres.search import SearchQuery, SearchRank, TrigramWordS
 from django.core import signing
 from django.core.cache import cache
 from django.db import connection, transaction
-from django.db.models import Count, F, Q, QuerySet
-from django.db.models.functions import Greatest
+from django.db.models import (
+    BooleanField,
+    Count,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Q,
+    QuerySet,
+    Subquery,
+    Value,
+)
+from django.db.models.functions import Coalesce, Greatest
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 
-from . import genres
+from . import genres, library_visibility
 from .models import (
     Author,
     Book,
@@ -55,11 +66,13 @@ from .models import (
     FileVariant,
     Genre,
     Identifier,
+    ScanJob,
 )
 
 logger = structlog.get_logger(__name__)
 
 DEFAULT_SORT: Final = "-created_at"
+_AUTHOR_SORT_ANNOTATION: Final = "first_author_name"
 RELEVANCE: Final = "relevance"
 # Browse sorts: name -> (Book field for the fallback, search-document field, descending).
 BROWSE_SORTS: Final[dict[str, tuple[str, str, bool]]] = {
@@ -67,8 +80,10 @@ BROWSE_SORTS: Final[dict[str, tuple[str, str, bool]]] = {
     "created_at": ("created_at", "book_created_at", False),
     "title": ("title", "title_sort", False),
     "-title": ("title", "title_sort", True),
+    # The fallback has no author column on Book; it annotates the first author name.
+    "author": (_AUTHOR_SORT_ANNOTATION, "author_sort", False),
 }
-FACETS: Final = ("language", "format", "genre", "category", "author", "decade")
+FACETS: Final = ("language", "format", "genre", "category", "author", "decade", "has_cover")
 MAX_RANKED_RESULTS: Final = 1000
 FACET_LIMIT: Final = 50
 # Global (unfiltered) counts barely change between imports; the design accepts
@@ -81,7 +96,7 @@ FUZZY_WORD_SIMILARITY: Final = 0.45
 _CURSOR_SALT: Final = "ebook_server.library.books.cursor"
 _READY_CACHE_KEY: Final = "library-search:index-ready:v1"
 _COUNT_CACHE_KEY: Final = "library-search:total:v1"
-_FACET_CACHE_KEY: Final = "library-search:facets:v1:{facet}"
+_FACET_CACHE_KEY: Final = "library-search:facets:v2:{facet}"
 _ISBN_LIKE = re.compile(r"[0-9Xx][0-9Xx-]{8,16}[0-9Xx]")
 _TOKEN = re.compile(r"[^\W_]+")
 
@@ -241,10 +256,13 @@ def content_digest(weighted_text: Sequence[str]) -> str:
 
 
 def _book_sources(book_ids: Sequence[int]) -> list[BookSource]:
-    """Read everything `build_document` needs for these books in six queries."""
+    """Read everything `build_document` needs for these books in a few queries.
+
+    Raw-scan books (#127) are left out, so `index_books` removes their rows.
+    """
     sources = {
         row[0]: BookSource(*row)
-        for row in Book.objects.filter(pk__in=book_ids)
+        for row in library_visibility.visible_books(Book.objects.filter(pk__in=book_ids))
         .order_by()
         .values_list(
             "id",
@@ -285,8 +303,10 @@ def _book_sources(book_ids: Sequence[int]) -> list[BookSource]:
     ):
         sources[book_id].identifiers.append((kind, value, normalized))
     for book_id, book_format in (
-        FileVariant.objects.filter(
-            book_id__in=ids, processing_state=FileVariant.ProcessingState.COMPLETE
+        library_visibility.without_pending_scan_variants(
+            FileVariant.objects.filter(
+                book_id__in=ids, processing_state=FileVariant.ProcessingState.COMPLETE
+            )
         )
         .order_by()
         .values_list("book_id", "format")
@@ -310,6 +330,8 @@ _DOCUMENT_UPDATE_FIELDS: Final = [
 
 def index_books(book_ids: Iterable[int]) -> int:
     """(Re)write the search rows of these books; rows of deleted books are removed.
+
+    So are the rows of raw-scan books (#127): they are never in the search index.
 
     Idempotent and safe to call for any id. Returns the number of books indexed.
     """
@@ -451,7 +473,9 @@ def _upsert_documents_postgresql(built: Sequence[_BuiltDocument]) -> None:
 def rebuild_search_index(*, batch_size: int = INDEX_BATCH_SIZE) -> int:
     """Rebuild every search row (management command and nightly job)."""
     del batch_size  # index_books batches internally; kept for the command's interface.
-    BookSearchDocument.objects.exclude(book_id__in=Book.objects.values("pk")).delete()
+    BookSearchDocument.objects.exclude(
+        book_id__in=library_visibility.visible_books().values("pk")
+    ).delete()
     total = 0
     last_id = 0
     while True:
@@ -532,11 +556,15 @@ def verify_search_index(*, sample: int = 500) -> IndexReport:
     PostgreSQL the stored `tsvector` is also compared with a freshly computed one.
     """
     missing = list(
-        Book.objects.filter(search_document__isnull=True)
+        library_visibility.visible_books()
+        .filter(search_document__isnull=True)
         .order_by("pk")
         .values_list("pk", flat=True)[:1000]
     )
-    orphan_count = BookSearchDocument.objects.exclude(book_id__in=Book.objects.values("pk")).count()
+    # A row of a deleted or raw-scan (#127) book is an orphan.
+    orphan_count = BookSearchDocument.objects.exclude(
+        book_id__in=library_visibility.visible_books().values("pk")
+    ).count()
     sample_ids = list(
         BookSearchDocument.objects.order_by("?").values_list("book_id", flat=True)[:sample]
     )
@@ -563,8 +591,22 @@ def verify_search_index(*, sample: int = 500) -> IndexReport:
 
 
 def invalidate_cached_counts() -> None:
+    invalidate_global_counts()
+    cache.delete(_READY_CACHE_KEY)
+
+
+# Derived from the global facets; cleared with them.
+LANGUAGE_SHELVES_CACHE_KEY: Final = "library-landing:language-shelves:v1"
+
+
+def invalidate_global_counts() -> None:
+    """Drop the cached unfiltered total, global facet counts and language shelves."""
     cache.delete_many(
-        [_COUNT_CACHE_KEY, _READY_CACHE_KEY, *(_FACET_CACHE_KEY.format(facet=f) for f in FACETS)]
+        [
+            _COUNT_CACHE_KEY,
+            LANGUAGE_SHELVES_CACHE_KEY,
+            *(_FACET_CACHE_KEY.format(facet=f) for f in FACETS),
+        ]
     )
 
 
@@ -576,7 +618,7 @@ def search_index_ready() -> bool:
     """
     ready = cache.get(_READY_CACHE_KEY)
     if ready is None:
-        ready = not Book.objects.filter(search_document__isnull=True).exists()
+        ready = not library_visibility.visible_books().filter(search_document__isnull=True).exists()
         cache.set(_READY_CACHE_KEY, ready, GLOBAL_CACHE_SECONDS if ready else 60)
         if not ready:
             logger.warning("library_search_index_incomplete", backend="fallback")
@@ -615,6 +657,9 @@ def _flush_pending() -> None:
         return
     try:
         index_books(ids)
+        # Global counts follow the indexing job instead of waiting out the five
+        # minutes (#28 Q3); they are recomputed on the next landing/browse view.
+        invalidate_global_counts()
     except Exception:  # never fail the write that triggered indexing
         cache.delete(_READY_CACHE_KEY)
         logger.exception("library_search_index_failed", book_count=len(ids))
@@ -660,6 +705,11 @@ def _on_book_child_changed(sender: type[Any], instance: Any, **kwargs: Any) -> N
     schedule_reindex([instance.book_id])
 
 
+def _on_scan_job_saved(sender: type[ScanJob], instance: ScanJob, **kwargs: Any) -> None:
+    # A scan job's state decides whether its book is in the library (#127).
+    schedule_reindex([instance.book_id])
+
+
 def connect_signals() -> None:
     """Keep search rows current on every ORM write (called from `CoreConfig.ready`).
 
@@ -685,6 +735,8 @@ def connect_signals() -> None:
         )
     # `BookGenre` is the explicit genre link model (#50): `genres.assign_*` and the
     # admin inline create, re-source and delete its rows directly, without m2m_changed.
+    post_save.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-save-ScanJob")
+    post_delete.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-delete-ScanJob")
     for child in (FileVariant, Identifier, CoverImage, BookGenre):
         post_save.connect(
             _on_book_child_changed, sender=child, dispatch_uid=f"{uid}-save-{child.__name__}"
@@ -753,6 +805,13 @@ class SearchRequest:
     genre: str = ""
     language: str = ""
     book_format: str = ""
+    # Exact filters behind the facet links (#28 phase 3): entity ids, a decade
+    # (e.g. 1990 for 1990-1999) and whether the book has a front cover.
+    author_id: int | None = None
+    genre_id: int | None = None
+    category_id: int | None = None
+    decade: int | None = None
+    has_cover: bool | None = None
     sort: str = ""
     cursor: str = ""
     page: int | None = None
@@ -769,6 +828,11 @@ class SearchRequest:
                 self.genre,
                 self.language,
                 self.book_format,
+                self.author_id is not None,
+                self.genre_id is not None,
+                self.category_id is not None,
+                self.decade is not None,
+                self.has_cover is not None,
             )
         )
 
@@ -796,8 +860,16 @@ class SearchPage:
 
 @dataclass(frozen=True)
 class FacetCount:
+    """One facet bucket. `value` is the display text; `key` is what its filter link
+    sends (`?author_id=<key>`, `?format=<key>`, ...), an id for entity facets."""
+
     value: str
     count: int
+    key: str = ""
+
+    @property
+    def filter_key(self) -> str:
+        return self.key or self.value
 
 
 class SearchBackend(Protocol):
@@ -915,7 +987,7 @@ def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
     `COUNT(*)` over `core_book`. Each relation filter matches on its own:
     `?q=` and `?author=` may match different authors of the same book.
     """
-    books = Book.objects.all()
+    books = library_visibility.visible_books()
     if request.query:
         books = books.filter(
             Q(title__icontains=request.query)
@@ -943,16 +1015,64 @@ def legacy_filtered_books(request: SearchRequest) -> QuerySet[Book]:
         books = books.filter(language__iexact=request.language)
     if request.book_format:
         books = books.filter(
-            pk__in=FileVariant.objects.filter(
-                format__iexact=request.book_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
+            pk__in=library_visibility.without_pending_scan_variants(
+                FileVariant.objects.filter(
+                    format__iexact=request.book_format,
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                )
             ).values("book_id"),
         )
+    for relation, column, value in (
+        (Book.authors.through, "author_id", request.author_id),
+        (Book.genres.through, "genre_id", request.genre_id),
+        (Book.categories.through, "category_id", request.category_id),
+    ):
+        if value is not None:
+            books = books.filter(
+                pk__in=relation.objects.filter(**{column: value}).values("book_id")
+            )
+    if request.decade is not None:
+        start, end = request.decade, request.decade + 9
+        books = books.filter(
+            Q(publication_year__gte=start, publication_year__lte=end)
+            | Q(
+                publication_year__isnull=True,
+                publication_date__year__gte=start,
+                publication_date__year__lte=end,
+            )
+        )
+    if request.has_cover is not None:
+        books = books.filter(front_cover__isnull=not request.has_cover)
     return books
 
 
 def _named_counts(rows: Iterable[tuple[Any, int]]) -> list[FacetCount]:
     return [FacetCount(value=str(value), count=count) for value, count in rows if value]
+
+
+def _entity_counts(rows: Iterable[tuple[Any, Any, int]]) -> list[FacetCount]:
+    return [
+        FacetCount(value=str(name), count=count, key=str(pk)) for pk, name, count in rows if name
+    ]
+
+
+def _has_cover_counts(rows: Iterable[tuple[Any, int]]) -> list[FacetCount]:
+    counts = {bool(value): count for value, count in rows}
+    return [
+        FacetCount(value="true" if value else "false", count=counts[value], key=str(int(value)))
+        for value in (True, False)
+        if counts.get(value)
+    ]
+
+
+def _with_author_sort_key(books: QuerySet[Book]) -> QuerySet[Book]:
+    """Annotate the alphabetically first author name ("" without authors)."""
+    first_author = (
+        Book.authors.through.objects.filter(book_id=OuterRef("pk"))
+        .order_by("author__full_name")
+        .values("author__full_name")[:1]
+    )
+    return books.annotate(**{_AUTHOR_SORT_ANNOTATION: Coalesce(Subquery(first_author), Value(""))})
 
 
 class DatabaseFallbackSearchBackend:
@@ -965,6 +1085,8 @@ class DatabaseFallbackSearchBackend:
         books = legacy_filtered_books(request)
         book_field, _document_field, descending = BROWSE_SORTS[sort]
         count = books.count()
+        if book_field == _AUTHOR_SORT_ANNOTATION:
+            books = _with_author_sort_key(books)
         if request.page is not None:
             page, start, stop = _offset_window(request)
             prefix = "-" if descending else ""
@@ -1008,9 +1130,11 @@ class DatabaseFallbackSearchBackend:
                 )
             elif facet == "format":
                 rows = (
-                    FileVariant.objects.filter(
-                        book_id__in=book_ids,
-                        processing_state=FileVariant.ProcessingState.COMPLETE,
+                    library_visibility.without_pending_scan_variants(
+                        FileVariant.objects.filter(
+                            book_id__in=book_ids,
+                            processing_state=FileVariant.ProcessingState.COMPLETE,
+                        )
                     )
                     .values_list("format")
                     .annotate(n=Count("book_id", distinct=True))
@@ -1023,12 +1147,26 @@ class DatabaseFallbackSearchBackend:
                     "author": Book.authors.through,
                 }[facet]
                 name_field = f"{facet}__full_name" if facet == "author" else f"{facet}__name"
-                rows = (
+                results[facet] = _entity_counts(
                     relation.objects.filter(book_id__in=book_ids)
-                    .values_list(name_field)
+                    .values_list(f"{facet}_id", name_field)
                     .annotate(n=Count("book_id"))
-                    .order_by("-n", name_field)
+                    .order_by("-n", name_field)[:FACET_LIMIT]
                 )
+                continue
+            elif facet == "has_cover":
+                results[facet] = _has_cover_counts(
+                    Book.objects.filter(pk__in=book_ids)
+                    .annotate(
+                        with_cover=ExpressionWrapper(
+                            Q(front_cover__isnull=False), output_field=BooleanField()
+                        )
+                    )
+                    .values_list("with_cover")
+                    .annotate(n=Count("pk"))
+                    .order_by()
+                )
+                continue
             elif facet == "decade":
                 results[facet] = _decade_counts(
                     Book.objects.filter(pk__in=book_ids).values_list(
@@ -1072,7 +1210,11 @@ class PostgresSearchBackend:
     name = "postgresql"
 
     def _filtered(self, request: SearchRequest) -> QuerySet[BookSearchDocument]:
-        documents = BookSearchDocument.objects.all()
+        # Raw-scan books have no row (`index_books`); excluding them here as well keeps
+        # them out even while a reindex is still pending (#127).
+        documents = BookSearchDocument.objects.exclude(
+            book_id__in=library_visibility.raw_scan_book_ids()
+        )
         if request.title:
             documents = documents.filter(title_sort__contains=fold(request.title))
         if request.author:
@@ -1102,6 +1244,17 @@ class PostgresSearchBackend:
                     BookSearchFacet.Kind.FORMAT, [fold(request.book_format)]
                 )
             )
+        for kind, entity_id in (
+            (BookSearchFacet.Kind.AUTHOR, request.author_id),
+            (BookSearchFacet.Kind.GENRE, request.genre_id),
+            (BookSearchFacet.Kind.CATEGORY, request.category_id),
+        ):
+            if entity_id is not None:
+                documents = documents.filter(book_id__in=_facet_book_ids(kind, [str(entity_id)]))
+        if request.decade is not None:
+            documents = documents.filter(publication_decade=request.decade)
+        if request.has_cover is not None:
+            documents = documents.filter(has_cover=request.has_cover)
         return documents
 
     def _text_match(
@@ -1245,6 +1398,10 @@ class PostgresSearchBackend:
         return results
 
     def _facet(self, documents: QuerySet[BookSearchDocument], facet: str) -> list[FacetCount]:
+        if facet == "has_cover":
+            return _has_cover_counts(
+                documents.values_list("has_cover").annotate(n=Count("pk")).order_by()
+            )
         if facet in ("language", "decade"):
             column = "language" if facet == "language" else "publication_decade"
             rows = (
@@ -1276,7 +1433,7 @@ class PostgresSearchBackend:
             )
         )
         return [
-            FacetCount(value=str(names[int(value)]), count=n)
+            FacetCount(value=str(names[int(value)]), count=n, key=str(value))
             for value, n in counted
             if int(value) in names
         ]
@@ -1293,3 +1450,145 @@ def get_search_backend() -> SearchBackend:
     if connection.vendor == "postgresql" and search_index_ready():
         return PostgresSearchBackend()
     return DatabaseFallbackSearchBackend()
+
+
+# ------------------------------------------------------------- landing page
+
+
+def global_facets(facets: Sequence[str]) -> dict[str, list[FacetCount]]:
+    """Facet counts over the whole library, cached for `GLOBAL_CACHE_SECONDS`.
+
+    The PostgreSQL backend caches these itself; this also caches the fallback,
+    so the landing page costs no facet query on a warm cache with either one.
+    """
+    keys = {facet: _FACET_CACHE_KEY.format(facet=facet) for facet in facets if facet in FACETS}
+    cached = cache.get_many(list(keys.values()))
+    results = {facet: cached[key] for facet, key in keys.items() if key in cached}
+    missing = [facet for facet in keys if facet not in results]
+    if missing:
+        computed = get_search_backend().facet_counts(SearchRequest(), missing)
+        cache.set_many(
+            {keys[facet]: counts for facet, counts in computed.items()}, GLOBAL_CACHE_SECONDS
+        )
+        results.update(computed)
+    return {facet: results.get(facet, []) for facet in keys}
+
+
+def total_books() -> int:
+    """All books, from the same five-minute cache as the unfiltered browse count."""
+    total = cache.get(_COUNT_CACHE_KEY)
+    if total is None:
+        total = library_visibility.visible_books().count()
+        cache.set(_COUNT_CACHE_KEY, total, GLOBAL_CACHE_SECONDS)
+    return int(total)
+
+
+def newest_book_ids(*, limit: int, language: str = "") -> list[int]:
+    """Ids of the newest books ("Recently added", "New in <language>"), one query.
+
+    "Recently added" means the Book was created recently, not that a variant was
+    added (#28 Q4). Both paths walk a `created_at` index backwards.
+    """
+    if connection.vendor == "postgresql" and search_index_ready():
+        documents = BookSearchDocument.objects.all()
+        if language:
+            documents = documents.filter(language=fold(language))
+        return list(
+            documents.order_by("-book_created_at", "-book_id").values_list("book_id", flat=True)[
+                :limit
+            ]
+        )
+    books = library_visibility.visible_books()
+    if language:
+        books = books.filter(language__iexact=language)
+    return list(books.order_by("-created_at", "-id").values_list("id", flat=True)[:limit])
+
+
+_IDENTIFYING_DECISIONS: Final = (
+    "accept_candidate",
+    "manual_entry",
+    "merged_book",
+)
+
+
+def recently_identified_book_ids(*, limit: int) -> list[int]:
+    """Books most recently resolved through manual review, newest decision first."""
+    from .models import ReviewTask
+
+    rows = (
+        ReviewTask.objects.filter(
+            state=ReviewTask.State.RESOLVED,
+            decision__in=_IDENTIFYING_DECISIONS,
+            resolved_book__isnull=False,
+            decided_at__isnull=False,
+        )
+        .order_by("-decided_at", "-id")
+        .values_list("resolved_book_id", flat=True)[: limit * 4]
+    )
+    unique: list[int] = []
+    for book_id in rows:
+        if book_id is not None and book_id not in unique:
+            unique.append(book_id)
+        if len(unique) == limit:
+            break
+    return unique
+
+
+# ------------------------------------------------------------- author index
+
+AUTHOR_INDEX_SORT: Final = "authors"
+
+
+@dataclass(frozen=True)
+class AuthorEntry:
+    id: int
+    name: str
+    book_count: int
+
+
+@dataclass
+class AuthorIndexPage:
+    authors: list[AuthorEntry]
+    next_cursor: str | None
+    previous_cursor: str | None
+
+
+def author_index_page(
+    *, letter: str = "", cursor: str = "", page_size: int = 50
+) -> AuthorIndexPage:
+    """One page of the author A-Z index: authors with at least one book.
+
+    Keyset-paginated on `(full_name, id)` (the unique `full_name` index), so any
+    page costs the same. `letter` jumps to the first name at or after it; it is
+    turned into a cursor, so "previous" works from there too. Raises
+    `InvalidCursorError` for a tampered cursor.
+    """
+    if not cursor and letter:
+        cursor = Cursor(AUTHOR_INDEX_SORT, letter[:1].upper(), 0).encode()
+    authors = Author.objects.filter(
+        Exists(Book.authors.through.objects.filter(author_id=OuterRef("pk")))
+    )
+    ids, next_cursor, previous_cursor = _keyset_page(
+        authors,
+        request=SearchRequest(cursor=cursor, page_size=page_size),
+        sort=AUTHOR_INDEX_SORT,
+        key_field="full_name",
+        id_field="id",
+        descending=False,
+    )
+    names = dict(Author.objects.filter(pk__in=ids).values_list("pk", "full_name"))
+    counts = dict(
+        Book.authors.through.objects.filter(author_id__in=ids)
+        .values_list("author_id")
+        .annotate(n=Count("book_id"))
+        .order_by()
+    )
+    return AuthorIndexPage(
+        authors=[
+            AuthorEntry(id=pk, name=names[pk], book_count=counts.get(pk, 0))
+            for pk in ids
+            if pk in names
+        ],
+        next_cursor=next_cursor,
+        previous_cursor=previous_cursor,
+    )

@@ -9,16 +9,19 @@
     {% block head %}{% endblock %}
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     <header class="site-header">
       <a class="brand" href="{% url 'library-home' %}?view=html">Hackerspace Library</a>
       <nav aria-label="Main navigation">
         <a href="{% url 'library-books' %}?view=html">Books</a>
+        <a href="{% url 'library-authors' %}?view=html">Authors</a>
         <a href="{% url 'imports-upload' %}">Upload</a>
         <a href="{% url 'review-queue' %}?view=html">Reviews</a>
         <a href="{% url 'scan-jobs' %}?view=html">Scanning</a>
+        <a href="{% url 'scan-raw-scans' %}?view=html">Raw scans</a>
         {% if contributions_enabled and request.user.is_authenticated %}<a href="{% url 'my-contributions' %}?view=html">My contributions</a>{% endif %}
         {% if contributions_admin_link %}<a href="{% url 'contributions-admin' %}?view=html">Recognition admin</a>{% endif %}
-        {% if request.user.is_staff %}<a href="/admin/">Admin</a>{% endif %}
+        {% if request.user.is_staff %}<a href="{% url 'intake-progress' %}?view=html">Intake</a><a href="/admin/">Admin</a>{% endif %}
       </nav>
     <span class="identity">{{ request.user.username }}</span>
     <form class="logout-form" method="post" action="{% url 'library-logout' %}">
@@ -26,7 +29,7 @@
       <button type="submit">Sign out</button>
     </form>
     </header>
-    <main class="page-shell">
+    <main class="page-shell" id="main-content">
       {% block content %}{% endblock %}
     </main>
     {% block body_extra %}{% endblock %}

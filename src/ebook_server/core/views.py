@@ -24,6 +24,7 @@ from django.conf import settings as django_settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
+from django.core.cache import cache
 from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
@@ -41,6 +42,7 @@ from django.http import (
 )
 from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
@@ -64,6 +66,8 @@ from . import (
     conversion,
     genres,
     intake,
+    intake_progress,
+    library_visibility,
     llm,
     llm_identification,
     metadata_search,
@@ -73,15 +77,22 @@ from . import (
     review_batch,
     review_identification,
     scan_identification,
+    scan_lifecycle,
+    scan_logs,
     scan_pipeline,
+    scanner_opf,
     scantailor,
     search,
 )
+from . import thumbnails as thumbnails_module
 from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
+    Author,
     Book,
+    Category,
     CoverImage,
+    CoverThumbnail,
     FileVariant,
     Genre,
     ImportJob,
@@ -100,6 +111,7 @@ from .models import (
     StorageLocation,
 )
 from .referenced_files import ReferencedFileError, ensure_reference_intact
+from .scan_job_ids import normalize_scan_job_id
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
@@ -225,6 +237,8 @@ def _serialize_scan_page(
         "id": str(page.id),
         "logical_sequence_number": page.logical_sequence_number,
         "side": page.side,
+        "recognized_page_number": page.recognized_page_number,
+        "scanner_status": page.status,
         "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
         "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],
@@ -546,7 +560,7 @@ def _scan_todos_for_query(request: HttpRequest) -> tuple[Any, str]:
     if states:
         queryset = queryset.filter(state__in=states)
     if raw_job_id := _coerce_str_or_none(request.GET.get("job_id")):
-        job_id = _coerce_uuid(raw_job_id)
+        job_id = normalize_scan_job_id(raw_job_id)
         if job_id is None:
             return None, "invalid job_id"
         queryset = queryset.filter(scan_job_id=job_id)
@@ -739,7 +753,15 @@ def _store_scan_page(
     capture_timestamp: datetime | None,
     requested_checksum: str | None = None,
     force_new_version: bool = False,
+    accepting_states: frozenset[str] = scan_lifecycle.CAPTURE_STATES,
 ) -> tuple[ScanPage, ScanPageVersion, bool]:
+    """Store one page image as a new (or the matching existing) version.
+
+    ``accepting_states`` are the job states this upload is allowed in, checked under
+    the row lock. A new version for a ``complete`` job (a replacement, §5) puts the
+    job back to ``captured`` with "re-finish needed"; its library variants stay until
+    the next finish instead of being invalidated.
+    """
     staged_path, size_bytes = _stage_scan_upload(uploaded_file)
     storage = _default_scan_storage()
     destination: str | None = None
@@ -771,11 +793,7 @@ def _store_scan_page(
 
         with transaction.atomic():
             locked_job = ScanJob.objects.select_for_update().get(pk=job.pk)
-            if locked_job.state not in {
-                ScanJob.State.OPEN,
-                ScanJob.State.CAPTURING,
-                ScanJob.State.PAUSED,
-            }:
+            if locked_job.state not in accepting_states:
                 raise ValueError("job not accepting pages")
 
             page, _ = ScanPage.objects.get_or_create(
@@ -814,6 +832,7 @@ def _store_scan_page(
                 )
                 storage.store(staged_path, destination)
 
+            scan_lifecycle.reopen_for_refinish(locked_job)
             version = _append_version(
                 page=page,
                 uploader_id=uploader_id,
@@ -830,7 +849,8 @@ def _store_scan_page(
                 page_id=str(page.id),
                 reason="source changed",
             )
-            scan_pipeline.invalidate_scan_job_library_artifacts(page.scan_job)
+            if not locked_job.refinish_needed:
+                scan_pipeline.invalidate_scan_job_library_artifacts(locked_job)
             destination = None  # The DB row now owns the stored file.
             return page, version, True
     finally:
@@ -1448,28 +1468,323 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     if profile.is_disabled:
         return JsonResponse({"detail": "forbidden"}, status=403)
     if _wants_html(request):
-        recent_books = (
-            Book.objects.select_related("front_cover", "back_cover")
-            .prefetch_related(*_book_list_prefetches())
-            .order_by("-created_at", "-id")[:12]
+        started = time.perf_counter()
+        context = _library_landing_context()
+        logger.info(
+            "library_landing",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
         )
-        return render(
-            request,
-            "core/library_home.html",
-            {
-                "profile": profile,
-                "recent_books": [
-                    _serialize_book(book, include_variants=False) for book in recent_books
-                ],
-                "book_count": Book.objects.count(),
-                "variant_count": FileVariant.objects.filter(
-                    processing_state=FileVariant.ProcessingState.COMPLETE,
-                ).count(),
-            },
-        )
+        return render(request, "core/library_home.html", {"profile": profile, **context})
     return JsonResponse(
         {"status": "ok", "user": request.user.username, "role": profile.role},
     )
+
+
+SHELF_SIZE: Final = 12
+# Facets of the landing page sidebar, in display order, with their headings.
+LANDING_FACETS: Final[tuple[tuple[str, str], ...]] = (
+    ("format", "Format"),
+    ("language", "Language"),
+    ("genre", "Genre"),
+    ("category", "Category"),
+    ("author", "Author"),
+    ("decade", "Decade"),
+    ("has_cover", "Cover"),
+)
+LANDING_FACET_ITEMS: Final = 8
+# Query parameter each facet's links set on `/library/books/`.
+FACET_FILTER_PARAMS: Final[dict[str, str]] = {
+    "format": "format",
+    "language": "language",
+    "genre": "genre_id",
+    "category": "category_id",
+    "author": "author_id",
+    "decade": "decade",
+    "has_cover": "has_cover",
+}
+
+
+def _facet_label(facet: str, item: search.FacetCount) -> str:
+    if facet == "format":
+        return item.value.upper()
+    if facet == "language":
+        return item.value.upper() if len(item.value) <= 3 else item.value
+    if facet == "decade":
+        return f"{item.value}s"
+    if facet == "has_cover":
+        return "With cover" if item.value == "true" else "Without cover"
+    return item.value
+
+
+def _facet_links(facets: dict[str, list[search.FacetCount]]) -> list[dict[str, Any]]:
+    """Sidebar groups for the template; facets without values are hidden (#50)."""
+    groups = []
+    for facet, heading in LANDING_FACETS:
+        items = facets.get(facet, [])[:LANDING_FACET_ITEMS]
+        if not items:
+            continue
+        param = FACET_FILTER_PARAMS[facet]
+        groups.append(
+            {
+                "name": facet,
+                "heading": heading,
+                "items": [
+                    {
+                        "label": _facet_label(facet, item),
+                        "count": item.count,
+                        "query": urlencode({"view": "html", param: item.filter_key}),
+                    }
+                    for item in items
+                ],
+            }
+        )
+    return groups
+
+
+def _language_shelf_ids(
+    languages: list[search.FacetCount],
+) -> list[tuple[str, str, list[int]]]:
+    """ "New in <language>" shelves, cached with the global facets.
+
+    The most common language is skipped: its shelf would mostly repeat "Recently
+    added". The next two get a shelf when the library has more than one language.
+    """
+    cached = cache.get(search.LANGUAGE_SHELVES_CACHE_KEY)
+    if cached is not None:
+        return list(cached)
+    shelves = [
+        (item.value, item.filter_key, search.newest_book_ids(limit=SHELF_SIZE, language=item.value))
+        for item in languages[1:3]
+    ]
+    cache.set(search.LANGUAGE_SHELVES_CACHE_KEY, shelves, search.GLOBAL_CACHE_SECONDS)
+    return shelves
+
+
+def _shelf_books(book_ids: list[int]) -> dict[int, Book]:
+    """Shelf cards need title, authors and the cover thumbnail: two queries in all."""
+    if not book_ids:
+        return {}
+    # Raw-scan books (#127) never appear on a shelf, whatever the id source.
+    return thumbnails_module.with_thumbnail_refs(
+        library_visibility.visible_books().prefetch_related("authors")
+    ).in_bulk(book_ids)
+
+
+def _library_landing_context() -> dict[str, Any]:
+    """Search-first landing page (#28 Q1): search box, global facets, shelves, indexes.
+
+    Global facet counts, the total and the language shelves come from a
+    five-minute cache; "Recently added" and "Recently identified" are live.
+    """
+    facets = search.global_facets([facet for facet, _heading in LANDING_FACETS])
+    recent_ids = search.newest_book_ids(limit=SHELF_SIZE)
+    identified_ids = search.recently_identified_book_ids(limit=SHELF_SIZE)
+    language_shelves = _language_shelf_ids(facets.get("language", []))
+    books = _shelf_books(
+        list(
+            dict.fromkeys(
+                [
+                    *recent_ids,
+                    *identified_ids,
+                    *(i for _l, _k, ids in language_shelves for i in ids),
+                ]
+            )
+        )
+    )
+
+    def cards(ids: list[int]) -> list[dict[str, Any]]:
+        return [_shelf_card(books[book_id]) for book_id in ids if book_id in books]
+
+    shelves: list[dict[str, Any]] = [
+        {
+            "id": "recently-added",
+            "title": "Recently added",
+            "books": cards(recent_ids),
+            "see_all": urlencode({"view": "html", "sort": "-created_at"}),
+        },
+        {
+            "id": "recently-identified",
+            "title": "Recently identified",
+            "books": cards(identified_ids),
+            "see_all": None,
+        },
+    ]
+    for value, key, ids in language_shelves:
+        shelves.append(
+            {
+                "id": f"new-in-{key}",
+                "title": f"New in {value.upper() if len(value) <= 3 else value}",
+                "books": cards(ids),
+                "see_all": urlencode({"view": "html", "language": key, "sort": "-created_at"}),
+            }
+        )
+    return {
+        "book_count": (total := search.total_books()),
+        "book_count_display": f"{total:,}",
+        "facet_groups": _facet_links(facets),
+        "shelves": [shelf for shelf in shelves if shelf["books"]],
+        "letters": AUTHOR_INDEX_LETTERS,
+    }
+
+
+def _shelf_card(book: Book) -> dict[str, Any]:
+    return {
+        "id": book.id,
+        "title": book.title,
+        "authors": [author.full_name for author in book.authors.all()],
+        "year": book.published_year,
+        "cover_image": _cover_image_payload(book),
+    }
+
+
+def _cover_image_payload(book: Book) -> dict[str, Any] | None:
+    """What an `<img>` for the front cover needs: thumbnail srcset or the full cover.
+
+    Thumbnails come from the `with_thumbnail_refs` annotation of the list query,
+    so rendering never queries per book. Without a current thumbnail (not yet
+    generated, or the cover could not be decoded) the full cover is used.
+    """
+    if not book.front_cover_id:
+        return None
+    refs = thumbnails_module.annotated_thumbnails(book) or {}
+    medium = refs.get(CoverThumbnail.Size.MEDIUM)
+    small = refs.get(CoverThumbnail.Size.SMALL)
+    primary = medium or small
+    if primary is None:
+        return {
+            "src": f"/library/books/{book.id}/covers/front/",
+            "srcset": "",
+            "width": 240,
+            "height": 320,
+            "thumbnail": False,
+        }
+    return {
+        "src": primary.url,
+        "small_src": (small or primary).url,
+        "srcset": ", ".join(f"{ref.url} {ref.width}w" for ref in (small, medium) if ref),
+        "width": primary.width,
+        "height": primary.height,
+        "thumbnail": True,
+    }
+
+
+AUTHOR_INDEX_LETTERS: Final = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+AUTHOR_INDEX_PAGE_SIZE: Final = 60
+
+
+@require_GET
+@login_required
+def library_authors(request: HttpRequest) -> HttpResponseBase:
+    """Author A-Z index (#28 Q1): authors with books, keyset-paginated by name."""
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    letter = request.GET.get("letter", "").strip()[:1].upper()
+    if letter and letter not in AUTHOR_INDEX_LETTERS:
+        letter = ""
+    page_size = min(_as_positive_int(request.GET.get("page_size"), AUTHOR_INDEX_PAGE_SIZE), 200)
+    try:
+        page = search.author_index_page(
+            letter=letter,
+            cursor=request.GET.get("cursor", "").strip(),
+            page_size=page_size,
+        )
+    except search.InvalidCursorError:
+        return JsonResponse({"detail": "invalid_cursor"}, status=400)
+
+    def page_url(cursor: str | None) -> str | None:
+        if not cursor:
+            return None
+        params = {"cursor": cursor}
+        if _wants_html(request):
+            params["view"] = "html"
+        if "page_size" in request.GET:
+            params["page_size"] = str(page_size)
+        return f"?{urlencode(params)}"
+
+    if _wants_html(request):
+        return render(
+            request,
+            "core/library_authors.html",
+            {
+                "authors": page.authors,
+                "letter": letter,
+                "letters": AUTHOR_INDEX_LETTERS,
+                "next_url": page_url(page.next_cursor),
+                "previous_url": page_url(page.previous_cursor),
+            },
+        )
+    return JsonResponse(
+        {
+            "items": [
+                {"id": entry.id, "name": entry.name, "book_count": entry.book_count}
+                for entry in page.authors
+            ],
+            "next_cursor": page.next_cursor,
+            "previous_cursor": page.previous_cursor,
+        }
+    )
+
+
+_SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@require_GET
+@login_required
+def library_cover_thumbnail(request: HttpRequest, sha256: str, size: str) -> HttpResponseBase:
+    """A content-addressed cover thumbnail, cacheable forever by the member's browser.
+
+    The permission check always runs here. With
+    `BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX` set, nginx sends the bytes
+    (`X-Accel-Redirect` to an `internal` location) instead of a Python worker.
+    """
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    if size not in thumbnails_module.THUMBNAIL_WIDTHS or not _SHA256_RE.fullmatch(sha256):
+        return HttpResponseNotFound()
+    thumbnail = (
+        CoverThumbnail.objects.select_related("storage_location")
+        .filter(sha256=sha256, size=size)
+        .first()
+    )
+    if thumbnail is None:
+        return HttpResponseNotFound("thumbnail not available")
+
+    etag = f'"{thumbnail.sha256}"'
+    headers = {
+        "Cache-Control": thumbnails_module.IMMUTABLE_CACHE_CONTROL,
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if etag in request.headers.get("If-None-Match", ""):
+        not_modified = HttpResponse(status=304)
+        for name, value in headers.items():
+            not_modified[name] = value
+        return not_modified
+
+    accel_prefix = str(
+        getattr(django_settings, "BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX", "") or ""
+    )
+    response: HttpResponseBase
+    if accel_prefix:
+        response = HttpResponse(content_type=thumbnail.mime_type)
+        response["X-Accel-Redirect"] = f"{accel_prefix.rstrip('/')}/{thumbnail.storage_identifier}"
+    else:
+        try:
+            storage = backend_for_location(thumbnail.storage_location)
+            stream = storage.open(thumbnail.storage_identifier)
+        except StorageConfigurationError:
+            return HttpResponse("thumbnail storage unavailable", status=503)
+        except FileNotFoundError:
+            return HttpResponseNotFound("thumbnail missing")
+        except OSError:
+            return HttpResponse("storage unavailable", status=503)
+        response = FileResponse(stream, as_attachment=False, content_type=thumbnail.mime_type)
+        response["Content-Length"] = str(thumbnail.size_bytes)
+    for name, value in headers.items():
+        response[name] = value
+    return response
 
 
 # Attribute that `_book_list_prefetches` fills with the book's COMPLETE variants.
@@ -1488,8 +1803,10 @@ def _book_list_prefetches() -> list[str | Prefetch[Any]]:
         "genres",
         Prefetch(
             "file_variants",
-            queryset=FileVariant.objects.filter(
-                processing_state=FileVariant.ProcessingState.COMPLETE,
+            queryset=library_visibility.without_pending_scan_variants(
+                FileVariant.objects.filter(
+                    processing_state=FileVariant.ProcessingState.COMPLETE,
+                )
             ).only("id", "book_id", "format", "processing_state"),
             to_attr=_COMPLETE_VARIANTS_ATTR,
         ),
@@ -1502,11 +1819,27 @@ def _complete_variants(book: Book) -> list[FileVariant]:
         return prefetched
     # `.all()` reuses a plain `file_variants` prefetch when there is one; a
     # `.filter()` here would bypass it and cost one query per book (#28).
+    variants = list(book.file_variants.all())
+    hidden = _pending_scan_variant_ids(book, variants)
     return [
         variant
-        for variant in book.file_variants.all()
+        for variant in variants
         if variant.processing_state == FileVariant.ProcessingState.COMPLETE
+        and variant.id not in hidden
     ]
+
+
+def _pending_scan_variant_ids(book: Book, variants: list[FileVariant]) -> set[int]:
+    """Cleaned variants of ``book`` built by a scan job that is not finished (#127)."""
+    cleaned = {
+        variant.id for variant in variants if variant.source_type == FileVariant.SourceType.CLEANED
+    }
+    if not cleaned:
+        return set()
+    shown = library_visibility.without_pending_scan_variants(
+        FileVariant.objects.filter(pk__in=cleaned)
+    ).values_list("id", flat=True)
+    return cleaned - set(shown)
 
 
 def _serialize_book(
@@ -1515,7 +1848,7 @@ def _serialize_book(
     include_variants: bool = False,
     include_conversion_options: bool = False,
 ) -> dict[str, Any]:
-    book_payload = {
+    book_payload: dict[str, Any] = {
         "id": book.id,
         "title": book.title,
         "subtitle": book.subtitle,
@@ -1537,6 +1870,11 @@ def _serialize_book(
 
     if book.front_cover_id and book.front_cover is not None:
         book_payload["cover_front"] = _serialize_cover(book.front_cover)
+        refs = thumbnails_module.annotated_thumbnails(book)
+        if refs is not None:  # list queries annotate the current thumbnails (#28)
+            book_payload["cover_front"]["thumbnails"] = {
+                size: ref.url for size, ref in refs.items()
+            }
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
@@ -1614,6 +1952,66 @@ _LIBRARY_FILTER_PARAMS: Final = (
 )
 
 
+def _optional_id(raw: str | None) -> int | None:
+    value = (raw or "").strip()
+    return int(value) if value.isdigit() and 0 < len(value) <= 18 else None
+
+
+def _optional_decade(raw: str | None) -> int | None:
+    value = (raw or "").strip().removesuffix("s")
+    if not value.isdigit() or len(value) > 4:
+        return None
+    return (int(value) // 10) * 10
+
+
+def _optional_flag(raw: str | None) -> bool | None:
+    value = (raw or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    return None
+
+
+def _active_filter_chips(
+    request: HttpRequest, search_request: search.SearchRequest
+) -> list[dict[str, str]]:
+    """Removable labels for the filters in effect (one name query per entity filter)."""
+    chips: list[tuple[str, str, str]] = []
+    for param, label, value in (
+        ("q", "Search", search_request.query),
+        ("title", "Title", search_request.title),
+        ("author", "Author", search_request.author),
+        ("category", "Category", search_request.category),
+        ("genre", "Genre", search_request.genre),
+        ("language", "Language", search_request.language),
+        ("format", "Format", search_request.book_format.upper()),
+    ):
+        if value:
+            chips.append((param, label, f"{label}: {value}"))
+    for param, label, model, field_name, entity_id in (
+        ("author_id", "Author", Author, "full_name", search_request.author_id),
+        ("genre_id", "Genre", Genre, "name", search_request.genre_id),
+        ("category_id", "Category", Category, "name", search_request.category_id),
+    ):
+        if entity_id is not None:
+            name = model.objects.filter(pk=entity_id).values_list(field_name, flat=True).first()
+            chips.append((param, label, f"{label}: {name or 'unknown'}"))
+    if search_request.decade is not None:
+        chips.append(("decade", "Decade", f"Decade: {search_request.decade}s"))
+    if search_request.has_cover is not None:
+        chips.append(
+            ("has_cover", "Cover", "With cover" if search_request.has_cover else "Without cover")
+        )
+    result = []
+    for param, name, text in chips:
+        params = request.GET.copy()
+        for dropped in (param, "cursor", "page"):
+            params.pop(dropped, None)
+        result.append({"label": text, "name": name.lower(), "remove_url": f"?{params.urlencode()}"})
+    return result
+
+
 def _library_search_request(request: HttpRequest) -> search.SearchRequest:
     raw_page = request.GET.get("page")
     page_size = min(_as_positive_int(request.GET.get("page_size"), 25), 100)
@@ -1628,6 +2026,11 @@ def _library_search_request(request: HttpRequest) -> search.SearchRequest:
         genre=filters["genre"],
         language=filters["language"],
         book_format=filters["book_format"],
+        author_id=_optional_id(request.GET.get("author_id")),
+        genre_id=_optional_id(request.GET.get("genre_id")),
+        category_id=_optional_id(request.GET.get("category_id")),
+        decade=_optional_decade(request.GET.get("decade")),
+        has_cover=_optional_flag(request.GET.get("has_cover")),
         sort=request.GET.get("sort", "").strip(),
         cursor=request.GET.get("cursor", "").strip(),
         page=_as_positive_int(raw_page, 1) if raw_page is not None else None,
@@ -1682,11 +2085,11 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         result = backend.search(search_request)
     except search.InvalidCursorError:
         return JsonResponse({"detail": "invalid_cursor"}, status=400)
-    books_by_id = (
-        Book.objects.select_related("front_cover", "back_cover")
+    books_by_id = thumbnails_module.with_thumbnail_refs(
+        library_visibility.visible_books()
+        .select_related("front_cover", "back_cover")
         .prefetch_related(*_book_list_prefetches())
-        .in_bulk(result.book_ids)
-    )
+    ).in_bulk(result.book_ids)
     serialized = [
         _serialize_book(books_by_id[book_id], include_variants=False)
         for book_id in result.book_ids
@@ -1698,7 +2101,9 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         if name.strip() in search.FACETS
     ]
     facet_payload = {
-        name: [{"value": item.value, "count": item.count} for item in counts]
+        name: [
+            {"value": item.value, "count": item.count, "key": item.filter_key} for item in counts
+        ]
         for name, counts in (
             backend.facet_counts(search_request, requested_facets).items()
             if requested_facets
@@ -1716,11 +2121,19 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         duration_ms=round((time.perf_counter() - started) * 1000, 1),
     )
     if _wants_html(request):
+        for book_payload in serialized:
+            book_payload["cover_image"] = _cover_image_payload(books_by_id[book_payload["id"]])
         return render(
             request,
             "core/library_books.html",
             {
                 "books": serialized,
+                "active_filters": _active_filter_chips(request, search_request),
+                "hidden_filters": [
+                    (param, request.GET[param])
+                    for param in ("author_id", "genre_id", "category_id", "decade", "has_cover")
+                    if request.GET.get(param, "").strip()
+                ],
                 "count": result.count,
                 "fuzzy": result.fuzzy,
                 "page_number": result.page,
@@ -1765,15 +2178,19 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
     if profile is None:
         return HttpResponseForbidden()
     try:
-        book = Book.objects.prefetch_related(
-            "authors",
-            "categories",
-            "genres",
-            "identifiers",
-            "file_variants",
-            "front_cover",
-            "back_cover",
-        ).get(pk=book_id)
+        book = (
+            library_visibility.visible_books()
+            .prefetch_related(
+                "authors",
+                "categories",
+                "genres",
+                "identifiers",
+                "file_variants",
+                "front_cover",
+                "back_cover",
+            )
+            .get(pk=book_id)
+        )
     except Book.DoesNotExist:
         return HttpResponseNotFound()
 
@@ -1818,36 +2235,31 @@ def library_book_download(
         return HttpResponseForbidden()
 
     try:
-        book = Book.objects.prefetch_related("file_variants__storage_location").get(pk=book_id)
+        book = (
+            library_visibility.visible_books()
+            .prefetch_related("file_variants__storage_location")
+            .get(pk=book_id)
+        )
     except Book.DoesNotExist:
         return HttpResponseNotFound()
+    servable = library_visibility.library_variants(
+        book.file_variants.filter(processing_state=FileVariant.ProcessingState.COMPLETE)
+    )
 
     variant = None
     variant_id = request.GET.get("variant_id")
     requested_format = request.GET.get("format", "").strip()
     if variant_id:
         try:
-            variant = book.file_variants.get(
-                pk=int(variant_id),
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            )
+            variant = servable.get(pk=int(variant_id))
         except (ValueError, FileVariant.DoesNotExist):
             return HttpResponseBadRequest("variant_id invalid")
     elif requested_format:
-        variant = (
-            book.file_variants.filter(
-                format__iexact=requested_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            )
-            .order_by("id")
-            .first()
-        )
+        variant = servable.filter(format__iexact=requested_format).order_by("id").first()
     if variant is None and requested_format:
         return HttpResponseNotFound("requested format not available")
     if variant is None:
-        variant = book.file_variants.filter(
-            processing_state=FileVariant.ProcessingState.COMPLETE,
-        ).first()
+        variant = servable.order_by("id").first()
 
     if variant is None:
         return HttpResponseNotFound("variant not available")
@@ -1890,6 +2302,7 @@ def library_book_cover(
     try:
         cover = CoverImage.objects.select_related("storage_location").get(
             book_id=book_id,
+            book__in=library_visibility.visible_books(),
             position=position,
         )
     except CoverImage.DoesNotExist:
@@ -2212,7 +2625,7 @@ def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
 
 def _scan_job_transition_allowed(job: ScanJob, target_state: str) -> bool:
     if target_state == ScanJob.State.CANCELLED:
-        return job.state in {ScanJob.State.OPEN, ScanJob.State.CAPTURING, ScanJob.State.PAUSED}
+        return job.state in scan_lifecycle.PROCESSING_STATES
     if target_state == ScanJob.State.PAUSED:
         return job.state in {ScanJob.State.OPEN, ScanJob.State.CAPTURING}
     if target_state == ScanJob.State.CAPTURING:
@@ -2522,7 +2935,7 @@ def scan_job_workspace(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     try:
@@ -2531,12 +2944,14 @@ def scan_job_workspace(
         return HttpResponseNotFound()
 
     pages = _serialize_workspace_pages(job)
+    opf_metadata = scanner_opf.display_metadata(job)
     payload = {
         "job_id": str(job.id),
         "state": job.state,
         "pages": pages,
         "count": len(pages),
         "stage_order": list(scantailor.stage_order()),
+        "metadata_opf": opf_metadata,
     }
     if _wants_html(request):
         stage_navigation = [
@@ -2546,7 +2961,12 @@ def scan_job_workspace(
         return render(
             request,
             "core/scan_workspace.html",
-            {"job": job, "pages": pages, "stage_navigation": stage_navigation},
+            {
+                "job": job,
+                "pages": pages,
+                "stage_navigation": stage_navigation,
+                "opf_metadata": opf_metadata,
+            },
         )
     return JsonResponse(payload)
 
@@ -2558,7 +2978,7 @@ async def scan_job_workspace_events(
     job_id: str,
 ) -> HttpResponseBase:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     initial_payload = await sync_to_async(
@@ -2614,7 +3034,7 @@ def scan_page_stages(
     page_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     try:
@@ -2642,7 +3062,7 @@ def scan_page_stage(
     page_id: str,
     stage: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     profile = _active_library_profile(request)
@@ -2675,11 +3095,7 @@ def scan_page_stage(
         )
         return JsonResponse(_serialize_workspace_page(page))
 
-    if page.scan_job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
 
     payload = _request_payload(request)
@@ -2719,7 +3135,7 @@ def scan_job_stage_batch(
     job_id: str,
     stage: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     profile = _active_library_profile(request)
@@ -2734,11 +3150,7 @@ def scan_job_stage_batch(
         job = ScanJob.objects.prefetch_related("pages").get(pk=job_id)
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    if job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
 
     payload = _json_body(request)
@@ -2820,7 +3232,7 @@ def scan_page_stage_preview(
     page_id: str,
     stage: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
     normalized_stage = _normalize_stage(stage)
     if normalized_stage is None:
@@ -2876,6 +3288,7 @@ def scan_jobs(
             ScanJob.State.OPEN,
             ScanJob.State.CAPTURING,
             ScanJob.State.PAUSED,
+            ScanJob.State.CAPTURED,
             ScanJob.State.FINALIZING,
         ]
         queryset = _scan_job_queryset(with_open_todo_count=include_open_todos)
@@ -2963,7 +3376,7 @@ def scan_job_detail(
     job_id: str,
 ) -> HttpResponseBase:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = (
@@ -2976,7 +3389,9 @@ def scan_job_detail(
         )
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    return JsonResponse(_scan_job_payload(job))
+    payload = _scan_job_payload(job)
+    payload["logs"] = scan_logs.serialize_job_logs(job)
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -2985,7 +3400,7 @@ def scan_job_todos(
     request: HttpRequest,
     job_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     profile = _active_library_profile(request)
@@ -3021,7 +3436,7 @@ def scan_job_ocr_request(
     request: HttpRequest,
     job_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3059,7 +3474,7 @@ def scan_job_identification_request(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3167,11 +3582,7 @@ def scan_page_request_rescan(
         page = ScanPage.objects.select_related("scan_job").get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    if page.scan_job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if page.scan_job.state not in scan_lifecycle.RESCAN_STATES:
         return HttpResponseBadRequest("scan job is not accepting rescan requests")
 
     payload = _scan_page_request_payload(request)
@@ -3216,13 +3627,58 @@ def scan_page_request_rescan(
     )
 
 
+@require_http_methods(["GET", "POST"])
+@scan_api_login_required
+def upload_scan_log(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """List a scan job's scanner logs (GET) or upload one (POST, processed by a worker).
+
+    POST only stages the bounded upload and queues a ``scan_log`` processing job
+    (202); hashing and storing happen on a worker. The log's ``state`` (``queued``,
+    ``stored``, ``duplicate``, ``failed``) is reported here and on the scan job.
+    """
+    if _coerce_uuid(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ScanJob.objects.get(pk=job_id)
+    except (ScanJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if request.method == "GET":
+        return JsonResponse({"job_id": str(job.id), "logs": scan_logs.serialize_job_logs(job)})
+    if job.state == ScanJob.State.CANCELLED:
+        return HttpResponseBadRequest("job cancelled")
+    uploaded_file = request.FILES.get("file")
+    if uploaded_file is None:
+        return HttpResponseBadRequest("missing_file")
+    try:
+        log = scan_logs.stage_scan_log(job, uploaded_file, profile.user_id)
+    except scan_logs.ScanLogError as exc:
+        return HttpResponseBadRequest(str(exc))
+    except scan_logs.ScanLogDispatchError:
+        logger.exception("scan log dispatch failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "queue unavailable", "retryable": True}, status=503)
+    except OSError:
+        logger.exception("scan log staging failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "storage unavailable", "retryable": True}, status=503)
+    return JsonResponse(
+        {
+            "job_id": str(job.id),
+            "log": scan_logs.serialize_scan_log(log),
+            "status_url": reverse("scan-job-upload-log", args=[job.id]),
+        },
+        status=202,
+    )
+
+
 @require_POST
 @scan_api_login_required
 def upload_scan_page(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3330,11 +3786,7 @@ def scan_page(
     scanner_metadata = _normalize_scanner_metadata(payload.get("scanner_metadata"))
     job = page.scan_job
 
-    if job.state not in {
-        ScanJob.State.OPEN,
-        ScanJob.State.CAPTURING,
-        ScanJob.State.PAUSED,
-    }:
+    if job.state not in scan_lifecycle.RESCAN_STATES:
         return HttpResponseBadRequest("job not accepting pages")
 
     try:
@@ -3347,6 +3799,7 @@ def scan_page(
             scanner_metadata=scanner_metadata,
             capture_timestamp=capture_timestamp,
             requested_checksum=requested_checksum,
+            accepting_states=scan_lifecycle.RESCAN_STATES,
         )
     except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
@@ -3488,6 +3941,54 @@ def scan_page_thumbnail(
     return response
 
 
+@require_GET
+@login_required
+def scan_job_portal_link(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """``/j/<job_id>`` (contract §9): the scanner's QR code. Login, then the workspace.
+
+    It answers as soon as the job is registered (§8.4); an unknown ID is a 404.
+    """
+    if normalize_scan_job_id(job_id) is None:
+        return HttpResponseNotFound()
+    if _active_library_profile(request) is None:
+        return HttpResponseForbidden()
+    if not ScanJob.objects.filter(pk=job_id).exists():
+        return HttpResponseNotFound()
+    return redirect(reverse("scan-job-workspace", kwargs={"job_id": job_id}) + "?view=html")
+
+
+@require_GET
+@scan_api_login_required
+def raw_scans(request: HttpRequest) -> HttpResponseBase:
+    """Portal list of raw scans (``captured``, contract §9): not in the library yet."""
+    if _active_library_profile(request) is None:
+        return HttpResponseForbidden()
+    summaries = scan_lifecycle.raw_scan_summaries()
+    if _wants_html(request):
+        return render(request, "core/raw_scans.html", {"summaries": summaries})
+    return JsonResponse(
+        {
+            "items": [
+                {
+                    "job_id": str(summary.job.pk),
+                    "title": summary.title,
+                    "page_count": summary.page_count,
+                    "open_rescans": summary.open_rescans,
+                    "refinish_needed": summary.refinish_needed,
+                    "completeness": summary.completeness,
+                    "metadata": summary.metadata,
+                    "scanner_id": summary.job.scanner_id,
+                    "captured_at": (
+                        summary.job.captured_at.isoformat() if summary.job.captured_at else None
+                    ),
+                }
+                for summary in summaries
+            ],
+            "count": len(summaries),
+        }
+    )
+
+
 @require_POST
 @scan_api_login_required
 def scan_job_pause(
@@ -3495,7 +3996,7 @@ def scan_job_pause(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)
@@ -3514,7 +4015,7 @@ def scan_job_resume(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)
@@ -3532,7 +4033,7 @@ def scan_job_finish(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3542,6 +4043,10 @@ def scan_job_finish(
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
+    if job.book_id is None and job.state in scan_lifecycle.PROCESSING_STATES:
+        # S6 (#130) links from the job's OPF here; without a linker (or when it
+        # finds nothing to link) scan identification and the review queue run.
+        scan_lifecycle.link_book_for_finish(job)
     if job.book_id is None:
         try:
             identification_job = scan_identification.request_scan_identification(
@@ -3656,7 +4161,7 @@ def scan_job_cancel(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)
@@ -3748,6 +4253,22 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
     if _wants_html(request):
         return redirect("imports-status", job_id=job.id)
     return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
+
+
+@require_GET
+@login_required
+def intake_progress_view(request: HttpRequest) -> HttpResponseBase:
+    """Admin page: how much is still left to import, per source, uploads and scanner.
+
+    Database aggregates only (``core.intake_progress``); nothing is scanned or hashed.
+    """
+    profile = _active_library_profile(request)
+    if profile is None or not profile.is_admin():
+        return HttpResponseForbidden()
+    progress = intake_progress.intake_progress()
+    if _wants_html(request):
+        return render(request, "core/intake_progress.html", {"progress": progress})
+    return JsonResponse(progress)
 
 
 @require_GET
@@ -4095,6 +4616,24 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         else None
     )
     payload["failed_search_error"] = search_context["failed_search_error"]
+    scanner_opf_review = scanner_opf.review_context(task)
+    payload["scanner_opf"] = (
+        {
+            "kind": scanner_opf_review["kind"],
+            "rows": scanner_opf_review.get("rows", []),
+            "preselected": scanner_opf_review.get("preselected"),
+            "reason": scanner_opf_review.get("reason"),
+            # Send back with action=resolve; a review whose evidence changed is rejected.
+            "revision": scanner_opf_review.get("revision"),
+            "open": scanner_opf_review.get("open"),
+            "obsolete": scanner_opf_review.get("obsolete"),
+            "possible_duplicate_book_ids": [
+                book.pk for book in scanner_opf_review.get("duplicates", [])
+            ],
+        }
+        if scanner_opf_review is not None
+        else None
+    )
     isbn_lookup = search_context["isbn_lookup"]
     payload["isbn_lookup"] = (
         {
@@ -4128,6 +4667,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "books": Book.objects.order_by("title")[:250],
                 "llm_panel": llm_panel,
                 "llm_candidate_ids": _llm_candidate_ids(task),
+                "scanner_opf_review": scanner_opf_review,
                 **search_context,
             },
         )
@@ -4869,6 +5409,73 @@ def review_manual_entry(
             "book_id": str(book.id),
             "variant_id": str(variant.id) if variant is not None else None,
         },
+    )
+
+
+@require_POST
+@login_required
+def review_scanner_opf(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Scanner-OPF review actions (#130).
+
+    ``action=resolve`` with ``choice`` decides a metadata conflict (provider record vs
+    scanner OPF: ``scanner``/``provider``; hand-edited field vs OPF:
+    ``current``/``scanner``). ``action=create_book`` creates a Book from the scanner's
+    OPF for a scan that finish handed to identification (ambiguous ISBN, likely
+    duplicate).
+    """
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return HttpResponseForbidden()
+    try:
+        task = ReviewTask.objects.select_related("scan_job").get(pk=task_id)
+    except (ReviewTask.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    payload = _request_payload(request)
+    action = str(payload.get("action") or "")
+    try:
+        if action == "resolve":
+            revision = str(payload.get("revision") or "")
+            if not revision:
+                return HttpResponseBadRequest(
+                    "revision is required: send the scanner_opf.revision of the review you "
+                    "decided on"
+                )
+            book = scanner_opf.resolve_conflict(
+                task,
+                choice=str(payload.get("choice") or ""),
+                user=profile.user,
+                revision=revision,
+            )
+        elif action == "create_book":
+            book = scanner_opf.create_book_from_review(task, user=profile.user)
+            contributions.record_review_resolution(task)
+        else:
+            return HttpResponseBadRequest("action must be resolve or create_book")
+    except scanner_opf.StaleReview as exc:
+        # The decision was made on evidence that no longer applies: reject it and show
+        # the refreshed review (form error on the page, 409 for API clients).
+        if _wants_html(request):
+            messages.error(request, str(exc))
+            return redirect("review-detail", task_id=task.id)
+        task.refresh_from_db()
+        context = scanner_opf.review_context(task)
+        return JsonResponse(
+            {
+                "task_id": str(task.id),
+                "error": str(exc),
+                "state": task.state,
+                "revision": context["revision"] if context is not None else None,
+            },
+            status=409,
+        )
+    except scanner_opf.ScannerOpfError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "book_id": str(book.pk), "state": ReviewTask.State.RESOLVED},
+        task_id=task.id,
     )
 
 

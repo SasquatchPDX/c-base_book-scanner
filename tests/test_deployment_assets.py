@@ -113,6 +113,29 @@ def test_scanner_tls_front_end_is_tls13_only_and_fails_closed() -> None:
     assert "return" not in root_location.group(1)
 
 
+THUMBNAIL_LOCATION = re.compile(r"location /_protected/cover-thumbnails/ \{(?P<body>[^}]*)\}")
+
+
+def test_both_front_ends_serve_cover_thumbnails_internally() -> None:
+    """X-Accel-Redirect for cover thumbnails (#28) works through either front end."""
+    expected = [
+        "internal;",
+        "alias /var/lib/book-scanner/cover-thumbnails/;",
+        "access_log off;",
+        "add_header X-Content-Type-Options nosniff always;",
+    ]
+    for name in ("book-scanner.conf", "serif-lan-tls.conf"):
+        bodies = THUMBNAIL_LOCATION.findall(_nginx_directives(name))
+        assert len(bodies) == 1, name
+        lines = [line.strip() for line in bodies[0].splitlines() if line.strip()]
+        assert lines == expected, name
+    # Only the TLS server of the scanner front end proxies the application.
+    servers = _server_blocks(_nginx_directives("serif-lan-tls.conf"))
+    with_thumbnails = [server for server in servers if THUMBNAIL_LOCATION.search(server)]
+    assert len(with_thumbnails) == 1
+    assert re.search(r"listen \S*443 ssl;", with_thumbnails[0])
+
+
 EVENT_STREAM_LOCATION = re.compile(r'location ~ "(?P<regex>[^"]*/workspace/events/\$)" \{')
 STREAM_JOB_IDS = (
     "3f2b8c1e-9d4a-4b6f-a1c2-0e5d7f9a8b3c",  # web job (UUID)
