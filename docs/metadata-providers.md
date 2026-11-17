@@ -172,6 +172,22 @@ next search fails it and starts a new one. New terms submitted while a search is
 queued replace its terms; while one is running they are saved and the reviewer is
 asked to search again once it finishes (HTTP 409 for API clients).
 
+### ISBN lookup from the review page (#59)
+
+"Look up by ISBN" (`POST /reviews/<id>/isbn-lookup/`, field `isbn`) queues the
+same background search with ISBN-only signals: no title, author or folder
+fallback, and the task's saved title/author terms are left alone. The value must
+be one ISBN-10/13 with a valid check digit (spaces, hyphens and an `ISBN:` prefix
+are ignored). The run is recorded with `query.mode = "isbn"`.
+
+The typed ISBN is never trusted on its own (external verification is
+mandatory): a candidate counts as *ISBN verified* only when a provider returned a
+record carrying that ISBN in either form. If all verified records name the same
+title, the page offers "Accept ISBN match" for the best one. If they name
+different titles, the reviewer is asked to compare them. If none is verified, or
+providers failed, the task stays open with its earlier candidates. Nothing is
+accepted automatically; accepting still goes through the normal candidate flow.
+
 ## Subject / genre evidence
 
 Subject tags are captured as evidence only; they do not affect candidate scoring and

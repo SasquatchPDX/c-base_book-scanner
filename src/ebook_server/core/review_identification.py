@@ -173,6 +173,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
     task: ReviewTask | None = None
+    mode = "text"
     signals: identification.IdentificationInput | None = None
     outcomes: list[identification.ProviderOutcome] | None = None
     search_started_at = timezone.now()
@@ -183,7 +184,12 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
         import_job = task.import_job
         if import_job is None:
             raise ReviewIdentificationError("review task is not for an import")
-        signals = _review_signals(task, import_job, details.get("terms"))
+        terms = details.get("terms")
+        if metadata_search.is_isbn_terms(terms):
+            mode = "isbn"
+            signals = metadata_search.isbn_signals(str(terms["isbn"]))
+        else:
+            signals = _review_signals(task, import_job, terms)
         candidates, outcomes = identification.resolve_candidates_with_report(signals)
         with transaction.atomic():
             search = metadata_search.record_search(
@@ -195,6 +201,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
                 processing_job_id=processing_job.job_id,
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
+                mode=mode,
             )
             metadata_search.save_candidates(
                 search=search,
@@ -262,6 +269,7 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
                 exc=exc,
+                mode=mode,
             )
         logger.exception(
             "review_identification_failed",
@@ -282,6 +290,7 @@ def _record_failed_search(
     requested_by_id: int | None,
     started_at: datetime,
     exc: Exception,
+    mode: str,
 ) -> None:
     stage = "saving the results failed" if outcomes is not None else "the search failed"
     try:
@@ -294,6 +303,7 @@ def _record_failed_search(
             requested_by_id=requested_by_id,
             started_at=started_at,
             error=f"{stage}: {type(exc).__name__}",
+            mode=mode,
         )
     except Exception:  # never mask the original failure
         logger.exception(

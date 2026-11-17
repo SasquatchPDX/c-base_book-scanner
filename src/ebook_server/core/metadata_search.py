@@ -10,9 +10,10 @@ staleness window), never from a status flag a killed worker could leave behind.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, TypeGuard
 
 from django.contrib.auth.models import AbstractBaseUser
 from django.db import models as django_models
@@ -93,12 +94,95 @@ def task_terms(task: ReviewTask) -> dict[str, Any]:
     }
 
 
-def query_payload(signals: identification.IdentificationInput) -> dict[str, Any]:
+def query_payload(
+    signals: identification.IdentificationInput,
+    *,
+    mode: str = "text",
+) -> dict[str, Any]:
     """The terms actually sent to providers, as shown to reviewers."""
     return {
+        "mode": mode,
         "title_hints": list(signals.title_hints[:3]),
         "author": signals.best_author(),
-        "isbns": list(signals.isbns[:1]),
+        # The first ISBN is the one queried; an ISBN lookup also lists its other form,
+        # which counts when verifying a returned record.
+        "isbns": list(signals.isbns[:2] if mode == "isbn" else signals.isbns[:1]),
+    }
+
+
+# ------------------------------------------------------------------- ISBN lookup
+
+
+def parse_isbn(raw: Any) -> str | None:
+    """The single valid ISBN-10/13 a reviewer typed, normalized, or ``None``.
+
+    Spaces and hyphens are ignored; the check digit must be valid. Several ISBNs
+    in one field are rejected rather than guessed between.
+    """
+    if not isinstance(raw, str):
+        return None
+    compact = re.sub(r"[\s\-\u2010-\u2015]", "", raw)
+    compact = re.sub(r"^isbn(?:1[03])?:?", "", compact, flags=re.IGNORECASE)
+    if not compact or len(compact) > 13:
+        return None
+    values = identification.normalize_isbns(compact)
+    return values[0] if values else None
+
+
+def isbn_terms(isbn: str) -> dict[str, Any]:
+    return {"isbn": isbn}
+
+
+def is_isbn_terms(terms: Any) -> TypeGuard[dict[str, Any]]:
+    return isinstance(terms, dict) and isinstance(terms.get("isbn"), str) and bool(terms["isbn"])
+
+
+def isbn_signals(isbn: str) -> identification.IdentificationInput:
+    """Signals for a lookup by ISBN only: no title, author or folder fallback.
+
+    Both ISBN forms are listed so a record carrying either one scores as an ISBN
+    match; providers are queried with the first (the form the reviewer typed).
+    """
+    return identification.IdentificationInput(
+        title_hints=[],
+        author_hints=[],
+        isbns=identification.normalize_isbns(isbn) or [isbn],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+
+
+def isbn_lookup_result(
+    search: MetadataSearch | None,
+    current_ids: set[int],
+) -> dict[str, Any] | None:
+    """How the latest run answered an ISBN lookup, or ``None`` if it was no lookup.
+
+    A candidate is *verified* when the provider record carries the looked-up ISBN
+    (in either form); the typed value alone is never trusted. The lookup is
+    *unambiguous* when all verified current records name the same title, so
+    several providers agreeing on one book still count as a single match.
+    """
+    if search is None or not isinstance(search.query, dict) or search.query.get("mode") != "isbn":
+        return None
+    isbns = {str(value) for value in search.query.get("isbns") or [] if value}
+    verified = [
+        candidate
+        for candidate in search.candidates.all()
+        if candidate.id in current_ids and ({candidate.isbn10, candidate.isbn13} & isbns)
+    ]
+    verified.sort(key=lambda candidate: (-candidate.score, candidate.id))
+    titles = {identification.normalize_text(candidate.title) for candidate in verified}
+    return {
+        "isbn": (search.query.get("isbns") or [""])[0],
+        "state": search.state,
+        "provider_errors": len(search.provider_errors),
+        "verified": verified,
+        "verified_candidate_ids": [candidate.id for candidate in verified],
+        "unambiguous": len(titles) == 1,
+        "best": verified[0] if len(titles) == 1 else None,
     }
 
 
@@ -125,6 +209,7 @@ def record_search(
     requested_by_id: int | None = None,
     started_at: datetime | None = None,
     error: str = "",
+    mode: str = "text",
 ) -> MetadataSearch:
     """Persist one finished run (FAILED when ``error`` is given)."""
     return MetadataSearch.objects.create(
@@ -134,7 +219,7 @@ def record_search(
         scan_job=scan_job,
         processing_job_id=processing_job_id,
         requested_by_id=requested_by_id,
-        query=query_payload(signals),
+        query=query_payload(signals, mode=mode),
         providers=[outcome.as_dict() for outcome in outcomes or []],
         candidate_count=candidate_count,
         error=error[:MAX_ERROR_LENGTH],

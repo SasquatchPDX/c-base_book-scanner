@@ -1114,6 +1114,7 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
             latest_search is not None
             and any(candidate.id in current_ids for candidate in latest_search.candidates.all())
         ),
+        "isbn_lookup": metadata_search.isbn_lookup_result(latest_search, current_ids),
     }
 
 
@@ -3574,6 +3575,20 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         else None
     )
     payload["failed_search_error"] = search_context["failed_search_error"]
+    isbn_lookup = search_context["isbn_lookup"]
+    payload["isbn_lookup"] = (
+        {
+            "isbn": isbn_lookup["isbn"],
+            "state": isbn_lookup["state"],
+            "verified_candidate_ids": [str(pk) for pk in isbn_lookup["verified_candidate_ids"]],
+            "unambiguous": isbn_lookup["unambiguous"],
+            "best_candidate_id": (
+                str(isbn_lookup["best"].id) if isbn_lookup["best"] is not None else None
+            ),
+        }
+        if isbn_lookup is not None
+        else None
+    )
     if _wants_html(request):
         return render(
             request,
@@ -3788,17 +3803,13 @@ def _save_review_terms(task: ReviewTask, terms: dict[str, Any]) -> None:
         scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
 
 
-@require_POST
-@login_required
-def review_search_again(
+def _closed_or_forbidden_review(
     request: HttpRequest,
     task_id: str,
-) -> HttpResponseBase:
-    """Save the posted search terms (if any) and queue a provider search with them."""
+) -> tuple[AppUserProfile, ReviewTask] | HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
-    payload = _request_payload(request)
     try:
         task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
@@ -3807,17 +3818,26 @@ def review_search_again(
         return HttpResponseForbidden()
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
+    return profile, task
 
-    posted_terms = metadata_search.terms_from_payload(payload)
-    if posted_terms is not None:
-        _save_review_terms(task, posted_terms)
-    terms = metadata_search.task_terms(task)
+
+def _queue_review_search(
+    request: HttpRequest,
+    *,
+    profile: AppUserProfile,
+    task: ReviewTask,
+    terms: dict[str, Any],
+    decision_payload: dict[str, Any],
+    notes: str,
+    busy_prefix: str,
+) -> HttpResponseBase:
+    """Claim the task and queue a provider search with ``terms`` (text or ISBN)."""
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
-    task.decision_notes = str(payload.get("notes", ""))
+    task.decision_notes = notes
     task.decided_at = timezone.now()
-    task.decision_payload = {"search_again": True, "terms": terms}
+    task.decision_payload = decision_payload
     task.save(
         update_fields=[
             "state",
@@ -3853,7 +3873,7 @@ def review_search_again(
         task.state = ReviewTask.State.OPEN
         task.save(update_fields=["state", "updated_at"])
         if _wants_html(request):
-            messages.warning(request, f"Search terms saved, but {exc}.")
+            messages.warning(request, f"{busy_prefix} {exc}.")
             return redirect("review-detail", task_id=task.id)
         return JsonResponse({"task_id": str(task.id), "error": str(exc)}, status=409)
     except (
@@ -3877,6 +3897,67 @@ def review_search_again(
             "identification_job": job_payload,
         },
         status=202,
+    )
+
+
+@require_POST
+@login_required
+def review_search_again(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Save the posted search terms (if any) and queue a provider search with them."""
+    loaded = _closed_or_forbidden_review(request, task_id)
+    if isinstance(loaded, HttpResponseBase):
+        return loaded
+    profile, task = loaded
+    payload = _request_payload(request)
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
+    terms = metadata_search.task_terms(task)
+    return _queue_review_search(
+        request,
+        profile=profile,
+        task=task,
+        terms=terms,
+        decision_payload={"search_again": True, "terms": terms},
+        notes=str(payload.get("notes", "")),
+        busy_prefix="Search terms saved, but",
+    )
+
+
+@require_POST
+@login_required
+def review_isbn_lookup(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Queue a provider lookup by the ISBN the reviewer typed (#59).
+
+    The typed ISBN is only a query: a record counts as verified when a provider
+    returns it carrying that ISBN. The task's saved title/author terms are kept.
+    """
+    loaded = _closed_or_forbidden_review(request, task_id)
+    if isinstance(loaded, HttpResponseBase):
+        return loaded
+    profile, task = loaded
+    payload = _request_payload(request)
+    isbn = metadata_search.parse_isbn(payload.get("isbn"))
+    if isbn is None:
+        message = "enter one valid ISBN-10 or ISBN-13 (the check digit did not match)"
+        if _wants_html(request):
+            messages.error(request, f"ISBN lookup not started: {message}.")
+            return redirect("review-detail", task_id=task.id)
+        return HttpResponseBadRequest(message)
+    return _queue_review_search(
+        request,
+        profile=profile,
+        task=task,
+        terms=metadata_search.isbn_terms(isbn),
+        decision_payload={"isbn_lookup": isbn},
+        notes=str(payload.get("notes", "")),
+        busy_prefix="ISBN lookup not started:",
     )
 
 

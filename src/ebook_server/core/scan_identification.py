@@ -157,7 +157,11 @@ def request_scan_identification(
     with transaction.atomic():
         locked = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
         search_terms = terms if terms is not None else _provisional_terms(locked)
-        if not search_terms.get("title") and not search_terms.get("authors"):
+        if (
+            not search_terms.get("title")
+            and not search_terms.get("authors")
+            and not metadata_search.is_isbn_terms(search_terms)
+        ):
             raise ScanIdentificationError("a provisional title or author is required")
         active = (
             ProcessingJob.objects.select_for_update()
@@ -236,6 +240,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
     scan_job: ScanJob | None = None
+    mode = "text"
     signals: identification.IdentificationInput | None = None
     outcomes: list[identification.ProviderOutcome] | None = None
     search_started_at = timezone.now()
@@ -244,7 +249,11 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         if scan_job.book_id is not None:
             raise ScanIdentificationError("scan job is already linked to a book")
         terms = details.get("terms")
-        signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
+        if metadata_search.is_isbn_terms(terms):
+            mode = "isbn"
+            signals = metadata_search.isbn_signals(str(terms["isbn"]))
+        else:
+            signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
         candidates, outcomes = identification.resolve_candidates_with_report(signals)
         with transaction.atomic():
             search = metadata_search.record_search(
@@ -256,6 +265,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 processing_job_id=processing_job.job_id,
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
+                mode=mode,
             )
             metadata_search.save_candidates(
                 search=search,
@@ -300,6 +310,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
                 exc=exc,
+                mode=mode,
             )
         logger.exception(
             "scan_identification_failed",
@@ -321,6 +332,7 @@ def _record_failed_search(
     requested_by_id: int | None,
     started_at: datetime,
     exc: Exception,
+    mode: str,
 ) -> None:
     stage = "saving the results failed" if outcomes is not None else "the search failed"
     try:
@@ -333,6 +345,7 @@ def _record_failed_search(
             requested_by_id=requested_by_id,
             started_at=started_at,
             error=f"{stage}: {type(exc).__name__}",
+            mode=mode,
         )
     except Exception:  # never mask the original failure
         logger.exception(
