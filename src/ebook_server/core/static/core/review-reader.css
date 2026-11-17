@@ -1,0 +1,28 @@
+/* Review-page reader panel (issue #6): a collapsed tab that folds out from the right. */
+.review-reader{position:fixed;top:0;right:0;bottom:0;z-index:40;display:flex;align-items:flex-start;pointer-events:none}
+.review-reader>*{pointer-events:auto}
+.review-reader [hidden]{display:none!important}
+.review-reader-toggle{margin-top:120px;border-radius:10px 0 0 10px;writing-mode:vertical-rl;transform:rotate(180deg);padding:16px 10px;box-shadow:0 8px 24px rgba(23,33,27,.2)}
+.review-reader.is-open .review-reader-toggle{display:none}
+.review-reader-body{display:flex;flex-direction:column;gap:10px;width:min(56rem,94vw);height:100vh;padding:18px;background:var(--surface,#fffdf8);border-left:1px solid var(--line,#d9ded8);box-shadow:-18px 0 45px rgba(20,30,23,.18)}
+.review-reader-body[hidden]{display:none}
+.review-reader-header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.review-reader-header h2{margin:0}
+.review-reader-tabs{display:flex;flex-wrap:wrap;gap:6px}
+.review-reader-tab{background:#e5ebe6;color:var(--ink,#17211b);padding:6px 11px;font-size:.84rem}
+.review-reader-tab:hover,.review-reader-tab[aria-selected="true"]{background:var(--green,#2e6b4d);color:white}
+.review-reader-meta{margin:0;font-size:.84rem;min-height:1.3em}
+.review-reader-viewer{flex:1;min-height:0;overflow:auto;border:1px solid var(--line,#d9ded8);border-radius:10px;background:#e9ece8}
+.review-reader-viewer>pre{margin:0;min-height:100%;border-radius:0;background:white;font-size:.9rem}
+.review-reader-viewer>iframe{display:block;width:100%;height:100%;border:0;background:white}
+.review-reader-viewer.has-frame{overflow:hidden;display:flex;flex-direction:column}
+.review-reader-viewer.has-frame>iframe{flex:1}
+.review-reader-pages{display:grid;gap:12px;padding:12px;justify-items:center}
+.review-reader-pages img,.review-reader-pages canvas{display:block;max-width:100%;height:auto;background:white;box-shadow:0 2px 10px rgba(20,30,23,.15)}
+.review-reader-page{width:100%;display:grid;justify-items:center}
+.review-reader-page-placeholder{width:100%;aspect-ratio:3/4;max-width:640px;background:white;opacity:.6}
+.review-reader-nav{display:flex;align-items:center;gap:8px;padding:8px;background:var(--surface,#fffdf8);border-bottom:1px solid var(--line,#d9ded8)}
+.review-reader-nav select{flex:1;width:auto;padding:5px 8px}
+.review-reader-message{padding:24px;display:grid;gap:10px;justify-items:start}
+.review-reader-more{margin:12px}
+@media(max-width:560px){.review-reader-toggle{margin-top:80px}.review-reader-body{width:100vw;padding:12px}}
