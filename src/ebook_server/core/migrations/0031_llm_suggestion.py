@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0030_metadata_search_runs"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -25,6 +25,7 @@ class Migration(migrations.Migration):
                     ("scan_identification", "Scan identification"),
                     ("scan_finalization", "Scan finalization"),
                     ("llm_identification", "LLM identification assist"),
+                    ("reference_check", "Referenced file check"),
                 ],
                 max_length=32,
             ),

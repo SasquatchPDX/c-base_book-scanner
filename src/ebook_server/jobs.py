@@ -172,6 +172,116 @@ def scheduler_active(queue: Queue) -> bool:
         return False
 
 
+def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
+    """Return (first positional arg of every live RQ job, scheduler running?).
+
+    "Live" covers the queue itself plus the started, scheduled and deferred
+    registries, i.e. every RQ job that may still execute. Job functions take the
+    database row id as their first argument, so the set identifies rows that still
+    have an RQ job. ``None`` means Redis could not be consulted (or the inline queue
+    is in use) and callers must not assume anything about queued work.
+    """
+    queue = get_queue()
+    rq_queue = getattr(queue, "queue", None)
+    if rq_queue is None:
+        return None, None
+    from rq.registry import (
+        DeferredJobRegistry,
+        ScheduledJobRegistry,
+        StartedJobRegistry,
+    )
+
+    # LLM identification jobs run on their own queue (#26); inspect it too.
+    rq_queues = [rq_queue]
+    llm_queue = getattr(get_queue(llm_queue_name()), "queue", None)
+    if llm_queue is not None and llm_queue.name != rq_queue.name:
+        rq_queues.append(llm_queue)
+    try:
+        jobs: list[Any] = []
+        for inspected in rq_queues:
+            jobs.extend(inspected.get_jobs())
+            for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
+                registry = registry_cls(queue=inspected)
+                jobs.extend(
+                    inspected.fetch_job(registry_job_id(member))
+                    for member in registry.get_job_ids()
+                )
+        scheduler = scheduler_active(rq_queue)
+    except Exception:
+        return None, None
+    ids = {str(job.args[0]) for job in jobs if job is not None and job.args}
+    return ids, scheduler
+
+
+def _rq_registries(rq_queue: Queue) -> list[Any]:
+    """Every RQ registry from which a job can still run or be re-run."""
+    from rq.registry import (
+        DeferredJobRegistry,
+        FailedJobRegistry,
+        ScheduledJobRegistry,
+        StartedJobRegistry,
+    )
+
+    return [
+        registry_cls(queue=rq_queue)
+        for registry_cls in (
+            StartedJobRegistry,
+            ScheduledJobRegistry,
+            DeferredJobRegistry,
+            FailedJobRegistry,
+        )
+    ]
+
+
+def discard_rq_jobs(func_name: str, first_args: set[str]) -> int | None:
+    """Delete RQ jobs running ``func_name`` for the given row ids.
+
+    Removes them from the queue and from the started, scheduled, deferred and failed
+    registries, so neither a scheduled retry nor RQ's abandoned-job handling after
+    a worker restart can run them again. Returns the number deleted, or ``None``
+    when there is no inspectable RQ queue (inline/no queue, or Redis unreachable).
+    """
+    rq_queue = getattr(get_queue(), "queue", None)
+    if rq_queue is None or not first_args:
+        return None if rq_queue is None else 0
+    try:
+        registries = _rq_registries(rq_queue)
+        # Registry members are job ids, except the started registry (rq >= 2), which
+        # stores "<job_id>:<execution_id>"; keep the raw members to remove them.
+        members: dict[str, list[tuple[Any, str]]] = {}
+        for job_id in rq_queue.get_job_ids():
+            members.setdefault(job_id, [])
+        for registry in registries:
+            for raw in registry.get_job_ids(cleanup=False):
+                members.setdefault(registry_job_id(raw), []).append((registry, raw))
+        removed = 0
+        for job_id, entries in members.items():
+            job = rq_queue.fetch_job(job_id)
+            if job is None or job.func_name != func_name or not job.args:
+                continue
+            if str(job.args[0]) not in first_args:
+                continue
+            for registry, raw in entries:
+                registry.connection.zrem(registry.key, raw)
+            rq_queue.remove(job_id)
+            job.delete()
+            removed += 1
+    except Exception:
+        logger.warning("rq_discard_failed", func_name=func_name, exc_info=True)
+        return None
+    return removed
+
+
+def registry_job_id(member: str) -> str:
+    """Job id of an RQ registry member (``<job_id>`` or ``<job_id>:<execution_id>``)."""
+    return member.split(":", 1)[0]
+
+
+def queue_is_async() -> bool:
+    """True when jobs go to a real RQ queue rather than running inline."""
+    return isinstance(get_queue(), ConfiguredQueue)
+
+
 def get_queue(name: str | None = None) -> QueueLike | None:
     """The configured queue; ``name`` selects another RQ queue on the same Redis."""
     if not settings.BOOK_SCANNER_QUEUE_URL:

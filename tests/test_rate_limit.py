@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 from django.test import override_settings
 
-from ebook_server.core.identification import OpenLibraryMetadataProvider
+from ebook_server.core.identification import OpenLibraryMetadataProvider, ProviderRequestError
 from ebook_server.core.rate_limit import (
     LocalRateLimiter,
     RateLimitWaitExceeded,
@@ -177,5 +177,7 @@ def test_open_library_treats_excessive_wait_as_failed_request() -> None:
 
     set_rate_limiter(_Saturated())
     with patch("ebook_server.core.identification.urlopen") as opener:
-        assert OpenLibraryMetadataProvider().search("Dune") == []
+        # A failed request is reported as an error (#40), never as "no results".
+        with pytest.raises(ProviderRequestError, match="rate limited"):
+            OpenLibraryMetadataProvider().search("Dune")
     opener.assert_not_called()

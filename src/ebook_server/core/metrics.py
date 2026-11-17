@@ -84,6 +84,15 @@ class PersistentStateCollector:
         yield collection
 
         yield _group_count_metrics(
+            name="ebook_server_referenced_file_variants",
+            documentation="Indexed-in-place file variants by reference (drift) state.",
+            rows=FileVariant.objects.filter(storage_location__read_only=True)
+            .values("reference_state")
+            .annotate(total=Count("id")),
+            label_names=("reference_state",),
+        )
+
+        yield _group_count_metrics(
             name="ebook_server_processing_jobs",
             documentation="Current processing job count by type and state.",
             rows=ProcessingJob.objects.values("job_type", "state").annotate(total=Count("id")),
@@ -150,7 +159,10 @@ class PersistentStateCollector:
         yield duration_metric
 
         confidence_values: dict[str, list[float]] = defaultdict(list)
-        candidates = MetadataCandidate.objects.values_list("provider_id", "score")
+        # Superseded candidates are search history; count only the current ones.
+        candidates = MetadataCandidate.objects.filter(superseded_at__isnull=True).values_list(
+            "provider_id", "score"
+        )
         for provider_id, score in candidates.iterator():
             confidence_values[provider_id].append(float(score))
         confidence_metric = GaugeMetricFamily(
