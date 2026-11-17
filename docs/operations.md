@@ -275,6 +275,21 @@ are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
 
+Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
+or `cover.png` (Calibre-style) over format extraction, but only when the folder
+holds a single book: every intake-supported file in it, and every file previously
+queued from it, must share the job file's name stem (`metadata.opf` and the cover
+itself are ignored). A folder of several books never lends its cover to any of them.
+The sidecar is untrusted input: symlinks and folders outside the source root are
+ignored, files over 25 MiB or 40 megapixels are rejected, and the image is verified
+and decoded by Pillow (JPEG/PNG only, decompression-bomb warnings are failures)
+before the usual normalization. An invalid sidecar is logged
+(`sidecar_cover_rejected`) and format extraction is used instead. Such covers record
+`extractor_tool=sidecar+pillow`. The sidecar file is only read: it is left in place
+for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
+reviewed MOVE import can still use it later. Disable with
+`BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
+
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original
 staging file, which may already have been removed after verified archival. Poll
