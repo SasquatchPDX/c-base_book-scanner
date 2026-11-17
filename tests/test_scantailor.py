@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
 from typing import cast
 
+import cv2
 import numpy as np
 import pytest
 from asgiref.sync import async_to_sync
@@ -1556,3 +1557,129 @@ def test_stage_run_records_current_algorithm_version() -> None:
     assert state.status == ScanTailorStageState.StageStatus.SUCCESS
     assert state.algorithm_version == scantailor.DEFAULT_STAGE_ALGORITHM_VERSION["dewarping"]
     assert state.algorithm_version != "opencv-v1"
+
+
+def _keystoned(image: Image.Image, inset: float) -> Image.Image:
+    """Simulate a camera tilted towards the page top: the top edge is narrower."""
+    width, height = image.size
+    source = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    target = np.array(
+        [[inset, 0], [width - inset, 0], [width, height], [0, height]], dtype=np.float32
+    )
+    matrix = cv2.getPerspectiveTransform(source, target)
+    warped = cv2.warpPerspective(np.asarray(image), matrix, (width, height), borderValue=235)
+    return Image.fromarray(warped)
+
+
+@pytest.mark.parametrize("size", [(900, 1200), (1800, 2400)])
+def test_auto_dewarp_detects_text_lines_and_straightens_keystone(
+    size: tuple[int, int], tmp_path: Path
+) -> None:
+    width, height = size
+    page = _keystoned(_text_page(width, height), inset=width * 0.07)
+    detected = scantailor._auto_dewarp_points(page)
+    assert detected is not None
+    quad, method = detected
+    assert method == "text_lines"
+    assert not scantailor._dewarp_correction_is_negligible(quad, page.size)
+    top_left, top_right, bottom_right, bottom_left = quad
+    # the text block's top is narrower than its bottom, as simulated
+    assert (top_right[0] - top_left[0]) < (bottom_right[0] - bottom_left[0]) - 0.05 * width
+
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(_state(), source, output, tmp_path / "p.png")
+    assert result["dewarp_mode"] == "auto"
+    assert result["dewarp_detection"] == "text_lines"
+    assert result["dewarp_correction"] == "applied"
+    assert result["dewarp_warning"] == ""
+
+    corrected = Image.open(output)
+    redetected = scantailor._detect_text_line_quad(corrected)
+    assert redetected is not None
+    assert scantailor._dewarp_correction_is_negligible(redetected, corrected.size)
+
+
+def test_auto_dewarp_leaves_an_upright_text_page_untouched(tmp_path: Path) -> None:
+    page = _text_page()
+    source = _save(page, tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    result = scantailor._run_perspective_dewarp(_state(), source, output, tmp_path / "p.png")
+    assert result["dewarp_mode"] == "auto"
+    assert result["dewarp_detection"] == "text_lines"
+    assert result["dewarp_correction"] == "none_needed"
+    assert np.array_equal(np.asarray(Image.open(output).convert("L")), np.asarray(page))
+
+
+def test_auto_dewarp_on_blank_page_reports_that_nothing_was_found(tmp_path: Path) -> None:
+    source = _save(Image.new("L", (900, 1200), 235), tmp_path / "in.png")
+    result = scantailor._run_perspective_dewarp(
+        _state(), source, tmp_path / "out.png", tmp_path / "p.png"
+    )
+    assert result["dewarp_mode"] == "auto_fallback"
+    assert result["dewarp_detection"] == "none"
+    assert result["dewarp_warning"]
+
+
+def test_auto_dewarp_still_finds_a_photographed_sheet_outline() -> None:
+    sheet = Image.open(io.BytesIO(_trapezoid_bytes()))
+    detected = scantailor._auto_dewarp_points(sheet)
+    assert detected is not None
+    assert detected[1] == "page_outline"
+
+
+def _column_page(columns: int, *, ragged: bool, seed: int = 3) -> Image.Image:
+    rng = np.random.default_rng(seed)
+    width, height = 1200, 1600
+    page = Image.new("L", (width, height), 235)
+    draw = ImageDraw.Draw(page)
+    column_width = (width * 0.76 - (columns - 1) * 40) / columns
+    for column in range(columns):
+        start = width * 0.12 + column * (column_width + 40)
+        for y in range(200, 1400, 28):
+            end = (
+                start
+                + column_width
+                - (int(rng.integers(0, int(column_width * 0.4))) if ragged else 0)
+            )
+            x = start
+            while x < end - 20:
+                word = int(rng.integers(20, 70))
+                draw.rectangle((x, y, min(x + word, end), y + 9), fill=30)
+                x += word + 14
+    return page
+
+
+@pytest.mark.parametrize(("columns", "ragged"), [(2, False), (1, True)])
+def test_text_line_detection_handles_columns_and_ragged_right(columns: int, ragged: bool) -> None:
+    upright = _column_page(columns, ragged=ragged)
+    quad = scantailor._detect_text_line_quad(upright)
+    assert quad is not None
+    # an upright page needs no correction: ragged ends must not invent a keystone
+    assert scantailor._dewarp_correction_is_negligible(quad, upright.size)
+    # the quad spans the outer text edges, not one column
+    assert quad[0][0] < 160 and quad[1][0] > 1000
+
+    tilted = _keystoned(upright, inset=80)
+    quad = scantailor._detect_text_line_quad(tilted)
+    assert quad is not None
+    geometry = scantailor._dewarp_output_geometry(quad, tilted.size)
+    corrected = Image.fromarray(
+        cv2.warpPerspective(
+            np.asarray(tilted),
+            geometry.matrix,
+            (geometry.canvas_width, geometry.canvas_height),
+            borderValue=235,
+        )
+    )
+    redetected = scantailor._detect_text_line_quad(corrected)
+    assert redetected is not None
+    assert scantailor._dewarp_correction_is_negligible(redetected, corrected.size)
+
+
+def test_text_line_detection_rejects_too_few_lines() -> None:
+    page = Image.new("L", (900, 1200), 235)
+    draw = ImageDraw.Draw(page)
+    for x in range(100, 800, 60):
+        draw.rectangle((x, 500, x + 40, 510), fill=30)
+    assert scantailor._detect_text_line_quad(page) is None
