@@ -3442,6 +3442,24 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             needs_review = top_candidate is None
         if sidecar_conflicts:
             needs_review = True
+        if needs_review and assessment is None and not sidecar_conflicts:
+            # No provider record may be accepted. The file's own independent evidence
+            # (path, text header, embedded metadata) may still agree on what it is.
+            from . import local_identity
+
+            local = local_identity.local_consensus(metadata, signals, candidates)
+            if local is not None:
+                top_candidate = local.as_candidate()
+                metadata[local_identity.LOCAL_IDENTITY_KEY] = local.evidence
+                job.evidence = metadata
+                _save_job(job, update_fields=["evidence", "updated_at"])
+                logger.info(
+                    "intake_local_consensus_accepted",
+                    import_job_id=str(job.id),
+                    title_origins=list(local.title_origins),
+                    author_source=local.author_source,
+                )
+                needs_review = False
         if needs_review:
             _archive_for_review(job, candidates)
             if assessment is None:

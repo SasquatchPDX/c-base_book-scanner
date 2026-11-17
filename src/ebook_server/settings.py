@@ -113,6 +113,8 @@ class Settings(BaseSettings):
     # Candidates within this score margin of the best one count as tied for auto-accept.
     identification_tie_margin: float = 0.02
     identification_work_isbn_bonus: float = 0.3
+    # Identify a file from agreeing independent local evidence when no provider fits.
+    identification_local_consensus: bool = True
     review_queue_page_size: int = 50
     review_batch_min_score: float = 0.75
     review_batch_ambiguity_margin: float = 0.05
@@ -367,6 +369,7 @@ BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
 BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
+BOOK_SCANNER_IDENTIFICATION_LOCAL_CONSENSUS = settings.identification_local_consensus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
 BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
 BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin
