@@ -184,7 +184,7 @@ see `docs/operations.md`).
 `GET jobs/{id}` and `capture-complete` are built from *manifest sources* in
 `core/scan_manifest.py`. Each source owns one field (`pages`, `covers`, `metadata_opf`):
 what serif holds, its JSON status and how the request's field is parsed. Only pages exist
-so far. Until a feature is stored on serif it is "nothing expected":
+so far. Until a feature is stored on serif, nothing of it can be verified:
 
 - a field with no registered source is left out of `GET jobs/{id}` (covers until S4,
   `metadata_opf` until S6). In a `capture-complete` request it **fails closed**: an empty
