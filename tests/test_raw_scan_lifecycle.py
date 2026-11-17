@@ -355,12 +355,13 @@ def fake_extensions() -> Iterator[_FakeCoverSource]:
     real = {source.name: source for source in scan_manifest.manifest_sources()}.get("covers")
     source = _FakeCoverSource({"front": "a" * 64})
     scan_manifest.register_manifest_source(source)
+    real_high_water_mark = scan_manifest._event_high_water_mark  # S5's, from apps.ready
     scan_manifest.register_event_high_water_mark(lambda job: 812)
     yield source
     scan_manifest.unregister_manifest_source("covers")
     if real is not None:  # the S4 cover store (#128)
         scan_manifest.register_manifest_source(real)
-    scan_manifest.register_event_high_water_mark(None)
+    scan_manifest.register_event_high_water_mark(real_high_water_mark)
 
 
 @pytest.mark.django_db

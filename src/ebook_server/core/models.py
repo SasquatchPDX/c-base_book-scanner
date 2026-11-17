@@ -886,6 +886,21 @@ class ScanJob(models.Model):
     # new search supersedes an older one, so a stale queue entry or a late worker
     # can never make its results current (#104).
     current_search_job_id = models.UUIDField(null=True, blank=True, editable=False)
+    # Projected from the scanner's scan.jsonl events (#129, contract §4.4): the
+    # latest ``job`` event sets the calibration, the latest ``completeness_check`` the
+    # flags. ``completeness_flags`` is NULL until a completeness check has arrived; an
+    # empty list means the scanner found no gaps.
+    page_width_mm = models.FloatField(null=True, blank=True)
+    page_number_crop = models.JSONField(null=True, blank=True)
+    completeness_flags = models.JSONField(null=True, blank=True)
+    completeness_checked_at = models.DateTimeField(null=True, blank=True)
+    # Highest ScanEvent id already rendered into scan.jsonl in the job folder and in
+    # the book folder; lets queued renders that have nothing new to write skip (#129).
+    scan_jsonl_job_rendered_through = models.BigIntegerField(null=True, blank=True, editable=False)
+    scan_jsonl_book_rendered_through = models.BigIntegerField(null=True, blank=True, editable=False)
+    # This job's scan.jsonl in the book folder, claimed once at the first write after
+    # finish ("<folder>/scan.jsonl", or "scan-<job id>.jsonl" when the book already has one).
+    scan_jsonl_book_identifier = models.CharField(max_length=1024, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -1137,6 +1152,53 @@ class ScanTodo(models.Model):
 
     def __str__(self) -> str:
         return f"{self.scan_job_id}:{self.scan_page_id}:{self.todo_type}:{self.state}"
+
+
+class ScanEvent(models.Model):
+    """One line of a scan job's ``scan.jsonl`` process log (#129, contract §4.4/§6.7).
+
+    Lines from the scanner (origin ``sans``) are numbered ``1, 2, 3...`` in the scanner's
+    file order; ``(scan_job, line_no)`` is unique for them and is the idempotency key.
+    serif's own lines (origin ``serif``: ``rescan_flag``, ``rescan_replace``) have no
+    ``line_no``. ``raw`` is the line exactly as received or written, without newline;
+    ``type`` is copied out of it for queries. Rows are append-only. Their primary key is
+    the arrival order: every insert for a job happens under that job's row lock (see
+    ``core.scan_events``), so ordering a job's events by ``id`` is the order they arrived.
+    """
+
+    class Origin(models.TextChoices):
+        SANS = "sans", "Scanner"
+        SERIF = "serif", "Server"
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="events")
+    origin = models.CharField(max_length=8, choices=Origin.choices)
+    line_no = models.PositiveIntegerField(null=True, blank=True)
+    raw = models.TextField()
+    type = models.CharField(max_length=64)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan_job", "line_no"],
+                condition=models.Q(origin="sans"),
+                name="uniq_scanevent_sans_line_no_per_job",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin="sans", line_no__isnull=False, line_no__gte=1)
+                    | models.Q(origin="serif", line_no__isnull=True)
+                ),
+                name="scanevent_line_no_matches_origin",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["scan_job", "type"]),
+        ]
+
+    def __str__(self) -> str:
+        suffix = f"#{self.line_no}" if self.line_no is not None else ""
+        return f"{self.scan_job_id}:{self.origin}{suffix}:{self.type}"
 
 
 class ScanTailorStageState(models.Model):

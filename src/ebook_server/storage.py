@@ -275,6 +275,15 @@ class StorageBackend(Protocol):
         ``OSError`` where hard links are unsupported). Returns the storage id written.
         """
 
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        """Atomically make ``destination`` hold exactly ``data``, replacing any old file.
+
+        The bytes go to a hidden temporary file beside the destination first, which is
+        then renamed over it, so readers see either the old or the new file, never a
+        partial one. Only for files the caller alone owns and regenerates (a rendered
+        log); never for archive originals, which use ``publish_unique``.
+        """
+
     def stat(self, location: str) -> tuple[int, int]:
         """Return ``(size_bytes, mtime_ns)`` for an artifact."""
 
@@ -466,6 +475,19 @@ class LocalFilesystemStorage:
             dest.unlink(missing_ok=True)
             raise
 
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        dest = self._prepare_destination(destination)
+        staged = dest.with_name(f".{uuid.uuid4().hex}.partial")
+        try:
+            with staged.open("xb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(staged, dest)
+        finally:
+            staged.unlink(missing_ok=True)
+        return destination
+
     def stat(self, location: str) -> tuple[int, int]:
         result = self.resolve_location(location).stat()
         return result.st_size, result.st_mtime_ns
@@ -542,6 +564,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
         mode: PublishMode = "copy",
     ) -> str:
         raise self._refuse("publish")
+
+    def replace_bytes(self, destination: str, data: bytes) -> str:
+        raise self._refuse("replace")
 
     def ensure_free_space(self, required_bytes: int) -> None:
         raise self._refuse("write")

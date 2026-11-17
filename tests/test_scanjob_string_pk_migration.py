@@ -36,6 +36,7 @@ EXPECTED_REFERENCES = {
 # Foreign keys to ScanJob added by later migrations: created with the string key already,
 # so 0038 never has to convert them (it runs on the historical state, which lacks them).
 REFERENCES_ADDED_LATER = {
+    "ScanEvent",  # 0041_scan_events, #129
     "ScanCover",  # 0040, #128
 }
 
