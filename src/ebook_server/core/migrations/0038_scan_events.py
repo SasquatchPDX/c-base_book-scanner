@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0038_scanjob_string_pk"),
+        ("core", "0037_scanjob_string_pk"),
     ]
 
     operations = [

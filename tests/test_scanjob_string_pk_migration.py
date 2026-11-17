@@ -1,4 +1,4 @@
-"""Migration ``core.0038_scanjob_string_pk``: UUID -> string ScanJob primary key (#126).
+"""Migration ``core.0037_scanjob_string_pk``: UUID -> string ScanJob primary key (#126).
 
 Runs on SQLite here and, re-collected by
 ``tests/integration/test_scanjob_string_pk_migration_postgres.py``, on PostgreSQL.
@@ -17,9 +17,9 @@ from django.db.migrations.exceptions import IrreversibleError
 from django.db.migrations.executor import MigrationExecutor
 from django.utils import timezone
 
-BEFORE = [("core", "0037_scanner_device")]
-AFTER = [("core", "0038_scanjob_string_pk")]
-MIGRATION = importlib.import_module("ebook_server.core.migrations.0038_scanjob_string_pk")
+BEFORE = [("core", "0036_book_search_document")]
+AFTER = [("core", "0037_scanjob_string_pk")]
+MIGRATION = importlib.import_module("ebook_server.core.migrations.0037_scanjob_string_pk")
 
 # (model, FK field) pairs that reference ScanJob; the issue names the first three plus
 # the review/processing/search tables.
@@ -53,7 +53,7 @@ def _migrate_to_latest() -> None:
 
 
 def _seed(apps: Any) -> dict[str, Any]:
-    """Create one of everything that references a scan job, in the 0037 (UUID) schema."""
+    """Create one of everything that references a scan job, in the 0036 (UUID) schema."""
     now = timezone.now()
     user = apps.get_model("auth", "User").objects.create(username="pk-migration-operator")
     book = apps.get_model("core", "Book").objects.create(title="Migrated Book")
@@ -193,7 +193,7 @@ def test_string_pk_migration_forward_and_backward() -> None:
         assert scan_job_model.objects.get(pk=job_key).notes == {"hint": "kept"}
         # New fields exist and are empty for migrated jobs.
         migrated = scan_job_model.objects.get(pk=job_key)
-        assert migrated.device_id is None
+        assert migrated.source == "web"
         assert migrated.scan_started_at is None
 
         processing = new_apps.get_model("core", "ProcessingJob")
