@@ -567,6 +567,52 @@ identifier, and nothing reads metadata back from a path. Consequences:
   link on the same share, with the `_unsorted` name removed after the database
   commit; where hard links are unsupported the file stays under `_unsorted`).
 
+#### `metadata.opf` in each book folder (`BOOK_SCANNER_WRITE_BOOK_OPF`)
+
+Under a book-scoped layout (`author_title`, `calibre`, or a custom template with book
+fields) each book folder also gets a Calibre-compatible `metadata.opf` (OPF 2.0 Dublin
+Core, as Calibre writes it): title (with subtitle), authors with `opf:role="aut"` and
+`opf:file-as`, a stable `uuid` identifier plus ISBN/DOI/OCLC identifiers, language,
+publisher, date (the year alone when only the year is known), description, genres and
+categories as `dc:subject`, `calibre:title_sort`, and a `cover` guide reference when the
+cover image is in the same folder. Calibre, e-readers and file managers can read it.
+
+- **It is derived, never edited by hand.** The database is authoritative. Any change
+  to a book's metadata (title, subtitle, authors, identifiers, publisher, dates,
+  language, description, genres/categories, covers, a file joining/leaving the
+  folder, or deleting an attached author, genre or category) advances the book's
+  requested generation (`BookOpfState`, a separate table so an ordinary `Book.save()`
+  can never roll it back) and queues one background job after the database commit.
+  Further edits while that job is queued and not yet started do not queue more jobs,
+  so a review that changes ten fields writes the file once; an edit that commits once
+  the job has started queues a new one. The job records the generation it wrote only
+  if it is still the requested one, otherwise it writes again. A queued job lost with
+  its worker stops blocking new ones after the job timeout. A hand edit is overwritten
+  by the next regeneration.
+- **Atomic:** the job writes a hidden temporary file in the folder and renames it over
+  `metadata.opf`, so a reader never sees a half-written file. An unchanged file is not
+  rewritten.
+- **Never written on read-only, indexed-in-place locations.** Those folders belong to
+  their share. A book whose files are all referenced in place gets no OPF. A
+  `metadata.opf` the application did not generate is never overwritten.
+- **Marked as ours:** each file carries `<meta name="ebook-server:generated"
+  content="true"/>`. `core.book_opf.is_generated_book_opf()` recognizes it, so an
+  intake OPF-sidecar reader can skip it: a re-import of an archive folder must never
+  treat our own output as external evidence.
+- A reorganize writes the OPF into the new folder and removes the generated OPF left
+  alone in the old one; deleting a book removes it too.
+- `BOOK_SCANNER_WRITE_BOOK_OPF=false` turns it off. It has no effect under the `job`
+  layout (no book folders).
+
+After upgrading (or after restoring a share), queue a write for every existing book
+folder:
+
+```bash
+uv run python manage.py write_book_opfs --dry-run      # list the books, queue nothing
+uv run python manage.py write_book_opfs                # every book with an archive folder
+uv run python manage.py write_book_opfs --book 12      # one book (repeatable)
+```
+
 #### Reorganize: sorting the archive into the tree
 
 Files archived before the layout existed (`books/<import job id>/`), books whose title

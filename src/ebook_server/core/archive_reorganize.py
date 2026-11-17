@@ -34,7 +34,7 @@ from django.utils import timezone
 
 from ebook_server.jobs import get_queue, is_stale_running
 
-from . import archive_layout, scan_logs
+from . import archive_layout, book_opf, scan_logs
 from .models import (
     Book,
     CoverImage,
@@ -293,6 +293,18 @@ def _move_entry(entry: dict[str, Any]) -> tuple[str, str]:
     return "moved", destination
 
 
+def _drop_vacated_opfs(vacated: set[tuple[int, str]]) -> None:
+    """Remove the generated ``metadata.opf`` left alone in a folder the files moved out of.
+
+    The book's new folder gets its own OPF from the regeneration job that the moved
+    records' updates queue.
+    """
+    for location_id, folder in sorted(vacated):
+        location = StorageLocation.objects.filter(pk=location_id, read_only=False).first()
+        if location is not None:
+            book_opf.remove_orphaned_opf(filesystem_backend_for_location(location), folder)
+
+
 def request_reorganize(
     *,
     book_ids: Iterable[int] | None = None,
@@ -410,12 +422,15 @@ def process_reorganize_job(job_id: str) -> None:
         entries = _details(plan_job).get("plan") or []
         results: list[dict[str, Any]] = []
         counts = {"moved": 0, "skipped": 0, STALE: 0, "failed": 0}
+        vacated: set[tuple[int, str]] = set()
         for entry in entries:
             try:
                 status, detail = _move_entry(entry)
             except Exception as exc:  # one bad file must not stop the batch
                 status, detail = "failed", f"{type(exc).__name__}: {exc}"
             counts[status] += 1
+            if status == "moved":
+                vacated.add((int(entry["storage_location_id"]), _folder_of(str(entry["from"]))))
             results.append(
                 {
                     "kind": entry.get("kind"),
@@ -424,6 +439,7 @@ def process_reorganize_job(job_id: str) -> None:
                     "detail": detail,
                 }
             )
+        _drop_vacated_opfs(vacated)
         summary = (
             f"{counts['moved']} moved, {counts['skipped']} skipped, "
             f"{counts[STALE]} stale, {counts['failed']} failed"

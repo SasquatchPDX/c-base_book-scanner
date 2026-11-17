@@ -495,6 +495,31 @@ class Book(models.Model):
         return self.title
 
 
+class BookOpfState(models.Model):
+    """Regeneration state of a book folder's generated ``metadata.opf`` (see core.book_opf).
+
+    Kept out of ``Book`` on purpose: an ordinary ``Book.save()`` writes every column of
+    a possibly stale instance, and must never roll this state back. Both counters only
+    move through queryset updates. The OPF is stale while ``requested_generation`` is
+    ahead of ``written_generation``.
+    """
+
+    book = models.OneToOneField(
+        Book, on_delete=models.CASCADE, primary_key=True, related_name="opf_state"
+    )
+    # Incremented (F() + 1) on every metadata change that affects the OPF.
+    requested_generation = models.PositiveBigIntegerField(default=0)
+    # The requested generation the worker last rendered and wrote, set only while that
+    # generation is still the requested one.
+    written_generation = models.PositiveBigIntegerField(default=0)
+    # Set when a job was queued and not yet started; the job clears it when it starts.
+    # Dedupes queued jobs per book; a claim older than the job timeout is ignored.
+    job_queued_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.book_id}: {self.written_generation}/{self.requested_generation}"
+
+
 class Identifier(models.Model):
     """Identifiers associated with a book (ISBN-10, ISBN-13, DOI, etc.)."""
 
