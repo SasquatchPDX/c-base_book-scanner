@@ -1169,6 +1169,7 @@ class ProcessingJob(models.Model):
         COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
         SCAN_LOG = "scan_log", "Scanner log"
+        ARCHIVE_REORGANIZE = "archive_reorganize", "Archive reorganize"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"

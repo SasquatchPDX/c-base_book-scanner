@@ -561,11 +561,47 @@ identifier, and nothing reads metadata back from a path. Consequences:
 - **Correcting a book's title or author does not rename its folder.** The folder is
   assigned once (`Book.archive_folder`) and later files of that book keep joining
   it. Moving books into the folder their current metadata implies is an explicit,
-  admin-run reorganize.
+  admin-run reorganize (below).
 - **Files waiting for review** are archived under `_unsorted/<import job id>/` and
   moved into the book folder when identification or review settles the Book (a hard
   link on the same share, with the `_unsorted` name removed after the database
   commit; where hard links are unsupported the file stays under `_unsorted`).
+
+#### Reorganize: sorting the archive into the tree
+
+Files archived before the layout existed (`books/<import job id>/`), books whose title
+or author was corrected, and everything imported from a COPY/MOVE source can be moved
+into the folder each Book's *current* metadata implies. It is always two background
+jobs (`ProcessingJob`, type `archive_reorganize`), never work inside a web request:
+
+1. **Plan (dry run).** In the admin, select Books ("Plan moving selected books into
+   their archive folders") or COPY/MOVE sources ("Plan sorting books imported from
+   these sources into the archive tree"). The worker lists every file that would move
+   and where; the plan appears on the job's admin page. Nothing changes on storage.
+2. **Apply.** Select the finished plan under Processing jobs and run "Apply selected
+   archive reorganize plans". The plan is applied exactly as reviewed: each entry is
+   re-checked first (the record still points at the planned file with the planned
+   hash, still belongs to the planned Book, and that Book's current metadata still
+   implies the planned folder and file name). An entry that no longer matches, for
+   example because the title was edited after the dry run, is reported `stale` and
+   nothing is moved for it; the job's summary asks for a new dry run
+   (`requires_new_plan`). A valid entry is copied into the planned folder (never
+   over an existing file), verified by SHA-256, re-pointed in the database, and only
+   then is the old copy deleted; empty folders are pruned. A failed verification
+   keeps the original and fails the job. A plan applies once.
+
+From the shell (runs in the command's own process):
+
+```bash
+uv run python manage.py reorganize_archive --book 12 --book 13   # or --source 3, or --all
+uv run python manage.py reorganize_archive --apply <plan job id>
+uv run python manage.py reorganize_archive --run-queued          # admin-queued jobs, no worker
+```
+
+Files referenced in place (read-only locations) are never moved, and index-in-place
+sources cannot be selected: an indexed share stays exactly as it is. Plans are capped at
+5000 files; plan again after applying to continue. The `job` layout has no tree to sort
+into, so reorganize refuses to run under it.
 
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
