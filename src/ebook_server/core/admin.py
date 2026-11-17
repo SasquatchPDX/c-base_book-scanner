@@ -22,6 +22,7 @@ from .models import (
     Identifier,
     ImportGroup,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
@@ -422,3 +423,25 @@ class ScanTodoAdmin(admin.ModelAdmin[ScanTodo]):
         "created_at",
     )
     list_filter = ("todo_type", "state")
+
+
+@admin.register(LLMSuggestion)
+class LLMSuggestionAdmin(admin.ModelAdmin[LLMSuggestion]):
+    """Read-only: suggestions are evidence written by the LLM job, never edited by hand."""
+
+    list_display = (
+        "created_at",
+        "import_job",
+        "trigger",
+        "outcome",
+        "model",
+        "new_candidate_count",
+    )
+    list_filter = ("trigger", "outcome", "model")
+    readonly_fields = tuple(field.name for field in LLMSuggestion._meta.fields)
+
+    def has_add_permission(self, request: Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: Any, obj: LLMSuggestion | None = None) -> bool:
+        return False
