@@ -549,6 +549,18 @@ def test_llm_jobs_have_their_own_timeout() -> None:
 # --- end to end with a fake server --------------------------------------------------------
 
 
+@pytest.fixture
+def inline_workflow_queue() -> Iterator[None]:
+    """Run these fake-client workflows in-process on SQLite and PostgreSQL alike.
+
+    They assert completed upload/LLM results and install process-local provider and
+    LLM doubles. An infrastructure Redis URL must not send their work to a separate
+    worker, which cannot use those doubles (or the test database transaction).
+    """
+    with override_settings(BOOK_SCANNER_QUEUE_URL="inline://"):
+        yield
+
+
 def _install_echo_provider(monkeypatch: pytest.MonkeyPatch, *, only_title: str) -> None:
     """A provider that knows exactly one book, found only by its exact title."""
 
@@ -599,6 +611,7 @@ def _upload_txt(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("inline_workflow_queue")
 def test_zero_candidate_import_gets_llm_hints_but_never_a_book(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -671,6 +684,7 @@ def test_zero_candidate_import_gets_llm_hints_but_never_a_book(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("inline_workflow_queue")
 def test_reviewer_button_queues_llm_job_with_review_permissions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -716,6 +730,7 @@ def test_reviewer_button_queues_llm_job_with_review_permissions(
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("inline_workflow_queue")
 def test_invalid_output_and_server_failure_are_recorded_without_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
