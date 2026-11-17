@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     sidecar_covers_enabled: bool = True
+    # Cover thumbnails (#28): a regenerable cache on the application VM. Empty root means
+    # `<storage_root>/cover-thumbnails`. With an accel prefix (for example
+    # `/_protected/cover-thumbnails/`) Django checks permissions and hands the file to
+    # nginx with X-Accel-Redirect; see deploy/nginx/book-scanner.conf.
+    cover_thumbnail_root: str = ""
+    cover_thumbnail_accel_prefix: str = ""
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -263,6 +269,8 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_COVER_THUMBNAIL_ROOT = settings.cover_thumbnail_root
+BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX = settings.cover_thumbnail_accel_prefix
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
     settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT

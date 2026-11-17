@@ -11,6 +11,7 @@ class CoreConfig(AppConfig):
     verbose_name = "Core"
 
     def ready(self) -> None:
-        from .search import connect_signals
+        from . import search, thumbnails
 
-        connect_signals()
+        search.connect_signals()
+        thumbnails.connect_signals()

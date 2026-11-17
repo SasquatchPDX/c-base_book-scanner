@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import redis
@@ -21,6 +22,7 @@ from asgiref.sync import sync_to_async
 from django.conf import settings as django_settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
+from django.core.cache import cache
 from django.core.files.base import File
 from django.db import connections, transaction
 from django.db.models import Count, Prefetch, Q
@@ -63,13 +65,17 @@ from . import (
     scantailor,
     search,
 )
+from . import thumbnails as thumbnails_module
 from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
     Author,
     Book,
+    Category,
     CoverImage,
+    CoverThumbnail,
     FileVariant,
+    Genre,
     Identifier,
     ImportJob,
     MetadataCandidate,
@@ -1324,28 +1330,322 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     if profile.is_disabled:
         return JsonResponse({"detail": "forbidden"}, status=403)
     if _wants_html(request):
-        recent_books = (
-            Book.objects.select_related("front_cover", "back_cover")
-            .prefetch_related(*_book_list_prefetches())
-            .order_by("-created_at", "-id")[:12]
+        started = time.perf_counter()
+        context = _library_landing_context()
+        logger.info(
+            "library_landing",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
         )
-        return render(
-            request,
-            "core/library_home.html",
-            {
-                "profile": profile,
-                "recent_books": [
-                    _serialize_book(book, include_variants=False) for book in recent_books
-                ],
-                "book_count": Book.objects.count(),
-                "variant_count": FileVariant.objects.filter(
-                    processing_state=FileVariant.ProcessingState.COMPLETE,
-                ).count(),
-            },
-        )
+        return render(request, "core/library_home.html", {"profile": profile, **context})
     return JsonResponse(
         {"status": "ok", "user": request.user.username, "role": profile.role},
     )
+
+
+SHELF_SIZE: Final = 12
+# Facets of the landing page sidebar, in display order, with their headings.
+LANDING_FACETS: Final[tuple[tuple[str, str], ...]] = (
+    ("format", "Format"),
+    ("language", "Language"),
+    ("genre", "Genre"),
+    ("category", "Category"),
+    ("author", "Author"),
+    ("decade", "Decade"),
+    ("has_cover", "Cover"),
+)
+LANDING_FACET_ITEMS: Final = 8
+# Query parameter each facet's links set on `/library/books/`.
+FACET_FILTER_PARAMS: Final[dict[str, str]] = {
+    "format": "format",
+    "language": "language",
+    "genre": "genre_id",
+    "category": "category_id",
+    "author": "author_id",
+    "decade": "decade",
+    "has_cover": "has_cover",
+}
+
+
+def _facet_label(facet: str, item: search.FacetCount) -> str:
+    if facet == "format":
+        return item.value.upper()
+    if facet == "language":
+        return item.value.upper() if len(item.value) <= 3 else item.value
+    if facet == "decade":
+        return f"{item.value}s"
+    if facet == "has_cover":
+        return "With cover" if item.value == "true" else "Without cover"
+    return item.value
+
+
+def _facet_links(facets: dict[str, list[search.FacetCount]]) -> list[dict[str, Any]]:
+    """Sidebar groups for the template; facets without values are hidden (#50)."""
+    groups = []
+    for facet, heading in LANDING_FACETS:
+        items = facets.get(facet, [])[:LANDING_FACET_ITEMS]
+        if not items:
+            continue
+        param = FACET_FILTER_PARAMS[facet]
+        groups.append(
+            {
+                "name": facet,
+                "heading": heading,
+                "items": [
+                    {
+                        "label": _facet_label(facet, item),
+                        "count": item.count,
+                        "query": urlencode({"view": "html", param: item.filter_key}),
+                    }
+                    for item in items
+                ],
+            }
+        )
+    return groups
+
+
+def _language_shelf_ids(
+    languages: list[search.FacetCount],
+) -> list[tuple[str, str, list[int]]]:
+    """ "New in <language>" shelves, cached with the global facets.
+
+    The most common language is skipped: its shelf would mostly repeat "Recently
+    added". The next two get a shelf when the library has more than one language.
+    """
+    cached = cache.get(search.LANGUAGE_SHELVES_CACHE_KEY)
+    if cached is not None:
+        return list(cached)
+    shelves = [
+        (item.value, item.filter_key, search.newest_book_ids(limit=SHELF_SIZE, language=item.value))
+        for item in languages[1:3]
+    ]
+    cache.set(search.LANGUAGE_SHELVES_CACHE_KEY, shelves, search.GLOBAL_CACHE_SECONDS)
+    return shelves
+
+
+def _shelf_books(book_ids: list[int]) -> dict[int, Book]:
+    """Shelf cards need title, authors and the cover thumbnail: two queries in all."""
+    if not book_ids:
+        return {}
+    return thumbnails_module.with_thumbnail_refs(Book.objects.prefetch_related("authors")).in_bulk(
+        book_ids
+    )
+
+
+def _library_landing_context() -> dict[str, Any]:
+    """Search-first landing page (#28 Q1): search box, global facets, shelves, indexes.
+
+    Global facet counts, the total and the language shelves come from a
+    five-minute cache; "Recently added" and "Recently identified" are live.
+    """
+    facets = search.global_facets([facet for facet, _heading in LANDING_FACETS])
+    recent_ids = search.newest_book_ids(limit=SHELF_SIZE)
+    identified_ids = search.recently_identified_book_ids(limit=SHELF_SIZE)
+    language_shelves = _language_shelf_ids(facets.get("language", []))
+    books = _shelf_books(
+        list(
+            dict.fromkeys(
+                [
+                    *recent_ids,
+                    *identified_ids,
+                    *(i for _l, _k, ids in language_shelves for i in ids),
+                ]
+            )
+        )
+    )
+
+    def cards(ids: list[int]) -> list[dict[str, Any]]:
+        return [_shelf_card(books[book_id]) for book_id in ids if book_id in books]
+
+    shelves: list[dict[str, Any]] = [
+        {
+            "id": "recently-added",
+            "title": "Recently added",
+            "books": cards(recent_ids),
+            "see_all": urlencode({"view": "html", "sort": "-created_at"}),
+        },
+        {
+            "id": "recently-identified",
+            "title": "Recently identified",
+            "books": cards(identified_ids),
+            "see_all": None,
+        },
+    ]
+    for value, key, ids in language_shelves:
+        shelves.append(
+            {
+                "id": f"new-in-{key}",
+                "title": f"New in {value.upper() if len(value) <= 3 else value}",
+                "books": cards(ids),
+                "see_all": urlencode({"view": "html", "language": key, "sort": "-created_at"}),
+            }
+        )
+    return {
+        "book_count": (total := search.total_books()),
+        "book_count_display": f"{total:,}",
+        "facet_groups": _facet_links(facets),
+        "shelves": [shelf for shelf in shelves if shelf["books"]],
+        "letters": AUTHOR_INDEX_LETTERS,
+    }
+
+
+def _shelf_card(book: Book) -> dict[str, Any]:
+    return {
+        "id": book.id,
+        "title": book.title,
+        "authors": [author.full_name for author in book.authors.all()],
+        "year": book.published_year,
+        "cover_image": _cover_image_payload(book),
+    }
+
+
+def _cover_image_payload(book: Book) -> dict[str, Any] | None:
+    """What an `<img>` for the front cover needs: thumbnail srcset or the full cover.
+
+    Thumbnails come from the `with_thumbnail_refs` annotation of the list query,
+    so rendering never queries per book. Without a current thumbnail (not yet
+    generated, or the cover could not be decoded) the full cover is used.
+    """
+    if not book.front_cover_id:
+        return None
+    refs = thumbnails_module.annotated_thumbnails(book) or {}
+    medium = refs.get(CoverThumbnail.Size.MEDIUM)
+    small = refs.get(CoverThumbnail.Size.SMALL)
+    primary = medium or small
+    if primary is None:
+        return {
+            "src": f"/library/books/{book.id}/covers/front/",
+            "srcset": "",
+            "width": 240,
+            "height": 320,
+            "thumbnail": False,
+        }
+    return {
+        "src": primary.url,
+        "small_src": (small or primary).url,
+        "srcset": ", ".join(f"{ref.url} {ref.width}w" for ref in (small, medium) if ref),
+        "width": primary.width,
+        "height": primary.height,
+        "thumbnail": True,
+    }
+
+
+AUTHOR_INDEX_LETTERS: Final = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+AUTHOR_INDEX_PAGE_SIZE: Final = 60
+
+
+@require_GET
+@login_required
+def library_authors(request: HttpRequest) -> HttpResponseBase:
+    """Author A-Z index (#28 Q1): authors with books, keyset-paginated by name."""
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    letter = request.GET.get("letter", "").strip()[:1].upper()
+    if letter and letter not in AUTHOR_INDEX_LETTERS:
+        letter = ""
+    page_size = min(_as_positive_int(request.GET.get("page_size"), AUTHOR_INDEX_PAGE_SIZE), 200)
+    try:
+        page = search.author_index_page(
+            letter=letter,
+            cursor=request.GET.get("cursor", "").strip(),
+            page_size=page_size,
+        )
+    except search.InvalidCursorError:
+        return JsonResponse({"detail": "invalid_cursor"}, status=400)
+
+    def page_url(cursor: str | None) -> str | None:
+        if not cursor:
+            return None
+        params = {"cursor": cursor}
+        if _wants_html(request):
+            params["view"] = "html"
+        if "page_size" in request.GET:
+            params["page_size"] = str(page_size)
+        return f"?{urlencode(params)}"
+
+    if _wants_html(request):
+        return render(
+            request,
+            "core/library_authors.html",
+            {
+                "authors": page.authors,
+                "letter": letter,
+                "letters": AUTHOR_INDEX_LETTERS,
+                "next_url": page_url(page.next_cursor),
+                "previous_url": page_url(page.previous_cursor),
+            },
+        )
+    return JsonResponse(
+        {
+            "items": [
+                {"id": entry.id, "name": entry.name, "book_count": entry.book_count}
+                for entry in page.authors
+            ],
+            "next_cursor": page.next_cursor,
+            "previous_cursor": page.previous_cursor,
+        }
+    )
+
+
+_SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@require_GET
+@login_required
+def library_cover_thumbnail(request: HttpRequest, sha256: str, size: str) -> HttpResponseBase:
+    """A content-addressed cover thumbnail, cacheable forever by the member's browser.
+
+    The permission check always runs here. With
+    `BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX` set, nginx sends the bytes
+    (`X-Accel-Redirect` to an `internal` location) instead of a Python worker.
+    """
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    if size not in thumbnails_module.THUMBNAIL_WIDTHS or not _SHA256_RE.fullmatch(sha256):
+        return HttpResponseNotFound()
+    thumbnail = (
+        CoverThumbnail.objects.select_related("storage_location")
+        .filter(sha256=sha256, size=size)
+        .first()
+    )
+    if thumbnail is None:
+        return HttpResponseNotFound("thumbnail not available")
+
+    etag = f'"{thumbnail.sha256}"'
+    headers = {
+        "Cache-Control": thumbnails_module.IMMUTABLE_CACHE_CONTROL,
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if etag in request.headers.get("If-None-Match", ""):
+        not_modified = HttpResponse(status=304)
+        for name, value in headers.items():
+            not_modified[name] = value
+        return not_modified
+
+    accel_prefix = str(
+        getattr(django_settings, "BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX", "") or ""
+    )
+    response: HttpResponseBase
+    if accel_prefix:
+        response = HttpResponse(content_type=thumbnail.mime_type)
+        response["X-Accel-Redirect"] = f"{accel_prefix.rstrip('/')}/{thumbnail.storage_identifier}"
+    else:
+        try:
+            storage = backend_for_location(thumbnail.storage_location)
+            stream = storage.open(thumbnail.storage_identifier)
+        except StorageConfigurationError:
+            return HttpResponse("thumbnail storage unavailable", status=503)
+        except FileNotFoundError:
+            return HttpResponseNotFound("thumbnail missing")
+        except OSError:
+            return HttpResponse("storage unavailable", status=503)
+        response = FileResponse(stream, as_attachment=False, content_type=thumbnail.mime_type)
+        response["Content-Length"] = str(thumbnail.size_bytes)
+    for name, value in headers.items():
+        response[name] = value
+    return response
 
 
 # Attribute that `_book_list_prefetches` fills with the book's COMPLETE variants.
@@ -1391,7 +1691,7 @@ def _serialize_book(
     include_variants: bool = False,
     include_conversion_options: bool = False,
 ) -> dict[str, Any]:
-    book_payload = {
+    book_payload: dict[str, Any] = {
         "id": book.id,
         "title": book.title,
         "subtitle": book.subtitle,
@@ -1413,6 +1713,11 @@ def _serialize_book(
 
     if book.front_cover_id and book.front_cover is not None:
         book_payload["cover_front"] = _serialize_cover(book.front_cover)
+        refs = thumbnails_module.annotated_thumbnails(book)
+        if refs is not None:  # list queries annotate the current thumbnails (#28)
+            book_payload["cover_front"]["thumbnails"] = {
+                size: ref.url for size, ref in refs.items()
+            }
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
@@ -1480,6 +1785,64 @@ _LIBRARY_FILTER_PARAMS: Final = (
 )
 
 
+def _optional_id(raw: str | None) -> int | None:
+    value = (raw or "").strip()
+    return int(value) if value.isdigit() and 0 < len(value) <= 18 else None
+
+
+def _optional_decade(raw: str | None) -> int | None:
+    value = (raw or "").strip().removesuffix("s")
+    if not value.isdigit() or len(value) > 4:
+        return None
+    return (int(value) // 10) * 10
+
+
+def _optional_flag(raw: str | None) -> bool | None:
+    value = (raw or "").strip().lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    return None
+
+
+def _active_filter_chips(
+    request: HttpRequest, search_request: search.SearchRequest
+) -> list[dict[str, str]]:
+    """Removable labels for the filters in effect (one name query per entity filter)."""
+    chips: list[tuple[str, str]] = []
+    for param, label, value in (
+        ("q", "Search", search_request.query),
+        ("title", "Title", search_request.title),
+        ("author", "Author", search_request.author),
+        ("category", "Category", search_request.category),
+        ("genre", "Genre", search_request.genre),
+        ("language", "Language", search_request.language),
+        ("format", "Format", search_request.book_format.upper()),
+    ):
+        if value:
+            chips.append((param, f"{label}: {value}"))
+    for param, label, model, field_name, entity_id in (
+        ("author_id", "Author", Author, "full_name", search_request.author_id),
+        ("genre_id", "Genre", Genre, "name", search_request.genre_id),
+        ("category_id", "Category", Category, "name", search_request.category_id),
+    ):
+        if entity_id is not None:
+            name = model.objects.filter(pk=entity_id).values_list(field_name, flat=True).first()
+            chips.append((param, f"{label}: {name or 'unknown'}"))
+    if search_request.decade is not None:
+        chips.append(("decade", f"Decade: {search_request.decade}s"))
+    if search_request.has_cover is not None:
+        chips.append(("has_cover", "With cover" if search_request.has_cover else "Without cover"))
+    result = []
+    for param, text in chips:
+        params = request.GET.copy()
+        for name in (param, "cursor", "page"):
+            params.pop(name, None)
+        result.append({"label": text, "remove_url": f"?{params.urlencode()}"})
+    return result
+
+
 def _library_search_request(request: HttpRequest) -> search.SearchRequest:
     raw_page = request.GET.get("page")
     page_size = min(_as_positive_int(request.GET.get("page_size"), 25), 100)
@@ -1494,6 +1857,11 @@ def _library_search_request(request: HttpRequest) -> search.SearchRequest:
         genre=filters["genre"],
         language=filters["language"],
         book_format=filters["book_format"],
+        author_id=_optional_id(request.GET.get("author_id")),
+        genre_id=_optional_id(request.GET.get("genre_id")),
+        category_id=_optional_id(request.GET.get("category_id")),
+        decade=_optional_decade(request.GET.get("decade")),
+        has_cover=_optional_flag(request.GET.get("has_cover")),
         sort=request.GET.get("sort", "").strip(),
         cursor=request.GET.get("cursor", "").strip(),
         page=_as_positive_int(raw_page, 1) if raw_page is not None else None,
@@ -1548,11 +1916,11 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         result = backend.search(search_request)
     except search.InvalidCursorError:
         return JsonResponse({"detail": "invalid_cursor"}, status=400)
-    books_by_id = (
-        Book.objects.select_related("front_cover", "back_cover")
-        .prefetch_related(*_book_list_prefetches())
-        .in_bulk(result.book_ids)
-    )
+    books_by_id = thumbnails_module.with_thumbnail_refs(
+        Book.objects.select_related("front_cover", "back_cover").prefetch_related(
+            *_book_list_prefetches()
+        )
+    ).in_bulk(result.book_ids)
     serialized = [
         _serialize_book(books_by_id[book_id], include_variants=False)
         for book_id in result.book_ids
@@ -1564,7 +1932,9 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         if name.strip() in search.FACETS
     ]
     facet_payload = {
-        name: [{"value": item.value, "count": item.count} for item in counts]
+        name: [
+            {"value": item.value, "count": item.count, "key": item.filter_key} for item in counts
+        ]
         for name, counts in (
             backend.facet_counts(search_request, requested_facets).items()
             if requested_facets
@@ -1582,11 +1952,19 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
         duration_ms=round((time.perf_counter() - started) * 1000, 1),
     )
     if _wants_html(request):
+        for book_payload in serialized:
+            book_payload["cover_image"] = _cover_image_payload(books_by_id[book_payload["id"]])
         return render(
             request,
             "core/library_books.html",
             {
                 "books": serialized,
+                "active_filters": _active_filter_chips(request, search_request),
+                "hidden_filters": [
+                    (param, request.GET[param])
+                    for param in ("author_id", "genre_id", "category_id", "decade", "has_cover")
+                    if request.GET.get(param, "").strip()
+                ],
                 "count": result.count,
                 "fuzzy": result.fuzzy,
                 "page_number": result.page,

@@ -632,6 +632,47 @@ Global facet counts and the unfiltered total are cached for up to five minutes.
 Search logs record the backend, sort, result count and duration, never the
 query text.
 
+### Landing page and author index
+
+`/library/` is search-first (#28): a search box, a facet sidebar with global
+counts (format, language, genre, category, author, decade, cover), shelves
+("Recently added", "Recently identified" from review, and "New in <language>"
+for the second and third most common languages) and an author A–Z index at
+`/library/authors/`. Every facet link opens `/library/books/` with an exact
+filter: `format`, `language`, `genre_id`, `category_id`, `author_id`, `decade`
+(`1990` for 1990–1999) or `has_cover` (`1`/`0`). The global counts, the total
+and the language shelves are cached for five minutes; "Recently added" and
+"Recently identified" are live. Everything works without JavaScript.
+
+### Cover thumbnails
+
+Lists and shelves show 120 px and 240 px wide WebP thumbnails instead of the
+full covers. They are derived, regenerable files (`CoverThumbnail`, migration
+0024) in the `cover-thumbnails` storage location, a cache on the application
+VM. Its directory is `BOOK_SCANNER_COVER_THUMBNAIL_ROOT` (default
+`<storage root>/cover-thumbnails`), copied into the location's `base_path`
+when the location is first created; change it later in the admin. Expect about
+15 KB per book.
+
+A background job renders them whenever a front cover is stored. After the
+upgrade to migration 0024, and whenever the
+`ebook_server_library_derived_rows_missing{kind="cover_thumbnails"}` metric is
+above zero, backfill them:
+
+```bash
+uv run python manage.py generate_cover_thumbnails            # missing or stale only
+uv run python manage.py generate_cover_thumbnails --enqueue  # one RQ job per cover
+uv run python manage.py generate_cover_thumbnails --force    # regenerate all
+```
+
+Thumbnail URLs (`/library/covers/<sha256>/<size>.webp`) contain the file's
+hash and are served with `Cache-Control: private, max-age=31536000, immutable`.
+Django always checks the session and the member's status. With
+`BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX=/_protected/cover-thumbnails/` it
+then hands the file to nginx (`X-Accel-Redirect`) instead of streaming it from
+a Python worker; see `deploy/nginx/README.md`. A cover that cannot be decoded
+keeps the full-size cover in lists and is logged as `cover_thumbnail_failed`.
+
 ## Metrics and logs
 
 Set a long random `BOOK_SCANNER_METRICS_BEARER_TOKEN` in production and configure

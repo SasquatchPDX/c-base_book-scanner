@@ -215,8 +215,10 @@ def test_keyset_browse_and_filters_match_the_book_table() -> None:
         "-created_at", "-id"
     )
     assert _ids(filtered) == [book.pk for book in expected]
-    assert filtered["facets"]["format"] == [{"value": "epub", "count": len(expected)}]
-    assert filtered["facets"]["language"] == [{"value": "de", "count": len(expected)}]
+    assert filtered["facets"]["format"] == [
+        {"value": "epub", "count": len(expected), "key": "epub"}
+    ]
+    assert filtered["facets"]["language"] == [{"value": "de", "count": len(expected), "key": "de"}]
 
 
 def _plan(sql: str, params: list[Any]) -> str:
@@ -253,3 +255,66 @@ def test_search_queries_use_the_gin_and_btree_indexes() -> None:
     format_plan = _plan(format_sql, list(format_params))
     assert "booksearchfacet_lookup_idx" in format_plan
     assert "upper(" not in format_plan.lower()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgres_exact_filters_and_author_sort_match_the_fallback() -> None:
+    """Phase 2/3 filters behave the same on both backends (#28)."""
+    for index in range(12):
+        book = _book(
+            f"Exact {index:02d}",
+            authors=(f"Writer {index % 4}", f"Writer {(index + 1) % 4}"),
+            genres=(f"Genre {index % 3}",),
+            formats=("epub",) if index % 2 else ("pdf",),
+        )
+        Book.objects.filter(pk=book.pk).update(
+            publication_year=1980 + index * 3 if index % 5 else None
+        )
+    search.rebuild_search_index()  # publication_year was changed with `.update()`
+    writer = Author.objects.get(full_name="Writer 2")
+    genre = Genre.objects.get(name="Genre 1")
+    requests = [
+        search.SearchRequest(author_id=writer.pk, page_size=50),
+        search.SearchRequest(genre_id=genre.pk, book_format="epub", page_size=50),
+        search.SearchRequest(decade=1990, page_size=50),
+        search.SearchRequest(has_cover=False, page_size=50),
+        search.SearchRequest(has_cover=True, page_size=50),
+        search.SearchRequest(sort="author", page_size=50),
+    ]
+    postgres = search.PostgresSearchBackend()
+    fallback = search.DatabaseFallbackSearchBackend()
+    for request in requests:
+        assert postgres.search(request).book_ids == fallback.search(request).book_ids, request
+
+    facets = ["author", "genre", "decade", "has_cover"]
+    filtered = search.SearchRequest(book_format="epub")
+    for request in (search.SearchRequest(), filtered):
+        pg_counts = postgres.facet_counts(request, facets)
+        fb_counts = fallback.facet_counts(request, facets)
+        for facet in facets:
+            assert sorted(pg_counts[facet], key=repr) == sorted(fb_counts[facet], key=repr), facet
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgres_landing_page_and_author_index() -> None:
+    for index in range(8):
+        _book(
+            f"Landing {index}",
+            authors=(f"Zed {index}" if index % 2 else f"Abe {index}",),
+            language=("de", "en", "fr")[index % 3],
+            formats=("epub",),
+        )
+    client = _client()
+    client.get("/library/", headers={"Accept": "text/html"})  # fills the facet cache
+
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as queries:
+        page = client.get("/library/", headers={"Accept": "text/html"}).content.decode()
+    assert len(queries) <= 10
+    assert "Recently added" in page and "Landing 7" in page
+    assert "format=epub" in page
+
+    authors = client.get("/library/authors/", {"letter": "Z", "page_size": "3"}).json()
+    assert [item["name"] for item in authors["items"]] == ["Zed 1", "Zed 3", "Zed 5"]
+    assert authors["previous_cursor"] and authors["next_cursor"]

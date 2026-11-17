@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from django.conf import settings
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef
 from django.utils import timezone
 from prometheus_client.core import GaugeMetricFamily
 from redis import Redis
@@ -16,6 +16,8 @@ from rq import Queue
 
 from .models import (
     Book,
+    CoverImage,
+    CoverThumbnail,
     FileVariant,
     ImportJob,
     MetadataCandidate,
@@ -79,6 +81,30 @@ class PersistentStateCollector:
             ).count(),
         )
         yield collection
+
+        library = GaugeMetricFamily(
+            "ebook_server_library_derived_rows_missing",
+            "Books without a search row and front covers without current thumbnails (#28).",
+            labels=["kind"],
+        )
+        library.add_metric(
+            ["search_documents"], Book.objects.filter(search_document__isnull=True).count()
+        )
+        library.add_metric(
+            ["cover_thumbnails"],
+            CoverImage.objects.filter(position=CoverImage.CoverPosition.FRONT)
+            .exclude(
+                Exists(
+                    CoverThumbnail.objects.filter(
+                        cover_id=OuterRef("pk"),
+                        size=CoverThumbnail.Size.MEDIUM,
+                        source_sha256=OuterRef("sha256"),
+                    )
+                )
+            )
+            .count(),
+        )
+        yield library
 
         yield _group_count_metrics(
             name="ebook_server_processing_jobs",

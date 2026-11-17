@@ -289,13 +289,26 @@ def test_fallback_facet_counts_match_brute_force() -> None:
     payload = client.get("/library/books/", {"facets": "language,format,genre,bogus"}).json()
     filtered = client.get("/library/books/", {"language": "en", "facets": "format"}).json()
 
+    # `key` is what a facet link filters on: the value itself, or the entity id.
     assert payload["facets"] == {
-        "language": [{"value": "de", "count": 2}, {"value": "en", "count": 2}],
-        "format": [{"value": "epub", "count": 2}, {"value": "pdf", "count": 2}],
-        "genre": [{"value": "Manual", "count": 2}, {"value": "Novel", "count": 2}],
+        "language": [
+            {"value": "de", "count": 2, "key": "de"},
+            {"value": "en", "count": 2, "key": "en"},
+        ],
+        "format": [
+            {"value": "epub", "count": 2, "key": "epub"},
+            {"value": "pdf", "count": 2, "key": "pdf"},
+        ],
+        "genre": [
+            {"value": "Manual", "count": 2, "key": str(manual.pk)},
+            {"value": "Novel", "count": 2, "key": str(novel.pk)},
+        ],
     }
     assert filtered["facets"] == {
-        "format": [{"value": "epub", "count": 2}, {"value": "pdf", "count": 1}],
+        "format": [
+            {"value": "epub", "count": 2, "key": "epub"},
+            {"value": "pdf", "count": 1, "key": "pdf"},
+        ],
     }
     assert "facets" not in client.get("/library/books/").json()
 

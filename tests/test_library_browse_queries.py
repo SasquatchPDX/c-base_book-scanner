@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from django.core.cache import cache
 from django.db import connection
 from django.db.models import Q, QuerySet
 from django.test import Client
@@ -288,9 +289,12 @@ def test_library_books_query_count_is_independent_of_page_size(params: dict[str,
 
 @pytest.mark.django_db
 def test_library_home_query_count_is_independent_of_book_count() -> None:
+    cache.clear()
     client = _client()
     client.get("/library/")
     _seed_books()
+    # The first landing request computes the cached global facets and language shelves.
+    cold = _count_queries(client, "/library/", {"view": "html"})
     few = _count_queries(client, "/library/", {"view": "html"})
 
     for index in range(10):
@@ -300,4 +304,7 @@ def test_library_home_query_count_is_independent_of_book_count() -> None:
     many = _count_queries(client, "/library/", {"view": "html"})
 
     assert len(few) == len(many)
-    assert len(many) <= 12
+    # Design acceptance (#28 phase 3): the landing page renders in at most 10 queries.
+    assert len(many) <= 10
+    assert len(cold) <= 25
+    cache.clear()
