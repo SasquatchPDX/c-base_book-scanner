@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0023_multipart_works"),
+        ("core", "0031_multipart_works"),
     ]
 
     operations = [
