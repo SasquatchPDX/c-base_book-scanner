@@ -105,7 +105,7 @@ def restore_uuid_ids(apps: Any, schema_editor: Any) -> None:
         blocking = [row[0] for row in cursor.fetchall() if _canonical_uuid(row[0]) is None]
     if blocking:
         raise IrreversibleError(
-            f"core.0037 cannot be reversed: {len(blocking)} scan job(s) have scanner-assigned "
+            f"core.0041 cannot be reversed: {len(blocking)} scan job(s) have scanner-assigned "
             f"IDs that are not UUIDs (for example {sorted(blocking)[0]!r})."
         )
     if connection.features.has_native_uuid_field:
@@ -169,7 +169,7 @@ def canonicalize_json_references(apps: Any, schema_editor: Any) -> None:
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0036_book_search_document"),
+        ("core", "0040_cover_thumbnail"),
     ]
 
     operations = [

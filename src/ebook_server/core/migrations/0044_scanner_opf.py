@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0038_scanjob_raw_scan_lifecycle"),
+        ("core", "0043_scanjob_raw_scan_lifecycle"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -28,6 +28,8 @@ class Migration(migrations.Migration):
                     ("combine_parts", "Combine multi-part work"),
                     ("reference_check", "Referenced file check"),
                     ("scanner_opf_check", "Scanner OPF provider check"),
+                    ("scan_log", "Scanner log"),
+                    ("archive_reorganize", "Archive reorganize"),
                 ],
                 max_length=32,
             ),

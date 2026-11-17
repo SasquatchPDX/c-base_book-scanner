@@ -80,8 +80,8 @@ def test_string_pk_migration_types_and_timing_on_postgresql(
             )
             (foreign_keys,) = cursor.fetchone()
         assert set(column_types.values()) == {"character varying"}, column_types
-        assert len(column_types) == 9  # core_scanjob.id plus eight referencing tables
-        assert foreign_keys == 8
+        assert len(column_types) == 10  # core_scanjob.id plus nine referencing tables
+        assert foreign_keys == 9
 
         new_job = new_apps.get_model("core", "ScanJob")
         sample = str(jobs[len(jobs) // 2].id)
@@ -89,7 +89,7 @@ def test_string_pk_migration_types_and_timing_on_postgresql(
         assert new_job.objects.get(pk=sample).stage_states.count() == PAGES_PER_JOB
         with capsys.disabled():
             print(
-                f"\n[0037 on PostgreSQL] {JOBS} jobs, {JOBS * PAGES_PER_JOB} pages, "
+                f"\n[0041 on PostgreSQL] {JOBS} jobs, {JOBS * PAGES_PER_JOB} pages, "
                 f"{JOBS * PAGES_PER_JOB} stage states: {elapsed:.2f}s"
             )
     finally:

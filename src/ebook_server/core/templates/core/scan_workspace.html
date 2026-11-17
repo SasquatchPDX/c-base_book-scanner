@@ -46,6 +46,24 @@
     <p class="review-notice" data-raw-scan>Raw scan, being processed. It joins the library after ScanTailor processing and finish.{% if job.refinish_needed %} A page was replaced after the book was finished: re-finish needed.{% endif %}</p>
   {% endif %}
 
+  {% if job.completeness_flags is not None %}
+    <section class="finish-panel" data-completeness>
+      <div>
+        <h2>Scanner completeness check</h2>
+        {% if job.completeness_flags %}
+          <p>The scanner flagged {{ job.completeness_flags|length }} possible gap{{ job.completeness_flags|length|pluralize }} in the printed page numbers.</p>
+          <ul>
+            {% for flag in job.completeness_flags %}
+              <li>{% if flag.sequence_number_range %}Captures {{ flag.sequence_number_range|join:"–" }}: {% endif %}{{ flag.detail|default:"anomaly" }}{% if flag.missing_page_numbers %} (missing {{ flag.missing_page_numbers|join:", " }}){% endif %}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p>The scanner found no gaps in the printed page numbers.</p>
+        {% endif %}
+      </div>
+    </section>
+  {% endif %}
+
   {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}
     <section class="finish-panel">
       <div>
@@ -132,7 +150,7 @@
     {% for page in pages %}
       <article class="scan-page-card" id="page-{{ page.id }}">
         <header>
-          <label class="page-select"><input type="checkbox" data-page-select data-page-id="{{ page.id }}">Page {{ page.logical_sequence_number }} · {{ page.side }}</label>
+          <label class="page-select"><input type="checkbox" data-page-select data-page-id="{{ page.id }}">Page {{ page.logical_sequence_number }} · {{ page.side }}{% if page.recognized_page_number %} · printed {{ page.recognized_page_number }}{% endif %}</label>
           {% if page.open_rescan_todos %}<span class="status status-failed">Rescan requested</span>{% endif %}
         </header>
         {% if page.thumbnail %}<img src="{{ page.thumbnail }}" alt="Captured page {{ page.logical_sequence_number }}">{% endif %}

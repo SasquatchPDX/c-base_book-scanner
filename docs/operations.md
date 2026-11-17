@@ -561,11 +561,93 @@ identifier, and nothing reads metadata back from a path. Consequences:
 - **Correcting a book's title or author does not rename its folder.** The folder is
   assigned once (`Book.archive_folder`) and later files of that book keep joining
   it. Moving books into the folder their current metadata implies is an explicit,
-  admin-run reorganize.
+  admin-run reorganize (below).
 - **Files waiting for review** are archived under `_unsorted/<import job id>/` and
   moved into the book folder when identification or review settles the Book (a hard
   link on the same share, with the `_unsorted` name removed after the database
   commit; where hard links are unsupported the file stays under `_unsorted`).
+
+#### `metadata.opf` in each book folder (`BOOK_SCANNER_WRITE_BOOK_OPF`)
+
+Under a book-scoped layout (`author_title`, `calibre`, or a custom template with book
+fields) each book folder also gets a Calibre-compatible `metadata.opf` (OPF 2.0 Dublin
+Core, as Calibre writes it): title (with subtitle), authors with `opf:role="aut"` and
+`opf:file-as`, a stable `uuid` identifier plus ISBN/DOI/OCLC identifiers, language,
+publisher, date (the year alone when only the year is known), description, genres and
+categories as `dc:subject`, `calibre:title_sort`, and a `cover` guide reference when the
+cover image is in the same folder. Calibre, e-readers and file managers can read it.
+
+- **It is derived, never edited by hand.** The database is authoritative. Any change
+  to a book's metadata (title, subtitle, authors, identifiers, publisher, dates,
+  language, description, genres/categories, covers, a file joining/leaving the
+  folder, or deleting an attached author, genre or category) advances the book's
+  requested generation (`BookOpfState`, a separate table so an ordinary `Book.save()`
+  can never roll it back) and queues one background job after the database commit.
+  Further edits while that job is queued and not yet started do not queue more jobs,
+  so a review that changes ten fields writes the file once; an edit that commits once
+  the job has started queues a new one. The job records the generation it wrote only
+  if it is still the requested one, otherwise it writes again. A queued job lost with
+  its worker stops blocking new ones after the job timeout. A hand edit is overwritten
+  by the next regeneration.
+- **Atomic:** the job writes a hidden temporary file in the folder and renames it over
+  `metadata.opf`, so a reader never sees a half-written file. An unchanged file is not
+  rewritten.
+- **Never written on read-only, indexed-in-place locations.** Those folders belong to
+  their share. A book whose files are all referenced in place gets no OPF. A
+  `metadata.opf` the application did not generate is never overwritten.
+- **Marked as ours:** each file carries `<meta name="ebook-server:generated"
+  content="true"/>`. `core.book_opf.is_generated_book_opf()` recognizes it, so an
+  intake OPF-sidecar reader can skip it: a re-import of an archive folder must never
+  treat our own output as external evidence.
+- A reorganize writes the OPF into the new folder and removes the generated OPF left
+  alone in the old one; deleting a book removes it too.
+- `BOOK_SCANNER_WRITE_BOOK_OPF=false` turns it off. It has no effect under the `job`
+  layout (no book folders).
+
+After upgrading (or after restoring a share), queue a write for every existing book
+folder:
+
+```bash
+uv run python manage.py write_book_opfs --dry-run      # list the books, queue nothing
+uv run python manage.py write_book_opfs                # every book with an archive folder
+uv run python manage.py write_book_opfs --book 12      # one book (repeatable)
+```
+
+#### Reorganize: sorting the archive into the tree
+
+Files archived before the layout existed (`books/<import job id>/`), books whose title
+or author was corrected, and everything imported from a COPY/MOVE source can be moved
+into the folder each Book's *current* metadata implies. It is always two background
+jobs (`ProcessingJob`, type `archive_reorganize`), never work inside a web request:
+
+1. **Plan (dry run).** In the admin, select Books ("Plan moving selected books into
+   their archive folders") or COPY/MOVE sources ("Plan sorting books imported from
+   these sources into the archive tree"). The worker lists every file that would move
+   and where; the plan appears on the job's admin page. Nothing changes on storage.
+2. **Apply.** Select the finished plan under Processing jobs and run "Apply selected
+   archive reorganize plans". The plan is applied exactly as reviewed: each entry is
+   re-checked first (the record still points at the planned file with the planned
+   hash, still belongs to the planned Book, and that Book's current metadata still
+   implies the planned folder and file name). An entry that no longer matches, for
+   example because the title was edited after the dry run, is reported `stale` and
+   nothing is moved for it; the job's summary asks for a new dry run
+   (`requires_new_plan`). A valid entry is copied into the planned folder (never
+   over an existing file), verified by SHA-256, re-pointed in the database, and only
+   then is the old copy deleted; empty folders are pruned. A failed verification
+   keeps the original and fails the job. A plan applies once.
+
+From the shell (runs in the command's own process):
+
+```bash
+uv run python manage.py reorganize_archive --book 12 --book 13   # or --source 3, or --all
+uv run python manage.py reorganize_archive --apply <plan job id>
+uv run python manage.py reorganize_archive --run-queued          # admin-queued jobs, no worker
+```
+
+Files referenced in place (read-only locations) are never moved, and index-in-place
+sources cannot be selected: an indexed share stays exactly as it is. Plans are capped at
+5000 files; plan again after applying to continue. The `job` layout has no tree to sort
+into, so reorganize refuses to run under it.
 
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
@@ -815,6 +897,12 @@ index-in-place sources hashed, plus review/complete/failed counts):
 uv run python manage.py ingest_sources --status
 uv run python manage.py ingest_sources --source-id 1 --status --json
 ```
+
+Admins see the same numbers in the web app at **Intake** (`/library/intake/`,
+JSON without `?view=html`): one row per source with a completion bar, plus web
+uploads and scan jobs still in progress. The page reads database counts only (no
+filesystem walk, no hashing) and refreshes every 30 seconds. Files a source has
+not been scanned for yet appear once `ingest_sources` has discovered them.
 
 ### Source transfer modes
 
@@ -1344,6 +1432,83 @@ still works for one release and answers with a `Deprecation: true` header.
 Global facet counts and the unfiltered total are cached for up to five minutes.
 Search logs record the backend, sort, result count and duration, never the
 query text.
+`ebook_server_search_index_lag_seconds` (age of the oldest book without a search
+row) and `ebook_server_library_derived_rows_missing{kind="search_documents"}`
+should stay at 0; anything else means indexing failed for those books.
+
+### Landing page and author index
+
+`/library/` is search-first (#28): a search box, a facet sidebar with global
+counts (format, language, genre, category, author, decade, cover), shelves
+("Recently added", "Recently identified" from review, and "New in <language>"
+for the second and third most common languages) and an author A–Z index at
+`/library/authors/`. Every facet link opens `/library/books/` with an exact
+filter: `format`, `language`, `genre_id`, `category_id`, `author_id`, `decade`
+(`1990` for 1990–1999) or `has_cover` (`1`/`0`). The global counts, the total
+and the language shelves are cached for five minutes; "Recently added" and
+"Recently identified" are live. Everything works without JavaScript.
+
+### Cover thumbnails
+
+Lists and shelves show 120 px and 240 px wide WebP thumbnails instead of the
+full covers. They are derived, regenerable files (`CoverThumbnail`, migration
+0037) in the `cover-thumbnails` storage location, a cache on the application
+VM. Its directory is `BOOK_SCANNER_COVER_THUMBNAIL_ROOT` (default
+`<storage root>/cover-thumbnails`), copied into the location's `base_path`
+when the location is first created; change it later in the admin. Expect about
+15 KB per book.
+
+A background job renders them whenever a front cover is stored. After the
+upgrade to migration 0037, and whenever the
+`ebook_server_library_derived_rows_missing{kind="cover_thumbnails"}` metric is
+above zero, backfill them:
+
+```bash
+uv run python manage.py generate_cover_thumbnails            # missing or stale only
+uv run python manage.py generate_cover_thumbnails --enqueue  # one RQ job per cover
+uv run python manage.py generate_cover_thumbnails --force    # regenerate all
+uv run python manage.py generate_cover_thumbnails --verify   # also repair damaged files
+```
+
+`--verify` checks every front cover, including those whose rows look current,
+and regenerates only covers whose files are missing or whose size or SHA-256
+differ from the `CoverThumbnailFile` registry. Run it after restoring the cache
+from an old snapshot or after a disk error.
+
+Thumbnail URLs (`/library/covers/<sha256>/<size>.webp`) contain the file's
+hash and are served with `Cache-Control: private, max-age=31536000, immutable`.
+Django always checks the session and the member's status. With
+`BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX=/_protected/cover-thumbnails/` it
+then hands the file to nginx (`X-Accel-Redirect`) instead of streaming it from
+a Python worker; see `deploy/nginx/README.md`. A cover that cannot be decoded
+keeps the full-size cover in lists and is logged as `cover_thumbnail_failed`.
+
+A job publishes only when the cover still has the bytes it rendered. It checks
+the cover's current hash under a lock on the cover row, so a slow job for a
+replaced cover ends as `stale` and leaves the newer thumbnails alone.
+Thumbnail files are content-addressed and shared by identical covers, so they
+are never deleted inline. When the last row referencing a file is replaced or
+deleted, the file's `CoverThumbnailFile` registry row is marked unreferenced.
+A periodic collection deletes files that stayed unreferenced for longer than
+`BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS` (default one day). It re-checks
+references under the same registry row lock that publication takes, and a
+publisher that finds a file collected writes it again.
+
+Thumbnail files are written only while the publishing job holds the file's
+registry row lock, after the cover-hash check, and always through a temporary
+file in the same directory that is then renamed over the final name. Readers
+(Django or nginx) therefore never see a partial file, and a write that fails
+part way leaves the previous file as it was. An existing file is reused only
+when its size and SHA-256 match the registry; otherwise it is replaced (logged
+as `cover_thumbnail_file_repaired`). A job reports `current` only after the
+same check, so a retry repairs a damaged file instead of trusting that it
+exists. Serving trusts the rows and does not hash files. Run collection from cron
+or a systemd timer, for example hourly:
+
+```bash
+uv run python manage.py collect_cover_thumbnails
+uv run python manage.py collect_cover_thumbnails --grace-seconds 3600 --limit 5000
+```
 
 ## Metrics and logs
 

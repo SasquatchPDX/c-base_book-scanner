@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0037_scanjob_string_pk"),
+        ("core", "0042_scan_events"),
     ]
 
     operations = [

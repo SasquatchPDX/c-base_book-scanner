@@ -15,6 +15,8 @@
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
+- `POST /scan/jobs/{job_id}/logs/` -> upload a scanner log file (202, processed by a worker)
+- `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
 - `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
@@ -104,6 +106,36 @@ book queues bibliographic identification instead (202, `requires_bibliographic_r
 
 A runnable version of this flow is `scripts/scanner_client_example.py`.
 
+## Scanner logs and where scan output is stored
+
+`POST /scan/jobs/{job_id}/logs/` takes a multipart `file` field holding a whole
+scanner log file: plain text, at most 8 MiB. The request only writes the
+bounded upload to scan staging (an empty or oversized upload is refused with 400) and
+records the log with a `scan_log` processing job, which is queued once the request's
+transaction commits; it answers `202` with the log (`state: queued`) and a
+`status_url`. A worker then checks that the content is text, hashes it and stores it.
+It hashes the stored copy again and compares it with the upload before it records the
+log as stored and deletes the staged upload; a copy that does not match is removed, the
+staged upload is kept and the log becomes `failed` (an admin can retry it). The log's
+`state` becomes `stored`, `duplicate` (the same content is already stored for the job;
+`duplicate_of` names that log, and no second file is written) or `failed` (with
+`error`). `GET /scan/jobs/{job_id}/logs/` and the scan job detail (`logs`) report it.
+The client filename is only kept as provenance; the server stores each upload as
+`scan-upload-<first 8 hex digits of its SHA-256>.log`.
+
+Uploaded log files never take the name `scan.jsonl`. In the book folder that name is
+reserved for the scanner event log rendered from the events endpoint (#129, S5), which
+is rewritten as events arrive; `/logs/` uploads are immutable originals.
+
+Everything the library keeps from a scan goes into the book's archive folder on the
+attached storage (`<Author>/<Title>/` under the default `BOOK_SCANNER_ARCHIVE_LAYOUT`):
+the cleaned PDF (`<Title> - <Author>.pdf`), OCR output and conversions derived from it,
+the cover, and uploaded scanner logs (`scan-upload-<sha8>.log`). A log uploaded before the
+job is linked to a book waits in scan storage and is moved into the book folder during
+finalization; the scan-storage copy is deleted only after the archive copy's SHA-256 is
+verified. Raw page captures and ScanTailor stage outputs stay in `scan-artifacts/`,
+keyed by scan job, because the job may still be unidentified and stages are re-run.
+
 ## Storage and resilience
 
 - Scanner sends raw image artifacts; server stores immutable upload.
@@ -184,15 +216,17 @@ see `docs/operations.md`).
 `GET jobs/{id}` and `capture-complete` are built from *manifest sources* in
 `core/scan_manifest.py`. Each source owns one field (`pages`, `covers`, `metadata_opf`):
 what serif holds, its JSON status and how the request's field is parsed. Only pages exist
-so far. Until a feature is stored on serif, nothing of it can be verified:
+so far, plus the stored `scan.jsonl` event lines (S5). Until a feature is stored on serif,
+nothing of it can be verified:
 
 - a field with no registered source is left out of `GET jobs/{id}` (covers until S4,
   `metadata_opf` until S6). In a `capture-complete` request it **fails closed**: an empty
   value (`null` or `[]`) is accepted, but every declared item is reported `missing`
   (`cover:front`, `cover:back`, `metadata_opf`), because serif cannot have stored it;
-- the event high-water mark is `0` until S5 stores `scan.jsonl` lines, and
-  `capture-complete` compares the request's `sans_last_line_no` with that `0`, so any
-  later line is `mismatched` (`events`).
+- the event high-water mark is the highest stored scanner `line_no` of the job's
+  `scan.jsonl` lines (S5, `scan_events.sans_high_water_mark`, registered at app start
+  with `scan_manifest.register_event_high_water_mark`), `0` before the first line. A
+  request `sans_last_line_no` that differs from it is `mismatched` (`events`).
 
 S4 and S6 call `scan_manifest.register_manifest_source(...)`; S5 calls
 `scan_manifest.register_event_high_water_mark(...)`. S6 (#130) registers `metadata_opf`:
@@ -337,18 +371,93 @@ scan job. Library browse, search (both backends; such books are never in the sea
 index), home, book detail, download and covers use it. A raw scan never hides a book that
 is already in the library for another reason.
 
-### Upgrade note: migration `0037_scanjob_string_pk`
+
+### `scan.jsonl` event lines (`POST /api/scanner/v1/jobs/{job_id}/events`)
+
+The scanner's append-only process log (`scan.jsonl`, libreflip/sans#48, contract §4.4
+and §6.7) arrives line by line. Each line is stored raw as a `ScanEvent` (`origin`,
+`line_no`, `raw`, `type`, `received_at`).
+
+- Request: `{"first_line_no": 58, "lines": ["{\"type\":\"attempt\",...}", ...]}`. The
+  scanner numbers its lines `1, 2, 3...` in file order; `(job, line_no)` is unique and is
+  the idempotency key.
+- `200 {"sans_last_line_no": N}`: stored. Lines at or below the stored high-water mark
+  must be byte-identical; they are confirmed and skipped, so re-sending an overlapping
+  batch changes nothing.
+- `409 event_gap`: `first_line_no` is beyond the high-water mark + 1;
+  `details.expected_first_line_no` says where to resume.
+- `409 event_conflict`: a stored line differs (`details.line_no`). Nothing of the batch
+  is stored.
+- `422 invalid_event`: a line is not one JSON object with a non-empty string `type`, is
+  longer than 64 KiB, or contains a line break (`details.line_no`). Nothing is stored.
+- `413 payload_too_large`: more than 1000 lines or 1 MiB of line bytes in one batch.
+- `409 job_state`: the job is cancelled. Every other state accepts events, so the final
+  `completeness_check` still arrives after capture.
+- `404 not_found`: no such job, or a web-created job (only `source=scanner` jobs are
+  served).
+
+Overlapping batches that arrive concurrently are serialised by the job's row lock, with
+the unique constraint as the backstop: no duplicate and no gap can be stored.
+
+Known event types are projected into the database; all others (`attempt`, future
+telemetry) are stored only. For each projected field the latest valid value wins; a
+malformed field (wrong type, a number that does not fit a float, NaN/Infinity, a
+`sequence_number` beyond 2147483647) is ignored while the line itself is stored:
+
+| Event | Projection |
+|---|---|
+| `job` | `ScanJob.page_width_mm`, `ScanJob.page_number_crop` |
+| `page` | `ScanPage.recognized_page_number`, `ScanPage.status` (for `sequence_number`, side `single`) |
+| `completeness_check` | `ScanJob.completeness_flags` (shown in the scan workspace), `completeness_checked_at` |
+
+A `page` event that arrives before its page image is applied when the page is created
+(`scan_events.project_page_from_events`). serif appends its own lines (origin `serif`:
+`rescan_flag`, `rescan_replace`, each with `"origin": "serif"`, `"at"` and `"todo_id"`)
+with `scan_events.append_serif_event`. `scan_events.sans_high_water_mark(job)` gives the
+scanner's high-water mark, as `GET jobs/{job_id}` and `capture-complete` report it.
+
+**The rendered file.** After every change, once the transaction has committed, a
+background job writes the combined `scan.jsonl`: every stored line in arrival order, each
+followed by `\n`. The scanner's lines therefore appear byte-for-byte in `line_no` order,
+with serif's lines at the positions where they arrived. The write is atomic (temporary
+file in the same folder, then rename) and goes through the storage backend:
+
+- into the job folder in scan storage: `scan-artifacts/scan-jobs/<job_id>/scan.jsonl`;
+- once the job is finished (`complete`, linked to a Book), also into the book's archive
+  folder as `scan.jsonl` (`books/<book id>/scan.jsonl` under the `job` layout). Events
+  that arrive after finish update the book's copy too.
+
+serif never overwrites a file it did not write. The first write to each folder claims a
+name with an exclusive create (the allocation `publish_unique` uses): `scan.jsonl`, else
+`scan-<job_id>.jsonl`, else `scan-<job_id>-<token>.jsonl`. A name that already exists (a
+log uploaded independently, another tool's file) or that another scan job of the same
+book has claimed is skipped. The claimed name is kept on the job
+(`scan_jsonl_job_identifier`, `scan_jsonl_book_identifier`), and later renders replace
+only that file.
+
+Concurrent renders are fenced: each pass takes the next `scan_jsonl_render_generation`
+under the job's row lock, stages its snapshot beside the file, and renames it into place
+only while still holding the newest generation, again under the row lock. An older pass
+that a newer one overtook discards its snapshot. A pass records its high-water mark
+(`scan_jsonl_*_rendered_through`) only after the file reads back as the snapshot, and a
+render decides whether a file is current by its size and SHA-256, never by the mark, so
+a retry after an interrupted or failed write always repairs the file.
+
+The database is authoritative; the files are renderings and can be rebuilt with
+`scan_events.write_scan_jsonl(job_id)`.
+
+### Upgrade note: migration `0041_scanjob_string_pk`
 
 The migration changes `core_scanjob.id` from `uuid` to `varchar(64)`, together with every
 column that references it: `ScanPage`, `ScanTodo`, `ScanTailorStageState`,
-`MetadataSearch`, `MetadataCandidate`, `ReviewTask`, `LLMSuggestion` and
-`ContributionEvent`. Existing IDs keep their value in canonical string form, so links,
+`MetadataSearch`, `MetadataCandidate`, `ReviewTask`, `LLMSuggestion`,
+`ContributionEvent` and `ScanLog`. Existing IDs keep their value in canonical string form, so links,
 storage paths and `scan_job_id` values in JSON details stay valid. The JSON fields are
 `ProcessingJob.details`, `FileVariant.converter_options`, `ScanJob.notes`,
 `ReviewTask.decision_payload` and `ContributionEvent.outcome`. Any non-canonical spelling
 in them is rewritten.
 
-- **PostgreSQL** casts `uuid::varchar` and rewrites all nine tables and every index on
+- **PostgreSQL** casts `uuid::varchar` and rewrites all ten tables and every index on
   the changed columns (primary key, foreign-key indexes, the composite and unique indexes
   that contain `scan_job_id`) under an `ACCESS EXCLUSIVE` lock. Stop the web and worker
   units while `migrate` runs. The string keys are 36 bytes instead of 16, so these
