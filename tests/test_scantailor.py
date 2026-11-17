@@ -1440,3 +1440,109 @@ def test_content_box_on_dark_surroundings_finds_text_not_frame() -> None:
     assert right < 950
     assert top > 150
     assert bottom < 1250
+
+
+def test_passthrough_byte_copies_normalised_png(tmp_path: Path) -> None:
+    """#54: an unchanged normalised PNG is copied, not decoded and re-encoded."""
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(200, 200))
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+
+    assert scantailor._passthrough(source, output, preview) == {"algorithm": "copy"}
+
+    assert output.read_bytes() == source.read_bytes()
+    assert scantailor._compute_sha256(output) == scantailor._compute_sha256(source)
+    with Image.open(preview) as rendered:
+        assert rendered.format == "PNG"
+
+
+@pytest.mark.parametrize(
+    ("image", "save_kwargs"),
+    [
+        (Image.new("L", (40, 60), 200), {"format": "TIFF"}),
+        (Image.new("RGBA", (40, 60), (200, 200, 200, 128)), {"format": "PNG"}),
+        (Image.new("I;16", (40, 60), 40000), {"format": "PNG"}),
+    ],
+)
+def test_passthrough_still_normalises_other_inputs(
+    image: Image.Image,
+    save_kwargs: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    source = _save(image, tmp_path / "in.bin", **save_kwargs)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    assert output.read_bytes() != source.read_bytes()
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.mode in {"L", "RGB"}
+        assert written.size == (40, 60)
+
+
+def test_exif_rotated_input_is_normalised_and_sized_like_load_image(tmp_path: Path) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 CW on display
+    source = _save(Image.new("RGB", (80, 50), (250, 250, 250)), tmp_path / "in.jpg", exif=exif)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    loaded = scantailor._load_image(source)
+    assert loaded.size == (50, 80)
+    assert scantailor._oriented_size(source) == loaded.size
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.size == (50, 80)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (50, 80)
+    assert (recorded["output_width"], recorded["output_height"]) == (50, 80)
+
+
+def test_zero_angle_deskew_keeps_identical_pixels_by_copy(tmp_path: Path) -> None:
+    source = _save(_text_page(300, 400), tmp_path / "in.png")
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+    result = scantailor._run_deskew(_state({"manual_angle": 0}), source, output, preview)
+
+    assert result["angle"] == 0
+    assert output.read_bytes() == source.read_bytes()
+    assert preview.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_noop_stage_still_persists_own_output_artifact_with_provenance() -> None:
+    client, job = _create_scan_job("scan-user-noop-stage")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_text_heavy_bytes(),
+        filename="noop.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 0}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+
+    split = ScanTailorStageState.objects.get(scan_page=page, stage="page_split")
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+    # The no-op stage has its own artifact (and preview) with full provenance ...
+    assert deskew.output_storage_identifier
+    assert deskew.output_storage_identifier != split.output_storage_identifier
+    assert deskew.preview_storage_identifier
+    assert deskew.input_stage_state_id == split.id
+    assert deskew.algorithm and deskew.algorithm_version
+    # ... byte-identical to its input, so the hashes match.
+    assert deskew.output_sha256 == split.output_sha256
+    assert deskew.output_size_bytes == split.output_size_bytes
+    assert deskew.parameters["output_width"] == deskew.parameters["input_width"]
