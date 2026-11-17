@@ -500,6 +500,10 @@ class FileVariant(models.Model):
     class VariantFormat(models.TextChoices):
         EPUB = "epub", "EPUB"
         MOBI = "mobi", "MOBI"
+        AZW = "azw", "AZW"
+        AZW3 = "azw3", "AZW3"
+        PRC = "prc", "PRC"
+        RTF = "rtf", "RTF"
         PDF = "pdf", "PDF"
         TXT = "txt", "TXT"
         HTML = "html", "HTML"

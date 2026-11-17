@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0023_book_search_document"),
+        ("core", "0024_book_search_document"),
     ]
 
     operations = [

@@ -283,6 +283,16 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+`--preview` lists every importable file and every skipped file, followed by a
+per-source summary such as `importable=108 skipped=3 (.chm=2, .lit=1)`. Skipped
+files are unsupported formats (`SKIPPED (unsupported format: .chm) => <path>`) and
+audio files (see "Audio files and audiobooks" below); the per-extension counts cover
+both. With `--json`, rows carry `"status": "importable"` or `"status": "skipped"`;
+skipped rows add `"skipped": "unsupported"` or `"skipped": "audio"`, `extension` and
+`reason`, and each source ends with a
+`{"source_location_id", "summary": {"importable", "skipped", "skipped_audio",
+"skipped_by_extension"}}` row.
+
 ### Audio files and audiobooks
 
 This system does not manage audiobooks. The decision and its research are in
@@ -537,7 +547,16 @@ hash downloaded bytes while staging them on disk and remove partial temporary
 files after download failures. Changed results receive separate storage paths
 even when the service repeats a filename, preserving prior outputs.
 
-Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
+Digital intake accepts EPUB, MOBI, AZW, AZW3, PRC, RTF, PDF, TXT, HTML, FB2,
+DjVu, CBZ, and CBR. AZW/AZW3/PRC must carry a PalmDB `BOOKMOBI` header (PRC may
+also be plain PalmDOC `TEXtREAd`); RTF must start with `{\rtf`. AZW/AZW3/PRC
+metadata is read with Calibre's `ebook-meta` like MOBI; RTF metadata currently falls
+back to filename/folder signals before external verification. These four formats
+are stored and downloadable as uploaded, but no conversion route is offered from them
+until one is binary-verified (see `docs/conversion-matrix.md`).
+Files in any other format (for example CHM, LIT, LRF, PDB, DOC/DOCX, ZIP/RAR) are
+not imported: source discovery logs a `source_files_skipped_unsupported` warning
+with per-extension counts, and `--preview` lists them (see above).
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text
 encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP readers
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
@@ -651,14 +670,14 @@ and the language shelves are cached for five minutes; "Recently added" and
 
 Lists and shelves show 120 px and 240 px wide WebP thumbnails instead of the
 full covers. They are derived, regenerable files (`CoverThumbnail`, migration
-0024) in the `cover-thumbnails` storage location, a cache on the application
+0025) in the `cover-thumbnails` storage location, a cache on the application
 VM. Its directory is `BOOK_SCANNER_COVER_THUMBNAIL_ROOT` (default
 `<storage root>/cover-thumbnails`), copied into the location's `base_path`
 when the location is first created; change it later in the admin. Expect about
 15 KB per book.
 
 A background job renders them whenever a front cover is stored. After the
-upgrade to migration 0024, and whenever the
+upgrade to migration 0025, and whenever the
 `ebook_server_library_derived_rows_missing{kind="cover_thumbnails"}` metric is
 above zero, backfill them:
 
