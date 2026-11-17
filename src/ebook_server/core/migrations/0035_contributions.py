@@ -11,7 +11,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
     dependencies = [
         ("auth", "0012_alter_user_first_name_max_length"),
-        ("core", "0032_processingjob_combine_parts"),
+        ("core", "0034_llm_suggestion"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

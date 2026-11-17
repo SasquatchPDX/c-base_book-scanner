@@ -26,6 +26,7 @@ from .models import (
     Identifier,
     ImportGroup,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
@@ -63,7 +64,9 @@ class BookAdmin(admin.ModelAdmin[Book]):
     search_fields = ("title", "subtitle", "publisher")
     filter_horizontal = ("authors", "categories")
     inlines = (BookGenreInline,)
-    readonly_fields = ("genres_curated_at", "genres_curated_by")
+    # archive_folder is assigned by core.archive_layout; editing it by hand would orphan
+    # the book's folder.
+    readonly_fields = ("genres_curated_at", "genres_curated_by", "archive_folder")
 
     def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
         super().save_formset(request, form, formset, change)
@@ -466,3 +469,25 @@ class ContributorPreferenceAdmin(_ReadOnlyLedgerAdmin):
 @admin.register(ContributionMonthlyTotal)
 class ContributionMonthlyTotalAdmin(_ReadOnlyLedgerAdmin):
     list_display = ("user", "month", "kind", "points", "event_count")
+
+
+@admin.register(LLMSuggestion)
+class LLMSuggestionAdmin(admin.ModelAdmin[LLMSuggestion]):
+    """Read-only: suggestions are evidence written by the LLM job, never edited by hand."""
+
+    list_display = (
+        "created_at",
+        "import_job",
+        "trigger",
+        "outcome",
+        "model",
+        "new_candidate_count",
+    )
+    list_filter = ("trigger", "outcome", "model")
+    readonly_fields = tuple(field.name for field in LLMSuggestion._meta.fields)
+
+    def has_add_permission(self, request: Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: Any, obj: LLMSuggestion | None = None) -> bool:
+        return False

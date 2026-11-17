@@ -63,6 +63,8 @@ from . import (
     conversion,
     genres,
     intake,
+    llm,
+    llm_identification,
     metadata_search,
     multipart,
     ocr,
@@ -81,6 +83,7 @@ from .models import (
     FileVariant,
     Genre,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
@@ -1248,6 +1251,10 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
     "author_conflict": (
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
+    ),
+    "llm_derived": (
+        "The best match was found through search terms suggested by the local AI "
+        "server. AI suggestions are unverified, so a person must confirm the match."
     ),
     "ambiguous_tie": (
         "Several different books tied for the best score, so none was accepted "
@@ -4060,6 +4067,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    llm_panel = _llm_panel(task)
+    payload["llm_suggestion"] = llm_panel["suggestion_payload"] if llm_panel else None
     multipart_group = multipart.group_for_task(task)
     payload["multipart"] = multipart_group
     search_context = _review_search_context(task)
@@ -4105,10 +4114,71 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "candidates": candidates,
                 "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
+                "llm_panel": llm_panel,
+                "llm_candidate_ids": _llm_candidate_ids(task),
                 **search_context,
             },
         )
     return JsonResponse(payload)
+
+
+def _llm_candidate_ids(task: ReviewTask) -> set[int]:
+    """Candidates found only through LLM-proposed search terms (labelled on the page)."""
+    if task.import_job_id is None:
+        return set()
+    return {
+        candidate.pk
+        for candidate in MetadataCandidate.objects.filter(import_job_id=task.import_job_id)
+        if isinstance(candidate.raw_payload, dict)
+        and candidate.raw_payload.get(llm_identification.HINT_SOURCE_KEY)
+        == llm_identification.HINT_SOURCE_LLM
+    }
+
+
+def _llm_suggestion_payload(suggestion: LLMSuggestion) -> dict[str, Any]:
+    output = suggestion.output if isinstance(suggestion.output, dict) else {}
+    grounding = suggestion.grounding if isinstance(suggestion.grounding, dict) else {}
+    return {
+        "id": suggestion.pk,
+        "label": "AI suggestion, unverified",
+        "trigger": suggestion.trigger,
+        "outcome": suggestion.outcome,
+        "model": suggestion.model,
+        "model_version": suggestion.model_version,
+        "prompt_template_version": suggestion.prompt_template_version,
+        "created_at": suggestion.created_at.isoformat(),
+        "new_candidate_count": suggestion.new_candidate_count,
+        "output": output,
+        "grounding": grounding,
+    }
+
+
+def _llm_panel(task: ReviewTask) -> dict[str, Any] | None:
+    """The "AI suggestion (unverified)" panel for an import review task, or None."""
+    if task.import_job_id is None:
+        return None
+    suggestion = llm_identification.latest_suggestion(task)
+    enabled = llm.llm_enabled()
+    if suggestion is None and not enabled:
+        return None
+    grounding = (
+        suggestion.grounding if suggestion and isinstance(suggestion.grounding, dict) else {}
+    )
+    output = suggestion.output if suggestion and isinstance(suggestion.output, dict) else {}
+    active = llm_identification.active_job(task)
+    return {
+        "enabled": enabled,
+        "suggestion": suggestion,
+        "suggestion_payload": _llm_suggestion_payload(suggestion) if suggestion else None,
+        "output": output,
+        "title_hints": grounding.get("title_hints", []),
+        "author_hints": grounding.get("author_hints", []),
+        "isbn_hints_kept": grounding.get("isbn_hints_kept", []),
+        "isbn_hints_dropped": grounding.get("isbn_hints_dropped", []),
+        "first_title": (output.get("title_hints") or [""])[0],
+        "authors_text": ", ".join(output.get("author_hints") or []),
+        "active_job": active,
+    }
 
 
 _book_for_candidate = review_accept.book_for_candidate
@@ -4508,6 +4578,83 @@ def _queue_review_search(
         },
         status=202,
     )
+
+
+@require_POST
+@login_required
+def review_ask_llm(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Queue the local-LLM identification assist for one import review task (#26)."""
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return HttpResponseBadRequest("forbidden")
+    try:
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
+    except ReviewTask.DoesNotExist:
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    if not llm.llm_enabled():
+        return HttpResponseBadRequest("the AI identification assist is disabled")
+    try:
+        processing_job = llm_identification.request_llm_identification(
+            review_task=task,
+            trigger=LLMSuggestion.Trigger.REVIEWER,
+            requested_by_user_id=profile.user_id,
+        )
+    except llm_identification.LLMIdentificationError as exc:
+        return HttpResponseBadRequest(str(exc))
+    if _wants_html(request):
+        if processing_job.state in {
+            ProcessingJob.JobState.SUCCESS,
+            ProcessingJob.JobState.FAILED,
+        }:
+            return redirect("review-detail", task_id=task.id)
+        return redirect("llm-identification-job-status", job_id=processing_job.job_id)
+    return JsonResponse(
+        {
+            "task_id": str(task.id),
+            "llm_job": llm_identification.job_payload(processing_job),
+        },
+        status=202,
+    )
+
+
+@require_GET
+@login_required
+def llm_identification_job_status(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.LLM_IDENTIFICATION:
+        return HttpResponseNotFound()
+    payload = llm_identification.job_payload(job)
+    try:
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(
+            pk=payload.get("review_task_id"),
+        )
+    except (ReviewTask.DoesNotExist, ValueError, TypeError):
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    if _wants_html(request):
+        if job.state in {ProcessingJob.JobState.SUCCESS, ProcessingJob.JobState.FAILED}:
+            return redirect("review-detail", task_id=task.id)
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "AI identification assist"},
+        )
+    return JsonResponse(payload)
 
 
 @require_POST

@@ -247,6 +247,39 @@ The archive directory name is fixed (`BOOK_SCANNER_ARCHIVE_DIRNAME`) so the arch
 always sits behind the storage-root mount and sentinel checks below; it is not a
 separate setting that could point back at the VM disk.
 
+### Archive layout (`BOOK_SCANNER_ARCHIVE_LAYOUT`)
+
+Inside `library-artifacts/`, files are written in a Calibre-style tree: one folder
+per book holding every format, conversions, the cover (`cover.jpg`) and OCR output.
+
+| Value | Folder for a book |
+| --- | --- |
+| `author_title` (default) | `<Author>/<Title>/` (first author). A second, different book with the same author and title gets `<Author>/<Title> (<book id>)/`. |
+| `calibre` | `<Author>/<Title> (<book id>)/`, exactly as Calibre names folders. |
+| `job` | `books/<import job id>/` for originals and `books/<book id>/{converted,covers,ocr}/` for derived files: the layout used before #7. |
+| custom template | `/`-separated, with `{author}`, `{title}`, `{book_id}`, `{year}`, `{language}` (or `{job_id}` alone for a per-import layout), e.g. `{language}/{author}/{title}`. |
+
+Files are named `<Title> - <Author>.<ext>`. Names are NFC-normalized, stripped of
+control characters, path separators and characters Windows/SMB reject, capped at
+120 bytes per component, and Windows device names (`CON`, `NUL`, ...) are prefixed
+with `_`; a new file never overwrites an existing one (a short random suffix is
+added instead). Folder names are compared case-insensitively, because SMB clients
+treat `Asimov/Foundation` and `asimov/foundation` as the same folder.
+
+The database stays authoritative: each file records its storage location and
+identifier, and nothing reads metadata back from a path. Consequences:
+
+- **Changing the layout applies to new files only.** Existing files stay where they
+  are and keep working.
+- **Correcting a book's title or author does not rename its folder.** The folder is
+  assigned once (`Book.archive_folder`) and later files of that book keep joining
+  it. Moving books into the folder their current metadata implies is an explicit,
+  admin-run reorganize.
+- **Files waiting for review** are archived under `_unsorted/<import job id>/` and
+  moved into the book folder when identification or review settles the Book (a hard
+  link on the same share, with the `_unsorted` name removed after the database
+  commit; where hard links are unsupported the file stays under `_unsorted`).
+
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
 library references each file where it already is, read-only.
@@ -779,6 +812,14 @@ lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
 Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
 no scheduler lock is present.
 
+If the local LLM identification assist is enabled (`BOOK_SCANNER_LLM_ENABLED`,
+see `docs/metadata-providers.md`), its jobs go to a separate queue
+(`BOOK_SCANNER_LLM_QUEUE_NAME`, default `llm`) so a bulk import cannot flood the AI
+server or starve OCR. Run one or two workers for it, for example
+`rq worker --config ebook_server.rq_settings --url redis://localhost:6379/0 llm`,
+or add `llm` to an existing worker's queue list. Without such a worker, LLM jobs
+stay queued and `recover_stale_jobs` reports them.
+
 ### Worker concurrency (ScanTailor-Web batches)
 
 One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
@@ -1044,3 +1085,14 @@ appropriate. Never include document contents in incident notes or metrics labels
 Break the backlog down by task type and age, confirm metadata providers are
 healthy, and assign reviewers. Do not lower confidence thresholds merely to clear
 the queue; uncertain matches must remain explicit human-review work.
+
+### Book Scanner LLM assist failing
+
+More than half of the LLM identification requests in the last hour failed or
+returned invalid output. Check that the AI server is up and reachable from the
+workers, that `BOOK_SCANNER_LLM_MODEL` still exists on it (a renamed or swapped
+model is the usual cause of `invalid_output`), and the `llm_identification_failed`
+log events (they carry the error class and model, never book content). Imports are
+unaffected: they stay in review without AI hints. Disable the assist with
+`BOOK_SCANNER_LLM_ENABLED=false` if the server will be down for long, and re-run
+`evaluate_llm_identification` after any model change.

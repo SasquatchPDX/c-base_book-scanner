@@ -1,0 +1,68 @@
+relative_path,title,author,is_single_book,notes
+misc-01/Books/Absolute Java/ch01_noPW.pdf,Absolute Java,Walter Savitch,false,chapter file
+misc-01/Books/Absolute Java/ch12_noPW.pdf,Absolute Java,Walter Savitch,false,chapter file
+misc-01/Books/Absolute Java/Appendix1_noPW.pdf,Absolute Java,Walter Savitch,false,appendix file
+misc-01/Books/All in One CISSP Exam Guide/ch06.pdf,CISSP All-in-One Exam Guide,Shon Harris,false,chapter file
+misc-01/Books/All in One CISSP Exam Guide/FM.pdf,CISSP All-in-One Exam Guide,Shon Harris,false,front matter
+misc-01/Books/All in One CISSP Exam Guide/Index.pdf,CISSP All-in-One Exam Guide,Shon Harris,false,index
+misc-01/Books/Security Engineering/SE-01.pdf,Security Engineering,Ross Anderson,false,chapter file
+misc-01/Books/Security Engineering/SE-Bib.pdf,Security Engineering,Ross Anderson,false,bibliography
+misc-01/Books/Network Warrior.pdf,Network Warrior,Gary A. Donahue,true,
+misc-01/Books/C in A Nutshell 2006.chm,C in a Nutshell,Peter Prinz,true,
+misc-01/Books/C++ Cookbook 2005.chm,C++ Cookbook,D. Ryan Stephens,true,
+misc-01/Books/C++ In a Nutshell 2003.chm,C++ in a Nutshell,Ray Lischner,true,
+misc-01/Books/Cisco CookBook.chm,Cisco IOS Cookbook,Kevin Dooley,true,
+misc-01/Books/Malware Forensics.pdf,Malware Forensics,Cameron H. Malin,true,
+misc-01/Books/No Tech Hacking.pdf,No Tech Hacking,Johnny Long,true,
+misc-01/Books/How to be Invisible.pdf,How to Be Invisible,J. J. Luna,true,
+misc-01/Books/Perfect Passwords.pdf,Perfect Passwords,Mark Burnett,true,
+misc-01/Books/Nmap.pdf,Nmap in the Enterprise,,true,author not verified
+misc-01/Books/Wireshark Ethereal.pdf,Wireshark & Ethereal Network Protocol Analyzer Toolkit,Angela Orebaugh,true,
+"Alcott, Louisa May/Little Women.txt",Little Women,Louisa May Alcott,true,
+"Alcott, Louisa May/Little Men.txt",Little Men,Louisa May Alcott,true,
+"Asimov, Isaac/Foundation.txt",Foundation,Isaac Asimov,true,
+"Asimov, Isaac/I Robot.txt","I, Robot",Isaac Asimov,true,
+"Asimov, Isaac/Second Foundation.txt",Second Foundation,Isaac Asimov,true,
+"Austen, Jane/Emma.txt",Emma,Jane Austen,true,
+"Austen, Jane/Persuasion.txt",Persuasion,Jane Austen,true,
+"Austen, Jane/Northanger Abbey.txt",Northanger Abbey,Jane Austen,true,
+"Austen, Jane/Mansfield Park.txt",Mansfield Park,Jane Austen,true,
+"Bradbury, Ray/Veldt, The.txt",The Veldt,Ray Bradbury,true,short story
+"Card, Orson Scott/Treason.txt",Treason,Orson Scott Card,true,
+"Clancy, Tom/Patriot Games.txt",Patriot Games,Tom Clancy,true,
+"Clarke, Arthur C/Childhoods End.txt",Childhood's End,Arthur C. Clarke,true,
+"Crichton, Michael/Andromeda Strain.txt",The Andromeda Strain,Michael Crichton,true,
+"Crichton, Michael/Congo.txt",Congo,Michael Crichton,true,
+"Crichton, Michael/Timeline.txt",Timeline,Michael Crichton,true,
+"Defoe, Daniel/Robinson Crusoe.txt",Robinson Crusoe,Daniel Defoe,true,
+"Dickens, Charles/Great Expectations.txt",Great Expectations,Charles Dickens,true,
+"Dickens, Charles/Bleak House.txt",Bleak House,Charles Dickens,true,
+"Dickens, Charles/David Copperfield.txt",David Copperfield,Charles Dickens,true,
+"Doyle, Arthur Conan/A Study In Scarlet.txt",A Study in Scarlet,Arthur Conan Doyle,true,
+"Dunsay, Lord/Book_of_Wonder_by_Lord_Dunsay(HTML)/d_bride.htm",The Book of Wonder,Lord Dunsany,false,one story of a collection split into HTML files
+"Dunsay, Lord/Book_of_Wonder_by_Lord_Dunsay(HTML)/l_wonder.htm",The Book of Wonder,Lord Dunsany,false,one part of a collection split into HTML files
+"Gibson, William/Neuromancer.txt",Neuromancer,William Gibson,true,
+"Gibson, William/Count Zero.txt",Count Zero,William Gibson,true,
+"Gibson, William/Burning Chrome.txt",Burning Chrome,William Gibson,true,
+"Grimm, Gebruder/Little Mermaid.txt",The Little Mermaid,Hans Christian Andersen,true,folder names the wrong author
+"Grimm, Gebruder/Snow White.txt",Snow White,Brothers Grimm,true,
+"Heinlein, Robert A/Starship Troopers.txt",Starship Troopers,Robert A. Heinlein,true,
+"Heinlein, Robert A/Double Star.txt",Double Star,Robert A. Heinlein,true,
+"Heinlein, Robert A/Glory Road.txt",Glory Road,Robert A. Heinlein,true,
+"Lovecraft, H P/Dagon.txt",Dagon,H. P. Lovecraft,true,short story
+"Lovecraft, H P/Outsider, The.txt",The Outsider,H. P. Lovecraft,true,short story
+"Machiavelli, Niccolo/Prince, The.txt",The Prince,Niccolo Machiavelli,true,
+"Matheson, Richard/I Am Legend.txt",I Am Legend,Richard Matheson,true,
+"McCaffrey, Anne/DragonQuest.txt",Dragonquest,Anne McCaffrey,true,
+"Niven, Larry/Ringworld.txt",Ringworld,Larry Niven,true,
+"Niven, Larry/Lucifer's Hammer.txt",Lucifer's Hammer,Larry Niven,true,co-written with Jerry Pournelle
+"Orwell, George/1984.txt",Nineteen Eighty-Four,George Orwell,true,
+"Robinson, Kim Stanley/Red Mars.txt",Red Mars,Kim Stanley Robinson,true,
+"Sagan, Carl/Contact.txt",Contact,Carl Sagan,true,
+"Shakespeare, William/Hamlet.txt",Hamlet,William Shakespeare,true,
+"Shakespeare, William/King Lear.txt",King Lear,William Shakespeare,true,
+"Simak, Cliffard D/Waystation.txt",Way Station,Clifford D. Simak,true,folder misspells the author
+"Stephenson, Neal/Big U, The.txt",The Big U,Neal Stephenson,true,
+"Tolkien, J.R.R/Hobbit, The.txt",The Hobbit,J. R. R. Tolkien,true,
+"Tolkien, J.R.R/Silmarillion.doc",The Silmarillion,J. R. R. Tolkien,true,
+"Rushkoff, Douglas/Cyberia.txt",Cyberia,Douglas Rushkoff,true,

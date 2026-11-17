@@ -417,6 +417,12 @@ class Book(models.Model):
     edition = models.CharField(max_length=128, blank=True)
     language = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)
+    # Folder, relative to a writable archive location, that holds this book's files
+    # under a book-scoped archive layout (for example ``Author/Title``). It is assigned
+    # when the first file is archived and kept when the title or author is corrected
+    # later, so existing files stay where they are; only an explicit reorganize moves
+    # them (see core.archive_layout). Empty until assigned and under the ``job`` layout.
+    archive_folder = models.CharField(max_length=512, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -473,6 +479,15 @@ class Book(models.Model):
 
     class Meta:
         ordering = ["title"]
+        constraints = [
+            # Case-insensitive, because SMB shares and Windows/macOS clients treat
+            # "Asimov/Foundation" and "asimov/foundation" as the same folder.
+            models.UniqueConstraint(
+                Lower("archive_folder"),
+                condition=~models.Q(archive_folder=""),
+                name="uniq_book_archive_folder_ci",
+            ),
+        ]
 
     def __str__(self) -> str:
         return self.title
@@ -985,6 +1000,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        LLM_IDENTIFICATION = "llm_identification", "LLM identification assist"
         COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
 
@@ -1528,6 +1544,87 @@ class ReviewTask(models.Model):
     def __str__(self) -> str:
         source_id = self.import_job_id or self.scan_job_id
         return f"{source_id}:{self.task_type}:{self.state}"
+
+
+class LLMSuggestion(models.Model):
+    """Validated, structured output of one local-LLM identification request (#26).
+
+    Evidence only, never truth: the hints were used as provider search terms, and any
+    candidate they found still needs a reviewer. The evidence bundle itself (which may
+    contain book text) is not stored, only its SHA-256.
+    """
+
+    class Trigger(models.TextChoices):
+        AUTO_ZERO_CANDIDATES = "auto_zero_candidates", "Automatic: no candidates"
+        AUTO_LOW_SCORE = "auto_low_score", "Automatic: low score"
+        REVIEWER = "reviewer", "Reviewer request"
+
+    class Outcome(models.TextChoices):
+        HINTS_USED = "hints_used", "Hints found new candidates"
+        NO_NEW_CANDIDATES = "no_new_candidates", "No new candidates"
+        INVALID_OUTPUT = "invalid_output", "Invalid model output"
+        FAILED = "failed", "Failed"
+
+    import_job = models.ForeignKey(
+        ImportJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+        null=True,
+        blank=True,
+    )
+    review_task = models.ForeignKey(
+        ReviewTask,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="llm_suggestions",
+    )
+    processing_job = models.ForeignKey(
+        ProcessingJob,
+        on_delete=models.CASCADE,
+        related_name="llm_suggestions",
+    )
+    trigger = models.CharField(max_length=32, choices=Trigger.choices)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="llm_suggestions",
+    )
+    model = models.CharField(max_length=255, blank=True)
+    model_version = models.CharField(max_length=255, blank=True)
+    prompt_template_version = models.CharField(max_length=32, blank=True)
+    input_sha256 = models.CharField(max_length=64, blank=True)
+    output = models.JSONField(default=dict, blank=True)
+    grounding = models.JSONField(default=dict, blank=True)
+    outcome = models.CharField(max_length=32, choices=Outcome.choices)
+    new_candidate_count = models.PositiveIntegerField(default=0)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(import_job__isnull=False, scan_job__isnull=True)
+                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                ),
+                name="llm_suggestion_has_exactly_one_source",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        source_id = self.import_job_id or self.scan_job_id
+        return f"{source_id}:llm:{self.outcome}"
 
 
 def canonical_ldap_uid(uid: str) -> str:
