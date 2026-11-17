@@ -142,14 +142,19 @@ def _page_sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _create_scan_job(profile_user: str) -> tuple[Client, ScanJob]:
-    return _create_scan_job_with_book(profile_user, book_id=None)
+def _create_scan_job(
+    profile_user: str,
+    *,
+    capture_layout: str | None = None,
+) -> tuple[Client, ScanJob]:
+    return _create_scan_job_with_book(profile_user, book_id=None, capture_layout=capture_layout)
 
 
 def _create_scan_job_with_book(
     profile_user: str,
     *,
     book_id: int | None = None,
+    capture_layout: str | None = None,
 ) -> tuple[Client, ScanJob]:
     from ebook_server.core.models import get_or_create_profile
 
@@ -162,6 +167,8 @@ def _create_scan_job_with_book(
     }
     if book_id is not None:
         payload["book_id"] = str(book_id)
+    if capture_layout is not None:
+        payload["capture_layout"] = capture_layout
     response = client.post(
         "/scan/jobs/",
         data=payload,
