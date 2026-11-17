@@ -17,6 +17,13 @@ usual, but instead of N independent identifications a single ``MULTIPART_WORK``
 review task is opened once every part has settled. The reviewer either confirms the
 set as one Book (each file becomes an ordered part FileVariant) or rejects the
 grouping, after which every file is identified as an independent import.
+
+A part that is byte-identical to a file already in the library (attached to another
+Book) is not short-circuited onto that Book: it is archived for the group like any
+other part, shown on the review as a *duplicate* part, and blocks confirmation until
+the reviewer acknowledges it. On confirmation it becomes a part FileVariant of the
+group's Book backed by its own archived copy, with the identical variant recorded as
+provenance; the other Book and its variant are never touched.
 """
 
 from __future__ import annotations
@@ -332,13 +339,22 @@ SETTLED_PART_STATES = (
 
 # Where one detected member of a group stands (``group_membership``).
 MEMBER_ARCHIVED = "archived"  # archived and verified, waiting for the group decision
-MEMBER_IN_LIBRARY = "in_library"  # byte-identical to a file already in the library
+# Archived for this group, but byte-identical to a file already in the library (on
+# another Book). Needs an acknowledgement; confirming makes it a part of this Book too.
+MEMBER_DUPLICATE = "duplicate"
+# Resolved onto another Book without an archive copy of its own (it was not processed
+# as part of this pending group). It cannot become a part, so it counts as absent.
+MEMBER_IN_LIBRARY = "in_library"
 MEMBER_PENDING = "pending"  # being processed, or present but not imported yet
 MEMBER_MISSING = "missing"  # import failed, or the file disappeared before import
 MEMBER_SEPARATE = "separate"  # imported on its own, outside this group
 
-# Review-task payload key recording which absent parts a reviewer accepted to leave out.
+# Review-task payload key recording which absent and duplicate parts a reviewer
+# acknowledged (absent parts are left out, duplicate parts are included).
 INCOMPLETE_ACK_KEY = "multipart_incomplete_acknowledged"
+
+# ``converter_options`` key on a part variant whose bytes equal another library file.
+IDENTICAL_TO_KEY = "multipart_identical_to"
 
 
 class MultipartError(RuntimeError):
@@ -495,9 +511,11 @@ class GroupMember:
     status: str
     job: ImportJob | None = None
     detail: str = ""
+    # For MEMBER_DUPLICATE / MEMBER_IN_LIBRARY: the library file with the same bytes.
+    identical_variant: FileVariant | None = None
 
     def as_evidence(self) -> dict[str, Any]:
-        return {
+        evidence: dict[str, Any] = {
             "import_job_id": str(self.job.id) if self.job is not None else None,
             "filename": self.filename,
             "part_index": self.part_index,
@@ -506,6 +524,11 @@ class GroupMember:
             "status": self.status,
             "detail": self.detail,
         }
+        if self.identical_variant is not None:
+            evidence["identical_file_variant_id"] = self.identical_variant.id
+            evidence["identical_book_id"] = self.identical_variant.book_id
+            evidence["identical_book_title"] = self.identical_variant.book.title
+        return evidence
 
 
 @dataclass(frozen=True)
@@ -524,9 +547,24 @@ class GroupMembership:
         return self._with(MEMBER_ARCHIVED)
 
     @property
+    def duplicates(self) -> list[GroupMember]:
+        """Archived parts whose bytes are already in the library on another Book."""
+        return self._with(MEMBER_DUPLICATE)
+
+    @property
+    def includable(self) -> list[GroupMember]:
+        """Parts a confirmation turns into part variants, in reading order."""
+        return self._with(MEMBER_ARCHIVED, MEMBER_DUPLICATE)
+
+    @property
     def absent(self) -> list[GroupMember]:
         """Expected parts that will not be part of a confirmation."""
-        return self._with(MEMBER_MISSING, MEMBER_SEPARATE)
+        return self._with(MEMBER_MISSING, MEMBER_SEPARATE, MEMBER_IN_LIBRARY)
+
+    @property
+    def needs_acknowledgement(self) -> list[GroupMember]:
+        """Parts a reviewer must explicitly accept before the group can be confirmed."""
+        return self._with(MEMBER_MISSING, MEMBER_SEPARATE, MEMBER_IN_LIBRARY, MEMBER_DUPLICATE)
 
     @property
     def settled(self) -> bool:
@@ -543,27 +581,70 @@ def _preferred_job(jobs: list[ImportJob]) -> ImportJob | None:
     )
 
 
-def _member_status(group: ImportGroup, source_path: str, job: ImportJob | None) -> tuple[str, str]:
+def identical_library_variant(job: ImportJob) -> FileVariant | None:
+    """A library file with the same bytes as ``job``'s archived copy, if any.
+
+    The job's own archive location does not count. Evaluated on every membership
+    check, so a file imported elsewhere after this part was archived is still caught
+    before confirmation.
+    """
+    if not job.sha256:
+        return None
+    identical = FileVariant.objects.select_related("book").filter(sha256=job.sha256)
+    if job.storage_identifier:
+        identical = identical.exclude(
+            storage_location_id=job.storage_location_id,
+            storage_identifier=job.storage_identifier,
+        )
+    return identical.order_by("created_at", "id").first()
+
+
+def _identical_detail(variant: FileVariant) -> str:
+    return (
+        f'byte-identical to "{variant.original_filename}" of the book '
+        f'"{variant.book.title}" (book {variant.book_id})'
+    )
+
+
+def _member_status(
+    group: ImportGroup, source_path: str, job: ImportJob | None
+) -> tuple[str, str, FileVariant | None]:
     if job is not None:
         if job.state == ImportJob.State.LOW_CONFIDENCE:
-            return MEMBER_ARCHIVED, ""
+            identical = identical_library_variant(job)
+            if identical is not None:
+                return MEMBER_DUPLICATE, _identical_detail(identical), identical
+            return MEMBER_ARCHIVED, "", None
         if job.state == ImportJob.State.COMPLETE:
-            return MEMBER_IN_LIBRARY, "already in the library"
+            if group.book_id is not None and job.book_id == group.book_id:
+                return MEMBER_ARCHIVED, "", None
+            # Attached to another Book, without an archive copy of its own.
+            other = job.file_variant
+            if other is not None:
+                detail = (
+                    f"already in the library, {_identical_detail(other)}; "
+                    "it will not be a part of this book"
+                )
+            else:
+                detail = "already in the library on another book; it will not be a part"
+            return MEMBER_IN_LIBRARY, detail, other
         if job.state == ImportJob.State.FAILED:
-            return MEMBER_MISSING, job.last_error or "import failed"
-        return MEMBER_PENDING, "being processed"
+            return MEMBER_MISSING, job.last_error or "import failed", None
+        if job.state == ImportJob.State.CANCELLED:
+            return MEMBER_PENDING, "import cancelled; re-imported when its source resumes", None
+        return MEMBER_PENDING, "being processed", None
     outside = ImportJob.objects.filter(
         source_path=source_path, source_location_id=group.source_location_id
     ).exclude(import_group=group)
     if outside.exists():
-        return MEMBER_SEPARATE, "imported on its own, outside this group"
+        return MEMBER_SEPARATE, "imported on its own, outside this group", None
     try:
         present = Path(source_path).is_file()
     except OSError:
         present = False
     if present:
-        return MEMBER_PENDING, "not imported yet"
-    return MEMBER_MISSING, "source file no longer present"
+        return MEMBER_PENDING, "not imported yet", None
+    return MEMBER_MISSING, "source file no longer present", None
 
 
 def group_membership(group: ImportGroup) -> GroupMembership:
@@ -585,7 +666,7 @@ def group_membership(group: ImportGroup) -> GroupMembership:
         source_path = raw_path if isinstance(raw_path, str) else str(folder / filename)
         if job is not None:
             source_path = job.source_path
-        status, detail = _member_status(group, source_path, job)
+        status, detail, identical = _member_status(group, source_path, job)
         raw_index = part.get("index")
         members.append(
             GroupMember(
@@ -598,12 +679,13 @@ def group_membership(group: ImportGroup) -> GroupMembership:
                 status=status,
                 job=job,
                 detail=detail,
+                identical_variant=identical,
             )
         )
     for filename, jobs in by_name.items():  # attached, but no longer in the detection
         extra = _preferred_job(jobs)
         assert extra is not None
-        status, detail = _member_status(group, extra.source_path, extra)
+        status, detail, identical = _member_status(group, extra.source_path, extra)
         members.append(
             GroupMember(
                 filename=filename,
@@ -613,6 +695,7 @@ def group_membership(group: ImportGroup) -> GroupMembership:
                 status=status,
                 job=extra,
                 detail=detail,
+                identical_variant=identical,
             )
         )
     members.sort(key=lambda m: (m.part_index is None, m.part_index or 0, m.filename))
@@ -639,14 +722,21 @@ def _membership_blocker(membership: GroupMembership, task: ReviewTask) -> str | 
             f"{len(pending)} detected part(s) are not archived yet ({_names(pending)}); "
             "try again once they have been imported"
         )
-    if not membership.archived:
+    if not membership.includable:
         return "no archived parts are waiting for review"
-    absent = membership.absent
-    if {member.filename for member in absent} - _acknowledged_absent(task):
-        return (
-            f"{len(absent)} detected part(s) are missing ({_names(absent)}); "
-            "acknowledge the incomplete set before confirming it as one book"
+    acknowledged = _acknowledged_absent(task)
+    absent = [m for m in membership.absent if m.filename not in acknowledged]
+    duplicates = [m for m in membership.duplicates if m.filename not in acknowledged]
+    reasons = []
+    if absent:
+        reasons.append(f"{len(absent)} detected part(s) are missing ({_names(absent)})")
+    if duplicates:
+        reasons.append(
+            f"{len(duplicates)} part(s) are byte-identical to files already attached to "
+            f"another book ({_names(duplicates)})"
         )
+    if reasons:
+        return "; ".join(reasons) + "; acknowledge these parts before confirming one book"
     return None
 
 
@@ -702,20 +792,20 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
     from . import identification, intake
 
     membership = group_membership(group)
-    if not membership.settled or not membership.archived:
+    if not membership.settled or not membership.includable:
         return None
-    reviewable = [member.job for member in membership.archived if member.job is not None]
+    reviewable = [member.job for member in membership.includable if member.job is not None]
     signals = _group_signals(group, reviewable)
-    candidates = identification.resolve_candidates(signals)
+    candidates, outcomes = identification.resolve_candidates_with_report(signals)
 
     with transaction.atomic():
         locked = ImportGroup.objects.select_for_update().get(pk=group.pk)
         if locked.state != ImportGroup.State.PENDING:
             return None
         membership = group_membership(locked)
-        if not membership.settled or not membership.archived:
+        if not membership.settled or not membership.includable:
             return None
-        reviewable = [member.job for member in membership.archived if member.job is not None]
+        reviewable = [member.job for member in membership.includable if member.job is not None]
         lead = reviewable[0]
         task = (
             ReviewTask.objects.filter(
@@ -734,7 +824,9 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
             # The lead part changed (a late earlier-numbered part arrived): move the
             # task and its candidates to the new lead so actions apply consistently.
             task.import_job = lead
-        intake._save_metadata_candidates(lead, candidates, allow_match=False)
+        intake._save_metadata_candidates(
+            lead, candidates, signals=signals, outcomes=outcomes, allow_match=False
+        )
         folder_name = Path(locked.folder).name
         title = signals.best_title() or folder_name
         snapshot = [
@@ -746,12 +838,14 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
             for candidate in candidates
         ]
         absent = membership.absent
+        duplicates = membership.duplicates
         evidence = {
             "multipart": locked.detection,
             "folder": folder_name,
             "expected_part_count": len(membership.members),
             "parts": [member.as_evidence() for member in membership.members],
             "missing_parts": [member.as_evidence() for member in absent],
+            "duplicate_parts": [member.as_evidence() for member in duplicates],
         }
         count = (
             f"{len(reviewable)} of {len(membership.members)} parts"
@@ -777,6 +871,7 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
                 "candidate_count": len(candidates),
                 "multipart": True,
                 "missing_part_count": len(absent),
+                "duplicate_part_count": len(duplicates),
             },
         }
         if task is None:
@@ -798,6 +893,7 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
         review_task_id=task.id,
         part_count=len(reviewable),
         missing_part_count=len(absent),
+        duplicate_part_count=len(duplicates),
         candidate_count=len(candidates),
     )
     return task
@@ -829,11 +925,16 @@ def confirmation_blocker(task: ReviewTask) -> str | None:
     return _membership_blocker(group_membership(group), fresh)
 
 
-def acknowledge_incomplete(*, review_task: ReviewTask, reviewer: Any) -> list[str]:
-    """Record that the reviewer accepts confirming the group without its absent parts.
+def acknowledge_incomplete(
+    *, review_task: ReviewTask, reviewer: Any
+) -> tuple[list[str], list[str]]:
+    """Record the reviewer's decision on the parts that block a plain confirmation.
 
-    The acknowledgement names the absent files; if more parts go missing later, the
-    new ones need acknowledging again.
+    Absent parts (missing, failed, imported elsewhere) are left out of the Book.
+    Duplicate parts (byte-identical to a file of another Book) are included as parts
+    of this Book, backed by their own archived copy. The acknowledgement names the
+    files; a part that becomes absent or duplicate later needs acknowledging again.
+    Returns ``(absent, duplicates)`` file names.
     """
     with transaction.atomic():
         task = ReviewTask.objects.select_for_update().get(pk=review_task.pk)
@@ -850,11 +951,14 @@ def acknowledge_incomplete(*, review_task: ReviewTask, reviewer: Any) -> list[st
                 "try again once they have been imported"
             )
         absent = sorted(member.filename for member in membership.absent)
-        if not absent:
-            raise MultipartError("no detected parts are missing")
+        duplicates = sorted(member.filename for member in membership.duplicates)
+        if not absent and not duplicates:
+            raise MultipartError("no detected parts are missing or duplicated")
         payload = dict(task.decision_payload) if isinstance(task.decision_payload, dict) else {}
         payload[INCOMPLETE_ACK_KEY] = {
-            "filenames": absent,
+            "filenames": sorted(absent + duplicates),
+            "missing": absent,
+            "duplicates": [member.as_evidence() for member in membership.duplicates],
             "by": getattr(reviewer, "username", None),
             "at": timezone.now().isoformat(),
         }
@@ -866,8 +970,9 @@ def acknowledge_incomplete(*, review_task: ReviewTask, reviewer: Any) -> list[st
         import_group_id=str(group.id),
         review_task_id=task.id,
         missing_part_count=len(absent),
+        duplicate_part_count=len(duplicates),
     )
-    return absent
+    return absent, duplicates
 
 
 def update_part_order(task: ReviewTask, order: dict[str, tuple[int, str]]) -> None:
@@ -908,24 +1013,77 @@ def update_part_order(task: ReviewTask, order: dict[str, tuple[int, str]]) -> No
             job.save(update_fields=["part_index", "part_label", "updated_at"])
 
 
+@dataclass(frozen=True)
+class ConfirmedParts:
+    variants: list[FileVariant]
+    absent: list[str]  # acknowledged and left out
+    duplicates: list[dict[str, Any]]  # acknowledged and included; names the identical file
+
+
+def _part_variant(job: ImportJob, book: Book, identical: FileVariant | None) -> FileVariant:
+    """The part FileVariant of ``book`` for one archived group member.
+
+    Never reuses another Book's variant (Book != FileVariant): a part identical to a
+    file of another Book gets its own variant on ``book``, backed by the part's own
+    verified archive copy, with the identical variant recorded in
+    ``converter_options``. Only a variant with the same bytes already on ``book``
+    itself (merging the group into the Book that holds that file) is reused, so one
+    Book never holds two copies of the same bytes.
+    """
+    from . import intake
+
+    same_book = (
+        FileVariant.objects.filter(book=book, sha256=job.sha256)
+        .order_by("created_at", "id")
+        .first()
+    )
+    if same_book is not None:
+        if same_book.part_index is None and not same_book.part_label:
+            same_book.part_index = job.part_index
+            same_book.part_label = job.part_label
+            same_book.save(update_fields=["part_index", "part_label", "updated_at"])
+        intake.discard_redundant_archive_copy(job, keep=same_book)
+        return same_book
+    provenance = (
+        {
+            IDENTICAL_TO_KEY: {
+                "file_variant_id": identical.id,
+                "book_id": identical.book_id,
+                "import_job_id": str(job.id),
+            }
+        }
+        if identical is not None
+        else None
+    )
+    return intake._create_or_reuse_file_variant(
+        job,
+        book,
+        part_index=job.part_index,
+        part_label=job.part_label,
+        reuse_identical=False,
+        converter_options=provenance,
+    )
+
+
 def confirm_parts(
     *,
     lead_job: ImportJob,
     review_task: ReviewTask,
     book: Book,
-) -> tuple[list[FileVariant], list[str]]:
+) -> ConfirmedParts:
     """Resolve every archived part of the task's group as an ordered part of ``book``.
 
-    Each archived part becomes its own FileVariant carrying ``part_index`` and
-    ``part_label``; nothing is merged, rewritten or deleted. Parts that turned out to
-    be byte-identical to an existing variant keep that variant untouched. Returns the
-    variants and the file names of the (acknowledged) absent parts.
+    Each archived part (acknowledged duplicate parts included) becomes its own
+    FileVariant of ``book`` carrying ``part_index`` and ``part_label``; nothing is
+    merged, rewritten or deleted, and no other Book's variant is touched. Returns the
+    variants plus the acknowledged absent and duplicate parts.
     """
-    from . import intake
-
     if lead_job.import_group_id is None:
         raise MultipartError("review task has no pending multi-part group")
+    from . import intake
+
     variants: list[FileVariant] = []
+    duplicates: list[dict[str, Any]] = []
     first_part: tuple[FileVariant, ImportJob] | None = None
     with transaction.atomic():
         group = ImportGroup.objects.select_for_update().get(pk=lead_job.import_group_id)
@@ -936,16 +1094,13 @@ def confirm_parts(
         blocker = _membership_blocker(membership, fresh_task)
         if blocker is not None:
             raise MultipartError(blocker)
-        for member in membership.archived:
+        for member in membership.includable:
             job = member.job
             assert job is not None
             # Already archived and verified: this only records the variant row.
-            variant = intake._create_or_reuse_file_variant(
-                job,
-                book,
-                part_index=job.part_index,
-                part_label=job.part_label,
-            )
+            variant = _part_variant(job, book, member.identical_variant)
+            if member.status == MEMBER_DUPLICATE:
+                duplicates.append({**member.as_evidence(), "file_variant_id": variant.id})
             if first_part is None:
                 first_part = (variant, job)
             job.book = book
@@ -978,8 +1133,9 @@ def confirm_parts(
         book_id=book.id,
         part_count=len(variants),
         missing_part_count=len(absent),
+        duplicate_part_count=len(duplicates),
     )
-    return variants, absent
+    return ConfirmedParts(variants=variants, absent=absent, duplicates=duplicates)
 
 
 def reject_grouping(*, review_task: ReviewTask, reviewer: Any, notes: str = "") -> list[ImportJob]:
@@ -1094,6 +1250,47 @@ def settle_part(job: ImportJob) -> None:
         enqueue(identify_split_part, str(job.id))
 
 
+def _resolve_split_part_as_duplicate(job_id: str) -> bool:
+    """A split-off part identical to a library file resolves like any intake duplicate.
+
+    Outside the group the ordinary exact-duplicate rule applies: the job points at the
+    existing variant (whose Book is not changed) and the part's own, now redundant,
+    archive copy is discarded. Returns True when the job needs no identification.
+    """
+    from . import intake
+
+    with transaction.atomic():
+        job = ImportJob.objects.select_for_update().get(pk=job_id)
+        if job.state != ImportJob.State.LOW_CONFIDENCE or job.book_id is not None:
+            return True
+        identical = identical_library_variant(job)
+        if identical is None:
+            return False
+        intake.discard_redundant_archive_copy(job, keep=identical)
+        job.book = identical.book
+        job.file_variant = identical
+        job.storage_location = identical.storage_location
+        job.storage_identifier = identical.storage_identifier
+        job.state = ImportJob.State.COMPLETE
+        job.save(
+            update_fields=[
+                "state",
+                "book_id",
+                "file_variant_id",
+                "storage_location_id",
+                "storage_identifier",
+                "updated_at",
+            ],
+        )
+    logger.info(
+        "multipart_split_part_duplicate",
+        import_job_id=str(job_id),
+        file_variant_id=identical.id,
+        book_id=identical.book_id,
+    )
+    return True
+
+
 def identify_split_part(job_id: str) -> None:
     """Background job: identify one archived file of a decided group on its own.
 
@@ -1111,13 +1308,15 @@ def identify_split_part(job_id: str) -> None:
         return
     if _has_open_individual_review(job.pk):
         return
+    if _resolve_split_part_as_duplicate(job_id):
+        return
     metadata = dict(job.evidence) if isinstance(job.evidence, dict) else {}
     signals = identification.build_identification_input(
         source_path=job.source_path,
         original_filename=job.original_filename,
         extracted_metadata=metadata,
     )
-    candidates = identification.resolve_candidates(signals)
+    candidates, outcomes = identification.resolve_candidates_with_report(signals)
     file_authors = identification.evidence_author_names(metadata)
     decision = intake.decide_auto_accept(candidates, file_authors)
     with transaction.atomic():
@@ -1135,7 +1334,11 @@ def identify_split_part(job_id: str) -> None:
             job.evidence = metadata
             job.save(update_fields=["evidence", "updated_at"])
         intake._save_metadata_candidates(
-            job, candidates, allow_match=decision.blocked_reason is None
+            job,
+            candidates,
+            signals=signals,
+            outcomes=outcomes,
+            allow_match=decision.blocked_reason is None,
         )
         if decision.candidate is None:
             intake._create_review_task(job=job, candidates=candidates)
@@ -1161,6 +1364,7 @@ def group_for_task(task: ReviewTask) -> dict[str, Any] | None:
     detection = group.detection if isinstance(group.detection, dict) else {}
     membership = group_membership(group)
     absent = membership.absent
+    flagged = membership.needs_acknowledgement
     acknowledged = _acknowledged_absent(task)
     return {
         "id": str(group.id),
@@ -1183,8 +1387,9 @@ def group_for_task(task: ReviewTask) -> dict[str, Any] | None:
         ],
         "pending_parts": [member.as_evidence() for member in membership.pending],
         "missing_parts": [member.as_evidence() for member in absent],
-        "incomplete_acknowledged": bool(absent)
-        and not ({member.filename for member in absent} - acknowledged),
+        "duplicate_parts": [member.as_evidence() for member in membership.duplicates],
+        "incomplete_acknowledged": bool(flagged)
+        and not ({member.filename for member in flagged} - acknowledged),
         "confirmation_blocker": (
             confirmation_blocker(task) if group.state == ImportGroup.State.PENDING else None
         ),

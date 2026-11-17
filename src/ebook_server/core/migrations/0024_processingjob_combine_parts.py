@@ -23,6 +23,7 @@ class Migration(migrations.Migration):
                     ("scan_identification", "Scan identification"),
                     ("scan_finalization", "Scan finalization"),
                     ("combine_parts", "Combine multi-part work"),
+                    ("reference_check", "Referenced file check"),
                 ],
                 max_length=32,
             ),

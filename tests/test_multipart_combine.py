@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
 
@@ -379,3 +379,65 @@ def test_concurrent_first_request_reuses_the_job_that_won(
         )
         assert job.job_id == winner.job_id
         assert dispatched == []  # the losing request enqueued nothing
+
+
+@pytest.mark.django_db(transaction=True)
+def test_combined_work_includes_a_part_identical_to_another_books_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#101 second review end to end: the duplicate chapter is part of the combined book."""
+    from django.core.management import call_command
+
+    from ebook_server.core.models import ImportJob, ReviewTask, SourceLocation
+    from tests.test_multipart_works import (
+        _admin_client,
+        _library,
+        _location,
+        _other_book_with_identical_file,
+        _split_book_folder,
+        _stub_provider,
+    )
+
+    with override_settings(APP_DATA_DIR=tmp_path):
+        _library(tmp_path, monkeypatch)
+        _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+        root = tmp_path / "share"
+        _folder, parts = _split_book_folder(root)
+        other_variant = _other_book_with_identical_file(parts[0])
+        location = _location(root, SourceLocation.TransferMode.COPY)
+        call_command("ingest_sources", "--source-id", str(location.id), stdout=StringIO())
+        task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+        client = _admin_client()
+        assert (
+            client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/").status_code == 200
+        )
+        response = client.post(
+            f"/reviews/{task.id}/manual-entry/",
+            data=json.dumps({"title": "Learning Widgets"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 200, response.content
+        book = Book.objects.get(title="Learning Widgets")
+        assert ImportJob.objects.get(original_filename="ch01.txt").book_id == book.id
+
+        response = client.post(
+            f"/library/books/{book.id}/combine-parts/",
+            data=json.dumps({"target_format": "txt"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202, response.content
+        payload = response.json()
+        assert payload["state"] == ProcessingJob.JobState.SUCCESS, payload
+        combined = FileVariant.objects.get(pk=payload["output_variant_id"])
+        assert combined.book_id == book.id
+        text = (tmp_path / "library-artifacts" / combined.storage_identifier).read_text(
+            encoding="utf-8"
+        )
+        assert [line.split(",")[1].split(":")[0].strip() for line in text.split("\n\n")] == [
+            "ch01.txt",
+            "ch02.txt",
+            "ch03.txt",
+            "AppA.txt",
+        ]
+        other_variant.refresh_from_db()
+        assert other_variant.book.file_variants.count() == 1

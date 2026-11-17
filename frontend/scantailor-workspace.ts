@@ -28,6 +28,7 @@ interface StageState {
   preview_storage_identifier: string;
   last_error: string;
   invalidated_reason?: string;
+  auto_skipped?: boolean;
 }
 
 interface WorkspacePage {
@@ -197,12 +198,34 @@ export function stageErrorText(state: Pick<StageState, "status" | "last_error">)
   return state.status === "failed" ? state.last_error || "Stage failed" : "";
 }
 
+/** Page split modes; "none" is the recorded passthrough for single-page captures. */
+export const SPLIT_MODES = ["none", "auto", "manual", "single"] as const;
+
+/** True when page split completed automatically as "no split" (single-page capture). */
+export function isAutoSkippedSplit(state: Pick<StageState, "auto_skipped">): boolean {
+  return state.auto_skipped === true;
+}
+
+/** Short status shown in the page list for a stage. */
+export function stageStatusLabel(state: Pick<StageState, "status" | "auto_skipped">): string {
+  return isAutoSkippedSplit(state) ? "skipped · single page" : state.status;
+}
+
 /** Editor status line for a stage: errors only for failures, invalidation is informational. */
 export function stageStatusMessage(
-  state: Pick<StageState, "status" | "last_error" | "revision" | "invalidated_reason">,
+  state: Pick<StageState, "status" | "last_error" | "revision" | "invalidated_reason"> &
+    Partial<Pick<StageState, "auto_skipped">>,
 ): { text: string; tone: "info" | "error" } {
   const error = stageErrorText(state);
   if (error) return { text: error, tone: "error" };
+  if (isAutoSkippedSplit(state)) {
+    return {
+      text:
+        `Revision ${state.revision} · skipped: single-page capture, no split needed. ` +
+        "Choose manual or auto to split this page anyway.",
+      tone: "info",
+    };
+  }
   const base = `Revision ${state.revision} · ${state.status}`;
   if (state.status === "invalidated" && state.invalidated_reason) {
     return { text: `${base} (${state.invalidated_reason})`, tone: "info" };
@@ -481,7 +504,15 @@ class WorkspaceController {
   }
 
   private renderPageSplitControls(): void {
-    this.addSelect("Mode", "split_mode", ["auto", "manual", "single"], "auto", true);
+    const current = typeof this.draft.split_mode === "string" ? this.draft.split_mode : "auto";
+    this.draft.split_mode = current;
+    this.addSelectValue("Mode", current, SPLIT_MODES, (value) => {
+      this.draft.split_mode = value;
+      // A leftover split position would mark the page as a manual exception.
+      if (value !== "manual") delete this.draft.split_x;
+      this.renderControls();
+      this.renderGeometry();
+    });
     if (this.draft.split_mode === "manual") {
       this.addNumber("Split position", "split_x", 1, undefined, 1);
     }
@@ -979,9 +1010,14 @@ class WorkspaceController {
     if (!row) return;
     const status = row.querySelector<HTMLElement>("[data-stage-status]");
     if (status) {
-      status.textContent = state.status;
+      status.textContent = stageStatusLabel(state);
       status.className = `status status-${state.status}`;
-      status.title = state.status === "invalidated" ? (state.invalidated_reason ?? "") : "";
+      status.title =
+        state.status === "invalidated"
+          ? (state.invalidated_reason ?? "")
+          : isAutoSkippedSplit(state)
+            ? String(state.parameters.split_skipped_reason ?? "")
+            : "";
     }
     const error = row.querySelector<HTMLElement>("[data-stage-error]");
     if (error) {

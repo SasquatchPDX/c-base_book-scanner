@@ -27,7 +27,7 @@ from ebook_server.storage import StorageBackend
 
 from . import intake
 from .models import Book, CoverImage, FileVariant, ImportJob
-from .storage_registry import backend_for_location
+from .storage_registry import backend_for_location, writable_location_for
 
 logger = structlog.get_logger(__name__)
 
@@ -402,7 +402,11 @@ def extract_front_cover(
     if existing is not None:
         return existing
 
-    storage = backend_for_location(variant.storage_location)
+    # Read from wherever the variant lives; write the cover to a writable location
+    # (never onto a read-only, indexed-in-place share).
+    source_storage = backend_for_location(variant.storage_location)
+    cover_location = writable_location_for(variant.storage_location)
+    storage = backend_for_location(cover_location)
     sidecar_payload = (
         _sidecar_cover_payload(import_job, variant) if import_job is not None else None
     )
@@ -411,7 +415,7 @@ def extract_front_cover(
         extractor_tool = SIDECAR_EXTRACTOR_TOOL
         extractor_version = f"Pillow {version('Pillow')}"
     else:
-        extracted = _format_cover_payload(variant, storage)
+        extracted = _format_cover_payload(variant, source_storage)
         if extracted is None:
             return None
         payload, extractor_tool, extractor_version = extracted
@@ -439,7 +443,7 @@ def extract_front_cover(
             cover = CoverImage.objects.create(
                 book=book,
                 position=CoverImage.CoverPosition.FRONT,
-                storage_location=variant.storage_location,
+                storage_location=cover_location,
                 storage_identifier=destination,
                 mime_type="image/jpeg",
                 size_bytes=len(payload),

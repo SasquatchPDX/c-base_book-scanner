@@ -116,7 +116,8 @@ static-file step, reverse-proxy requirements, example `systemd` units
 
 Workflow routes return JSON to API clients and HTML to browsers through content
 negotiation. Rendered-page and form tests protect the browser workflows in CI.
-Normal intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR. Each
+Normal intake accepts EPUB, MOBI, AZW, AZW3, PRC, RTF, PDF, TXT, HTML, FB2, DjVu,
+CBZ, and CBR. Each
 format receives signature/container validation before metadata parsing, and every
 file still goes through external bibliographic verification. EPUB, PDF, and CBZ
 imports generate bounded normalized front covers when one can be extracted safely.

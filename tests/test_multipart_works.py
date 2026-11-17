@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from collections import defaultdict
+from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from typing import Any
 import pytest
 from django.core.management import call_command
 from django.test import Client, override_settings
+from django.utils import timezone
 
 from ebook_server.core import conversion, intake
 from ebook_server.core.intake import discover_source_jobs_for_location
@@ -459,7 +462,11 @@ def test_preview_reports_multipart_membership(tmp_path: Path) -> None:
         "ingest_sources", "--source-id", str(location.id), "--preview", "--json", stdout=stdout
     )
 
-    rows = {Path(row["path"]).name: row for row in json.loads(stdout.getvalue())}
+    rows = {
+        Path(row["path"]).name: row
+        for row in json.loads(stdout.getvalue())
+        if "path" in row  # the per-source summary row has no path
+    }
     assert rows["ch02.txt"]["part_label"] == "Chapter 2"
     assert rows["AppA.txt"]["part_label"] == "Appendix A"
     assert len({row["multipart_group"] for row in rows.values()}) == 1
@@ -722,3 +729,281 @@ def test_reorder_rejects_a_position_held_by_an_unsubmitted_part(
     assert response.status_code == 200, response.content
     positions = dict(ImportJob.objects.values_list("original_filename", "part_index"))
     assert positions == {"ch01.txt": 1, "AppA.txt": 2, "ch03.txt": 3, "ch02.txt": 4}
+
+
+# --- second review on PR #101: a part already attached to another Book -------------
+
+
+def _other_book_with_identical_file(path: Path, title: str = "Some Other Book") -> FileVariant:
+    """A Book that already owns a FileVariant with exactly ``path``'s bytes."""
+    data = path.read_bytes()
+    other = Book.objects.create(title=title)
+    return FileVariant.objects.create(
+        book=other,
+        format=FileVariant.VariantFormat.TXT,
+        mime_type="text/plain",
+        original_filename="some-other-book.txt",
+        storage_location=StorageLocation.objects.get(identifier="default"),
+        storage_identifier="books/other/some-other-book.txt",
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_part_identical_to_another_books_file_blocks_until_acknowledged_then_joins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verifier's probe: ch01.txt already exists, byte-identical, on another Book."""
+    storage = _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    ch01 = next(path for path in parts if path.name == "ch01.txt")
+    other_variant = _other_book_with_identical_file(ch01)
+    other_book = other_variant.book
+
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+
+    # The part is archived for the group, not resolved onto the other Book.
+    job = ImportJob.objects.get(original_filename="ch01.txt")
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert storage.hash(job.storage_identifier) == other_variant.sha256
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    statuses = {part["filename"]: part["status"] for part in task.embedded_metadata["parts"]}
+    assert statuses == {
+        "ch01.txt": "duplicate",
+        "ch02.txt": "archived",
+        "ch03.txt": "archived",
+        "AppA.txt": "archived",
+    }
+    [duplicate] = task.embedded_metadata["duplicate_parts"]
+    assert duplicate["filename"] == "ch01.txt"
+    assert duplicate["identical_book_id"] == other_book.id
+
+    client = _admin_client()
+    detail = client.get(f"/reviews/{task.id}/").json()["multipart"]
+    assert [part["filename"] for part in detail["duplicate_parts"]] == ["ch01.txt"]
+    assert detail["incomplete_acknowledged"] is False
+    assert "ch01.txt" in detail["confirmation_blocker"]
+    html = client.get(f"/reviews/{task.id}/", HTTP_ACCEPT="text/html").content.decode()
+    assert "multipart-duplicate" in html and "Some Other Book" in html
+
+    # Accepting the group candidate is refused while the duplicate is unacknowledged.
+    assert task.import_job is not None
+    candidate = task.import_job.metadata_candidates.get()
+    accept = {"candidate_id": candidate.id}
+    response = client.post(
+        f"/reviews/{task.id}/accept-candidate/",
+        data=json.dumps(accept),
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    assert b"ch01.txt" in response.content and b"acknowledge" in response.content
+    assert Book.objects.count() == 1
+
+    response = client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/")
+    assert response.status_code == 200, response.content
+    assert response.json()["acknowledged_duplicate_parts"] == ["ch01.txt"]
+    assert response.json()["acknowledged_missing_parts"] == []
+
+    response = client.post(
+        f"/reviews/{task.id}/accept-candidate/",
+        data=json.dumps(accept),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+
+    book = Book.objects.exclude(pk=other_book.pk).get()
+    variants = list(book.file_variants.order_by("part_index"))
+    assert [v.original_filename for v in variants] == [
+        "ch01.txt",
+        "ch02.txt",
+        "ch03.txt",
+        "AppA.txt",
+    ]
+    part_one = variants[0]
+    assert part_one.id != other_variant.id
+    assert part_one.sha256 == other_variant.sha256
+    assert part_one.storage_identifier == job.storage_identifier
+    assert storage.hash(part_one.storage_identifier) == part_one.sha256
+    identical_to = part_one.converter_options["multipart_identical_to"]
+    assert identical_to["file_variant_id"] == other_variant.id
+    # The other Book and its file are untouched.
+    other_variant.refresh_from_db()
+    assert other_variant.book_id == other_book.id
+    assert list(other_book.file_variants.all()) == [other_variant]
+    job.refresh_from_db()
+    assert (job.state, job.book_id, job.file_variant_id) == (
+        ImportJob.State.COMPLETE,
+        book.id,
+        part_one.id,
+    )
+    task.refresh_from_db()
+    confirmed = task.decision_payload["multipart_confirmed"]
+    assert confirmed["missing_parts"] == []
+    assert [d["filename"] for d in confirmed["duplicate_parts"]] == ["ch01.txt"]
+    assert confirmed["duplicate_parts"][0]["identical_file_variant_id"] == other_variant.id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_file_imported_elsewhere_after_archiving_is_caught_before_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    # While the review is open, the same bytes as ch02.txt arrive on another Book.
+    other_variant = _other_book_with_identical_file(
+        next(path for path in parts if path.name == "ch02.txt")
+    )
+
+    client = _admin_client()
+    manual = json.dumps({"title": "Learning Widgets"})
+    url = f"/reviews/{task.id}/manual-entry/"
+    response = client.post(url, data=manual, content_type="application/json")
+    assert response.status_code == 400
+    assert b"ch02.txt" in response.content
+    assert client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/").status_code == 200
+    response = client.post(url, data=manual, content_type="application/json")
+    assert response.status_code == 200, response.content
+    book = Book.objects.get(title="Learning Widgets")
+    assert book.file_variants.count() == 4
+    assert not book.file_variants.filter(pk=other_variant.pk).exists()
+    assert other_variant.book.file_variants.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_merging_into_the_book_that_holds_the_identical_file_reuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    existing = _other_book_with_identical_file(parts[0], title="Learning Widgets")
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    redundant_copy = ImportJob.objects.get(original_filename="ch01.txt").storage_identifier
+    assert storage.exists(redundant_copy)
+    client = _admin_client()
+    assert client.post(f"/reviews/{task.id}/multipart/acknowledge-incomplete/").status_code == 200
+
+    response = client.post(
+        f"/reviews/{task.id}/merge/",
+        data=json.dumps({"book_id": existing.book_id}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+
+    assert existing.book.file_variants.count() == 4  # no second copy of ch01 on one Book
+    existing.refresh_from_db()
+    assert (existing.part_index, existing.part_label) == (1, "Chapter 1")
+    assert ImportJob.objects.get(original_filename="ch01.txt").file_variant_id == existing.id
+    assert not storage.exists(redundant_copy)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rejected_group_part_identical_to_a_library_file_resolves_as_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Unrelated Title", authors=["Someone Else"])
+    root = tmp_path / "share"
+    _folder, parts = _split_book_folder(root)
+    other_variant = _other_book_with_identical_file(parts[0])
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    redundant_copy = ImportJob.objects.get(original_filename="ch01.txt").storage_identifier
+
+    response = _admin_client().post(f"/reviews/{task.id}/multipart/reject/")
+    assert response.status_code == 200, response.content
+
+    job = ImportJob.objects.get(original_filename="ch01.txt")
+    assert (job.state, job.book_id, job.file_variant_id) == (
+        ImportJob.State.COMPLETE,
+        other_variant.book_id,
+        other_variant.id,
+    )
+    assert not ReviewTask.objects.filter(
+        import_job=job, task_type=ReviewTask.TaskType.NEEDS_ATTENTION
+    ).exists()
+    assert not storage.exists(redundant_copy)
+    assert other_variant.book.file_variants.count() == 1
+    # The other three files are identified on their own as before.
+    assert ReviewTask.objects.filter(task_type=ReviewTask.TaskType.NEEDS_ATTENTION).count() == 3
+
+
+@pytest.mark.django_db(transaction=True)
+def test_identify_split_part_opens_one_review_when_two_runs_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that passed the unlocked pre-check re-checks under the job row lock."""
+    from ebook_server.core import identification, multipart
+
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Unrelated Title", authors=["Someone Else"])
+    root = tmp_path / "share"
+    _split_book_folder(root)
+    location = _location(root, SourceLocation.TransferMode.COPY)
+    _process_all(discover_source_jobs_for_location(location))
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    # Reject without running the enqueued identifications, so both runs start fresh.
+    monkeypatch.setattr("ebook_server.jobs.enqueue", lambda *_args, **_kwargs: None)
+    multipart.reject_grouping(review_task=task, reviewer=None)
+    job = ImportJob.objects.get(original_filename="ch02.txt")
+
+    original = identification.resolve_candidates_with_report
+    raced: list[bool] = []
+
+    def search_while_another_run_finishes(signals: Any) -> Any:
+        result = original(signals)
+        if not raced:
+            raced.append(True)
+            # The competing run completes while this one is searching providers.
+            multipart.identify_split_part(str(job.id))
+        return result
+
+    monkeypatch.setattr(
+        identification, "resolve_candidates_with_report", search_while_another_run_finishes
+    )
+    multipart.identify_split_part(str(job.id))
+
+    assert raced
+    reviews = ReviewTask.objects.filter(
+        import_job=job, task_type=ReviewTask.TaskType.NEEDS_ATTENTION
+    )
+    assert reviews.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recovering_a_stale_part_settles_its_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    root = tmp_path / "share"
+    _split_book_folder(root)
+    jobs = discover_source_jobs_for_location(_location(root, SourceLocation.TransferMode.COPY))
+    by_name = {job.original_filename: job for job in jobs}
+    _process_all([by_name[name] for name in ("ch01.txt", "ch02.txt", "ch03.txt")])
+    # The appendix's worker died mid-run: stuck in HASHING with an expired lease.
+    stuck = by_name["AppA.txt"]
+    ImportJob.objects.filter(pk=stuck.pk).update(
+        state=ImportJob.State.HASHING,
+        lease_owner="dead-worker",
+        lease_expires_at=timezone.now() - timedelta(hours=1),
+    )
+    assert not ReviewTask.objects.exists()
+
+    [stale] = intake.stale_import_jobs()
+    assert intake.recover_stale_import_job(stale, "worker gone")
+
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert [p["filename"] for p in task.embedded_metadata["missing_parts"]] == ["AppA.txt"]
