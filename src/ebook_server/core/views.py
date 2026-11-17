@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import redis
@@ -55,6 +56,7 @@ from ebook_server.storage import (
 from . import (
     book_deletion,
     conversion,
+    genres,
     intake,
     ocr,
     review_identification,
@@ -69,6 +71,7 @@ from .models import (
     Book,
     CoverImage,
     FileVariant,
+    Genre,
     Identifier,
     ImportJob,
     MetadataCandidate,
@@ -1222,6 +1225,87 @@ def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
     }
 
 
+def _reviewer_genre_choice(request: HttpRequest, payload: dict[str, Any]) -> list[Genre] | None:
+    """Genres a reviewer picked, or ``None`` when they made no choice.
+
+    JSON clients send ``genre_ids`` (a list, possibly empty). The review form sends
+    ``genres_reviewed=1`` plus one ``genre_ids`` checkbox value per chosen genre, so
+    unticking every suggestion is an explicit "no genres". Raises ``ValueError`` for
+    ids that are not existing genres.
+    """
+    if isinstance(payload.get("genre_ids"), list):
+        raw_ids: list[Any] = payload["genre_ids"]
+    elif payload.get("genres_reviewed"):
+        raw_ids = request.POST.getlist("genre_ids")
+    else:
+        return None
+    ids: list[int] = []
+    for raw in raw_ids:
+        value = _coerce_int(raw, minimum=1)
+        if value is None:
+            raise ValueError("invalid genre id")
+        if value not in ids:
+            ids.append(value)
+    found = {genre.pk: genre for genre in Genre.objects.filter(pk__in=ids)}
+    if len(found) != len(ids):
+        raise ValueError("unknown genre")
+    return [found[genre_id] for genre_id in ids]
+
+
+def _apply_review_genres(
+    *,
+    book: Book,
+    task: ReviewTask,
+    reviewer_genres: list[Genre] | None,
+    provider_subjects: list[Any] | None,
+    reviewer: Any = None,
+) -> dict[str, Any]:
+    """Attach genres on a review decision; returns decision-payload additions.
+
+    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
+    """
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    if reviewer_genres is not None:
+        genres.assign_reviewer(
+            book,
+            reviewer_genres,
+            suggestion=genres.suggest(provider_subjects, embedded),
+            user=reviewer,
+        )
+        return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
+    added = genres.assign_automatic(
+        book,
+        provider_subjects=provider_subjects,
+        embedded_subjects=embedded,
+    )
+    return {"automatic_genres": [genre.name for genre in added]} if added else {}
+
+
+def _attach_genre_suggestions(task: ReviewTask, candidates: list[MetadataCandidate]) -> None:
+    """Set ``candidate.genre_suggestion`` for the review page's genre picker."""
+    index = genres.build_index()
+    embedded = genres.embedded_subjects(task.embedded_metadata)
+    for candidate in candidates:
+        candidate.genre_suggestion = genres.suggest(  # type: ignore[attr-defined]
+            candidate.subjects, embedded, index
+        )
+
+
+def _serialize_genre_suggestion(suggestion: genres.GenreSuggestion) -> dict[str, Any]:
+    return {
+        "source": suggestion.source,
+        "genre_ids": suggestion.genre_ids,
+        "tags": [
+            {
+                "tag": match.tag,
+                "genre_id": match.genre.pk if match.genre else None,
+                "genre": match.genre.name if match.genre else None,
+            }
+            for match in suggestion.matches
+        ],
+    }
+
+
 def _build_manual_book_from_payload(payload: dict[str, Any]) -> Book:
     from . import identification
 
@@ -1527,11 +1611,15 @@ def _filtered_library_books(
             ).values("book_id"),
         )
     if genre:
-        books = books.filter(
-            pk__in=Book.genres.through.objects.filter(
-                genre__name__icontains=genre,
-            ).values("book_id"),
+        # A genre name or alias ("sci-fi") selects that genre; anything else is a
+        # substring match on genre names, as before.
+        genre_match = genres.genre_from_filter(genre)
+        genre_links = (
+            Book.genres.through.objects.filter(genre=genre_match)
+            if genre_match is not None
+            else Book.genres.through.objects.filter(genre__name__icontains=genre)
         )
+        books = books.filter(pk__in=genre_links.values("book_id"))
     if language:
         books = books.filter(language__iexact=language)
     if book_format:
@@ -1581,6 +1669,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     total = paginator.count
     serialized = [_serialize_book(book, include_variants=False) for book in page_books]
     if _wants_html(request):
+        filters = {
+            "q": query,
+            "title": title,
+            "author": author,
+            "category": category,
+            "genre": genre,
+            "language": language,
+            "format": book_format,
+            "sort": sort,
+        }
         return render(
             request,
             "core/library_books.html",
@@ -1588,16 +1686,10 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
                 "books": serialized,
                 "page_object": page_object,
                 "count": total,
-                "filters": {
-                    "q": query,
-                    "title": title,
-                    "author": author,
-                    "category": category,
-                    "genre": genre,
-                    "language": language,
-                    "format": book_format,
-                    "sort": sort,
-                },
+                "all_genres": list(Genre.objects.order_by("name")),
+                "filters": filters,
+                # Pagination links keep every active filter, not just ``q``.
+                "filter_query": urlencode({key: value for key, value in filters.items() if value}),
             },
         )
     return JsonResponse(
@@ -3686,8 +3778,14 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     payload = _serialize_task(task)
+    candidates = list(_review_candidates(task))
+    _attach_genre_suggestions(task, candidates)
     payload["candidates"] = [
-        _serialize_candidate(candidate) for candidate in _review_candidates(task)
+        {
+            **_serialize_candidate(candidate),
+            "genre_suggestion": _serialize_genre_suggestion(candidate.genre_suggestion),
+        }
+        for candidate in candidates
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
@@ -3699,7 +3797,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
-                "candidates": _review_candidates(task),
+                "candidates": candidates,
+                "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
             },
         )
@@ -3734,6 +3833,10 @@ def review_accept_candidate(
         return HttpResponseBadRequest("candidate not found")
     if candidate.import_job_id != task.import_job_id or candidate.scan_job_id != task.scan_job_id:
         return HttpResponseBadRequest("candidate not found")
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
 
     try:
         candidate_isbn13 = candidate.isbn13 or None
@@ -3816,16 +3919,28 @@ def review_accept_candidate(
         reviewer_authors = (
             [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
         )
-        decision_payload: dict[str, Any] | None = None
+        decision_additions: dict[str, Any] = {}
         if reviewer_authors and not book.authors.exists():
             for author_name in reviewer_authors:
                 author, _ = Author.objects.get_or_create(
                     full_name=intake._fit(Author, "full_name", author_name),
                 )
                 book.authors.add(author)
+            decision_additions["reviewer_authors"] = reviewer_authors
+        decision_additions.update(
+            _apply_review_genres(
+                book=book,
+                task=task,
+                reviewer_genres=reviewer_genres,
+                provider_subjects=candidate.subjects,
+                reviewer=request.user,
+            )
+        )
+        decision_payload: dict[str, Any] | None = None
+        if decision_additions:
             decision_payload = {
                 **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
-                "reviewer_authors": reviewer_authors,
+                **decision_additions,
             }
 
         variant = _resolve_review_source(
@@ -4073,7 +4188,19 @@ def review_manual_entry(
     payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
+    try:
+        reviewer_genres = _reviewer_genre_choice(request, payload)
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
     book = _build_manual_book_from_payload(payload)
+    # A manually entered book has no provider record, so only the file's own tags apply.
+    _apply_review_genres(
+        book=book,
+        task=task,
+        reviewer_genres=reviewer_genres,
+        provider_subjects=None,
+        reviewer=request.user,
+    )
 
     variant = _resolve_review_source(
         task=task,

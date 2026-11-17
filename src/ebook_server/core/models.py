@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 import uuid
 from datetime import UTC, datetime
-from typing import ClassVar, Final
+from typing import Any, ClassVar, Final
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.timezone import now
@@ -65,7 +68,11 @@ class Author(models.Model):
 
 
 class Category(models.Model):
-    """Taxonomy bucket for browsing/search."""
+    """Library shelving bucket, curated by admins only.
+
+    Categories are *not* derived from subject tags; tag-derived classification goes to
+    ``Genre`` (#50, see docs/metadata-providers.md).
+    """
 
     name = models.CharField(max_length=128, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -77,14 +84,107 @@ class Category(models.Model):
         return self.name
 
 
+def genre_key(value: str) -> str:
+    """Comparison key for genre names and aliases.
+
+    Folds case, accents, ``&``/``and``, punctuation and whitespace, so "Sci-Fi", "SciFi"
+    and "sci fi" share one key. Only exact keys match; there is no fuzzy matching.
+    """
+    text = unicodedata.normalize("NFKD", value).casefold()
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = text.replace("&", " and ")
+    return re.sub(r"[\W_]+", "", text)
+
+
 class Genre(models.Model):
-    """Genre taxonomy bucket."""
+    """Literary genre (fiction or nonfiction) assigned from subject tags (#50).
+
+    Only admins create genres; tags that map to no genre or alias stay evidence.
+    """
 
     name = models.CharField(max_length=128, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        ordering: ClassVar[list[str]] = ["name"]
 
     def __str__(self) -> str:
         return self.name
+
+
+class GenreAlias(models.Model):
+    """Admin-editable alternative spelling of a genre ("SciFi" -> Science fiction)."""
+
+    genre = models.ForeignKey(Genre, on_delete=models.CASCADE, related_name="aliases")
+    alias = models.CharField(
+        max_length=255,
+        help_text=(
+            "Subject tag as providers or files write it. Case, accents, punctuation and "
+            "spacing are ignored when matching."
+        ),
+    )
+    key = models.CharField(max_length=255, unique=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        ordering: ClassVar[list[str]] = ["alias"]
+        verbose_name_plural = "genre aliases"
+
+    def clean(self) -> None:
+        key = genre_key(self.alias)
+        if not key:
+            raise ValidationError({"alias": "Alias needs at least one letter or digit."})
+        if GenreAlias.objects.filter(key=key).exclude(pk=self.pk).exists():
+            raise ValidationError({"alias": "An equivalent alias already exists."})
+        for genre in Genre.objects.exclude(pk=self.genre_id).only("id", "name"):
+            if genre_key(genre.name) == key:
+                raise ValidationError({"alias": f"This is the name of the genre {genre.name}."})
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.key = genre_key(self.alias)
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.alias} -> {self.genre_id}"
+
+
+class BookGenre(models.Model):
+    """Book-to-genre link with provenance (#50).
+
+    Uses the original auto-created ``core_book_genres`` table. Automatic assignment never
+    removes or downgrades reviewer- or admin-set rows.
+    """
+
+    class Source(models.TextChoices):
+        PROVIDER = "provider", "Metadata provider subject"
+        EMBEDDED = "embedded", "Embedded file subject"
+        REVIEWER = "reviewer", "Reviewer"
+        ADMIN = "admin", "Admin"
+
+    book = models.ForeignKey("Book", on_delete=models.CASCADE)
+    genre = models.ForeignKey(Genre, on_delete=models.CASCADE)
+    # Rows added without explicit provenance (the admin inline, ``book.genres.add``)
+    # are treated as hand-curated.
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.ADMIN)
+    source_tag = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Subject tag that mapped to this genre, for automatic assignments.",
+    )
+    created_at = models.DateTimeField(default=now)
+
+    class Meta:
+        db_table = "core_book_genres"
+        unique_together = (("book", "genre"),)
+
+    def __str__(self) -> str:
+        return f"{self.book_id}:{self.genre_id} ({self.source})"
 
 
 class StorageLocation(models.Model):
@@ -280,10 +380,23 @@ class Book(models.Model):
         related_name="books",
         blank=True,
     )
-    genres: models.ManyToManyField[Genre, Genre] = models.ManyToManyField(
+    genres: models.ManyToManyField[Genre, BookGenre] = models.ManyToManyField(
         "Genre",
         related_name="books",
         blank=True,
+        through="BookGenre",
+    )
+    # Set on any reviewer or admin genre decision, including "no genres" (#50). Automatic
+    # assignment and the ``assign_genres`` backfill never touch a curated Book, whether
+    # or not it has genre links.
+    genres_curated_at = models.DateTimeField(null=True, blank=True, editable=False)
+    genres_curated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="+",
+        on_delete=models.SET_NULL,
     )
 
     front_cover = models.ForeignKey(
@@ -942,8 +1055,8 @@ class MetadataCandidate(models.Model):
     isbn13 = models.CharField(max_length=16, blank=True)
     score = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     raw_payload = models.JSONField(default=dict, blank=True)
-    # Provider-reported subject/genre/category tags: evidence only, not yet mapped to
-    # Book.categories / Book.genres (see #50 for the open taxonomy decision).
+    # Provider-reported subject/genre/category tags. Raw evidence; tags that map to a
+    # Genre (or GenreAlias) are attached to the Book on accept (#50).
     subjects = models.JSONField(default=list, blank=True)
     language = models.CharField(max_length=32, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
