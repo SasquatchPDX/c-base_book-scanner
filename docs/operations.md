@@ -202,13 +202,17 @@ OCR variant. The OCR service is a contract fixture; it validates orchestration
 and provenance, not recognition quality. Containers are removed when the suite
 exits.
 
-The suite reserves host ports 55432, 56379, 55389, 58080, 58081, and 58082 by default.
+The suite reserves host ports 15432, 16379, 13389, 18080, 18081, and 18082 by default.
+These sit below Linux's ephemeral port range (32768-60999) on purpose: ports
+inside it can be taken at random as source ports by the job's own outbound
+connections (image pulls, package downloads), which made binds fail
+intermittently with "address already in use". Keep any overrides below 32768.
 Override the PostgreSQL, Redis, LDAP, and exposed Nginx ports with
 `BOOK_SCANNER_INTEGRATION_POSTGRES_PORT`,
 `BOOK_SCANNER_INTEGRATION_REDIS_PORT`, and
 `BOOK_SCANNER_INTEGRATION_LDAP_PORT`, and
 `BOOK_SCANNER_INTEGRATION_PROXY_PORT`; override the OCR fixture port with
-`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 58081 is the suite-internal host
+`BOOK_SCANNER_INTEGRATION_OCR_PORT`. Port 18081 is the suite-internal host
 Uvicorn listener. Credentials in
 `compose.integration.yml` belong only to the public seeded test fixtures and must
 never be copied into a deployment.
@@ -230,6 +234,25 @@ uv run python manage.py verify_storage --verify-hashes
 The hash mode is I/O intensive and should run off peak. The command is read-only
 and exits non-zero for missing artifacts, hash mismatches, path errors, or an
 unsupported backend.
+
+### Free-space reserve
+
+Intake keeps `BOOK_SCANNER_STORAGE_MIN_FREE_BYTES` (default 2 GiB; `0`
+disables the check) free on the archive volume. This matters most when the volume
+also holds PostgreSQL or Redis data.
+
+- `ingest_sources` estimates the space it has left: free space, minus the
+  reserve, minus the source size of imports that are queued but not yet
+  archived. It queues files only while they fit. When it stops early it prints
+  `insufficient free space on the archive volume` to stderr; files not queued
+  are picked up by a later run once there is room.
+- Every import, including web uploads and jobs that were already queued, checks
+  free space again right before archiving. If the copy would breach the reserve,
+  the job fails with a clear `insufficient free space ...` error. The MOVE source
+  is left untouched. After freeing space, run `ingest_sources --retry-failed`.
+- `/healthz/dependencies/` reports `free_bytes` and `min_free_bytes` for the
+  storage root. The storage status becomes `degraded` (not `down`, so readiness
+  stays green) while free space is below the reserve.
 
 Confirmed book deletion is available only to local application admins. It checks
 artifact hashes, moves files into backend-local quarantine, commits the database
@@ -264,6 +287,11 @@ Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
+
+Imported variants record their origin in `FileVariant.source_type`: `upload` for
+web uploads, otherwise the source location's `default_source_type`
+(`incoming_folder` or `network_source`). An exact duplicate reuses the existing
+variant and keeps that variant's original origin.
 
 ### Metadata provider rate limits
 
@@ -418,6 +446,21 @@ read with member size/compression limits; Pillow warnings for decompression bomb
 are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
+
+Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
+or `cover.png` (Calibre-style) over format extraction, but only when the folder
+holds a single book: every intake-supported file in it, and every file previously
+queued from it, must share the job file's name stem (`metadata.opf` and the cover
+itself are ignored). A folder of several books never lends its cover to any of them.
+The sidecar is untrusted input: symlinks and folders outside the source root are
+ignored, files over 25 MiB or 40 megapixels are rejected, and the image is verified
+and decoded by Pillow (JPEG/PNG only, decompression-bomb warnings are failures)
+before the usual normalization. An invalid sidecar is logged
+(`sidecar_cover_rejected`) and format extraction is used instead. Such covers record
+`extractor_tool=sidecar+pillow`. The sidecar file is only read: it is left in place
+for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
+reviewed MOVE import can still use it later. Disable with
+`BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
 
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original

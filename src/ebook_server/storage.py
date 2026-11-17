@@ -70,6 +70,53 @@ def check_storage_root(
     return target
 
 
+class InsufficientStorageError(StorageUnavailableError):
+    """Raised when writing would push the storage volume below its free-space reserve."""
+
+
+def free_bytes(path: Path) -> int | None:
+    """Free bytes on the volume holding ``path`` (or its nearest existing parent)."""
+    candidate = path
+    while not candidate.exists():
+        if candidate.parent == candidate:
+            return None
+        candidate = candidate.parent
+    try:
+        return shutil.disk_usage(candidate).free
+    except OSError:
+        return None
+
+
+def min_free_bytes() -> int:
+    """Configured free-space reserve (``BOOK_SCANNER_STORAGE_MIN_FREE_BYTES``); 0 disables."""
+    try:
+        from django.conf import settings as django_settings
+
+        return max(int(getattr(django_settings, "BOOK_SCANNER_STORAGE_MIN_FREE_BYTES", 0) or 0), 0)
+    except Exception:  # settings not configured (pure-library use)
+        return 0
+
+
+def ensure_free_space(path: Path, required_bytes: int) -> None:
+    """Refuse a write of ``required_bytes`` that would leave less than the reserve free.
+
+    The reserve keeps headroom for PostgreSQL/Redis when they share the volume.
+    Unknown free space (unsupported filesystem) is not treated as an error.
+    """
+    reserve = min_free_bytes()
+    if reserve <= 0:
+        return
+    available = free_bytes(path)
+    if available is None:
+        return
+    if available - max(required_bytes, 0) < reserve:
+        raise InsufficientStorageError(
+            f"insufficient free space on the storage volume for {path}: "
+            f"{available} bytes free, {required_bytes} needed, "
+            f"{reserve} reserved (BOOK_SCANNER_STORAGE_MIN_FREE_BYTES)",
+        )
+
+
 def probe_storage_writable(root: Path) -> None:
     """Write and delete a tiny temp file under ``root``."""
     import tempfile
@@ -124,6 +171,12 @@ class StorageBackend(Protocol):
 
     def generate_destination(self, namespace: str, original_name: str) -> str:
         """Generate a stable storage id for a new artifact."""
+
+    def free_bytes(self) -> int | None:
+        """Free bytes available to this backend, or None when unknown."""
+
+    def ensure_free_space(self, required_bytes: int) -> None:
+        """Raise InsufficientStorageError if storing ``required_bytes`` breaches the reserve."""
 
 
 @dataclass(frozen=True)
@@ -208,3 +261,9 @@ class LocalFilesystemStorage:
     def generate_destination(self, namespace: str, original_name: str) -> str:
         safe_name = cap_filename(Path(original_name).name.replace(" ", "_"))
         return f"{namespace}/{safe_name}"
+
+    def free_bytes(self) -> int | None:
+        return free_bytes(Path(self.root))
+
+    def ensure_free_space(self, required_bytes: int) -> None:
+        ensure_free_space(Path(self.root), required_bytes)

@@ -43,7 +43,13 @@ from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
 from ebook_server.jobs import enqueue
-from ebook_server.storage import LocalFilesystemStorage, check_storage_root, probe_storage_writable
+from ebook_server.storage import (
+    LocalFilesystemStorage,
+    check_storage_root,
+    free_bytes,
+    min_free_bytes,
+    probe_storage_writable,
+)
 
 from . import (
     book_deletion,
@@ -228,6 +234,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_size_bytes": state.output_size_bytes,
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
+        "invalidated_reason": state.invalidated_reason,
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -885,7 +892,17 @@ def _check_storage() -> DependencyResult:
             storage_root.mkdir(parents=True, exist_ok=True)
         check_storage_root(root=storage_root)
         probe_storage_writable(storage_root)
-        return DependencyResult(name="storage", status="ok", details={"root": str(storage_root)})
+        details: dict[str, Any] = {"root": str(storage_root)}
+        available = free_bytes(storage_root)
+        reserve = min_free_bytes()
+        if available is not None:
+            details["free_bytes"] = available
+            details["min_free_bytes"] = reserve
+        if available is not None and reserve > 0 and available < reserve:
+            # Imports refuse to archive below the reserve; the app itself still serves.
+            details["warning"] = "free space below BOOK_SCANNER_STORAGE_MIN_FREE_BYTES"
+            return DependencyResult(name="storage", status="degraded", details=details)
+        return DependencyResult(name="storage", status="ok", details=details)
     except Exception as exc:  # pragma: no cover
         return DependencyResult(name="storage", status="down", details={"error": str(exc)})
 
@@ -1034,7 +1051,6 @@ def _resolve_review_source(
             job=import_job,
             review_task=task,
             book=book,
-            source_type=cast(str, FileVariant.SourceType.UPLOAD),
             selected_candidate=selected_candidate,
             reviewer=reviewer,
             decision=decision,

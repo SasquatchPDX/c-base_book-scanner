@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: book_scanner
       POSTGRES_PASSWORD: book_scanner_integration
     ports:
-      - "${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-55432}:5432"
+      - "${BOOK_SCANNER_INTEGRATION_POSTGRES_PORT:-15432}:5432"
     healthcheck:
       test:
         - CMD-SHELL
@@ -26,7 +26,7 @@ services:
       - --appendonly
       - "no"
     ports:
-      - "${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-56379}:6379"
+      - "${BOOK_SCANNER_INTEGRATION_REDIS_PORT:-16379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -36,7 +36,7 @@ services:
   openldap:
     image: ghcr.io/rroemhild/docker-test-openldap:master@sha256:c21d77472eaa195b3c0c2c6053266c9aede80f6290d0aca784b25f1ffe1ee197
     ports:
-      - "${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-55389}:10389"
+      - "${BOOK_SCANNER_INTEGRATION_LDAP_PORT:-13389}:10389"
     healthcheck:
       test:
         - CMD-SHELL
@@ -54,7 +54,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-58080}:8080"
+      - "${BOOK_SCANNER_INTEGRATION_PROXY_PORT:-18080}:8080"
     volumes:
       - ./deploy/nginx/integration.conf:/etc/nginx/conf.d/default.conf:ro
       - ./src/staticfiles:/srv/book-scanner/static:ro
