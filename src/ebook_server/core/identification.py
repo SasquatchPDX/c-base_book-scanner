@@ -101,6 +101,68 @@ WORK_ISBN_MATCH_SCORE = getattr(
 )
 # Minimum rapidfuzz token_set_ratio for two publisher names (noise words removed).
 PUBLISHER_MATCH_MIN_RATIO = 90.0
+# Values ebook tools write into the publisher field that name no publisher: converters,
+# authoring tools, distribution sites and placeholders. Compared after ``normalize_text``;
+# an entry also matches when followed only by version tokens ("calibre 5.42.0", "Adobe
+# InDesign CS6", "calibre (3.48.0) [https://calibre-ebook.com]"). Deliberately an exact
+# list: a domain-shaped name such as "Tor.com" or "Smashwords.com" is a real imprint and
+# stays a publisher signal (#144 review). Deployments add entries through
+# BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS.
+DEFAULT_IGNORED_PUBLISHERS: tuple[str, ...] = (
+    "calibre",
+    "calibre-ebook.com",
+    "adobe acrobat",
+    "adobe acrobat pro",
+    "adobe acrobat pro dc",
+    "adobe acrobat distiller",
+    "acrobat distiller",
+    "adobe distiller",
+    "adobe indesign",
+    "adobe pdf library",
+    "microsoft word",
+    "microsoft office word",
+    "libreoffice",
+    "libreoffice writer",
+    "openoffice",
+    "openoffice.org",
+    "openoffice.org writer",
+    "apache openoffice",
+    "pages",
+    "sigil",
+    "pandoc",
+    "abbyy finereader",
+    "finereader",
+    "kindle previewer",
+    "kindlegen",
+    "epub bud",
+    "epubbud.com",
+    "pubone.info",
+    "unknown",
+    "unknown publisher",
+    "n/a",
+    "none",
+    "s.n.",
+    "[s.n.]",
+    "-",
+)
+IGNORED_PUBLISHERS = frozenset(
+    " ".join(str(value).lower().split())
+    for value in (
+        *DEFAULT_IGNORED_PUBLISHERS,
+        *getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS", []),
+    )
+    if str(value).strip()
+)
+# A web address inside the publisher value ("ePub Bud (www.epubbud.com)", "calibre
+# [https://calibre-ebook.com]"): removed with its brackets before the rest is judged.
+_PUBLISHER_URL = re.compile(
+    r"[(\[<]\s*(?:[a-z][a-z0-9+.-]*://|www\.)[^)\]>]*[)\]>]|(?:[a-z][a-z0-9+.-]*://|\bwww\.)\S*"
+)
+# What may follow an ignored tool name: version numbers ("5.42.0", "v2", "(3.48.0)"),
+# Adobe release names ("CS6", "CC 2019") and build words.
+_PUBLISHER_VERSION_TOKEN = re.compile(
+    r"[(\[]?(?:v?\d[\w.\-]*|cs\d*|cc|dc|pro|x64|x86|build|version|for|mac|macos|macintosh|windows|win)[)\]]?,?"
+)
 _PUBLISHER_NOISE_TOKENS = frozenset(
     {
         "ag",
@@ -911,7 +973,7 @@ def build_identification_input(
         # Normalised (ISO 639-1, else 639-3) so "en" and "eng" compare equal; "UND" and
         # unknown codes become None ("no signal"), never a mismatch.
         language=normalize_language(_first_str(extracted_metadata.get("language"))),
-        publisher=normalize_text(extracted_metadata.get("publisher")),
+        publisher=publisher_signal(extracted_metadata.get("publisher")),
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
         else None,
@@ -1666,6 +1728,39 @@ def _pick_language(
     return normalize_text(usable_work[0]) if usable_work else None
 
 
+def publisher_signal(value: Any) -> str:
+    """The file's publisher as identification evidence, or ``""`` for no signal.
+
+    Raw metadata is evidence, not truth: converters and authoring tools write their own
+    name into the publisher field. A value that is only a web address, or that names an
+    ignored tool (``IGNORED_PUBLISHERS``, optionally followed by a version), counts as a
+    missing publisher: no edition conflict and no publisher bonus. A web address next
+    to a real name is dropped and the name kept ("Tor.com (www.tor.com)" -> "tor.com").
+    Domain-shaped imprints ("Tor.com", "Amazon.com Services LLC") are kept, so they still
+    reveal another edition (``edition_publisher_mismatch``).
+    """
+    text = normalize_text(value if isinstance(value, str) else None)
+    if not text or _is_ignored_publisher(text):
+        return ""
+    stripped = " ".join(_PUBLISHER_URL.sub(" ", text).split()).strip(" -,;:|/")
+    if stripped != text and (not stripped or _is_ignored_publisher(stripped)):
+        return ""
+    return stripped or text
+
+
+def _is_ignored_publisher(text: str) -> bool:
+    """True when ``text`` is an ignored tool/placeholder, alone or followed by versions."""
+    text = text.replace("®", "").replace("™", "")
+    text = " ".join(text.split())
+    if text in IGNORED_PUBLISHERS:
+        return True
+    words = text.split()
+    for cut in range(len(words) - 1, 0, -1):
+        if " ".join(words[:cut]) in IGNORED_PUBLISHERS:
+            return all(_PUBLISHER_VERSION_TOKEN.fullmatch(word) for word in words[cut:])
+    return False
+
+
 def _publisher_tokens(value: str) -> str:
     return " ".join(sorted(set(default_process(value).split()) - _PUBLISHER_NOISE_TOKENS))
 
@@ -1843,6 +1938,36 @@ def title_similarity(left: str, right: str) -> float:
 def author_similarity(left: list[str], right: list[str]) -> float:
     """Public form of the candidate author score (0.0 when no name corresponds)."""
     return _author_match_score(left, right)
+
+
+def titles_agree(left: str, right: str) -> bool:
+    """Whether two titles name the same book, tolerating subtitles and annotations.
+
+    "Foundation" agrees with "Foundation: A Novel"; "Foundation" and "Foundation and
+    Earth" do not (see :func:`_title_match_score`).
+    """
+    if not normalize_text(left) or not normalize_text(right):
+        return False
+    return any(
+        _title_match_score(a, b) >= SAME_BOOK_TITLE_MIN_SCORE
+        for a in _title_variants(left)
+        for b in _title_variants(right)
+    )
+
+
+def author_lists_agree(left: list[str], right: list[str]) -> bool:
+    """Whether two author lists name the same people (every name has a match).
+
+    Names are matched like :func:`authors_conflict` does ("Banks, Iain" and "Iain M.
+    Banks" agree). Two empty lists agree; an empty and a non-empty list do not.
+    """
+    left_names = [name for name in left if normalize_text(name)]
+    right_names = [name for name in right if normalize_text(name)]
+    if not left_names or not right_names:
+        return not left_names and not right_names
+    return all(
+        any(_author_names_agree(name, other) for other in right_names) for name in left_names
+    ) and all(any(_author_names_agree(name, other) for other in left_names) for name in right_names)
 
 
 # Creator values that say nothing about who wrote the book: office-suite and PDF

@@ -26,6 +26,7 @@ from ebook_server.core.models import (
     Identifier,
     ScanEvent,
     ScanJob,
+    ScanJobOpf,
     ScanPage,
     ScanPageVersion,
     ScanTodo,
@@ -447,10 +448,7 @@ def test_replacement_on_a_cancelled_job_is_job_state(key: str) -> None:  # noqa:
 
 
 @pytest.mark.django_db
-def test_rescan_list_title_comes_from_the_opf_then_the_book(
-    key: str,  # noqa: F811
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_rescan_list_title_comes_from_the_opf_then_the_book(key: str) -> None:  # noqa: F811
     _scan_book(key)
     _open_todo(0)
     _open_todo(1, state=ScanTodo.State.CLAIMED)
@@ -467,17 +465,31 @@ def test_rescan_list_title_comes_from_the_opf_then_the_book(
         "9780306406157",
         2,
     )
-    # The current OPF (S6, #130) wins over the Book.
-    monkeypatch.setattr(
-        scanner_rescans,
-        "_opf_fields",
-        lambda job: {"title": "OPF Title", "authors": ["Opf Author"], "isbn": "0306406152"},
+    # The effective OPF (S6, #130) wins over the Book; an app-generated OPF that is
+    # newer is not metadata and is skipped (scanner_opf.effective_opf).
+    job = ScanJob.objects.get(pk=JOB_ID)
+    ScanJobOpf.objects.create(
+        scan_job=job,
+        version=1,
+        sha256="a" * 64,
+        size_bytes=1,
+        content=b"x",
+        fields={"title": "OPF Title", "authors": ["Opf Author"], "isbn": "9780140449136"},
+    )
+    ScanJobOpf.objects.create(
+        scan_job=job,
+        version=2,
+        sha256="b" * 64,
+        size_bytes=1,
+        content=b"y",
+        fields={"title": "Generated", "authors": ["Serif"], "isbn": None},
+        app_generated=True,
     )
     item = _get(key, "rescans").json()["items"][0]
     assert (item["title"], item["authors"], item["isbn"]) == (
         "OPF Title",
         ["Opf Author"],
-        "0306406152",
+        "9780140449136",
     )
 
 

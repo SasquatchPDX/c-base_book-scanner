@@ -18,6 +18,13 @@
             · {{ summary.open_rescans }} open rescan{{ summary.open_rescans|pluralize }}
             {% if summary.job.scanner_id %}· {{ summary.job.scanner_id }}{% endif %}
           </p>
+          {% if summary.metadata.opf_version %}
+            <p data-raw-scan-opf>
+              {{ summary.metadata.authors|join:", "|default:"Unknown author" }}
+              {% if summary.metadata.isbn %}· ISBN <span class="mono">{{ summary.metadata.isbn }}</span>{% endif %}
+              {% if summary.metadata.language %}· {{ summary.metadata.language }}{% endif %}
+            </p>
+          {% endif %}
           {% if summary.completeness %}
             <p class="muted">Completeness:
               {% for flag, value in summary.completeness.items %}{{ flag }}: {{ value }}{% if not forloop.last %}, {% endif %}{% endfor %}

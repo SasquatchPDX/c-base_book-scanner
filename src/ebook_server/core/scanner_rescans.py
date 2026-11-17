@@ -29,7 +29,14 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, Q, QuerySet
 
-from . import scan_events, scan_lifecycle, scan_pipeline, scanner_uploads, scantailor
+from . import (
+    scan_events,
+    scan_lifecycle,
+    scan_pipeline,
+    scanner_opf,
+    scanner_uploads,
+    scantailor,
+)
 from .models import Book, ScanJob, ScanPage, ScanPageVersion, ScanTodo, ScanUploadSource
 from .scan_thumbnails import render_jpeg_thumbnail as render_jpeg_thumbnail
 from .storage_registry import backend_for_location
@@ -79,18 +86,13 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _opf_fields(job: ScanJob) -> dict[str, Any]:
-    """Fields of the job's current scanner OPF (S6, #130), or ``{}``.
+    """Fields of the job's effective scanner OPF (S6, #130), or ``{}``.
 
-    S6 stores OPF versions as ``job.opf_versions``; without it (or without an OPF)
-    there is nothing to read. An OPF that carries the application's own "generated"
-    marker is not metadata and is skipped (S6's ``effective_opf``).
-    TODO(S6, #130): call ``scanner_opf.effective_opf`` once #143 is merged.
+    An OPF that carries the application's own "generated" marker is not metadata and
+    is skipped (:func:`.scanner_opf.effective_opf`).
     """
-    versions = getattr(job, "opf_versions", None)
-    if versions is None:
-        return {}
-    opf = versions.filter(app_generated=False).order_by("-version").first()
-    fields = getattr(opf, "fields", None)
+    opf = scanner_opf.effective_opf(job)
+    fields = opf.fields if opf is not None else None
     return fields if isinstance(fields, dict) else {}
 
 

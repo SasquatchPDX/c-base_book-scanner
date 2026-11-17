@@ -8,7 +8,7 @@ from django.contrib import admin, messages
 from django.db.models import QuerySet
 from django.http import HttpRequest
 
-from . import genres
+from . import genres, scanner_opf
 from .models import (
     AppUserProfile,
     Author,
@@ -74,6 +74,22 @@ class BookAdmin(admin.ModelAdmin[Book]):
     @admin.action(description="Plan moving selected books into their archive folders (dry run)")
     def plan_archive_reorganize(self, request: HttpRequest, queryset: QuerySet[Book]) -> None:
         _queue_reorganize(self, request, book_ids=list(queryset.values_list("pk", flat=True)))
+
+    def save_model(self, request: HttpRequest, obj: Book, form: Any, change: bool) -> None:
+        if change and obj.pk is not None:
+            stored = Book.objects.filter(pk=obj.pk).first()
+            if stored is not None:
+                # Compared after the related authors are saved (save_related).
+                request._book_before = scanner_opf.snapshot_book(stored)  # type: ignore[attr-defined]
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request: HttpRequest, form: Any, formsets: Any, change: bool) -> None:
+        super().save_related(request, form, formsets, change)
+        before = getattr(request, "_book_before", None)
+        if isinstance(before, dict):
+            # Hand edits are reviewer provenance: a later scanner OPF never overwrites
+            # them (#130).
+            scanner_opf.record_reviewer_edits(form.instance, before, user=request.user)
 
     def save_formset(self, request: HttpRequest, form: Any, formset: Any, change: bool) -> None:
         super().save_formset(request, form, formset, change)

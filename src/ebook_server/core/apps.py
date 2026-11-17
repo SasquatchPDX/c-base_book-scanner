@@ -17,6 +17,7 @@ class CoreConfig(AppConfig):
             scan_covers,
             scan_events,
             scan_manifest,
+            scanner_opf,
             search,
             thumbnails,
         )
@@ -27,3 +28,5 @@ class CoreConfig(AppConfig):
         scan_covers.register()
         # capture-complete and GET jobs/{id} compare against the stored event lines (S5).
         scan_manifest.register_event_high_water_mark(scan_events.sans_high_water_mark)
+        # Scanner metadata.opf (#130): manifest source, raw-scan annotator, book linker.
+        scanner_opf.register()

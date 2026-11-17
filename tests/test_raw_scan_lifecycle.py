@@ -178,9 +178,9 @@ def test_get_job_reports_state_inventory_and_portal_url(key: str, member: Client
         {"sequence_number": 1, "sha256": sha1, "version": 1},
         {"sequence_number": 2, "sha256": sha2, "version": 1},
     ]
-    # No covers uploaded (S4 reports an empty list); the OPF is not stored yet (S6).
+    # No covers uploaded (S4 reports an empty list); no OPF was sent (S6).
     assert body["covers"] == []
-    assert "metadata_opf" not in body
+    assert body["metadata_opf"] is None
     assert body["open_rescans"] == 0
 
 
