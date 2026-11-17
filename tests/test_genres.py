@@ -30,7 +30,7 @@ from ebook_server.core.models import (
 from ebook_server.storage import LocalFilesystemStorage
 
 DC = "http://purl.org/dc/elements/1.1/"
-SEED = importlib.import_module("ebook_server.core.migrations.0023_seed_genres")
+SEED = importlib.import_module("ebook_server.core.migrations.0027_seed_genres")
 
 
 @pytest.fixture
@@ -577,8 +577,8 @@ def test_migrations_keep_existing_links_as_admin_set_and_reverse() -> None:
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
-    before = [("core", "0022_source_location_group_sibling_formats")]
-    after = [("core", "0023_seed_genres")]
+    before = [("core", "0025_importjob_cancelled_state")]
+    after = [("core", "0027_seed_genres")]
     executor = MigrationExecutor(connection)
     executor.migrate(before)
     old_apps = executor.loader.project_state(before).apps
@@ -611,8 +611,8 @@ def test_seed_reversal_keeps_pre_existing_admin_taxonomy() -> None:
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
-    schema_only = [("core", "0022_genre_alias_book_genre_provenance")]
-    seeded_state = [("core", "0023_seed_genres")]
+    schema_only = [("core", "0026_genre_alias_book_genre_provenance")]
+    seeded_state = [("core", "0027_seed_genres")]
     executor = MigrationExecutor(connection)
     executor.migrate(schema_only)
     old_apps = executor.loader.project_state(schema_only).apps

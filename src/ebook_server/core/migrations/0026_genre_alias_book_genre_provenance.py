@@ -13,12 +13,12 @@ class Migration(migrations.Migration):
 
     ``Book.genres_curated_*`` records a reviewer/admin genre decision independently of
     link rows (an explicit "no genres" leaves none). ``seeded`` marks the Genre and
-    GenreAlias rows that 0023 creates, so reversing it never deletes admin taxonomy.
+    GenreAlias rows that 0027 creates, so reversing it never deletes admin taxonomy.
     """
 
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0025_importjob_cancelled_state"),
     ]
 
     operations = [

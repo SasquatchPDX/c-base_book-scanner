@@ -170,7 +170,7 @@ def unseed_genres(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0022_genre_alias_book_genre_provenance"),
+        ("core", "0026_genre_alias_book_genre_provenance"),
     ]
 
     operations = [
