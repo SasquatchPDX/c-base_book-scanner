@@ -444,9 +444,20 @@ class ScanJob(models.Model):
         COMPLETE = "complete", "Complete"
         CANCELLED = "cancelled", "Cancelled"
 
+    class CaptureLayout(models.TextChoices):
+        """What one uploaded image contains; decides how Page Split treats it (#55)."""
+
+        SINGLE_PAGE = "single_page", "One page per image"
+        SPREAD = "spread", "Two facing pages per image"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     state = models.CharField(max_length=16, choices=State.choices, default=State.OPEN)
     scanner_id = models.CharField(max_length=64, blank=True)
+    capture_layout = models.CharField(
+        max_length=16,
+        choices=CaptureLayout.choices,
+        default=CaptureLayout.SINGLE_PAGE,
+    )
     operator = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

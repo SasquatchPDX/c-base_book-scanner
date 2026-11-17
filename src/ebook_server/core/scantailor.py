@@ -51,7 +51,8 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
 }
 
 DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
-    "page_split": "splitter-v1",
+    # v2: a single-page capture layout records a "no split" passthrough (#55).
+    "page_split": "splitter-v2",
     "deskew": "projection-v1",
     "select_content": "projection-v1",
     "margins": "padding-v1",
@@ -894,18 +895,122 @@ def _auto_split_position(
     return result.x
 
 
+SPLIT_MODES: Final[frozenset[str]] = frozenset({"auto", "manual", "single", "none"})
+SINGLE_PAGE_SPLIT_ALGORITHM: Final[str] = "single_page_passthrough"
+SINGLE_PAGE_SPLIT_REASON: Final[str] = (
+    "single-page capture layout: the image already holds exactly one page, no split"
+)
+# Recorded by a split run; dropped when another mode runs so none of them goes stale.
+_SPLIT_RESULT_KEYS: Final[tuple[str, ...]] = (
+    "algorithm",
+    "split_skipped",
+    "split_skipped_reason",
+    "capture_layout",
+    "resolved_split_x",
+    "resolved_width",
+    "split_confidence",
+    "split_method",
+)
+
+
+def _capture_layout(state: ScanTailorStageState) -> str:
+    """The capture layout of the state's scan job (#55).
+
+    A state that is not attached to a saved job (direct unit-level runs) keeps the
+    gutter-detecting behaviour, i.e. it is treated as ``spread``.
+    """
+    if state.scan_job_id is None:
+        return str(ScanJob.CaptureLayout.SPREAD)
+    return str(state.scan_job.capture_layout)
+
+
+def default_split_mode(capture_layout: str) -> str:
+    """Page Split mode used when a page has no explicit ``split_mode`` (#55)."""
+    return "none" if capture_layout == ScanJob.CaptureLayout.SINGLE_PAGE else "auto"
+
+
+def _explicit_split_mode(parameters: dict[str, Any] | None) -> str | None:
+    raw = (parameters or {}).get("split_mode")
+    if raw is None:
+        return None
+    mode = str(raw).strip().lower()
+    return mode if mode in SPLIT_MODES else None
+
+
+def effective_split_mode(state: ScanTailorStageState) -> str:
+    """The split mode a Page Split run of ``state`` uses."""
+    return _explicit_split_mode(state.parameters) or default_split_mode(_capture_layout(state))
+
+
+def split_algorithm_for_mode(split_mode: str) -> str:
+    """Stage ``algorithm`` recorded for a Page Split mode."""
+    if split_mode == "none":
+        return SINGLE_PAGE_SPLIT_ALGORITHM
+    if split_mode == "manual":
+        return "manual_split"
+    return "auto_split"
+
+
+def is_auto_skipped_split(state: ScanTailorStageState) -> bool:
+    """True for a Page Split stage that completed as a recorded "no split" passthrough."""
+    return (
+        state.stage == ScanTailorStageState.Stage.PAGE_SPLIT.value
+        and state.status == ScanTailorStageState.StageStatus.SUCCESS
+        and (state.parameters or {}).get("resolved_split_mode") == "none"
+    )
+
+
+def _run_single_page_split(
+    state: ScanTailorStageState,
+    parameters: dict[str, Any],
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+) -> dict[str, Any]:
+    """Record Page Split as "no split": the input is copied through unchanged.
+
+    Uses the shared passthrough helper (#54): a normalised PNG input is byte-copied,
+    anything else is normalised once, and no gutter detection runs. The stage still
+    gets its own output artifact, checksum and provenance, so downstream stages and
+    their invalidation behave exactly as after a real split.
+    """
+    image = _load_image(source_path)
+    _write_unchanged(image, source_path, output_path, preview_path)
+    recorded = {
+        key: value
+        for key, value in parameters.items()
+        if key not in _SPLIT_RESULT_KEYS and key != "split_x"
+    }
+    recorded.update(
+        {
+            "split_mode": "none",
+            "resolved_split_mode": "none",
+            "resolved_split_side": "single",
+            "algorithm": SINGLE_PAGE_SPLIT_ALGORITHM,
+            "split_skipped": True,
+            "split_skipped_reason": SINGLE_PAGE_SPLIT_REASON,
+            "capture_layout": _capture_layout(state),
+            "source_width": image.width,
+            "source_height": image.height,
+        },
+    )
+    return recorded
+
+
 def _run_page_split(
     state: ScanTailorStageState,
     source_path: Path,
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source = _load_image(source_path)
-
     parameters = dict(state.parameters or {})
-    split_mode = str(parameters.get("split_mode", "auto")).strip().lower()
-    if split_mode not in {"auto", "manual", "single"}:
-        split_mode = "auto"
+    split_mode = effective_split_mode(state)
+    if split_mode == "none":
+        return _run_single_page_split(state, parameters, source_path, output_path, preview_path)
+    for key in _SPLIT_RESULT_KEYS:
+        parameters.pop(key, None)
+
+    source = _load_image(source_path)
     side = state.scan_page.side
 
     dpi = _dpi_of(source)
@@ -2412,6 +2517,7 @@ _STAGE_RUNNERS: dict[
         "copy": _run_copy,
         "auto_split": _run_page_split,
         "manual_split": _run_page_split,
+        SINGLE_PAGE_SPLIT_ALGORITHM: _run_page_split,
     },
     ScanTailorStageState.Stage.DESKEW.value: {
         "copy": _run_copy,
@@ -2512,6 +2618,69 @@ def request_stage_job(
     )
     dispatch_stage_job(str(job.job_id))
     return job
+
+
+def auto_complete_single_page_split(
+    page: ScanPage,
+    *,
+    requested_by_user_id: int | None = None,
+) -> ProcessingJob | None:
+    """Queue the recorded "no split" Page Split run for a page of a single-page job (#55).
+
+    Called when a new page version arrives. In a ``single_page`` job Page Split needs
+    no human input, so it completes on its own as a background passthrough job. A
+    page whose split was switched to another mode (manual/auto/single) is a per-page
+    override and is left for the user to re-run. Returns the queued job, or ``None``
+    when nothing was queued.
+    """
+    if page.scan_job.capture_layout != ScanJob.CaptureLayout.SINGLE_PAGE:
+        return None
+    state = get_or_create_stage_state(
+        scan_job_id=str(page.scan_job_id),
+        page_id=str(page.id),
+        stage=ScanTailorStageState.Stage.PAGE_SPLIT.value,
+    )
+    if effective_split_mode(state) != "none":
+        return None
+    state.parameters = {"split_mode": "none"}
+    state.algorithm = split_algorithm_for_mode("none")
+    state.revision += 1
+    state.status = ScanTailorStageState.StageStatus.QUEUED
+    state.save(update_fields=["parameters", "algorithm", "revision", "status", "updated_at"])
+    # A new page version has normally invalidated everything already ("source
+    # changed"); keep that reason and only catch stages that are still current.
+    ScanTailorStageState.objects.filter(
+        scan_job_id=page.scan_job_id,
+        scan_page=page,
+        stage__in=downstream_stages(state.stage),
+    ).exclude(status=ScanTailorStageState.StageStatus.INVALIDATED).update(
+        status=ScanTailorStageState.StageStatus.INVALIDATED,
+        invalidated_reason="page_split updated",
+        last_error="",
+        updated_at=timezone.now(),
+    )
+    try:
+        return request_stage_job(state=state, requested_by_user_id=requested_by_user_id)
+    except Exception as exc:  # the page upload itself must still succeed
+        logger.warning(
+            "scantailor_auto_split_dispatch_failed",
+            scan_job_id=str(page.scan_job_id),
+            scan_page_id=str(page.id),
+            error=str(exc),
+        )
+        now = timezone.now()
+        message = f"automatic page split could not be queued: {exc}"
+        if state.worker_job_id:
+            ProcessingJob.objects.filter(
+                job_id=state.worker_job_id,
+                state=ProcessingJob.JobState.QUEUED,
+            ).update(state=ProcessingJob.JobState.FAILED, finished_at=now)
+        ScanTailorStageState.objects.filter(id=state.id, revision=state.revision).update(
+            status=ScanTailorStageState.StageStatus.FAILED,
+            last_error=message,
+            updated_at=now,
+        )
+        return None
 
 
 def dispatch_stage_job(job_id: str) -> None:

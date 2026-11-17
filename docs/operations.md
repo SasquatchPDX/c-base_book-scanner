@@ -31,6 +31,13 @@ sets `X-Accel-Buffering: no`. Tune the one-second/45-iteration defaults with
 `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`; account for the resulting
 database polling load when sizing large concurrent scanning sessions.
 
+New scan jobs default to the `single_page` capture layout, which is what the
+project's scanner produces. In that layout, ScanTailor's Page Split completes
+automatically as a recorded "no split" passthrough. If a scanner photographs
+two-page spreads, list its id in `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` (a JSON
+list). To change the default for every scanner, set
+`BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT=spread`. See `docs/scantailor-web.md`.
+
 `deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.

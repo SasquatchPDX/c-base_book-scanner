@@ -237,6 +237,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
         "invalidated_reason": state.invalidated_reason,
+        "auto_skipped": scantailor.is_auto_skipped_split(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
         "finished_at": state.finished_at.isoformat() if state.finished_at else None,
         "created_at": state.created_at.isoformat(),
@@ -254,6 +255,7 @@ def _serialize_scan_job(
         "id": str(job.id),
         "state": job.state,
         "scanner_id": job.scanner_id,
+        "capture_layout": job.capture_layout,
         "provisional_title": job.provisional_title,
         "provisional_authors": job.provisional_authors,
         "expected_page_count": job.expected_page_count,
@@ -285,6 +287,30 @@ _SCAN_SIDE_ALIASES: Final[dict[str, str]] = {
     "right": ScanPage.Side.RIGHT,
     "r": ScanPage.Side.RIGHT,
 }
+
+
+_CAPTURE_LAYOUT_ALIASES: Final[dict[str, str]] = {
+    "single_page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single-page": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "single": ScanJob.CaptureLayout.SINGLE_PAGE,
+    "spread": ScanJob.CaptureLayout.SPREAD,
+    "spreads": ScanJob.CaptureLayout.SPREAD,
+}
+
+
+def _resolve_capture_layout(raw: Any, scanner_id: str) -> str | None:
+    """Capture layout for a new scan job; ``None`` for an unrecognised value (#55).
+
+    An explicit ``capture_layout`` wins. Otherwise a scanner listed in
+    ``BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS`` gets ``spread`` and everything else the
+    configured default (``single_page``: one page per image). Page ``side`` values do
+    not imply spreads: a two-camera rig sends left and right as separate images.
+    """
+    if raw is not None and str(raw).strip():
+        return _CAPTURE_LAYOUT_ALIASES.get(str(raw).strip().lower())
+    if scanner_id and scanner_id in django_settings.BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS:
+        return str(ScanJob.CaptureLayout.SPREAD)
+    return str(django_settings.BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT)
 
 
 def _normalize_scan_side(raw_side: str | None) -> str | None:
@@ -830,6 +856,10 @@ def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None
         state = states.get(stage_name)
         if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
             break
+        if scantailor.is_auto_skipped_split(state):
+            # A "no split" passthrough shows the raw page; its full-size version
+            # makes the better thumbnail than the reduced stage preview (#55).
+            continue
         if state.preview_storage_identifier or state.output_storage_identifier:
             latest = state
     return latest
@@ -2191,6 +2221,12 @@ def _apply_stage_payload_to_state(
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
                 state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         state.parameters = merged
+        if stage == "page_split":
+            # The algorithm follows the chosen mode, so switching a single-page
+            # passthrough to a manual split (or back) never keeps a stale label (#55).
+            state.algorithm = scantailor.split_algorithm_for_mode(
+                scantailor.effective_split_mode(state),
+            )
 
     _bind_stage_inputs(state, page)
     state.revision += 1
@@ -2631,6 +2667,10 @@ def scan_jobs(
     else:
         book = None
 
+    capture_layout = _resolve_capture_layout(payload.get("capture_layout"), scanner_id)
+    if capture_layout is None:
+        return HttpResponseBadRequest("invalid capture_layout (expected single_page or spread)")
+
     notes = _normalize_scanner_metadata(payload.get("notes"))
     initial_state = _coerce_str_or_none(payload.get("state")) or ScanJob.State.OPEN
     if initial_state not in {
@@ -2643,6 +2683,7 @@ def scan_jobs(
     job = ScanJob.objects.create(
         state=initial_state,
         scanner_id=scanner_id,
+        capture_layout=capture_layout,
         operator=profile.user,
         book=book,
         provisional_title=job_title,
@@ -2975,6 +3016,7 @@ def upload_scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     status_code = 201 if created else 200
     if _wants_html(request):
@@ -3054,6 +3096,7 @@ def scan_page(
 
     if created:
         _complete_open_rescan_todos(page)
+        scantailor.auto_complete_single_page_split(page, requested_by_user_id=profile.user_id)
 
     return JsonResponse(
         {
