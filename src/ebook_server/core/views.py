@@ -1017,7 +1017,6 @@ def _resolve_review_source(
             job=import_job,
             review_task=task,
             book=book,
-            source_type=cast(str, FileVariant.SourceType.UPLOAD),
             selected_candidate=selected_candidate,
             reviewer=reviewer,
             decision=decision,

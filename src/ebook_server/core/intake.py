@@ -909,6 +909,16 @@ def _create_review_task(
     return existing
 
 
+def variant_source_type_for_job(job: ImportJob) -> str:
+    """FileVariant provenance for an import: upload, incoming folder, or network source."""
+    mapping: dict[str, str] = {
+        ImportJob.SourceType.UPLOAD: FileVariant.SourceType.UPLOAD,
+        ImportJob.SourceType.INCOMING_FOLDER: FileVariant.SourceType.INCOMING_FOLDER,
+        ImportJob.SourceType.NETWORK_SOURCE: FileVariant.SourceType.NETWORK_SOURCE,
+    }
+    return mapping.get(str(job.source_type), FileVariant.SourceType.UPLOAD)
+
+
 def _create_or_reuse_file_variant(
     job: ImportJob,
     book: Book,
@@ -917,7 +927,7 @@ def _create_or_reuse_file_variant(
     source_type: str = "",
 ) -> FileVariant:
     if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+        source_type = variant_source_type_for_job(job)
     duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
     if duplicate_variant is not None:
         return duplicate_variant
@@ -1030,15 +1040,14 @@ def resolve_import_with_review_data(
     job: ImportJob,
     review_task: ReviewTask,
     book: Book,
-    source_type: str,
+    source_type: str = "",
     selected_candidate: MetadataCandidate | None = None,
     reviewer: Any | None = None,
     decision: str = "",
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
 ) -> FileVariant:
-    if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+    """Resolve a reviewed import; ``source_type`` defaults to the job's origin."""
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
@@ -1345,7 +1354,7 @@ def process_import_job(job_id: str) -> None:
             storage_identifier=destination,
             size_bytes=job.size_bytes,
             sha256=job.sha256,
-            source_type=FileVariant.SourceType.UPLOAD,
+            source_type=variant_source_type_for_job(job),
             uploader=job.uploader,
             imported_at=timezone.now(),
             processing_state=FileVariant.ProcessingState.COMPLETE,

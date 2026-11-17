@@ -282,6 +282,8 @@ class FileVariant(models.Model):
 
     class SourceType(models.TextChoices):
         UPLOAD = "upload", "Upload"
+        INCOMING_FOLDER = "incoming_folder", "Incoming folder"
+        NETWORK_SOURCE = "network_source", "Network source"
         SCAN = "scan", "Scan"
         CONVERTED = "converted", "Converted"
         OCR = "ocr", "OCR"
