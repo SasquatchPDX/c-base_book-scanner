@@ -118,6 +118,79 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
     ),
 }
 
+# Audiobooks are not managed by this system (docs/design/32-audiobooks.md): members
+# are pointed to a separate audiobook server. Intake recognises audio files only so
+# it can skip them with a clear reason instead of lumping them in with unknown files.
+AUDIO_EXTENSIONS = frozenset(
+    {
+        ".m4b",
+        ".m4a",
+        ".mp3",
+        ".aac",
+        ".ogg",
+        ".oga",
+        ".opus",
+        ".flac",
+        ".wav",
+        ".wma",
+        ".mka",
+        ".ape",
+        ".aif",
+        ".aiff",
+        ".aa",
+        ".aax",
+        ".aaxc",
+    }
+)
+# Audible files carry DRM. They are never read, hashed, copied or converted here.
+DRM_AUDIO_EXTENSIONS = frozenset({".aa", ".aax", ".aaxc"})
+AUDIO_SKIP_REASON = "audio (not managed here)"
+DRM_AUDIO_SKIP_REASON = "audio (not managed here; DRM-protected Audible file)"
+
+
+def is_audio_filename(filename: str, mime_type: str | None = None) -> bool:
+    """True for audio/audiobook files, which intake skips (see docs/design/32-audiobooks.md).
+
+    The extension decides; a declared ``audio/*`` MIME type only counts when the
+    extension is not a supported book format.
+    """
+    extension = Path(filename).suffix.lower()
+    if extension in AUDIO_EXTENSIONS:
+        return True
+    if extension in SUPPORTED_FORMATS:
+        return False
+    return bool(mime_type and mime_type.lower().startswith("audio/"))
+
+
+def is_drm_audio_filename(filename: str) -> bool:
+    return Path(filename).suffix.lower() in DRM_AUDIO_EXTENSIONS
+
+
+def audio_skip_reason(filename: str) -> str:
+    return DRM_AUDIO_SKIP_REASON if is_drm_audio_filename(filename) else AUDIO_SKIP_REASON
+
+
+def audiobook_service_url() -> str:
+    """The configured audiobook service URL, or "" when unset or not http(s)."""
+    value = str(getattr(django_settings, "BOOK_SCANNER_AUDIOBOOK_SERVICE_URL", "") or "").strip()
+    return value if value.startswith(("https://", "http://")) else ""
+
+
+def audio_upload_rejection_message(filename: str) -> str:
+    """Message shown when a member uploads an audio file through the web form."""
+    if is_drm_audio_filename(filename):
+        lead = (
+            "This is a DRM-protected Audible file. This library does not accept or "
+            "process DRM-protected files."
+        )
+    else:
+        lead = "Audiobooks and other audio files are not managed by this e-book library."
+    service_url = audiobook_service_url()
+    if service_url:
+        return f"{lead} Please use the hackerspace audiobook service: {service_url}"
+    return f"{lead} Please ask the library admins where audiobooks are shared."
+
+
 MAX_UPLOAD_BYTES = getattr(
     django_settings,
     "BOOK_SCANNER_MAX_UPLOAD_BYTES",
@@ -464,6 +537,8 @@ def create_source_import_job(
 ) -> ImportJob:
     if not path.is_file():
         raise IntakeError(f"source path is not a file: {path}")
+    if is_audio_filename(path.name):
+        raise IntakeError(f"{audio_skip_reason(path.name)}: {path.name}")
     if not _is_supported_file(path):
         raise IntakeError(f"unsupported file format: {path.name}")
     safe_name = normalize_filename(path.name)
@@ -567,14 +642,27 @@ def discover_source_jobs_for_location(
     *,
     uploader: Any | None = None,
     byte_budget: ByteBudget | None = None,
+    skipped_audio: list[int] | None = None,
 ) -> list[ImportJob]:
     """Create DISCOVERED jobs for new files.
+
+    Audio files are never turned into jobs. Pass ``skipped_audio`` to receive how
+    many were seen (one count appended per call).
 
     With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
     would not fit, so a bulk import cannot queue more than the archive can hold.
     """
     jobs: list[ImportJob] = []
+    audio_skipped = 0
     for candidate in discover_source_paths(source_location):
+        if is_audio_filename(candidate.name):
+            audio_skipped += 1
+            logger.debug(
+                "intake_audio_skipped",
+                source_location_id=source_location.pk,
+                drm_protected=is_drm_audio_filename(candidate.name),
+            )
+            continue
         if not _is_supported_file(candidate):
             continue
         normalized = str(candidate.resolve())
@@ -610,14 +698,39 @@ def discover_source_jobs_for_location(
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
             continue
+    if audio_skipped:
+        logger.info(
+            "intake_audio_files_skipped",
+            source_location_id=source_location.pk,
+            count=audio_skipped,
+            reason=AUDIO_SKIP_REASON,
+        )
+    if skipped_audio is not None:
+        skipped_audio.append(audio_skipped)
     return jobs
 
 
 def preview_source_jobs(
     source_location: SourceLocation,
 ) -> list[dict[str, Any]]:
+    """Rows for files discovery would import, plus rows for skipped audio files.
+
+    Audio rows carry ``"skipped": "audio"`` and a ``reason``; they never become jobs.
+    """
     rows: list[dict[str, Any]] = []
     for candidate in discover_source_paths(source_location):
+        if is_audio_filename(candidate.name):
+            rows.append(
+                {
+                    "source_location_id": str(source_location.id),
+                    "path": str(candidate),
+                    "filename": candidate.name,
+                    "skipped": "audio",
+                    "drm_protected": is_drm_audio_filename(candidate.name),
+                    "reason": audio_skip_reason(candidate.name),
+                }
+            )
+            continue
         if not _is_supported_file(candidate):
             continue
         row: dict[str, Any] = {
