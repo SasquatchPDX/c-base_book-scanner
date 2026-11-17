@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     sidecar_covers_enabled: bool = True
+    sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
     queue_job_timeout_seconds: int = 30 * 60
@@ -257,6 +258,7 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
     settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT

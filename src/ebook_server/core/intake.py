@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+import os
 import re
 import shutil
+import stat
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -136,6 +138,25 @@ EBOOK_META_FORMATS = frozenset({"mobi", "azw", "azw3", "prc"})
 EBOOK_META_BINARY = "ebook-meta"
 EBOOK_META_TIMEOUT_SECONDS = 30.0
 DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
+# Sidecar files a library tool such as Calibre keeps next to a book's format files.
+# They never count as a separate book when deciding whether a folder holds one book.
+SIDECAR_COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png")
+SIDECAR_METADATA_NAME = "metadata.opf"
+SIDECAR_FILE_NAMES = frozenset({*SIDECAR_COVER_NAMES, SIDECAR_METADATA_NAME})
+# Evidence key that holds sidecar values next to (never over) embedded metadata.
+SIDECAR_EVIDENCE_KEY = "sidecar_metadata"
+SIDECAR_METADATA_FIELDS = (
+    "title",
+    "authors",
+    "language",
+    "description",
+    "publisher",
+    "subjects",
+    "identifier",
+)
+# Below this title similarity an embedded and a sidecar title name different books.
+SIDECAR_TITLE_CONFLICT_SCORE = 0.5
+PLACEHOLDER_METADATA_VALUES = frozenset({"unknown", "unknown author", "unknown title"})
 
 
 def normalize_filename(raw: str) -> str:
@@ -379,6 +400,274 @@ def _is_supported_file(path: Path) -> bool:
         return True
     except ValidationError:
         return False
+
+
+def _book_stem(name: str) -> str:
+    return Path(name).stem.casefold()
+
+
+def _folder_stems_from_jobs(job: ImportJob, folder: Path) -> set[str]:
+    """Stems of files previously queued from ``folder``; MOVE sources may already be gone."""
+    stems: set[str] = set()
+    source_paths = ImportJob.objects.filter(
+        source_location=job.source_location,
+        source_path__startswith=str(folder),
+    ).values_list("source_path", flat=True)
+    for raw in source_paths:
+        path = Path(raw)
+        if path.parent == folder:
+            stems.add(_book_stem(path.name))
+    return stems
+
+
+@dataclass(frozen=True)
+class SingleBookFolder:
+    """A source folder that holds exactly one book, plus the sidecar files found in it."""
+
+    path: Path
+    sidecars: dict[str, os.DirEntry[str]]
+
+    def sidecar_file(self, name: str) -> Path | None:
+        """The sidecar ``name`` as a regular, non-symlinked file in this folder, if any."""
+        entry = self.sidecars.get(name)
+        if entry is None:
+            return None
+        try:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                return None
+        except OSError:
+            return None
+        return self.path / entry.name
+
+
+def single_book_folder(job: ImportJob) -> SingleBookFolder | None:
+    """Return the job's source folder only if it holds a single book.
+
+    The folder qualifies when every intake-supported file in it, plus every file
+    previously queued from it (MOVE sources are deleted after archiving), shares the
+    job file's stem, as in a Calibre book folder (``Title - Author.epub``,
+    ``Title - Author.pdf``, ``cover.jpg``, ``metadata.opf``). A folder holding several
+    distinct books never lends its sidecars to any of them. Uploads have no source
+    folder, and folders outside the source root are refused. Cover and metadata
+    sidecars both use this one rule, so they always agree about a folder.
+    """
+    if job.source_location is None or not job.source_path:
+        return None
+    source = Path(job.source_path)
+    folder = source.parent
+    try:
+        root = Path(job.source_location.root_path).expanduser().resolve(strict=True)
+        resolved_folder = folder.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved_folder.is_relative_to(root):
+        return None
+
+    stems = {_book_stem(source.name)}
+    sidecars: dict[str, os.DirEntry[str]] = {}
+    try:
+        with os.scandir(resolved_folder) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith((".", "~")):
+                    continue
+                lowered = name.casefold()
+                if lowered in SIDECAR_FILE_NAMES:
+                    sidecars.setdefault(lowered, entry)
+                elif _is_supported_file(Path(name)):
+                    stems.add(_book_stem(name))
+    except OSError:
+        return None
+    stems |= _folder_stems_from_jobs(job, folder)
+    if len(stems) != 1:
+        return None
+    return SingleBookFolder(path=resolved_folder, sidecars=sidecars)
+
+
+def sidecar_metadata_enabled() -> bool:
+    return bool(getattr(django_settings, "BOOK_SCANNER_SIDECAR_METADATA_ENABLED", True))
+
+
+def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
+    """Read a small untrusted file without following symlinks; ``OSError`` if unusable."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if path.is_symlink():
+        raise OSError("refusing to follow a symlink")
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        if info.st_size > max_bytes:
+            raise OSError("file exceeds the safe size limit")
+        payload = handle.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise OSError("file exceeds the safe size limit")
+    return payload
+
+
+def read_sidecar_metadata(job: ImportJob) -> dict[str, Any] | None:
+    """Fields of a Calibre-style ``metadata.opf`` next to a single-book source file.
+
+    ``None`` when there is no usable sidecar: uploads, the setting is off, no
+    ``metadata.opf`` next to the file, the folder holds several books, the sidecar is
+    a symlink, too large, malformed, or rejected by defusedxml. A bad sidecar is
+    logged and treated as absent; it never fails the import.
+    """
+    if not sidecar_metadata_enabled() or job.source_location is None or not job.source_path:
+        return None
+    # Probe the one fixed name first so folders without a sidecar cost no listing.
+    probe = Path(job.source_path).parent / SIDECAR_METADATA_NAME
+    try:
+        if not probe.is_symlink() and not probe.exists():
+            return None
+    except OSError:
+        return None
+    folder = single_book_folder(job)
+    if folder is None:
+        logger.info(
+            "sidecar_metadata_ignored",
+            import_job_id=str(job.id),
+            reason="not_single_book_folder",
+        )
+        return None
+    path = folder.sidecar_file(SIDECAR_METADATA_NAME)
+    if path is None:
+        logger.warning(
+            "sidecar_metadata_rejected",
+            import_job_id=str(job.id),
+            reason="not_regular_file",
+        )
+        return None
+    try:
+        fields = parse_opf_metadata(_read_bounded_regular_file(path, MAX_FORMAT_METADATA_BYTES))
+    except (OSError, ET.ParseError, DefusedXmlException, ValueError) as exc:
+        logger.warning(
+            "sidecar_metadata_rejected",
+            import_job_id=str(job.id),
+            error_type=type(exc).__name__,
+        )
+        return None
+    return {key: value for key, value in fields.items() if value} or None
+
+
+def _is_placeholder(value: Any) -> bool:
+    if isinstance(value, list):
+        return all(_is_placeholder(item) for item in value)
+    if not isinstance(value, str):
+        return not value
+    return not value.strip() or value.strip().casefold() in PLACEHOLDER_METADATA_VALUES
+
+
+def _embedded_title(metadata: dict[str, Any], original_filename: str) -> str | None:
+    """The extractor's title, unless it is only the filename-stem fallback."""
+    title = metadata.get("title")
+    if not isinstance(title, str) or _is_placeholder(title):
+        return None
+    if title == Path(original_filename).stem:
+        return None
+    return title
+
+
+def _metadata_isbns(metadata: dict[str, Any]) -> set[str]:
+    isbns: set[str] = set()
+    for key in ("isbn", "isbn10", "isbn13", "identifier"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            isbns.update(identification.normalize_isbns(value))
+    return isbns
+
+
+def _sidecar_conflicts(
+    metadata: dict[str, Any],
+    sidecar: dict[str, Any],
+    *,
+    original_filename: str,
+) -> list[str]:
+    """Fields where the sidecar contradicts the file's own embedded metadata."""
+    conflicts: list[str] = []
+    embedded_isbns = _metadata_isbns(metadata)
+    sidecar_isbns = _metadata_isbns(sidecar)
+    if embedded_isbns and sidecar_isbns and not embedded_isbns & sidecar_isbns:
+        conflicts.append("isbn")
+    embedded_title = _embedded_title(metadata, original_filename)
+    sidecar_title = sidecar.get("title")
+    if (
+        embedded_title
+        and isinstance(sidecar_title, str)
+        and identification.title_similarity(embedded_title, sidecar_title)
+        < SIDECAR_TITLE_CONFLICT_SCORE
+    ):
+        conflicts.append("title")
+    embedded_authors = [
+        author
+        for author in metadata.get("authors") or []
+        if isinstance(author, str) and not _is_placeholder(author)
+    ]
+    sidecar_authors = [author for author in sidecar.get("authors") or [] if isinstance(author, str)]
+    if (
+        embedded_authors
+        and sidecar_authors
+        and identification.author_similarity(embedded_authors, sidecar_authors) == 0.0
+    ):
+        conflicts.append("authors")
+    return conflicts
+
+
+def apply_sidecar_metadata(
+    metadata: dict[str, Any],
+    sidecar: dict[str, Any] | None,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    """Merge sidecar fields into ``metadata`` without overwriting embedded values.
+
+    The sidecar is recorded under ``SIDECAR_EVIDENCE_KEY`` with the fields it filled
+    (provenance) and any conflicts. Only gaps are filled: a field the format extractor
+    left empty, a placeholder, or the filename-stem title fallback. A sidecar ISBN is
+    added as ``isbn`` when the file has none, so the embedded ``identifier`` survives.
+    When the sidecar contradicts embedded ISBN, title, or authors, nothing is merged;
+    the caller then routes the import to review instead of auto-accepting it.
+    """
+    if not sidecar:
+        return metadata
+    merged = dict(metadata)
+    conflicts = _sidecar_conflicts(metadata, sidecar, original_filename=original_filename)
+    applied: list[str] = []
+    if not conflicts:
+        for key in SIDECAR_METADATA_FIELDS:
+            value = sidecar.get(key)
+            if not value:
+                continue
+            if key == "identifier":
+                if _metadata_isbns(sidecar) and not _metadata_isbns(metadata):
+                    merged["isbn"] = value
+                    applied.append("isbn")
+                continue
+            if key == "title":
+                if _embedded_title(metadata, original_filename) is None:
+                    merged["title"] = value
+                    applied.append(key)
+                continue
+            if _is_placeholder(metadata.get(key)):
+                merged[key] = value
+                applied.append(key)
+    merged[SIDECAR_EVIDENCE_KEY] = {
+        "source": SIDECAR_METADATA_NAME,
+        "fields": {key: sidecar[key] for key in SIDECAR_METADATA_FIELDS if sidecar.get(key)},
+        "applied_fields": applied,
+        "conflicts": conflicts,
+    }
+    return merged
+
+
+def sidecar_conflicts_in(metadata: dict[str, Any]) -> list[str]:
+    """Conflicts recorded by ``apply_sidecar_metadata`` (empty without a sidecar)."""
+    sidecar = metadata.get(SIDECAR_EVIDENCE_KEY)
+    if not isinstance(sidecar, dict):
+        return []
+    conflicts = sidecar.get("conflicts")
+    return [str(item) for item in conflicts] if isinstance(conflicts, list) else []
 
 
 def _make_system_user() -> Any:
@@ -1484,6 +1773,11 @@ def process_import_job(job_id: str) -> None:
             detected_format,
             original_filename=job.original_filename,
         )
+        metadata = apply_sidecar_metadata(
+            metadata,
+            read_sidecar_metadata(job),
+            original_filename=job.original_filename,
+        )
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
         job.save(
@@ -1505,7 +1799,15 @@ def process_import_job(job_id: str) -> None:
         _save_metadata_candidates(job, candidates)
 
         top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
+        sidecar_conflicts = sidecar_conflicts_in(metadata)
+        if sidecar_conflicts:
+            # Curated sidecar metadata contradicts the file itself: a human decides.
+            logger.info(
+                "sidecar_metadata_conflict",
+                import_job_id=str(job.id),
+                fields=sidecar_conflicts,
+            )
+        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE or sidecar_conflicts:
             _create_review_task(job=job, candidates=candidates)
             job.state = ImportJob.State.LOW_CONFIDENCE
             job.save(update_fields=["state", "updated_at"])
