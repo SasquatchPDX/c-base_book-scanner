@@ -37,7 +37,7 @@
   <div class="list-stack">
     {% for book in books %}
       <article class="book-row">
-        <div class="cover-placeholder small" aria-hidden="true">{{ book.title|slice:":1" }}</div>
+        {% if book.cover_front %}<img class="cover-thumb small" src="{{ book.cover_front.url }}" alt="Front cover of {{ book.title }}" loading="lazy" decoding="async">{% else %}<div class="cover-placeholder small" aria-hidden="true">{{ book.title|slice:":1" }}</div>{% endif %}
         <div class="grow">
           <h2><a href="{% url 'library-book-detail' book.id %}?view=html">{{ book.title }}</a></h2>
           {% if book.subtitle %}<p>{{ book.subtitle }}</p>{% endif %}

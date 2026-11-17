@@ -1192,9 +1192,11 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     if profile.is_disabled:
         return JsonResponse({"detail": "forbidden"}, status=403)
     if _wants_html(request):
-        recent_books = Book.objects.prefetch_related("authors", "file_variants").order_by(
-            "-created_at",
-        )[:12]
+        recent_books = (
+            Book.objects.select_related("front_cover", "back_cover")
+            .prefetch_related("authors", "file_variants")
+            .order_by("-created_at")[:12]
+        )
         return render(
             request,
             "core/library_home.html",
@@ -1321,12 +1323,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     book_format = request.GET.get("format", "").strip()
     sort = request.GET.get("sort", "-created_at").strip()
 
-    books = Book.objects.all().prefetch_related(
-        "authors",
-        "categories",
-        "genres",
-        "identifiers",
-        "file_variants",
+    books = (
+        Book.objects.all()
+        .select_related("front_cover", "back_cover")
+        .prefetch_related(
+            "authors",
+            "categories",
+            "genres",
+            "identifiers",
+            "file_variants",
+        )
     )
 
     if query:
