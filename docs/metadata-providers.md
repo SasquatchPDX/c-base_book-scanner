@@ -141,8 +141,15 @@ so intake (`intake.decide_auto_accept`) also checks the top candidate's authors:
   candidate's authors is the same person as any of the file's embedded authors,
   using the name matching above. A bare surname on one side ("Tolkien") agrees with
   a full name that ends in it. Missing file authors are not a conflict.
+- **Stronger title evidence disagrees** (`stronger_title_evidence_disagrees`): the
+  same title-provenance check as the strong-match rule above, applied to every
+  candidate at or above the threshold however its score got there. A Dune candidate
+  matching only "Dune - Frank Herbert.epub" while the EPUB embeds "The Dragon in the
+  Sea" is held for review even when title, author and a shared language already
+  score 0.90 without the rule. The details record the candidate title, the matched
+  hint's source and the strongest titles.
 
-Either case sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
+Any of these cases sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
 `REVIEW` state (none is shown as a `MATCH`), and records in the import's evidence:
 `auto_accept_blocked` (the reason above), `auto_accept_block_details` (provider,
 score, candidate and file authors) and `suggested_authors` (the file's embedded

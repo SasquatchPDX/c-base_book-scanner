@@ -14,6 +14,7 @@ reviewer probes on PR #96 and PR #81:
 
 from __future__ import annotations
 
+import dataclasses
 import io
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ from ebook_server.core.identification import (
     strongest_title_evidence,
 )
 from ebook_server.core.models import (
+    Book,
     ImportJob,
     MetadataCandidate,
     ReviewTask,
@@ -264,6 +266,7 @@ def _catalogue_provider(
     books: list[tuple[str, list[str]]],
     *,
     any_title: bool = False,
+    extra_fields: dict[str, Any] | None = None,
 ) -> list[str | None]:
     """A provider that answers like a catalogue: only books whose title was queried.
 
@@ -287,7 +290,12 @@ def _catalogue_provider(
             queries.append(title)
             wanted = " ".join((title or "").lower().split())
             return [
-                {"title": book_title, "author_name": authors, "key": f"/works/{index}"}
+                {
+                    "title": book_title,
+                    "author_name": authors,
+                    "key": f"/works/{index}",
+                    **(extra_fields or {}),
+                }
                 for index, (book_title, authors) in enumerate(books)
                 if any_title or " ".join(book_title.lower().split()) == wanted
             ]
@@ -507,6 +515,94 @@ def test_embedded_title_contradicting_filename_title_is_not_imported_as_filename
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.get(import_job=job).inferred_title == "The Dragon in the Sea"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedded_title_conflict_blocks_auto_accept_already_above_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #81 review on ee563ba: the same probe with the common "en" language on file and
+    # provider. Title 0.55 + author 0.3 + language 0.05 reaches the threshold without
+    # the strong-match rule, so the shared auto-accept decision must block it itself.
+    _catalogue_provider(
+        monkeypatch,
+        [("Dune", ["Frank Herbert"])],
+        any_title=True,
+        extra_fields={"language": ["en"]},
+    )
+
+    job = _upload(
+        tmp_path,
+        monkeypatch,
+        "Dune - Frank Herbert.epub",
+        _epub_bytes(
+            "The Dragon in the Sea",
+            ["Frank Herbert"],
+            extra_metadata="<dc:language>en</dc:language>",
+        ),
+        "application/epub+zip",
+    )
+
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    assert candidate.title == "Dune"
+    assert float(candidate.score) >= intake.AUTO_ACCEPT_SCORE
+    # The rule never ran: the raw score was already high enough.
+    assert STRONG_MATCH_EVIDENCE_KEY not in candidate.raw_payload
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert not Book.objects.exists()
+    assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    details = job.evidence[intake.AUTO_ACCEPT_BLOCK_DETAILS_KEY]
+    assert details["candidate_title"] == "Dune"
+    assert details["title_source"] == "filename"
+    assert details["strongest_title_source"] == "embedded"
+    assert details["strongest_titles"] == ["The Dragon in the Sea"]
+    task = ReviewTask.objects.get(import_job=job)
+    assert task.inferred_title == "The Dragon in the Sea"
+    client = Client()
+    client.force_login(get_or_create_profile("evidence-uploader").user)
+    html = client.get(f"/reviews/{task.id}/?view=html").content.decode()
+    assert 'data-block-reason="stronger_title_evidence_disagrees"' in html
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedded_title_agreeing_with_match_still_auto_accepts_above_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _catalogue_provider(
+        monkeypatch, [("Dune", ["Frank Herbert"])], extra_fields={"language": ["en"]}
+    )
+
+    job = _upload(
+        tmp_path,
+        monkeypatch,
+        "Dune - Frank Herbert.epub",
+        _epub_bytes("Dune", ["Frank Herbert"], extra_metadata="<dc:language>en</dc:language>"),
+        "application/epub+zip",
+    )
+
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None
+    assert job.book.title == "Dune"
+    assert intake.AUTO_ACCEPT_BLOCKED_KEY not in job.evidence
+
+
+def test_decision_blocks_stronger_title_conflict_for_any_score() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Dune - Frank Herbert.epub",
+        original_filename="Dune - Frank Herbert.epub",
+        extracted_metadata={"title": "The Dragon in the Sea", "authors": ["Frank Herbert"]},
+    )
+    dune = dataclasses.replace(_candidate("Dune", ["Frank Herbert"]), score=1.0)
+    decision = intake.decide_auto_accept([dune], ["Frank Herbert"], file_evidence=signals)
+    assert decision.candidate is None
+    assert decision.blocked_reason == intake.BLOCK_TITLE_EVIDENCE_CONFLICT
+    dragon = dataclasses.replace(_candidate("The Dragon in the Sea", ["Frank Herbert"]), score=1.0)
+    accepted = intake.decide_auto_accept([dragon], ["Frank Herbert"], file_evidence=signals)
+    assert accepted.candidate is dragon
 
 
 # --- unit: the #9 strong-match rule on typed evidence -----------------------------------

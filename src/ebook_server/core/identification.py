@@ -1855,10 +1855,7 @@ def _strong_match_assessment(
     must not be contradicted by stronger title evidence (an embedded title beats a
     filename guess).
     """
-    title_score, title_hint = max(
-        ((_title_match_score(hint, candidate.title), hint) for hint in signals.title_hints),
-        default=(0.0, ""),
-    )
+    title_score, title_hint = _matched_title_hint(signals, candidate)
     author_names = [name for group in signals.author_groups() for name in group.names]
     author_hint = max(
         author_names,
@@ -1872,7 +1869,7 @@ def _strong_match_assessment(
     if title_score < config.min_title_score:
         blocked_by.append("title_not_exact")
     if not title_agrees:
-        blocked_by.append("stronger_title_evidence_disagrees")
+        blocked_by.append(TITLE_EVIDENCE_CONFLICT)
     if author_score < config.min_author_score:
         blocked_by.append("author_not_strong")
     if missing:
@@ -1948,6 +1945,46 @@ def _title_provenance(
         for form in _title_forms(evidence.title)
     )
     return source, strongest_source, agrees
+
+
+def _matched_title_hint(
+    signals: IdentificationInput, candidate: IdentificationCandidate
+) -> tuple[float, str]:
+    """The title hint that best matches the candidate's title, with its match score."""
+    return max(
+        ((_title_match_score(hint, candidate.title), hint) for hint in signals.title_hints),
+        default=(0.0, ""),
+    )
+
+
+# The candidate's title matches only weaker title evidence (e.g. a filename guess)
+# while stronger evidence (e.g. the embedded title) names another book.
+TITLE_EVIDENCE_CONFLICT = "stronger_title_evidence_disagrees"
+
+
+def title_evidence_conflict(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> dict[str, Any] | None:
+    """Why stronger title evidence contradicts ``candidate``, or ``None`` when it does not.
+
+    Shared by the strong-match rule (before promotion) and by the intake auto-accept
+    decision, which runs it on every candidate at or above the threshold however the
+    score got there (title + author + language/publisher bonuses, an ISBN, or the
+    rule). "Dune - Frank Herbert.epub" embedding "The Dragon in the Sea" is never
+    accepted as Dune: the Dune match comes from the filename only.
+    """
+    _, title_hint = _matched_title_hint(signals, candidate)
+    title_source, strongest_source, agrees = _title_provenance(signals, title_hint, candidate)
+    if agrees:
+        return None
+    return {
+        "candidate_title": candidate.title,
+        "title_hint": title_hint,
+        "title_source": title_source,
+        "strongest_title_source": strongest_source,
+        "strongest_titles": [evidence.title for evidence in strongest_title_evidence(signals)],
+    }
 
 
 def _explicit_authors_unmatched(signals: IdentificationInput, candidate_authors: list[str]) -> bool:

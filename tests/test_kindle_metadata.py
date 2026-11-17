@@ -171,6 +171,23 @@ def test_kindle_metadata_falls_back_on_unusable_ebook_meta_output(
     }
 
 
+@pytest.mark.usefixtures("ebook_meta_installed")
+def test_ebook_meta_staging_name_title_is_not_embedded_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Calibre names an untitled book after the file it read: the upload staging path.
+    staged = _kindle_file(tmp_path, "upload-qe6hxjg9.tmp")
+    opf = KINDLE_OPF.replace(b"Mobi Book", b"upload-qe6hxjg9")
+    monkeypatch.setattr(conversion, "_run_conversion_command", FakeEbookMeta(opf))
+
+    metadata = intake.extract_metadata(str(staged), "azw3", original_filename="Kindle Story.azw3")
+
+    assert metadata["title"] == "Kindle Story"
+    assert metadata["title_source"] == "filename"
+    assert metadata["authors"] == ["Megan Mobi"]
+
+
 def test_parse_opf_metadata_rejects_entity_declarations() -> None:
     with pytest.raises(DefusedXmlException):
         intake.parse_opf_metadata(ENTITY_OPF)

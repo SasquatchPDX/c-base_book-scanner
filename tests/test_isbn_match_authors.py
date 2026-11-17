@@ -182,25 +182,41 @@ def _candidate(*, authors: list[str], score: float = 1.0) -> identification.Iden
     )
 
 
+# Normalised file signals without title evidence: only the author checks apply.
+_NO_EVIDENCE = identification.IdentificationInput(
+    title_hints=[],
+    author_hints=[],
+    isbns=[],
+    folder_hints=[],
+    language=None,
+    publisher=None,
+    description=None,
+)
+
+
 def test_decision_accepts_matching_authors() -> None:
     top = _candidate(authors=["Alan Dean Foster"])
-    decision = intake.decide_auto_accept([top], ["Foster, Alan Dean"])
+    decision = intake.decide_auto_accept([top], ["Foster, Alan Dean"], file_evidence=_NO_EVIDENCE)
     assert decision.candidate is top
     assert decision.blocked_reason is None
 
 
 def test_decision_below_threshold_is_plain_review() -> None:
-    decision = intake.decide_auto_accept([_candidate(authors=[], score=0.2)], ["A B"])
+    decision = intake.decide_auto_accept(
+        [_candidate(authors=[], score=0.2)], ["A B"], file_evidence=_NO_EVIDENCE
+    )
     assert decision.candidate is None
     assert decision.blocked_reason is None
-    assert intake.decide_auto_accept([], []).candidate is None
+    assert intake.decide_auto_accept([], [], file_evidence=_NO_EVIDENCE).candidate is None
 
 
 @pytest.mark.parametrize(
     "authors", [[], ["Unknown"], ["Microsoft Office User"], ["Multiple Authors"]]
 )
 def test_decision_blocks_candidate_without_provider_authors(authors: list[str]) -> None:
-    decision = intake.decide_auto_accept([_candidate(authors=authors)], ["Alan Dean Foster"])
+    decision = intake.decide_auto_accept(
+        [_candidate(authors=authors)], ["Alan Dean Foster"], file_evidence=_NO_EVIDENCE
+    )
     assert decision.candidate is None
     assert decision.blocked_reason == intake.BLOCK_NO_PROVIDER_AUTHORS
     assert decision.details["file_authors"] == ["Alan Dean Foster"]
@@ -208,12 +224,14 @@ def test_decision_blocks_candidate_without_provider_authors(authors: list[str]) 
 
 
 def test_decision_blocks_without_provider_authors_even_when_file_has_none() -> None:
-    decision = intake.decide_auto_accept([_candidate(authors=[])], [])
+    decision = intake.decide_auto_accept([_candidate(authors=[])], [], file_evidence=_NO_EVIDENCE)
     assert decision.blocked_reason == intake.BLOCK_NO_PROVIDER_AUTHORS
 
 
 def test_decision_blocks_conflicting_authors() -> None:
-    decision = intake.decide_auto_accept([_candidate(authors=["Brian Herbert"])], ["Frank Herbert"])
+    decision = intake.decide_auto_accept(
+        [_candidate(authors=["Brian Herbert"])], ["Frank Herbert"], file_evidence=_NO_EVIDENCE
+    )
     assert decision.candidate is None
     assert decision.blocked_reason == intake.BLOCK_AUTHOR_CONFLICT
     assert decision.details["candidate_authors"] == ["Brian Herbert"]

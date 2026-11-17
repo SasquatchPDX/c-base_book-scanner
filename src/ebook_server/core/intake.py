@@ -284,6 +284,9 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# Stronger title evidence (e.g. the embedded title) names another book than the
+# candidate, whose title matches only a weaker hint such as the filename.
+BLOCK_TITLE_EVIDENCE_CONFLICT = identification.TITLE_EVIDENCE_CONFLICT
 
 
 @dataclass(frozen=True)
@@ -311,13 +314,19 @@ def _block_details(
 def decide_auto_accept(
     candidates: list[identification.IdentificationCandidate],
     file_authors: list[str],
+    *,
+    file_evidence: identification.IdentificationInput,
 ) -> AutoAcceptDecision:
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
-    is no evidence about authorship.
+    is no evidence about authorship. Finally its title must not be contradicted by
+    stronger title evidence in ``file_evidence`` (the normalised file signals): a
+    candidate matching only the filename title while the embedded title names another
+    book is held for review, whether its score came from the #9 strong-match rule or
+    from ordinary bonuses such as language (``identification.title_evidence_conflict``).
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
@@ -336,6 +345,13 @@ def decide_auto_accept(
             candidate=None,
             blocked_reason=BLOCK_AUTHOR_CONFLICT,
             details=_block_details(top, file_authors),
+        )
+    title_conflict = identification.title_evidence_conflict(file_evidence, top)
+    if title_conflict is not None:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_TITLE_EVIDENCE_CONFLICT,
+            details={**_block_details(top, file_authors), **title_conflict},
         )
     return AutoAcceptDecision(candidate=top)
 
@@ -1535,9 +1551,15 @@ def _extract_ebook_meta_metadata(
     except (ET.ParseError, DefusedXmlException) as exc:
         logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
         return fallback
+    title = fields["title"]
+    if isinstance(title, str) and title.strip() == Path(file_path).stem:
+        # Calibre reports the file's own name when the book has no title; that is the
+        # staging path (e.g. "upload-abc123"), not embedded evidence. Leave the title
+        # to the original-filename fallback instead of ranking it as embedded.
+        title = None
     return {
         **fields,
-        "title": fields["title"],
+        "title": title,
         "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
         "container_type": detected_format,
     }
@@ -3071,7 +3093,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_job(job, update_fields=["state", "updated_at"])
         candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
-        decision = decide_auto_accept(candidates, file_authors)
+        decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
             metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
