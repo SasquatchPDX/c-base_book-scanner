@@ -22,6 +22,7 @@ from ebook_server.core.models import (
     ScanPageVersion,
     StorageLocation,
 )
+from ebook_server.jobs import RQ_ENQUEUE_OPTIONS
 from ebook_server.storage import LocalFilesystemStorage
 from tests.streaming_fixtures import BoundedReadStream
 
@@ -101,7 +102,9 @@ class _DeferredQueue:
         self.calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
 
     def enqueue(self, func: Any, *args: Any, **kwargs: Any) -> str:
-        self.calls.append((func, args, kwargs))
+        # Like RQ, keep its own options (e.g. job_id) away from the function.
+        job_kwargs = {k: v for k, v in kwargs.items() if k not in RQ_ENQUEUE_OPTIONS}
+        self.calls.append((func, args, job_kwargs))
         return "deferred"
 
     def run_next(self) -> None:

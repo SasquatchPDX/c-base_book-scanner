@@ -81,11 +81,28 @@ authors of its first work record (`works[0]`), where Open Library usually keeps 
 - Reliability: practical; acceptable for initial MVP with retries and backoff.
 - Notes: strong for discovery and open catalogs; useful primary signal, not canonical truth.
 
-### Google Books API (secondary)
+### Google Books API (secondary, opt-in)
 
-- Query style: ISBN/title/author lookup and broader coverage in some domains.
+- Provider: `ebook_server.core.metadata_providers.GoogleBooksMetadataProvider`
+- Query style: `isbn:` lookup first, then `intitle:`/`inauthor:` search (5 results).
 - Fit: useful for fallback/confirmatory evidence where Open Library misses coverage.
+- Enabled only when listed in `BOOK_SCANNER_METADATA_PROVIDERS` **and**
+  `BOOK_SCANNER_GOOGLE_BOOKS_API_KEY` is set; without a key it is skipped with a
+  warning. The key travels in the query string, so errors and logs never include
+  the request URL.
 - Notes: operational terms and quotas need environment-specific validation before go-live.
+
+### Deutsche Nationalbibliothek (optional, opt-in)
+
+- Provider: `ebook_server.core.metadata_providers.DnbMetadataProvider`
+- Public SRU interface (`services.dnb.de/sru/dnb`, `oai_dc` records, no key): `num=`
+  ISBN lookup first, then `tit=`/`per=` search. Strong coverage of German-language
+  books. Responses are parsed with `defusedxml` and capped at 2 MiB.
+- Titles are cleaned of DNB's uniform-title prefix and statement of responsibility;
+  creators marked `[Verfasser]`/`[Autor]` are preferred and reordered to "First Last".
+- Enabled only when listed in `BOOK_SCANNER_METADATA_PROVIDERS`. Both extra providers
+  use the shared per-provider rate limiter (`metadata_rate_limits`, keys `dnb` and
+  `googlebooks`, default `metadata_rate_limit_default`).
 
 ### Hardcover.app (optional, opt-in)
 
@@ -141,6 +158,49 @@ For each hit store:
 - provenance timestamp
 
 Weak matches must route to review workflow instead of auto-linking.
+
+## Search runs and provider errors (#40)
+
+Every identification run (intake, review "Search providers again", scan
+identification) is stored as a `MetadataSearch`: the terms actually sent, one
+outcome per configured provider (`results`, `no_results` or `error` with a short
+reason such as `timed out`, `HTTP 503`, `unreachable`, `rate limited (HTTP 429)`,
+`malformed response`) and the candidates it returned. Providers signal failures
+by raising (`identification.ProviderRequestError` or any `OSError`); returning an
+empty list means a genuine miss. Reasons never contain URLs, queries or API keys.
+
+Runs are non-destructive. A run that returns candidates marks the earlier
+candidates `superseded_at` (kept as history, shown under "Earlier searches", not
+acceptable, not counted in metrics or the review queue). A run that returns
+nothing or fails leaves the earlier candidates current. A failure while saving
+results is recorded as a failed run rather than an empty success.
+
+The review form posts its title/author fields to the search action, so the
+searched terms are always the edited ones and are saved on the review task
+("Save terms only" saves without searching). A scan review's saved terms are
+also written to the scan job's provisional hints and are never overwritten when
+a later scan identification refreshes the task.
+
+The review page shows a search as in progress only while its queued/running
+`ProcessingJob` is live. A RUNNING search older than
+`BOOK_SCANNER_METADATA_SEARCH_STALE_SECONDS` (default 300) or a QUEUED one older
+than the generic job window is treated as dead: the page stops refreshing and the
+next search fails it and starts a new one. New terms submitted while a search is
+queued replace its terms; while one is running they are saved and the reviewer is
+asked to search again once it finishes (HTTP 409 for API clients).
+
+Searches are fenced so that an obsolete search can never publish. The import
+job / scan job records its current search job in `current_search_job_id`, moved
+under that row's lock whenever a new search replaces an older one (whose RQ
+entry, enqueued with the id `metadata-search-<job id>`, is also cancelled, best
+effort). A delivered queue entry only runs while its job is still QUEUED (or
+RUNNING with a dead worker) and current; a FAILED, finished or superseded job is
+ignored. When the providers return, the results become current only if, under
+the task, source and job row locks, the job is still current, still the attempt
+that started, and the review is still open (not resolved/cancelled, the import
+not complete, the scan not linked to a book). Otherwise the run is stored as a
+`discarded` ("Not applied") search whose candidates are history only: a review
+resolved while the providers ran keeps its decision and is never reopened.
 
 ## Subject / genre evidence
 
