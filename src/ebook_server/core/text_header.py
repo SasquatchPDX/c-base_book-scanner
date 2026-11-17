@@ -103,6 +103,25 @@ _LEADING_ARTICLE = re.compile(r"^(the|a|an|der|die|das)\s+", re.IGNORECASE)
 _PLACEHOLDER_PARTS = {"unknown", "anonymous"}
 
 
+_OCR_I_BETWEEN_CAPITALS = re.compile(r"(?<=[A-Z])[l1](?=[A-Z])")
+_SPACED_WORD_GAP = re.compile(r"\s{2,}")
+
+
+def _repair_line(line: str) -> str:
+    """Undo two common scan artefacts before a header line is read.
+
+    OCR reads a capital I between capitals as "l" or "1" ("THE LlTTLE PEAR GIRL",
+    "NARClSSUS"). Letter-spaced titles put one space between letters and two or more
+    between words ("D O W N   I N   F L A M E S").
+    """
+    line = _OCR_I_BETWEEN_CAPITALS.sub("I", line)
+    tokens = line.split()
+    if len(tokens) >= 4 and sum(len(token) == 1 for token in tokens) >= 0.8 * len(tokens):
+        words = [word.replace(" ", "") for word in _SPACED_WORD_GAP.split(line.strip())]
+        line = " ".join(word for word in words if word)
+    return line
+
+
 def _clean(value: str) -> str:
     value = value.strip().strip("*\"'“”„«»").strip()
     value = re.sub(r"\s+", " ", value)
@@ -190,6 +209,12 @@ def _title_variants(stem: str) -> list[str]:
         variants.append(part)
     if len(variants) > 1:
         variants.insert(0, " ".join(variants))
+    # The whole stem stays a candidate even when a part was taken for an author:
+    # "Dune - House Harkonnen" has a name-like second part, but a header line
+    # "Dune: House Harkonnen" names exactly the whole stem.
+    whole = " ".join(parts)
+    if len(parts) > 1 and whole not in variants:
+        variants.append(whole)
     for variant in list(variants):
         bare = _LEADING_ARTICLE.sub("", variant)
         if bare != variant and len("".join(_normalized_tokens(bare))) >= 4:
@@ -263,7 +288,7 @@ def parse_text_header(text: str, filename_stem: str) -> dict[str, Any] | None:
     """
     lines: list[str] = []
     for raw in text.splitlines():
-        line = raw.strip()
+        line = _repair_line(raw.strip())
         if not line or _DECORATION.match(line):
             continue
         lines.append(line[:MAX_LINE_LENGTH])
@@ -374,6 +399,12 @@ def parse_text_header(text: str, filename_stem: str) -> dict[str, Any] | None:
             name = _strip_possessive(_display_case(line))
             if name_like(name):
                 add_authors(likely_authors, [name], number, "name-like line beside title")
+                continue
+            # "Brian Herbert and Kevin J. Anderson": a line made only of names.
+            parts = [part for part in re.split(r"\s*(?:&|\band\b|\bund\b)\s*", line) if part]
+            names = _names(line)
+            if len(parts) >= 2 and len(names) == len(parts):
+                add_authors(likely_authors, names, number, "name-list line beside title")
 
     if title is None and not authors and not likely_authors:
         return None
