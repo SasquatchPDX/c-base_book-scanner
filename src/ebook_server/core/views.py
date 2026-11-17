@@ -9,6 +9,7 @@ import secrets
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
@@ -25,7 +26,8 @@ from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
-from django.db.models import Count, Prefetch, Q, QuerySet
+from django.db.models import Count, F, OuterRef, Prefetch, Q, QuerySet, Subquery
+from django.db.models.functions import Coalesce
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -62,6 +64,7 @@ from . import (
     metadata_search,
     multipart,
     ocr,
+    review_batch,
     review_identification,
     scan_identification,
     scan_pipeline,
@@ -86,6 +89,7 @@ from .models import (
     ScanPageVersion,
     ScanTailorStageState,
     ScanTodo,
+    SourceLocation,
     StorageLocation,
     clean_publication_year,
 )
@@ -1189,9 +1193,12 @@ def _resolve_review_source(
     selected_candidate: MetadataCandidate | None = None,
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant | None:
     import_job = task.import_job
     if import_job is not None:
+        # Cover extraction is queued after commit, never done in this request when a
+        # queue is configured; ``inline_cover_fallback`` only matters without one.
         return intake.resolve_import_with_review_data(
             job=import_job,
             review_task=task,
@@ -1201,6 +1208,7 @@ def _resolve_review_source(
             decision=decision,
             decision_notes=decision_notes,
             decision_payload=decision_payload,
+            inline_cover_fallback=inline_cover_fallback,
         )
     if task.scan_job_id is None:
         raise ValueError("review task has no source")
@@ -3760,6 +3768,122 @@ def import_status(
     return JsonResponse(payload)
 
 
+REVIEW_QUEUE_SORTS: Final = {
+    "-created": ("-created_at", "-id"),
+    "created": ("created_at", "id"),
+    "-confidence": ("-top_score", "-created_at"),
+    "confidence": ("top_score", "-created_at"),
+}
+REVIEW_QUEUE_STATES: Final = (ReviewTask.State.OPEN, ReviewTask.State.CLAIMED)
+
+
+def _parse_score(raw: str | None) -> float | None:
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if not 0.0 <= value <= 1.0:  # also rejects NaN
+        return None
+    return value
+
+
+def _review_queue_queryset(profile: AppUserProfile) -> Any:
+    """Open/claimed review tasks visible to ``profile``, annotated with their top score."""
+
+    def top_score(candidates: Any) -> Subquery:
+        return Subquery(
+            candidates.filter(superseded_at__isnull=True).order_by("-score").values("score")[:1]
+        )
+
+    tasks = (
+        ReviewTask.objects.select_related(
+            "import_job",
+            "import_job__uploader",
+            "import_job__source_location",
+            "scan_job",
+            "scan_job__operator",
+        )
+        .filter(state__in=REVIEW_QUEUE_STATES)
+        .annotate(
+            top_score=Coalesce(
+                top_score(MetadataCandidate.objects.filter(import_job=OuterRef("import_job"))),
+                top_score(MetadataCandidate.objects.filter(scan_job=OuterRef("scan_job"))),
+            ),
+        )
+    )
+    if profile.role != "admin":
+        tasks = tasks.filter(
+            Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
+        )
+    return tasks
+
+
+def _review_queue_filters(request: HttpRequest) -> dict[str, Any]:
+    state = request.GET.get("state", "").strip()
+    if state not in {choice.value for choice in REVIEW_QUEUE_STATES}:
+        state = ""
+    has_candidates = request.GET.get("has_candidates", "").strip().lower()
+    if has_candidates not in {"yes", "no"}:
+        has_candidates = ""
+    sort = request.GET.get("sort", "-created").strip()
+    if sort not in REVIEW_QUEUE_SORTS:
+        sort = "-created"
+    source = request.GET.get("source", "").strip()
+    if source not in {"upload", "scan"} and not source.isdigit():
+        source = ""
+    return {
+        "source": source,
+        "state": state,
+        "min_score": _parse_score(request.GET.get("min_score")),
+        "max_score": _parse_score(request.GET.get("max_score")),
+        "has_candidates": has_candidates,
+        "sort": sort,
+    }
+
+
+def _apply_review_queue_filters(tasks: Any, filters: dict[str, Any]) -> Any:
+    source = filters["source"]
+    if source == "upload":
+        tasks = tasks.filter(import_job__isnull=False, import_job__source_location__isnull=True)
+    elif source == "scan":
+        tasks = tasks.filter(scan_job__isnull=False)
+    elif source:
+        tasks = tasks.filter(import_job__source_location_id=int(source))
+    if filters["state"]:
+        tasks = tasks.filter(state=filters["state"])
+    if filters["min_score"] is not None:
+        tasks = tasks.filter(top_score__gte=Decimal(str(filters["min_score"])))
+    if filters["max_score"] is not None:
+        tasks = tasks.filter(top_score__lte=Decimal(str(filters["max_score"])))
+    if filters["has_candidates"] == "yes":
+        tasks = tasks.filter(top_score__isnull=False)
+    elif filters["has_candidates"] == "no":
+        tasks = tasks.filter(top_score__isnull=True)
+    ordering: list[Any] = []
+    for field in REVIEW_QUEUE_SORTS[filters["sort"]]:
+        if field == "top_score":
+            ordering.append(F("top_score").asc(nulls_last=True))
+        elif field == "-top_score":
+            ordering.append(F("top_score").desc(nulls_last=True))
+        else:
+            ordering.append(field)
+    return tasks.order_by(*ordering)
+
+
+def _review_queue_querystring(filters: dict[str, Any], page_size: int) -> str:
+    """Filter state for pagination links, so paging never drops the active filters."""
+    params: dict[str, str] = {"view": "html", "page_size": str(page_size)}
+    for key in ("source", "state", "has_candidates", "sort"):
+        if filters[key]:
+            params[key] = filters[key]
+    for key in ("min_score", "max_score"):
+        if filters[key] is not None:
+            params[key] = f"{filters[key]:g}"
+    return urlencode(params)
+
+
 @require_GET
 @login_required
 def review_queue(request: HttpRequest) -> HttpResponseBase:
@@ -3767,44 +3891,80 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
     if profile is None or profile.is_disabled:
         return HttpResponseForbidden()
 
-    tasks = ReviewTask.objects.select_related(
-        "import_job",
-        "import_job__uploader",
-        "import_job__source_location",
-        "scan_job",
-        "scan_job__operator",
-    ).filter(state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED])
-    if profile.role != "admin":
-        tasks = tasks.filter(
-            Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
-        )
-    task_list = list(tasks.order_by("-created_at"))
+    filters = _review_queue_filters(request)
+    tasks = _apply_review_queue_filters(_review_queue_queryset(profile), filters)
 
-    payload = [
-        {
-            **_serialize_task(task),
-            "candidate_count": _review_candidates(task).count(),
-            "candidates": [
-                _serialize_candidate(candidate) for candidate in _review_candidates(task)
-            ],
-        }
-        for task in task_list
-    ]
+    page_size = min(
+        _as_positive_int(request.GET.get("page_size"), review_batch.queue_page_size()),
+        review_batch.MAX_QUEUE_PAGE_SIZE,
+    )
+    paginator = Paginator(tasks, page_size)
+    page_object = paginator.get_page(_as_positive_int(request.GET.get("page"), 1))
+
+    min_score = review_batch.batch_min_score()
+    margin = review_batch.batch_ambiguity_margin()
+    rows: list[dict[str, Any]] = []
+    payload: list[dict[str, Any]] = []
+    task_list = list(page_object.object_list)
+    for task in task_list:
+        candidates = list(_review_candidates(task))
+        eligibility = review_batch.evaluate_top_candidates(
+            [candidate.score for candidate in candidates],
+            min_score=min_score,
+            ambiguity_margin=margin,
+        )
+        rows.append(
+            {
+                "task": task,
+                "top_candidate": candidates[0] if candidates else None,
+                "candidate_count": len(candidates),
+                "eligibility": eligibility,
+            },
+        )
+        payload.append(
+            {
+                **_serialize_task(task),
+                "source_location_id": (
+                    task.import_job.source_location_id if task.import_job is not None else None
+                ),
+                "top_score": eligibility.top_score,
+                "batch_accept_eligibility": eligibility.reason,
+                "candidate_count": len(candidates),
+                "candidates": [_serialize_candidate(candidate) for candidate in candidates],
+            },
+        )
+    # Formats of one book on this page collapse into one entry (#49); only the primary
+    # entry offers a batch checkbox, its siblings are re-assessed when it is accepted.
     groups = _group_sibling_review_tasks(task_list, payload)
+    row_by_task = {row["task"].id: row for row in rows}
+    group_rows = [{**row_by_task[group.primary.id], "group": group} for group in groups]
     if _wants_html(request):
         return render(
             request,
             "core/review_queue.html",
             {
-                "tasks": task_list,
-                "items": payload,
+                "rows": group_rows,
                 "groups": groups,
-                "count": len(payload),
+                "count": paginator.count,
+                "page_object": page_object,
+                "filters": filters,
+                "querystring": _review_queue_querystring(filters, page_size),
+                "source_locations": SourceLocation.objects.order_by("name"),
+                "batch_min_score": min_score,
+                "batch_ambiguity_margin": margin,
+                "batch_max_tasks": review_batch.batch_max_tasks(),
             },
         )
-    # The JSON list stays one item per task (non-breaking); items are only annotated
-    # with their sibling group so clients can collapse them like the HTML queue.
-    return JsonResponse({"items": payload, "count": len(payload), "group_count": len(groups)})
+    return JsonResponse(
+        {
+            "items": payload,
+            "count": paginator.count,
+            "page": page_object.number,
+            "num_pages": paginator.num_pages,
+            "page_size": page_size,
+            "group_count": len(groups),
+        },
+    )
 
 
 # Formats most likely to carry real embedded metadata first: the primary entry of a
@@ -3939,6 +4099,136 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     return JsonResponse(payload)
 
 
+def _book_for_candidate(candidate: MetadataCandidate) -> Book:
+    """Find the canonical Book a provider candidate describes, creating it if new."""
+    candidate_isbn13 = candidate.isbn13 or None
+    if candidate_isbn13:
+        existing_identifier = (
+            Identifier.objects.filter(
+                value=candidate_isbn13,
+            )
+            .select_related("book")
+            .first()
+        )
+        if existing_identifier is not None:
+            book = existing_identifier.book
+        else:
+            book = None
+    else:
+        book = None
+
+    if book is None:
+        candidate_isbn10 = candidate.isbn10 or None
+        if candidate_isbn10:
+            existing_identifier = (
+                Identifier.objects.filter(
+                    value=candidate_isbn10,
+                )
+                .select_related("book")
+                .first()
+            )
+            if existing_identifier is not None:
+                book = existing_identifier.book
+
+    if book is None:
+        candidate_author_set = {name.lower() for name in candidate.authors if isinstance(name, str)}
+        for existing_book in Book.objects.filter(title__iexact=candidate.title):
+            known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
+            if candidate_author_set.intersection(known_authors):
+                book = existing_book
+                break
+
+    if book is None:
+        candidate_edition = getattr(candidate, "edition", "")
+        book = Book.objects.create(
+            title=candidate.title,
+            publisher=candidate.publisher or "",
+            language=candidate.language or "",
+            description=candidate.description or "",
+            edition=candidate_edition or "",
+        )
+        book.publication_year = clean_publication_year(candidate.publication_year)
+        for author_name in candidate.authors:
+            if not isinstance(author_name, str):
+                continue
+            author, _ = Author.objects.get_or_create(full_name=author_name.strip())
+            if author_name.strip():
+                book.authors.add(author)
+        if candidate.isbn10:
+            Identifier.objects.get_or_create(
+                book=book,
+                kind=Identifier.IdentifierType.ISBN10,
+                value=candidate.isbn10,
+                defaults={"normalized_value": candidate.isbn10},
+            )
+        if candidate.isbn13:
+            Identifier.objects.get_or_create(
+                book=book,
+                kind=Identifier.IdentifierType.ISBN13,
+                value=candidate.isbn13,
+                defaults={"normalized_value": candidate.isbn13},
+            )
+        book.save()
+    return book
+
+
+def _accept_review_candidate(
+    *,
+    task: ReviewTask,
+    candidate: MetadataCandidate,
+    reviewer: Any,
+    decision_notes: str = "",
+    decision_payload: dict[str, Any] | None = None,
+    reviewer_authors: list[str] | None = None,
+    reviewer_genres: list[Genre] | None = None,
+    inline_cover_fallback: bool = True,
+) -> tuple[Book, FileVariant | None]:
+    """Resolve ``task`` with ``candidate``; shared by single and batch accept.
+
+    ``reviewer_authors`` only fill a Book that has no authors yet (provider authors
+    always win). ``reviewer_genres`` is an explicit reviewer choice; ``None`` assigns
+    genres automatically from provider/embedded subjects. Front-cover extraction is
+    a background job queued after commit; batch accept passes
+    ``inline_cover_fallback=False`` so it never extracts in the request, even without
+    a configured queue.
+    """
+    book = _book_for_candidate(candidate)
+    decision_additions: dict[str, Any] = {}
+    if reviewer_authors and not book.authors.exists():
+        for author_name in reviewer_authors:
+            author, _ = Author.objects.get_or_create(
+                full_name=intake._fit(Author, "full_name", author_name),
+            )
+            book.authors.add(author)
+        decision_additions["reviewer_authors"] = reviewer_authors
+    decision_additions.update(
+        _apply_review_genres(
+            book=book,
+            task=task,
+            reviewer_genres=reviewer_genres,
+            provider_subjects=candidate.subjects,
+            reviewer=reviewer,
+        )
+    )
+    if decision_additions:
+        decision_payload = {
+            **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
+            **(decision_payload or {}),
+            **decision_additions,
+        }
+    variant = _resolve_review_source(
+        task=task,
+        book=book,
+        selected_candidate=candidate,
+        reviewer=reviewer,
+        decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
+        decision_notes=decision_notes or f"Accepted candidate {candidate.id}",
+        decision_payload=decision_payload,
+        inline_cover_fallback=inline_cover_fallback,
+    )
+    return book, variant
+
+
 @require_POST
 @login_required
 def review_accept_candidate(
@@ -3981,77 +4271,6 @@ def review_accept_candidate(
         return HttpResponseBadRequest(str(exc))
 
     try:
-        candidate_isbn13 = candidate.isbn13 or None
-        if candidate_isbn13:
-            existing_identifier = (
-                Identifier.objects.filter(
-                    value=candidate_isbn13,
-                )
-                .select_related("book")
-                .first()
-            )
-            if existing_identifier is not None:
-                book = existing_identifier.book
-            else:
-                book = None
-        else:
-            book = None
-
-        if book is None:
-            candidate_isbn10 = candidate.isbn10 or None
-            if candidate_isbn10:
-                existing_identifier = (
-                    Identifier.objects.filter(
-                        value=candidate_isbn10,
-                    )
-                    .select_related("book")
-                    .first()
-                )
-                if existing_identifier is not None:
-                    book = existing_identifier.book
-
-        if book is None:
-            candidate_author_set = {
-                name.lower() for name in candidate.authors if isinstance(name, str)
-            }
-            for existing_book in Book.objects.filter(title__iexact=candidate.title):
-                known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
-                if candidate_author_set.intersection(known_authors):
-                    book = existing_book
-                    break
-
-        if book is None:
-            candidate_edition = getattr(candidate, "edition", "")
-            book = Book.objects.create(
-                title=candidate.title,
-                publisher=candidate.publisher or "",
-                language=candidate.language or "",
-                description=candidate.description or "",
-                edition=candidate_edition or "",
-            )
-            book.publication_year = clean_publication_year(candidate.publication_year)
-            for author_name in candidate.authors:
-                if not isinstance(author_name, str):
-                    continue
-                author, _ = Author.objects.get_or_create(full_name=author_name.strip())
-                if author_name.strip():
-                    book.authors.add(author)
-            if candidate.isbn10:
-                Identifier.objects.get_or_create(
-                    book=book,
-                    kind=Identifier.IdentifierType.ISBN10,
-                    value=candidate.isbn10,
-                    defaults={"normalized_value": candidate.isbn10},
-                )
-            if candidate.isbn13:
-                Identifier.objects.get_or_create(
-                    book=book,
-                    kind=Identifier.IdentifierType.ISBN13,
-                    value=candidate.isbn13,
-                    defaults={"normalized_value": candidate.isbn13},
-                )
-            book.save()
-
         # A candidate without authors (the provider record names none) can be accepted
         # with authors the reviewer confirmed, e.g. the file's suggested authors. They
         # only fill a Book that has no authors yet; provider authors always win.
@@ -4061,38 +4280,12 @@ def review_accept_candidate(
         reviewer_authors = (
             [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
         )
-        decision_additions: dict[str, Any] = {}
-        if reviewer_authors and not book.authors.exists():
-            for author_name in reviewer_authors:
-                author, _ = Author.objects.get_or_create(
-                    full_name=intake._fit(Author, "full_name", author_name),
-                )
-                book.authors.add(author)
-            decision_additions["reviewer_authors"] = reviewer_authors
-        decision_additions.update(
-            _apply_review_genres(
-                book=book,
-                task=task,
-                reviewer_genres=reviewer_genres,
-                provider_subjects=candidate.subjects,
-                reviewer=request.user,
-            )
-        )
-        decision_payload: dict[str, Any] | None = None
-        if decision_additions:
-            decision_payload = {
-                **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
-                **decision_additions,
-            }
-
-        variant = _resolve_review_source(
+        book, variant = _accept_review_candidate(
             task=task,
-            book=book,
-            selected_candidate=candidate,
+            candidate=candidate,
             reviewer=profile.user,
-            decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
-            decision_notes=f"Accepted candidate {candidate.id}",
-            decision_payload=decision_payload,
+            reviewer_authors=reviewer_authors,
+            reviewer_genres=reviewer_genres,
         )
         return _review_action_response(
             request,
@@ -4105,6 +4298,149 @@ def review_accept_candidate(
         )
     except Exception as exc:  # pragma: no cover
         return HttpResponseBadRequest(str(exc))
+
+
+def _batch_task_ids(request: HttpRequest) -> list[int] | None:
+    """Ordered, de-duplicated task ids from a form (``task_ids``) or JSON body."""
+    payload = _json_body(request)
+    raw: Any = payload.get("task_ids") if payload else request.POST.getlist("task_ids")
+    if not isinstance(raw, list):
+        return None
+    task_ids: list[int] = []
+    for value in raw:
+        task_id = _coerce_int(value, minimum=1)
+        if task_id is None:
+            return None
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+    return task_ids
+
+
+def _batch_accept_one(
+    *,
+    profile: AppUserProfile,
+    task_id: int,
+    min_score: float,
+    ambiguity_margin: float,
+) -> dict[str, Any]:
+    """Accept one task's top candidate if it is clearly eligible; report the outcome."""
+    result: dict[str, Any] = {"task_id": str(task_id)}
+    try:
+        with transaction.atomic():
+            try:
+                task = ReviewTask.objects.select_for_update().get(pk=task_id)
+            except ReviewTask.DoesNotExist:
+                return {**result, "outcome": "not_found"}
+            # Same rule as every single-task review action; checked before anything
+            # about the task (title, state, candidates) is revealed.
+            if not _can_manage_review_task(profile, task):
+                return {**result, "outcome": "forbidden"}
+            result["title"] = task.inferred_title or task.source_filename
+            if task.state not in REVIEW_QUEUE_STATES:
+                return {**result, "outcome": "closed"}
+            candidates = list(_review_candidates(task))
+            eligibility = review_batch.evaluate_top_candidates(
+                [candidate.score for candidate in candidates],
+                min_score=min_score,
+                ambiguity_margin=ambiguity_margin,
+            )
+            result["top_score"] = eligibility.top_score
+            result["runner_up_score"] = eligibility.runner_up_score
+            if not eligibility.eligible:
+                return {**result, "outcome": eligibility.reason}
+            candidate = candidates[0]
+            book, variant = _accept_review_candidate(
+                task=task,
+                candidate=candidate,
+                reviewer=profile.user,
+                decision_notes=(
+                    f"Batch-accepted top candidate {candidate.id} "
+                    f"(score {eligibility.top_score:.2f})"
+                ),
+                decision_payload={
+                    "batch_accept": True,
+                    "candidate_id": candidate.id,
+                    "top_score": eligibility.top_score,
+                    "runner_up_score": eligibility.runner_up_score,
+                    "min_score": min_score,
+                    "ambiguity_margin": ambiguity_margin,
+                },
+                # Up to BATCH_MAX_TASKS books: covers are background jobs only.
+                inline_cover_fallback=False,
+            )
+    except Exception as exc:  # one failing task must not abort the rest of the batch
+        logger.warning(
+            "review_batch_accept_task_failed",
+            review_task_id=task_id,
+            error_type=type(exc).__name__,
+        )
+        return {**result, "outcome": "error", "detail": str(exc)}
+    return {
+        **result,
+        "outcome": "accepted",
+        "candidate_id": str(candidate.id),
+        "book_id": str(book.id),
+        "file_variant_id": str(variant.id) if variant is not None else None,
+    }
+
+
+@require_POST
+@login_required
+def review_batch_accept(request: HttpRequest) -> HttpResponseBase:
+    """Accept the top candidate of each selected task that is clearly unambiguous.
+
+    Every task is checked individually: permissions, open state, a top score at or
+    above the batch minimum, and a runner-up outside the ambiguity margin. Anything
+    else is reported and left in the queue for individual review.
+    """
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return HttpResponseForbidden()
+
+    task_ids = _batch_task_ids(request)
+    if not task_ids:
+        return HttpResponseBadRequest("task_ids required")
+    max_tasks = review_batch.batch_max_tasks()
+    if len(task_ids) > max_tasks:
+        return HttpResponseBadRequest(f"at most {max_tasks} tasks per batch")
+
+    payload = _request_payload(request)
+    raw_min_score = payload.get("min_score")
+    min_score = review_batch.effective_min_score(
+        _parse_score(str(raw_min_score)) if raw_min_score is not None else None,
+    )
+    margin = review_batch.batch_ambiguity_margin()
+
+    results = [
+        _batch_accept_one(
+            profile=profile,
+            task_id=task_id,
+            min_score=min_score,
+            ambiguity_margin=margin,
+        )
+        for task_id in task_ids
+    ]
+    outcomes: dict[str, int] = {}
+    for item in results:
+        outcomes[item["outcome"]] = outcomes.get(item["outcome"], 0) + 1
+    logger.info(
+        "review_batch_accept",
+        reviewer_id=profile.user_id,
+        requested=len(task_ids),
+        min_score=min_score,
+        ambiguity_margin=margin,
+        **{f"outcome_{key}": value for key, value in sorted(outcomes.items())},
+    )
+    response_payload = {
+        "accepted": outcomes.get("accepted", 0),
+        "skipped": len(results) - outcomes.get("accepted", 0),
+        "min_score": min_score,
+        "ambiguity_margin": margin,
+        "results": results,
+    }
+    if _wants_html(request):
+        return render(request, "core/review_batch_result.html", response_payload)
+    return JsonResponse(response_payload)
 
 
 @require_POST
