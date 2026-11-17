@@ -284,6 +284,33 @@ application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
 
+### Metadata provider rate limits
+
+Every outbound metadata-provider request waits for a client-side slot before it is
+sent; a server-side HTTP 429 is only the fallback. Limits are minimum intervals per
+provider ID, configured in requests/second:
+
+```text
+BOOK_SCANNER_METADATA_RATE_LIMITS={"openlibrary":1.0}   # per provider_id; <= 0 disables
+BOOK_SCANNER_METADATA_RATE_LIMIT_DEFAULT=1.0            # providers not listed above
+BOOK_SCANNER_METADATA_RATE_LIMIT_MAX_WAIT_SECONDS=60
+```
+
+When `BOOK_SCANNER_REDIS_URL` is set, slots are reserved atomically in Redis
+(`ebook-server:ratelimit:metadata:<provider_id>`, using Redis server time), so the
+limit holds across all web and worker processes. Without Redis the limit is
+per process. If Redis is unreachable the lookup falls back to the per-process
+limiter and logs `rate_limiter_redis_unavailable`. A lookup whose slot would be more
+than the maximum wait away is treated as a failed provider request
+(`metadata_provider_rate_limit_wait_exceeded`), which routes the import to review
+like any other provider failure; raise the maximum or lower worker concurrency if
+this appears during bulk imports. New providers call
+`ebook_server.core.rate_limit.throttle_provider(provider_id)` before each request.
+
+`BOOK_SCANNER_METADATA_USER_AGENT` defaults to a project identifier with the
+repository URL; an empty value uses that default. Override it to add a contact
+address for your deployment.
+
 ## Workers and external tools
 
 Start RQ workers with the queue name configured by
@@ -383,6 +410,21 @@ read with member size/compression limits; Pillow warnings for decompression bomb
 are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
+
+Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
+or `cover.png` (Calibre-style) over format extraction, but only when the folder
+holds a single book: every intake-supported file in it, and every file previously
+queued from it, must share the job file's name stem (`metadata.opf` and the cover
+itself are ignored). A folder of several books never lends its cover to any of them.
+The sidecar is untrusted input: symlinks and folders outside the source root are
+ignored, files over 25 MiB or 40 megapixels are rejected, and the image is verified
+and decoded by Pillow (JPEG/PNG only, decompression-bomb warnings are failures)
+before the usual normalization. An invalid sidecar is logged
+(`sidecar_cover_rejected`) and format extraction is used instead. Such covers record
+`extractor_tool=sidecar+pillow`. The sidecar file is only read: it is left in place
+for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
+reviewed MOVE import can still use it later. Disable with
+`BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
 
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original
