@@ -746,6 +746,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        COMBINE_PARTS = "combine_parts", "Combine multi-part work"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"

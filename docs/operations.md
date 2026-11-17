@@ -366,6 +366,17 @@ The reviewer can fix the proposed order and labels, then either
   independent import in the background (auto-accepted only under the normal rules,
   otherwise an ordinary review task).
 
+Once confirmed, a book page offers **Combine N parts into one file** for PDF and TXT
+part sets (`POST /library/books/<id>/combine-parts/` with `target_format`; poll
+`GET /combine-jobs/<job-id>/`). A background job re-hashes every part against its
+recorded SHA-256, joins them in `part_index` order (pypdf for PDF, adding one
+bookmark per part label; charset-normalizer-decoded UTF-8 text for TXT) and stores
+a new `generated` FileVariant. That variant records the first part as
+`source_variant`, the tool and version, the job ID and, in `converter_options`, the
+ordered part variant IDs, hashes and labels. Repeat requests reuse it. It is a normal
+conversion source (for example PDF → EPUB). Other formats have no safe
+concatenation and are not offered.
+
 Originals are never merged, rewritten or deleted by either path. Completeness cannot
 be verified automatically; gaps in the numbering are shown on the review page.
 Disable detection with `BOOK_SCANNER_MULTIPART_DETECTION=false`.
