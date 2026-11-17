@@ -622,7 +622,10 @@ class ScanTailorStageState(models.Model):
     )
     preview_storage_identifier = models.CharField(max_length=512, blank=True)
     worker_job_id = models.CharField(max_length=64, blank=True)
+    # Only genuine processing failures (status FAILED) go in last_error. Routine
+    # bookkeeping such as "upstream stage changed" goes in invalidated_reason.
     last_error = models.TextField(blank=True)
+    invalidated_reason = models.TextField(blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

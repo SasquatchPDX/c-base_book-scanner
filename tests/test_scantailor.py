@@ -355,8 +355,48 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
 
     latest = client.get(_stages_url(str(job.id), str(page.id))).json()["stages"]
     status_by_stage = {entry["stage"]: entry["status"] for entry in latest}
+    by_stage = {entry["stage"]: entry for entry in latest}
     for stage_name in ("deskew", "select_content", "margins", "dewarping", "output"):
         assert status_by_stage[stage_name] == ScanTailorStageState.StageStatus.INVALIDATED
+        # Routine invalidation is not an error (#53).
+        assert by_stage[stage_name]["last_error"] == ""
+        assert by_stage[stage_name]["invalidated_reason"] == "page_split updated"
+
+    # Re-running a stage clears its invalidation note.
+    rerun = client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {}}),
+        content_type="application/json",
+    )
+    assert rerun.status_code == 202
+    deskew = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
+    assert deskew.invalidated_reason == ""
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failed_stage_that_is_invalidated_clears_stale_error() -> None:
+    client, job = _create_scan_job("scan-user-invalidation-failed")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"invalidate-failed",
+        filename="scan.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+    ScanTailorStageState.objects.filter(scan_page=page, stage="output").update(
+        status=ScanTailorStageState.StageStatus.FAILED,
+        last_error="cannot read image",
+    )
+    scantailor.invalidate_downstream_states(
+        page, from_stage="dewarping", reason="dewarping updated"
+    )
+    output = ScanTailorStageState.objects.get(scan_page=page, stage="output")
+    assert output.status == ScanTailorStageState.StageStatus.INVALIDATED
+    assert output.last_error == ""
+    assert output.invalidated_reason == "dewarping updated"
 
 
 @pytest.mark.django_db(transaction=True)
