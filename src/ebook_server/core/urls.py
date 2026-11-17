@@ -167,6 +167,7 @@ urlpatterns = [
     path("imports/upload/", views.upload_file, name="imports-upload"),
     path("imports/<uuid:job_id>/", views.import_status, name="imports-status"),
     path("reviews/", views.review_queue, name="review-queue"),
+    path("reviews/batch-accept/", views.review_batch_accept, name="review-batch-accept"),
     path("reviews/<int:task_id>/", views.review_detail, name="review-detail"),
     path(
         "reviews/<int:task_id>/accept-candidate/",

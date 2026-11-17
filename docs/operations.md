@@ -31,6 +31,13 @@ sets `X-Accel-Buffering: no`. Tune the one-second/45-iteration defaults with
 `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`; account for the resulting
 database polling load when sizing large concurrent scanning sessions.
 
+New scan jobs default to the `single_page` capture layout, which is what the
+project's scanner produces. In that layout, ScanTailor's Page Split completes
+automatically as a recorded "no split" passthrough. If a scanner photographs
+two-page spreads, list its id in `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` (a JSON
+list). To change the default for every scanner, set
+`BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT=spread`. See `docs/scantailor-web.md`.
+
 `deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.
@@ -285,10 +292,16 @@ jobs (`ProcessingJob`, type `archive_reorganize`), never work inside a web reque
    these sources into the archive tree"). The worker lists every file that would move
    and where; the plan appears on the job's admin page. Nothing changes on storage.
 2. **Apply.** Select the finished plan under Processing jobs and run "Apply selected
-   archive reorganize plans". Each entry is re-checked (skipped if the record changed
-   since the plan), copied into the book folder, verified by SHA-256, re-pointed in
-   the database, and only then is the old copy deleted; empty folders are pruned. A
-   failed verification keeps the original and fails the job. A plan applies once.
+   archive reorganize plans". The plan is applied exactly as reviewed: each entry is
+   re-checked first (the record still points at the planned file with the planned
+   hash, still belongs to the planned Book, and that Book's current metadata still
+   implies the planned folder and file name). An entry that no longer matches, for
+   example because the title was edited after the dry run, is reported `stale` and
+   nothing is moved for it; the job's summary asks for a new dry run
+   (`requires_new_plan`). A valid entry is copied into the planned folder (never
+   over an existing file), verified by SHA-256, re-pointed in the database, and only
+   then is the old copy deleted; empty folders are pruned. A failed verification
+   keeps the original and fails the job. A plan applies once.
 
 From the shell (runs in the command's own process):
 
@@ -365,6 +378,51 @@ uv run python manage.py ingest_sources --source-id 1 --preview --json
 uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
+
+### Batching, rate limits, and pausing a source
+
+`ingest_sources` never queues a whole source at once. Each run queues at most:
+
+- the source's **batch size**: import jobs in flight (DISCOVERED through
+  ARCHIVING; LOW_CONFIDENCE jobs waiting for review do not count). Set it per
+  source in admin (`ingest_batch_size`) or globally with
+  `BOOK_SCANNER_INGEST_BATCH_SIZE` (default 100); `0` means unlimited. `--limit N`
+  overrides it for one run (`--limit 0` = unlimited).
+- the source's **hourly rate**: new import jobs created in the last rolling hour
+  (`ingest_max_per_hour` per source, or `BOOK_SCANNER_INGEST_MAX_PER_HOUR`;
+  default `0` = unlimited). Use it to keep a large one-off migration from
+  flooding external metadata providers.
+
+Files beyond the limit are picked up by later runs, so run `ingest_sources` on a
+schedule (cron/systemd timer) to work through a large source gradually.
+
+To pause a source, use the "Pause imports" admin action (or set `is_paused`).
+A paused source queues nothing, and queued jobs that have not started yet are
+skipped by the worker and stay DISCOVERED. After "Resume imports", the next
+`ingest_sources` run re-queues them. Each run also re-queues DISCOVERED jobs that
+no longer have an RQ job (for example after `rq empty` or a Redis flush). If the
+RQ queue cannot be inspected, re-queueing is skipped with a warning.
+
+A job that ends up queued twice is still processed only once. A worker first
+claims the job's lease (`ImportJob.lease_owner` / `lease_expires_at`) with one
+conditional update, which succeeds only for an unowned job waiting to run
+(DISCOVERED, or FAILED with a queue retry due). Any other delivery returns
+without doing anything, whichever phase it finds the job in (logged as
+`intake_duplicate_delivery_skipped`). Each later write of the job locks its row,
+checks that the worker still owns the lease, and renews it. Leaving the active
+phases (COMPLETE, LOW_CONFIDENCE, FAILED) releases the lease. The lease lasts
+`BOOK_SCANNER_INGEST_LEASE_SECONDS`; the default `0` means the RQ job timeout
+plus five minutes. A job whose lease expired is never taken over by another
+delivery. `recover_stale_jobs` handles it, see below.
+`--preview` lists every importable file and every skipped file, followed by a
+per-source summary such as `importable=108 skipped=3 (.chm=2, .lit=1)`. Skipped
+files are unsupported formats (`SKIPPED (unsupported format: .chm) => <path>`) and
+audio files (see "Audio files and audiobooks" below); the per-extension counts cover
+both. With `--json`, rows carry `"status": "importable"` or `"status": "skipped"`;
+skipped rows add `"skipped": "unsupported"` or `"skipped": "audio"`, `extension` and
+`reason`, and each source ends with a
+`{"source_location_id", "summary": {"importable", "skipped", "skipped_audio",
+"skipped_by_extension"}}` row.
 
 ### Audio files and audiobooks
 
@@ -469,6 +527,30 @@ the oldest. The other formats are listed under it with their own candidate count
 links. The JSON response keeps one item per task, so existing clients are unaffected.
 Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
 and the response gains `group_count`.
+
+### Stopping (cancelling) a source import
+
+Do not stop a bulk import with `rq empty`: it leaves DISCOVERED rows behind, and
+RQ's abandoned-job handling can still re-run the job that was in progress when
+the worker stopped. Instead run:
+
+```bash
+uv run python manage.py cancel_source_import --source-id 1          # dry run
+uv run python manage.py cancel_source_import --source-id 1 --apply  # act
+```
+
+`--apply` pauses the source and marks its import jobs that have not started
+archiving `CANCELLED`. It then deletes their RQ jobs from the queue and from the
+started, scheduled, deferred and failed registries. A cancelled job never runs again,
+even if RQ redelivers it after a worker restart. A job that is running when it is
+cancelled stops at its next phase boundary without archiving, creating a review
+task, or creating a Book, and is not retried. Cancelling clears the job's lease
+and locks its row. Each phase save of the worker locks the same row before
+checking the state, so a cancellation never commits between that check and the
+save. Jobs already `ARCHIVING` are left
+to finish, because a MOVE source may already be in the archive; `LOW_CONFIDENCE`
+jobs waiting for review are untouched. To import the cancelled files later,
+resume the source and run `ingest_sources`; they are discovered again.
 
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
@@ -609,6 +691,48 @@ this appears during bulk imports. New providers call
 repository URL; an empty value uses that default. Override it to add a contact
 address for your deployment.
 
+## Reviewing imports in bulk
+
+Large source imports create many review tasks. The review queue
+(`/reviews/?view=html`, or `GET /reviews/` as JSON) supports this work:
+
+- Filters: `source` (`upload`, `scan`, or a `SourceLocation` id), `state`
+  (`open`/`claimed`), `min_score`/`max_score` on the top candidate's confidence
+  (0–1), and `has_candidates` (`yes`/`no`).
+- Sorting: `sort=-created` (default), `created`, `-confidence`, `confidence`;
+  tasks without candidates sort last.
+- Pagination: `page` and `page_size` (default
+  `BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE`, 50; capped at 200). JSON responses
+  carry `count` (all matching tasks), `page`, `num_pages` and `page_size`.
+
+Selecting tasks and choosing **Accept top candidate for selected** posts to
+`POST /reviews/batch-accept/` (`task_ids` as repeated form fields or a JSON list;
+an optional `min_score` may only raise the threshold). Each task is checked
+individually with the same permission rule as single-task actions (admins: all
+tasks; members: their own uploads and scan jobs) and is resolved through the same
+code path as accepting a candidate on the detail page. A task is accepted only if:
+
+- its top candidate scores at least `BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE`
+  (default 0.75), and
+- the runner-up trails by more than `BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN`
+  (default 0.05); exact ties are always ambiguous.
+
+Everything else stays open and is reported per task (`accepted`, `ambiguous`,
+`below_min_score`, `no_candidates`, `closed`, `forbidden`, `not_found`,
+`error`). A batch holds at most `BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
+100) tasks. Batch-resolved tasks record `batch_accept`, the scores and the
+thresholds used in `decision_payload`. The originals were already archived when
+the review task was created, so accepting only links records; no archive copy,
+parsing or rendering happens in the request. Front-cover extraction for each
+accepted file is a background job (`intake.extract_front_cover_job`) queued after
+that task's transaction commits, exactly as for a single accept; see "Covers from
+review decisions" below. Batch accept never changes the intake auto-accept
+threshold (`BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`).
+
+The queue shows formats of one book (see `group_sibling_formats`) as one entry,
+grouped within the current page; only that entry has a batch checkbox, and the
+other formats are re-assessed when it is accepted.
+
 ## Workers and external tools
 
 Start RQ workers with the queue name configured by
@@ -684,6 +808,15 @@ returns ScanJobs stuck in FINALIZING with no live finalization job to their
 prior state so Finish can be retried. It does not re-queue anything itself;
 re-request OCR/conversion/identification from the UI afterwards.
 
+It also lists import jobs stuck in an active phase (HASHING through ARCHIVING)
+whose lease has expired, and import jobs without a lease (left by a worker from
+before leases existed) that have not changed for one lease duration. `--apply`
+marks them FAILED (`import lease expired in <phase>`) and clears the lease. The
+update is conditional, so a worker that renewed its lease in the meantime is not
+touched, and a worker that lost its lease stops at its next write. These jobs are
+not retried automatically, because a MOVE source may be half moved. Check the
+source, then re-queue them with `ingest_sources --source-id N --retry-failed`.
+
 Do not grant a worker access to the Docker socket merely to obtain a converter.
 Bake reviewed converter binaries into its restricted image instead.
 
@@ -722,7 +855,16 @@ hash downloaded bytes while staging them on disk and remove partial temporary
 files after download failures. Changed results receive separate storage paths
 even when the service repeats a filename, preserving prior outputs.
 
-Digital intake accepts EPUB, MOBI, PDF, TXT, HTML, FB2, DjVu, CBZ, and CBR.
+Digital intake accepts EPUB, MOBI, AZW, AZW3, PRC, RTF, PDF, TXT, HTML, FB2,
+DjVu, CBZ, and CBR. AZW/AZW3/PRC must carry a PalmDB `BOOKMOBI` header (PRC may
+also be plain PalmDOC `TEXtREAd`); RTF must start with `{\rtf`. AZW/AZW3/PRC
+metadata is read with Calibre's `ebook-meta` like MOBI; RTF metadata currently falls
+back to filename/folder signals before external verification. These four formats
+are stored and downloadable as uploaded, but no conversion route is offered from them
+until one is binary-verified (see `docs/conversion-matrix.md`).
+Files in any other format (for example CHM, LIT, LRF, PDB, DOC/DOCX, ZIP/RAR) are
+not imported: source discovery logs a `source_files_skipped_unsupported` warning
+with per-extension counts, and `--preview` lists them (see above).
 Beautiful Soup handles bounded HTML metadata, Charset Normalizer detects text
 encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP readers
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
@@ -743,6 +885,20 @@ are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
 
+### Covers from review decisions
+
+Resolving an import in review (accept candidate, merge, manual entry, batch accept,
+or a format sibling linked automatically) does not extract the cover in the web
+request. It queues `ebook_server.core.intake.extract_front_cover_job` with
+`transaction.on_commit`, so the job is dispatched only once the decision is committed
+(a rolled-back decision queues nothing) and runs without holding any row locks. The
+job is idempotent: the Book's existing front cover is reused, so a repeated delivery
+does no storage work. Failing to dispatch is logged as
+`cover_extraction_dispatch_failed` and never undoes the decision. Without a configured
+queue (development only; production requires Redis) a single decision extracts inline
+after commit, while batch accept skips extraction and logs
+`cover_extraction_skipped_no_queue`.
+
 Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
 or `cover.png` (Calibre-style) over format extraction, but only when the folder
 holds a single book: every intake-supported file in it, and every file previously
@@ -757,6 +913,27 @@ before the usual normalization. An invalid sidecar is logged
 for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
 reviewed MOVE import can still use it later. Disable with
 `BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
+
+A sibling Calibre-style `metadata.opf` is read as extra identification evidence
+under the same single-book-folder rule (`intake.single_book_folder`), so the cover
+and metadata sidecars always agree about a folder. A stray OPF in a folder of
+several books is ignored (`sidecar_metadata_ignored`), and so is a `metadata.opf`
+the application generated itself, recognised by
+`<meta name="ebook-server:generated" content="true"/>`
+(`reason=generated_by_ebook_server`). The OPF is parsed by the same
+defusedxml parser used for `ebook-meta` output. Symlinks, files over 2 MiB,
+malformed XML, and entity declarations are rejected (`sidecar_metadata_rejected`)
+and treated as "no sidecar"; they never fail the import. Sidecar values are kept
+under `evidence.sidecar_metadata` (`fields`, `applied_fields`, `conflicts`). They
+only fill gaps: empty fields, placeholders, a title the extractor marked as a
+filename fallback, and an ISBN added as `isbn` when the file has none. Every
+extraction records `evidence.title_source` (`embedded`, `filename`, or `sidecar`
+once a sidecar filled it); an embedded title equal to the filename stem is still
+embedded and is never replaced. They never overwrite embedded metadata. If
+the sidecar's ISBN, title, or authors contradict the file's embedded metadata,
+nothing is merged and the import goes to manual review even when the top candidate
+clears the auto-accept threshold (`sidecar_metadata_conflict`). Disable with
+`BOOK_SCANNER_SIDECAR_METADATA_ENABLED=false`.
 
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original

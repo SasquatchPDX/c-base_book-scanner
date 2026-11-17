@@ -139,6 +139,9 @@ CONVERTER_REGISTRY: dict[str, Converter] = {
     "pandoc": PandocConverter(),
 }
 
+# Only routes with binary-verified acceptance evidence are advertised (Sprint020). AZW,
+# AZW3, PRC and RTF are intake formats (#23) but stay without conversion routes until
+# real ebook-convert acceptance coverage exists; see docs/conversion-matrix.md.
 CAPABILITIES: tuple[ConversionCapability, ...] = (
     ConversionCapability("epub", "pdf", "calibre"),
     ConversionCapability("pdf", "epub", "calibre"),
@@ -153,6 +156,10 @@ CAPABILITIES: tuple[ConversionCapability, ...] = (
 FORMAT_TO_MIME: dict[str, str] = {
     "epub": "application/epub+zip",
     "mobi": "application/x-mobipocket-ebook",
+    "azw": "application/vnd.amazon.ebook",
+    "azw3": "application/x-mobi8-ebook",
+    "prc": "application/x-mobipocket-ebook",
+    "rtf": "application/rtf",
     "pdf": "application/pdf",
     "txt": "text/plain",
     "html": "text/html",
@@ -477,14 +484,14 @@ def _execute_plan(
         if existing is not None:
             return existing
 
-        storage_identifier = archive_layout.derived_destination(
+        storage_identifier = archive_layout.publish_derived(
             output_storage,
             source_variant.book,
+            str(current_path),
             f"{archive_layout.book_file_stem(source_variant.book)}.{target_format}",
             legacy_namespace=f"books/{source_variant.book_id}/converted",
             legacy_filename=f"{uuid.uuid4()}.{target_format}",
         )
-        output_storage.store(str(current_path), storage_identifier)
 
         return FileVariant.objects.create(
             book=source_variant.book,

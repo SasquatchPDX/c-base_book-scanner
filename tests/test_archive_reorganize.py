@@ -118,7 +118,7 @@ def test_legacy_job_folders_are_planned_then_moved_with_verification(tmp_path: P
 
     applied = _run_apply(plan)
     assert applied.state == ProcessingJob.JobState.SUCCESS, applied.details
-    assert applied.details["counts"] == {"moved": 3, "skipped": 0, "failed": 0}
+    assert applied.details["counts"] == {"moved": 3, "skipped": 0, "stale": 0, "failed": 0}
     epub.refresh_from_db()
     pdf.refresh_from_db()
     cover.refresh_from_db()
@@ -172,14 +172,111 @@ def test_failed_verification_keeps_the_original(tmp_path: Path) -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_entry_changed_since_plan_is_skipped(tmp_path: Path) -> None:
+def test_entry_changed_since_plan_is_stale(tmp_path: Path) -> None:
     book = _book("Dune", "Frank Herbert")
     variant = _variant(tmp_path, book, "books/9/dune.epub", b"spice")
     plan = _run_plan(book_ids=[book.pk])
     FileVariant.objects.filter(pk=variant.pk).update(storage_identifier="elsewhere/dune.epub")
     applied = _run_apply(plan)
-    assert applied.details["counts"] == {"moved": 0, "skipped": 1, "failed": 0}
+    assert applied.details["counts"] == {"moved": 0, "skipped": 0, "stale": 1, "failed": 0}
+    assert applied.details["requires_new_plan"] is True
     assert (_archive(tmp_path) / "books/9/dune.epub").exists()
+
+
+def _assert_nothing_moved(tmp_path: Path, variant: FileVariant, identifier: str) -> None:
+    variant.refresh_from_db()
+    assert variant.storage_identifier == identifier
+    assert (_archive(tmp_path) / identifier).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_metadata_changed_after_approval_makes_the_plan_stale(tmp_path: Path) -> None:
+    """Reviewer probe: plan Jane Austen/Emma, retitle, apply. Nothing unreviewed moves."""
+    book = _book("Emma", "Jane Austen")
+    variant = _variant(tmp_path, book, "books/1111/emma.epub", b"epub bytes")
+    plan = _run_plan(book_ids=[book.pk])
+    assert plan.details["plan"][0]["to_folder"] == "Jane Austen/Emma"
+
+    book.title = "Changed After Approval"
+    book.save()
+    applied = _run_apply(plan)
+
+    assert applied.details["counts"]["stale"] == 1
+    assert applied.details["counts"]["moved"] == 0
+    assert applied.details["requires_new_plan"] is True
+    assert "metadata changed" in applied.details["results"][0]["detail"]
+    assert "new dry run" in applied.details["summary"]
+    _assert_nothing_moved(tmp_path, variant, "books/1111/emma.epub")
+    assert not (_archive(tmp_path) / "Jane Austen").exists()
+    book.refresh_from_db()
+    assert book.archive_folder == ""
+
+    # A fresh dry run plans the new destination, and applying it moves the file there.
+    fresh = _run_plan(book_ids=[book.pk])
+    assert fresh.details["plan"][0]["to_folder"] == "Jane Austen/Changed After Approval"
+    assert _run_apply(fresh).details["counts"]["moved"] == 1
+    variant.refresh_from_db()
+    assert variant.storage_identifier == (
+        "Jane Austen/Changed After Approval/Changed After Approval - Jane Austen.epub"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_record_moved_to_another_book_after_approval_is_stale(tmp_path: Path) -> None:
+    book = _book("Emma", "Jane Austen")
+    other = _book("Persuasion", "Jane Austen")
+    variant = _variant(tmp_path, book, "books/1111/emma.epub", b"epub bytes")
+    plan = _run_plan(book_ids=[book.pk])
+    FileVariant.objects.filter(pk=variant.pk).update(book=other)
+
+    applied = _run_apply(plan)
+    assert applied.details["counts"]["stale"] == 1
+    assert "book association" in applied.details["results"][0]["detail"]
+    _assert_nothing_moved(tmp_path, variant, "books/1111/emma.epub")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recorded_hash_changed_after_approval_is_stale(tmp_path: Path) -> None:
+    book = _book("Emma", "Jane Austen")
+    variant = _variant(tmp_path, book, "books/1111/emma.epub", b"epub bytes")
+    plan = _run_plan(book_ids=[book.pk])
+    FileVariant.objects.filter(pk=variant.pk).update(sha256="0" * 64)
+
+    applied = _run_apply(plan)
+    assert applied.details["counts"]["stale"] == 1
+    _assert_nothing_moved(tmp_path, variant, "books/1111/emma.epub")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_planned_folder_taken_by_another_book_is_stale(tmp_path: Path) -> None:
+    book = _book("Emma", "Jane Austen")
+    variant = _variant(tmp_path, book, "books/1111/emma.epub", b"epub bytes")
+    plan = _run_plan(book_ids=[book.pk])
+    rival = _book("Emma", "Jane Austen")
+    Book.objects.filter(pk=rival.pk).update(archive_folder="Jane Austen/Emma")
+
+    applied = _run_apply(plan)
+    assert applied.details["counts"]["stale"] == 1
+    _assert_nothing_moved(tmp_path, variant, "books/1111/emma.epub")
+    book.refresh_from_db()
+    assert book.archive_folder == ""
+
+
+@pytest.mark.django_db(transaction=True)
+def test_apply_never_overwrites_a_file_at_the_planned_name(tmp_path: Path) -> None:
+    book = _book("Emma", "Jane Austen")
+    variant = _variant(tmp_path, book, "books/1111/emma.epub", b"epub bytes")
+    plan = _run_plan(book_ids=[book.pk])
+    Book.objects.filter(pk=book.pk).update(archive_folder="Jane Austen/Emma")
+    squatter = _archive(tmp_path) / "Jane Austen/Emma/Emma - Jane Austen.epub"
+    squatter.parent.mkdir(parents=True)
+    squatter.write_bytes(b"someone else's file")
+
+    applied = _run_apply(plan)
+    assert applied.details["counts"]["moved"] == 1
+    variant.refresh_from_db()
+    assert variant.storage_identifier.startswith("Jane Austen/Emma/Emma - Jane Austen-")
+    assert squatter.read_bytes() == b"someone else's file"
 
 
 @pytest.mark.django_db(transaction=True)

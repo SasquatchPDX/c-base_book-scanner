@@ -7,9 +7,14 @@ worker, never inside a web request:
    from selected COPY/MOVE sources, or all), list each archived file that is not in
    the folder its Book's current metadata implies, and where it would go. Nothing on
    storage changes.
-2. **Apply** a reviewed plan. Each entry is re-validated (the record still points at
-   the planned file), copied into the book folder, verified by SHA-256, re-pointed in
-   the database, and only then is the old copy deleted (AGENTS.md MOVE rule).
+2. **Apply** a reviewed plan, exactly as reviewed. Each entry is re-validated first:
+   the record still points at the planned file with the planned hash, still belongs
+   to the planned Book, and that Book's current metadata still implies the planned
+   destination folder and name. A mismatch marks the entry ``stale`` and moves
+   nothing (a fresh dry run is required); the destination is never recomputed. A
+   valid entry is copied into the planned folder (exclusively, never overwriting),
+   verified by SHA-256, re-pointed in the database, and only then is the old copy
+   deleted (AGENTS.md MOVE rule).
 
 Files on read-only locations (index-in-place sources) are never touched; index sources
 cannot be selected at all. This is also how a book follows a corrected title: the
@@ -36,6 +41,7 @@ from .models import (
     FileVariant,
     ImportJob,
     ProcessingJob,
+    ScanJob,
     ScanLog,
     SourceLocation,
     StorageLocation,
@@ -52,6 +58,10 @@ _KINDS: dict[str, Any] = {
     "cover": CoverImage,
     "scan_log": ScanLog,
 }
+
+
+# An apply entry whose reviewed plan no longer matches reality; a new dry run is needed.
+STALE = "stale"
 
 
 class ReorganizeError(ValueError):
@@ -130,7 +140,10 @@ def _files_of(book: Book) -> Iterator[tuple[str, Any]]:
         yield "variant", variant
     for cover in book.cover_images.select_related("storage_location").order_by("pk"):
         yield "cover", cover
-    for log in ScanLog.objects.filter(scan_job__book=book).select_related("storage_location"):
+    # Only stored logs have a file; queued/duplicate/failed uploads have none to move.
+    for log in ScanLog.objects.filter(
+        scan_job__book=book, state=ScanLog.State.STORED
+    ).select_related("storage_location"):
         yield "scan_log", log
 
 
@@ -180,6 +193,7 @@ def build_plan(scope: dict[str, Any]) -> ReorganizePlan:
                     "book_id": book.pk,
                     "storage_location_id": location.pk,
                     "from": record.storage_identifier,
+                    "sha256": record.sha256,
                     "to_folder": folder,
                     "name": _target_name(kind, record, book),
                 },
@@ -187,37 +201,85 @@ def build_plan(scope: dict[str, Any]) -> ReorganizePlan:
     return plan
 
 
+def _record_book_id(kind: str, record: Any) -> int | None:
+    if kind == "scan_log":
+        return (
+            ScanJob.objects.filter(pk=record.scan_job_id).values_list("book_id", flat=True).first()
+        )
+    return record.book_id
+
+
+def _stale_reason(
+    entry: dict[str, Any], kind: str, record: Any, book: Book | None, storage: Any
+) -> str:
+    """Why the reviewed plan no longer describes this move ("" when it still does).
+
+    The plan an admin approved names the record, its file and content hash, its Book,
+    and the exact destination folder and file name. If any of that changed since the
+    dry run (metadata edited, record relinked or re-pointed, folder taken by another
+    book), the entry is stale: it is skipped and a fresh dry run is required instead
+    of performing a move nobody reviewed.
+    """
+    if record.storage_location_id != entry.get(
+        "storage_location_id"
+    ) or record.storage_identifier != entry.get("from"):
+        return "file changed since the plan"
+    if entry.get("sha256") and record.sha256 != entry["sha256"]:
+        return "file content changed since the plan"
+    if book is None or _record_book_id(kind, record) != entry.get("book_id"):
+        return "book association changed since the plan"
+    planned_folder = str(entry.get("to_folder") or "")
+    if archive_layout.proposed_book_folder(book, storage).lower() != planned_folder.lower():
+        return "book metadata changed since the plan; its destination would differ"
+    if _target_name(kind, record, book) != entry.get("name"):
+        return "file name would differ from the plan"
+    return ""
+
+
 def _move_entry(entry: dict[str, Any]) -> tuple[str, str]:
-    """Apply one plan entry; returns ``(status, detail)``."""
-    model = _KINDS.get(str(entry.get("kind")))
+    """Apply one plan entry exactly as reviewed; returns ``(status, detail)``.
+
+    The file goes to the planned ``to_folder`` and nowhere else. A ``stale`` status
+    means the entry no longer matches the current state; nothing was changed for it.
+    """
+    kind = str(entry.get("kind"))
+    model = _KINDS.get(kind)
     if model is None:
         return "skipped", "unknown kind"
     record: Any = model.objects.select_related("storage_location").filter(pk=entry["id"]).first()
-    if (
-        record is None
-        or record.storage_location_id != entry["storage_location_id"]
-        or record.storage_identifier != entry["from"]
-    ):
-        return "skipped", "changed since the plan"
-    location: StorageLocation = record.storage_location
-    if location.read_only:
+    if record is None:
+        return STALE, "record no longer exists"
+    if kind == "scan_log" and record.state != ScanLog.State.STORED:
+        return STALE, "log is no longer stored"
+    location: StorageLocation | None = record.storage_location
+    if location is None or location.read_only:
         return "skipped", "read-only location"
     storage = filesystem_backend_for_location(location)
-    book = Book.objects.get(pk=entry["book_id"])
-    folder = archive_layout.reassign_book_folder(book, storage)
+    book = Book.objects.filter(pk=entry.get("book_id")).first()
+    reason = _stale_reason(entry, kind, record, book, storage)
+    if reason:
+        return STALE, reason
+    assert book is not None
+    folder = str(entry["to_folder"])
     source = record.storage_identifier
     if _folder_of(source).lower() == folder.lower():
         return "skipped", "already in place"
-    destination = storage.generate_destination(folder, entry["name"], unique=True)
-    storage.copy(source, destination)
+    if not archive_layout.claim_planned_book_folder(book, folder, storage):
+        return STALE, "planned folder is now taken; plan again"
+    # Exclusive: a file already at the planned name is never replaced.
+    destination = storage.publish_unique(source, folder, str(entry["name"]))
     if storage.hash(destination) != record.sha256:
         storage.delete(destination)
         return "failed", "copy verification failed; original kept"
     with transaction.atomic():
         locked: Any = model.objects.select_for_update().get(pk=record.pk)
-        if locked.storage_identifier != source or locked.storage_location_id != location.pk:
+        if (
+            locked.storage_identifier != source
+            or locked.storage_location_id != location.pk
+            or _record_book_id(kind, locked) != book.pk
+        ):
             storage.delete(destination)
-            return "skipped", "changed while moving"
+            return STALE, "changed while moving"
         locked.storage_identifier = destination
         locked.save(update_fields=["storage_identifier"])
         if model is FileVariant:
@@ -347,7 +409,7 @@ def process_reorganize_job(job_id: str) -> None:
         plan_job = ProcessingJob.objects.get(job_id=details["plan_job_id"])
         entries = _details(plan_job).get("plan") or []
         results: list[dict[str, Any]] = []
-        counts = {"moved": 0, "skipped": 0, "failed": 0}
+        counts = {"moved": 0, "skipped": 0, STALE: 0, "failed": 0}
         for entry in entries:
             try:
                 status, detail = _move_entry(entry)
@@ -362,14 +424,18 @@ def process_reorganize_job(job_id: str) -> None:
                     "detail": detail,
                 }
             )
+        summary = (
+            f"{counts['moved']} moved, {counts['skipped']} skipped, "
+            f"{counts[STALE]} stale, {counts['failed']} failed"
+        )
+        if counts[STALE]:
+            summary += "; stale entries were not moved, run a new dry run for them"
         details.update(
             {
                 "results": results,
                 "counts": counts,
-                "summary": (
-                    f"{counts['moved']} moved, {counts['skipped']} skipped, "
-                    f"{counts['failed']} failed"
-                ),
+                "requires_new_plan": bool(counts[STALE]),
+                "summary": summary,
             },
         )
         if counts["failed"]:

@@ -640,3 +640,94 @@ def test_authenticated_sse_streams_through_nginx_and_uvicorn() -> None:
             assert updated_stages[0]["status"] == ScanTailorStageState.StageStatus.RUNNING
 
         assert httpx.get(f"{proxy_base_url}/healthz/", timeout=3).status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_manual_split_interleaved_with_passthrough_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #102 reviewer interleaving against PostgreSQL row locks and connections."""
+    from tests.test_page_split_capture_layout import run_reviewer_interleaving
+
+    assert connection.vendor == "postgresql"
+    with override_settings(APP_DATA_DIR=tmp_path, BOOK_SCANNER_QUEUE_URL=""):
+        run_reviewer_interleaving(monkeypatch, "pg-layout-race-read")
+
+
+def _wait_for_lock_waiter(
+    errors: list[BaseException],
+    finished: list[ScanTailorStageState | None],
+    timeout: float = 15.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        assert not errors, errors
+        assert not finished, f"automation did not wait for the lock: {finished}"
+        with connection.cursor() as cursor:
+            # pg_locks is live; pg_stat_activity is snapshotted per transaction.
+            cursor.execute("SELECT count(*) FROM pg_locks WHERE NOT granted")
+            row = cursor.fetchone()
+        if row is not None and row[0] > 0:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the automatic passthrough never waited on the stage row lock")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_passthrough_blocked_by_manual_edit_lock_backs_off(tmp_path: Path) -> None:
+    """Automation that waits on a manual edit's row lock must not overwrite it after."""
+    import threading
+
+    from ebook_server.core import scantailor
+
+    profile = get_or_create_profile("pg-layout-race-lock")
+    job = ScanJob.objects.create(operator=profile.user, scanner_id="pg-race")
+    assert job.capture_layout == ScanJob.CaptureLayout.SINGLE_PAGE
+    page = ScanPage.objects.create(
+        scan_job=job,
+        logical_sequence_number=1,
+        side=ScanPage.Side.LEFT,
+    )
+    with override_settings(APP_DATA_DIR=tmp_path, BOOK_SCANNER_QUEUE_URL=""):
+        observed = scantailor.get_or_create_stage_state(
+            scan_job_id=str(job.id),
+            page_id=str(page.id),
+            stage=ScanTailorStageState.Stage.PAGE_SPLIT.value,
+        )
+        assert scantailor.effective_split_mode(observed) == "none"
+        claimed: list[ScanTailorStageState | None] = []
+        errors: list[BaseException] = []
+
+        def automation() -> None:
+            try:
+                claimed.append(
+                    scantailor._claim_automatic_single_page_split(observed, observed.revision),
+                )
+            except BaseException as exc:  # surfaced by the assertion below
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        with transaction.atomic():
+            # A manual edit in progress holds the row, exactly like the stage view.
+            locked = ScanTailorStageState.objects.select_for_update().get(pk=observed.pk)
+            worker = threading.Thread(target=automation)
+            worker.start()
+            _wait_for_lock_waiter(errors, claimed)
+            locked.parameters = {"split_mode": "manual", "split_x": 140}
+            locked.algorithm = "manual_split"
+            locked.revision += 1
+            locked.save(update_fields=["parameters", "algorithm", "revision", "updated_at"])
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+
+    assert claimed == [None]
+    final = ScanTailorStageState.objects.get(pk=observed.pk)
+    assert final.revision == observed.revision + 1
+    assert final.parameters == {"split_mode": "manual", "split_x": 140}
+    assert final.algorithm == "manual_split"
+    assert not ProcessingJob.objects.filter(
+        job_type=ProcessingJob.JobType.STAGE,
+        details__automatic=True,
+    ).exists()

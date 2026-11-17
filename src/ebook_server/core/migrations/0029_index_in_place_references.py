@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0028_scanjob_capture_layout"),
     ]
 
     operations = [
