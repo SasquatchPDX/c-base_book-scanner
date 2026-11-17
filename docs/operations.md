@@ -622,6 +622,48 @@ this appears during bulk imports. New providers call
 repository URL; an empty value uses that default. Override it to add a contact
 address for your deployment.
 
+## Reviewing imports in bulk
+
+Large source imports create many review tasks. The review queue
+(`/reviews/?view=html`, or `GET /reviews/` as JSON) supports this work:
+
+- Filters: `source` (`upload`, `scan`, or a `SourceLocation` id), `state`
+  (`open`/`claimed`), `min_score`/`max_score` on the top candidate's confidence
+  (0–1), and `has_candidates` (`yes`/`no`).
+- Sorting: `sort=-created` (default), `created`, `-confidence`, `confidence`;
+  tasks without candidates sort last.
+- Pagination: `page` and `page_size` (default
+  `BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE`, 50; capped at 200). JSON responses
+  carry `count` (all matching tasks), `page`, `num_pages` and `page_size`.
+
+Selecting tasks and choosing **Accept top candidate for selected** posts to
+`POST /reviews/batch-accept/` (`task_ids` as repeated form fields or a JSON list;
+an optional `min_score` may only raise the threshold). Each task is checked
+individually with the same permission rule as single-task actions (admins: all
+tasks; members: their own uploads and scan jobs) and is resolved through the same
+code path as accepting a candidate on the detail page. A task is accepted only if:
+
+- its top candidate scores at least `BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE`
+  (default 0.75), and
+- the runner-up trails by more than `BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN`
+  (default 0.05); exact ties are always ambiguous.
+
+Everything else stays open and is reported per task (`accepted`, `ambiguous`,
+`below_min_score`, `no_candidates`, `closed`, `forbidden`, `not_found`,
+`error`). A batch holds at most `BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
+100) tasks. Batch-resolved tasks record `batch_accept`, the scores and the
+thresholds used in `decision_payload`. The originals were already archived when
+the review task was created, so accepting only links records; no archive copy,
+parsing or rendering happens in the request. Front-cover extraction for each
+accepted file is a background job (`intake.extract_front_cover_job`) queued after
+that task's transaction commits, exactly as for a single accept; see "Covers from
+review decisions" below. Batch accept never changes the intake auto-accept
+threshold (`BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`).
+
+The queue shows formats of one book (see `group_sibling_formats`) as one entry,
+grouped within the current page; only that entry has a batch checkbox, and the
+other formats are re-assessed when it is accepted.
+
 ## Workers and external tools
 
 Start RQ workers with the queue name configured by
@@ -773,6 +815,20 @@ read with member size/compression limits; Pillow warnings for decompression bomb
 are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
+
+### Covers from review decisions
+
+Resolving an import in review (accept candidate, merge, manual entry, batch accept,
+or a format sibling linked automatically) does not extract the cover in the web
+request. It queues `ebook_server.core.intake.extract_front_cover_job` with
+`transaction.on_commit`, so the job is dispatched only once the decision is committed
+(a rolled-back decision queues nothing) and runs without holding any row locks. The
+job is idempotent: the Book's existing front cover is reused, so a repeated delivery
+does no storage work. Failing to dispatch is logged as
+`cover_extraction_dispatch_failed` and never undoes the decision. Without a configured
+queue (development only; production requires Redis) a single decision extracts inline
+after commit, while batch accept skips extraction and logs
+`cover_extraction_skipped_no_queue`.
 
 Source-folder imports (not web uploads) prefer a sibling `cover.jpg`, `cover.jpeg`,
 or `cover.png` (Calibre-style) over format extraction, but only when the folder

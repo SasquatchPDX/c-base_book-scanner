@@ -35,6 +35,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
 
+from ebook_server.jobs import get_queue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -47,6 +48,7 @@ from . import genres, identification, metadata_search, referenced_files, source_
 from .models import (
     Author,
     Book,
+    CoverImage,
     FileVariant,
     Identifier,
     ImportJob,
@@ -58,6 +60,7 @@ from .models import (
     clean_publication_year,
 )
 from .storage_registry import archive_root, backend_for_location, default_archive_location
+from .text_header import parse_text_header
 
 logger = structlog.get_logger(__name__)
 
@@ -782,13 +785,27 @@ def _sidecar_conflicts(metadata: dict[str, Any], sidecar: dict[str, Any]) -> lis
     sidecar_isbns = _metadata_isbns(sidecar)
     if embedded_isbns and sidecar_isbns and not embedded_isbns & sidecar_isbns:
         conflicts.append("isbn")
+    # Explicit text-header credits are independent file evidence too (#43).
+    # A filename-matching line or a nearby name-like line remains a weak hint:
+    # neither may turn a sidecar into a conflict on its own.
+    header = metadata.get(identification.TEXT_HEADER_EVIDENCE_KEY)
+    header = header if isinstance(header, dict) else {}
+    rules = header.get("rules")
+    rules = rules if isinstance(rules, list) else []
+    explicit_titles = [
+        rule["title"]
+        for rule in rules
+        if isinstance(rule, dict)
+        and rule.get("rule") in {"labelled title", "gutenberg header", "title by author"}
+        and isinstance(rule.get("title"), str)
+        and not _is_placeholder(rule["title"])
+    ]
     embedded_title = _embedded_title(metadata)
+    titles = [*explicit_titles, *([embedded_title] if embedded_title else [])]
     sidecar_title = sidecar.get("title")
-    if (
-        embedded_title
-        and isinstance(sidecar_title, str)
-        and identification.title_similarity(embedded_title, sidecar_title)
-        < SIDECAR_TITLE_CONFLICT_SCORE
+    if isinstance(sidecar_title, str) and any(
+        identification.title_similarity(title, sidecar_title) < SIDECAR_TITLE_CONFLICT_SCORE
+        for title in titles
     ):
         conflicts.append("title")
     embedded_authors = [
@@ -797,10 +814,18 @@ def _sidecar_conflicts(metadata: dict[str, Any], sidecar: dict[str, Any]) -> lis
         if isinstance(author, str) and not _is_placeholder(author)
     ]
     sidecar_authors = [author for author in sidecar.get("authors") or [] if isinstance(author, str)]
-    if (
-        embedded_authors
-        and sidecar_authors
-        and identification.author_similarity(embedded_authors, sidecar_authors) == 0.0
+    # ``authors`` contains explicit parser rules; ``likely_authors`` is deliberately
+    # excluded. Keep the groups separate so agreeing embedded metadata cannot hide a
+    # contradictory explicit header credit.
+    header_authors = header.get("authors")
+    header_authors = (
+        [name for name in header_authors if isinstance(name, str) and not _is_placeholder(name)]
+        if isinstance(header_authors, list)
+        else []
+    )
+    if sidecar_authors and any(
+        authors and identification.author_similarity(authors, sidecar_authors) == 0.0
+        for authors in (embedded_authors, header_authors)
     ):
         conflicts.append("authors")
     return conflicts
@@ -1315,12 +1340,18 @@ def _extract_format_metadata(
 
 def _extract_text_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     payload = _read_metadata_sample(Path(file_path))
-    _text, encoding = _decode_text_sample(payload)
-    return {
+    text, encoding = _decode_text_sample(payload)
+    metadata: dict[str, Any] = {
         "title": None,
         "raw_metadata": {"encoding": encoding},
         "container_type": "txt",
     }
+    # Plain text has no metadata container; its first lines often name title/author.
+    # Only the extracted hints and the rules that fired are kept, never the lines.
+    header = parse_text_header(text, Path(original_filename).stem)
+    if header is not None:
+        metadata[identification.TEXT_HEADER_EVIDENCE_KEY] = header
+    return metadata
 
 
 def _extract_html_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
@@ -1908,6 +1939,73 @@ def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None)
         )
 
 
+def extract_front_cover_job(file_variant_id: int, import_job_id: str | None = None) -> None:
+    """Background job: extract a variant's front cover once.
+
+    Idempotent: ``covers.extract_front_cover`` returns the Book's existing front cover,
+    so a repeated or duplicate delivery does no storage work.
+    """
+    variant = (
+        FileVariant.objects.select_related("book", "storage_location")
+        .filter(pk=file_variant_id)
+        .first()
+    )
+    if variant is None:
+        logger.info("cover_extraction_variant_missing", file_variant_id=file_variant_id)
+        return
+    job = (
+        ImportJob.objects.select_related("source_location").filter(pk=import_job_id).first()
+        if import_job_id
+        else None
+    )
+    _try_extract_front_cover(variant, job)
+
+
+def schedule_front_cover_extraction(
+    variant: FileVariant,
+    job: ImportJob | None = None,
+    *,
+    inline_fallback: bool = True,
+) -> None:
+    """Extract the front cover in a background job after the current transaction commits.
+
+    Cover extraction copies the whole archived file from network storage and parses or
+    renders it, so review decisions must not do it inside the request or while holding
+    row locks. Without a configured queue (development only; production requires Redis)
+    the extraction runs inline after commit when ``inline_fallback`` is set, and is
+    skipped otherwise (batch review); it is optional and never blocks the decision.
+    """
+    if CoverImage.objects.filter(
+        book_id=variant.book_id,
+        position=CoverImage.CoverPosition.FRONT,
+    ).exists():
+        return
+    file_variant_id = variant.pk
+    import_job_id = str(job.pk) if job is not None else None
+
+    def dispatch() -> None:
+        try:
+            queue = get_queue()
+            if queue is None:
+                if inline_fallback:
+                    extract_front_cover_job(file_variant_id, import_job_id)
+                else:
+                    logger.warning(
+                        "cover_extraction_skipped_no_queue",
+                        file_variant_id=file_variant_id,
+                    )
+                return
+            queue.enqueue(extract_front_cover_job, file_variant_id, import_job_id)
+        except Exception as exc:  # optional work; the committed decision stands
+            logger.warning(
+                "cover_extraction_dispatch_failed",
+                file_variant_id=file_variant_id,
+                error_type=type(exc).__name__,
+            )
+
+    transaction.on_commit(dispatch)
+
+
 def _provision_book_from_manual_metadata(
     *,
     title: str,
@@ -1961,11 +2059,14 @@ def resolve_import_with_review_data(
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
     propagate_to_siblings: bool = True,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant:
     """Resolve a reviewed import; ``source_type`` defaults to the job's origin.
 
     Other formats of the same book waiting in review are then offered ``book``
-    (``_propagate_book_to_siblings``), under the same sibling-group lock.
+    (``_propagate_book_to_siblings``), under the same sibling-group lock. Front-cover
+    extraction is queued after commit (``schedule_front_cover_extraction``); pass
+    ``inline_cover_fallback=False`` where it must never run in the caller's process.
     """
     with _sibling_group_lock(job):
         variant = _resolve_import(
@@ -1978,9 +2079,10 @@ def resolve_import_with_review_data(
             decision=decision,
             decision_notes=decision_notes,
             decision_payload=decision_payload,
+            inline_cover_fallback=inline_cover_fallback,
         )
         if propagate_to_siblings:
-            _propagate_book_to_siblings(job, book)
+            _propagate_book_to_siblings(job, book, inline_cover_fallback=inline_cover_fallback)
     return variant
 
 
@@ -1995,11 +2097,12 @@ def _resolve_import(
     decision: str,
     decision_notes: str,
     decision_payload: dict[str, Any] | None,
+    inline_cover_fallback: bool = True,
 ) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant, job)
+    schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -2263,7 +2366,13 @@ def _annotate_review_task(task: ReviewTask, payload: dict[str, Any]) -> None:
     task.save(update_fields=["decision_payload", "updated_at"])
 
 
-def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: ImportJob) -> bool:
+def _offer_book_to_waiting_job(
+    waiting: ImportJob,
+    book: Book,
+    *,
+    source_job: ImportJob,
+    inline_cover_fallback: bool = True,
+) -> bool:
     """Resolve a sibling waiting in review with ``book`` if the evidence allows it.
 
     Call under ``_sibling_group_lock``. Returns whether the job was linked.
@@ -2333,6 +2442,7 @@ def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: Im
             "rule": "group_sibling_formats",
             SIBLING_REVIEW_PAYLOAD_KEY: assessment.as_evidence(),
         },
+        inline_cover_fallback=inline_cover_fallback,
     )
     logger.info(
         "intake_linked_format_sibling",
@@ -2345,7 +2455,12 @@ def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: Im
     return True
 
 
-def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
+def _propagate_book_to_siblings(
+    job: ImportJob,
+    book: Book,
+    *,
+    inline_cover_fallback: bool = True,
+) -> None:
     """Offer ``book`` to other formats of it that wait in review.
 
     Siblings not processed yet consider it themselves in ``process_import_job``. A
@@ -2359,7 +2474,12 @@ def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
                 continue
             try:
                 with transaction.atomic():
-                    _offer_book_to_waiting_job(sibling, book, source_job=job)
+                    _offer_book_to_waiting_job(
+                        sibling,
+                        book,
+                        source_job=job,
+                        inline_cover_fallback=inline_cover_fallback,
+                    )
             except Exception:
                 logger.exception(
                     "intake_sibling_propagation_failed",

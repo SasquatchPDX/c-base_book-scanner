@@ -497,3 +497,57 @@ def test_generated_marker_detection() -> None:
     assert not intake.opf_is_app_generated(
         GENERATED_OPF.replace('content="true"', 'content="false"').encode("utf-8")
     )
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("title", "author", "conflict"),
+    [("Midworld", "Alan Dean Foster", "title"), ("Phylogenesis", "Someone Else", "authors")],
+)
+def test_sidecar_cannot_override_explicit_text_header_credits(
+    tmp_path: Path, provider: StubProvider, title: str, author: str, conflict: str
+) -> None:
+    root = tmp_path / "library"
+    book_dir = root / "Alan Dean Foster" / title
+    book_dir.mkdir(parents=True)
+    (book_dir / "metadata.opf").write_text(CALIBRE_OPF, encoding="utf-8")
+    (book_dir / f"{title}.txt").write_text(
+        f"Title: {title}\nAuthor: {author}\n\n" + "Actual book text. " * 50,
+        encoding="utf-8",
+    )
+
+    (job,) = _import_all(root, tmp_path)
+
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert job.evidence[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
+    assert job.evidence["text_header"]["title"] == title
+    assert _sidecar_evidence(job)["conflicts"] == [conflict]
+    assert _sidecar_evidence(job)["applied_fields"] == []
+    assert "isbn" not in job.evidence
+    assert provider.isbn_queries == []
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_weak_text_header_names_and_imprint_do_not_block_sidecar(
+    tmp_path: Path, provider: StubProvider
+) -> None:
+    root = tmp_path / "library"
+    book_dir = root / "Alan Dean Foster" / "Phylogenesis"
+    book_dir.mkdir(parents=True)
+    (book_dir / "metadata.opf").write_text(CALIBRE_OPF, encoding="utf-8")
+    (book_dir / "Phylogenesis.txt").write_text(
+        "Phylogenesis\nSomeone Else\nNew York\n\n" + "Actual book text. " * 50,
+        encoding="utf-8",
+    )
+
+    (job,) = _import_all(root, tmp_path)
+
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None and job.book.title == "Phylogenesis"
+    assert job.evidence["text_header"]["authors"] == []
+    assert job.evidence["text_header"]["likely_authors"] == ["Someone Else"]
+    assert _sidecar_evidence(job)["conflicts"] == []
+    assert job.evidence[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_SIDECAR
+    assert provider.isbn_queries
