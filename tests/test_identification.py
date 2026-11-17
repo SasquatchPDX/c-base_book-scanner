@@ -4,8 +4,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+from django.test import override_settings
+
 from ebook_server.core.identification import (
     AUTO_ACCEPT_SCORE,
+    STRONG_MATCH_EVIDENCE_KEY,
     IdentificationCandidate,
     IdentificationInput,
     _title_match_score,
@@ -214,3 +218,231 @@ def test_subset_title_with_matching_author_stays_below_auto_accept() -> None:
     assert [candidate.title for candidate in candidates] == ["Foundation", "Foundation and Earth"]
     assert candidates[1].score < AUTO_ACCEPT_SCORE
     assert candidates[0].score > candidates[1].score
+
+
+def _signals(
+    *,
+    title: str,
+    author: str | None,
+    isbns: list[str] | None = None,
+    language: str | None = None,
+    publication_year: int | None = None,
+) -> IdentificationInput:
+    return IdentificationInput(
+        title_hints=[title],
+        author_hints=[author] if author else [],
+        isbns=isbns or [],
+        folder_hints=[],
+        language=language,
+        publisher=None,
+        description=None,
+        publication_year=publication_year,
+    )
+
+
+def _resolve(
+    signals: IdentificationInput, payloads: list[dict[str, Any]]
+) -> list[IdentificationCandidate]:
+    with patch(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [_stub_provider_from_candidates(payloads)()],
+    ):
+        return resolve_candidates(signals)
+
+
+def _rule_evidence(candidate: IdentificationCandidate) -> dict[str, Any]:
+    evidence = candidate.raw[STRONG_MATCH_EVIDENCE_KEY]
+    assert isinstance(evidence, dict)
+    return evidence
+
+
+def test_pre_isbn_book_with_exact_title_and_author_auto_accepts() -> None:
+    # Regression for #9: title + author alone top out at 0.85, below auto-accept.
+    candidates = _resolve(
+        _signals(title="The Hobbit", author="J.R.R. Tolkien"),
+        [{"title": "The Hobbit", "author_name": ["J.R.R. Tolkien"], "first_publish_year": 1937}],
+    )
+
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["rule"] == "exact_title_strong_author"
+    assert evidence["applied"] is True
+    assert evidence["blocked_by"] == []
+    assert evidence["base_score"] == pytest.approx(0.85)
+    assert evidence["title_score"] == 1.0
+    assert evidence["author_score"] == 1.0
+
+
+def test_author_dash_title_filename_auto_accepts_despite_split_author_hints() -> None:
+    # "Author - Title" puts both halves into the author hints, which halves the
+    # list-level author score; the rule scores each hint on its own.
+    signals = build_identification_input(
+        source_path="/incoming/Isaac Asimov - Foundation.txt",
+        original_filename="Isaac Asimov - Foundation.txt",
+        extracted_metadata={},
+    )
+    candidates = _resolve(signals, [{"title": "Foundation", "author_name": ["Isaac Asimov"]}])
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(candidates[0])
+    assert evidence["title_hint"] == "Foundation"
+    assert evidence["author_hint"] == "Isaac Asimov"
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("Foundation.txt", {"title": "Foundation and Earth", "author_name": ["Isaac Asimov"]}),
+        ("Dune - House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        ("Gold - 03 - Frustration.txt", {"title": "Gold", "author_name": ["Isaac Asimov"]}),
+    ],
+)
+def test_partial_title_or_missing_author_does_not_auto_accept(
+    filename: str, payload: dict[str, Any]
+) -> None:
+    # The wrong matches from the #9 sample re-import must still go to review.
+    signals = build_identification_input(
+        source_path=f"/incoming/{filename}",
+        original_filename=filename,
+        extracted_metadata={},
+    )
+    candidates = _resolve(signals, [payload])
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["applied"] is False
+
+
+def test_subset_title_with_matching_author_is_blocked_as_not_exact() -> None:
+    candidates = _resolve(
+        _signals(title="Foundation", author="Isaac Asimov"),
+        [{"title": "Foundation and Earth", "author_name": ["Isaac Asimov"]}],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["title_not_exact"]
+
+
+def test_title_match_without_author_match_does_not_auto_accept() -> None:
+    candidates = _resolve(
+        _signals(title="Dune", author="Brian Herbert"),
+        [{"title": "Dune", "author_name": ["Frank Herbert"]}],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert "author_not_strong" in _rule_evidence(candidates[0])["blocked_by"]
+
+
+def test_near_tied_candidates_do_not_auto_accept() -> None:
+    candidates = _resolve(
+        _signals(title="Poems", author="Emily Dickinson"),
+        [
+            {"key": "/works/OL1W", "title": "Poems", "author_name": ["Emily Dickinson"]},
+            {"key": "/works/OL2W", "title": "Poems", "author_name": ["Emily Dickinson"]},
+        ],
+    )
+
+    assert all(candidate.score < AUTO_ACCEPT_SCORE for candidate in candidates)
+    evidence = _rule_evidence(candidates[0])
+    assert evidence["applied"] is False
+    assert evidence["blocked_by"] == ["near_tied_candidate"]
+    assert evidence["runner_up_score"] == pytest.approx(0.85)
+
+
+def test_clear_winner_over_weaker_candidate_auto_accepts() -> None:
+    candidates = _resolve(
+        _signals(title="Foundation", author="Isaac Asimov"),
+        [
+            {"title": "Foundation and Earth", "author_name": ["Isaac Asimov"]},
+            {"title": "Foundation", "author_name": ["Isaac Asimov"]},
+        ],
+    )
+
+    assert candidates[0].title == "Foundation"
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    assert candidates[1].score < AUTO_ACCEPT_SCORE
+
+
+def test_conflicting_isbn_blocks_strong_match() -> None:
+    candidates = _resolve(
+        _signals(title="Nineteen Eighty-Four", author="George Orwell", isbns=["9780306406157"]),
+        [
+            {
+                "title": "Nineteen Eighty-Four",
+                "author_name": ["George Orwell"],
+                "isbn": ["9780451524935"],
+            }
+        ],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["conflicting_isbn"]
+
+
+def test_unconfirmed_file_isbn_blocks_strong_match() -> None:
+    candidates = _resolve(
+        _signals(title="Nineteen Eighty-Four", author="George Orwell", isbns=["9780306406157"]),
+        [{"title": "Nineteen Eighty-Four", "author_name": ["George Orwell"]}],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["file_isbn_unconfirmed"]
+
+
+def test_conflicting_language_blocks_strong_match() -> None:
+    candidates = _resolve(
+        _signals(title="Der Process", author="Franz Kafka", language="de"),
+        [{"title": "Der Process", "author_name": ["Franz Kafka"], "language": ["eng"]}],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["conflicting_language"]
+
+
+def test_equivalent_language_codes_are_not_a_conflict() -> None:
+    candidates = _resolve(
+        _signals(title="Der Process", author="Franz Kafka", language="de-DE"),
+        [{"title": "Der Process", "author_name": ["Franz Kafka"], "language": ["eng", "ger"]}],
+    )
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+
+
+def test_file_dated_before_first_publication_blocks_strong_match() -> None:
+    candidates = _resolve(
+        _signals(title="Dune", author="Frank Herbert", publication_year=1920),
+        [{"title": "Dune", "author_name": ["Frank Herbert"], "first_publish_year": 1965}],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["publication_year_mismatch"]
+
+
+def test_later_reprint_year_is_not_a_conflict() -> None:
+    candidates = _resolve(
+        _signals(title="Dune", author="Frank Herbert", publication_year=2005),
+        [{"title": "Dune", "author_name": ["Frank Herbert"], "first_publish_year": 1965}],
+    )
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+
+
+def test_strong_match_rule_can_be_disabled() -> None:
+    with override_settings(BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED=False):
+        candidates = _resolve(
+            _signals(title="The Hobbit", author="J.R.R. Tolkien"),
+            [{"title": "The Hobbit", "author_name": ["J.R.R. Tolkien"]}],
+        )
+
+    assert candidates[0].score == pytest.approx(0.85)
+    assert STRONG_MATCH_EVIDENCE_KEY not in candidates[0].raw
+
+
+def test_build_identification_input_reads_publication_year() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/book.epub",
+        original_filename="book.epub",
+        extracted_metadata={"title": "Book", "date": "1951-06-01"},
+    )
+
+    assert signals.publication_year == 1951

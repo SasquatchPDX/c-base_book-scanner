@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     metadata_user_agent: str = DEFAULT_METADATA_USER_AGENT
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    # Exact-title + strong-author rule for matches without ISBN confirmation
+    # (docs/metadata-providers.md).
+    identification_strong_match_enabled: bool = True
+    identification_strong_match_min_title: float = 1.0
+    identification_strong_match_min_author: float = 0.9
+    identification_strong_match_tie_margin: float = 0.05
+    identification_strong_match_year_tolerance: int = 2
     ocr_service_url: str = "http://localhost:8020"
     ocr_request_timeout: float = 30.0
     ocr_max_attempts: int = 40
@@ -266,6 +273,17 @@ BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED = settings.identification_strong_match_enabled
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE = settings.identification_strong_match_min_title
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR = (
+    settings.identification_strong_match_min_author
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN = (
+    settings.identification_strong_match_tie_margin
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE = (
+    settings.identification_strong_match_year_tolerance
+)
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
 BOOK_SCANNER_OCR_REQUEST_TIMEOUT = settings.ocr_request_timeout
 BOOK_SCANNER_OCR_MAX_ATTEMPTS = settings.ocr_max_attempts

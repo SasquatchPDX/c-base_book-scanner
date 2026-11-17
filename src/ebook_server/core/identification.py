@@ -6,7 +6,7 @@ import importlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -34,6 +34,41 @@ AUTO_ACCEPT_SCORE = getattr(
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
 
+# Strong-evidence rule for candidates without ISBN confirmation (see
+# docs/metadata-providers.md and _apply_strong_match_rule). Its settings are read at
+# call time so they can be tuned per deployment and overridden in tests.
+STRONG_MATCH_RULE = "exact_title_strong_author"
+STRONG_MATCH_EVIDENCE_KEY = "_auto_accept_rule"
+
+# Common ISO 639-1 / 639-2 (B and T) codes and English names, for the language-conflict
+# check only. Unknown values are compared verbatim, which errs towards "conflict".
+_LANGUAGE_ALIASES: dict[str, str] = {
+    alias: code
+    for code, aliases in {
+        "en": ("eng", "english"),
+        "de": ("ger", "deu", "german", "deutsch"),
+        "fr": ("fre", "fra", "french"),
+        "es": ("spa", "spanish"),
+        "it": ("ita", "italian"),
+        "nl": ("dut", "nld", "dutch"),
+        "pt": ("por", "portuguese"),
+        "ru": ("rus", "russian"),
+        "pl": ("pol", "polish"),
+        "cs": ("cze", "ces", "czech"),
+        "sv": ("swe", "swedish"),
+        "da": ("dan", "danish"),
+        "no": ("nor", "nob", "norwegian"),
+        "fi": ("fin", "finnish"),
+        "hu": ("hun", "hungarian"),
+        "el": ("gre", "ell", "greek"),
+        "la": ("lat", "latin"),
+        "tr": ("tur", "turkish"),
+        "ja": ("jpn", "japanese"),
+        "zh": ("chi", "zho", "chinese"),
+    }.items()
+    for alias in (code, *aliases)
+}
+
 
 class MetadataProvider(Protocol):
     """Minimal metadata-provider contract."""
@@ -60,6 +95,7 @@ class IdentificationInput:
     language: str | None
     publisher: str | None
     description: str | None
+    publication_year: int | None = None
 
     def best_title(self) -> str | None:
         return self.title_hints[0] if self.title_hints else None
@@ -242,7 +278,21 @@ def build_identification_input(
         description=extracted_metadata.get("description")
         if isinstance(extracted_metadata.get("description"), str)
         else None,
+        publication_year=_metadata_year(extracted_metadata),
     )
+
+
+def _metadata_year(extracted_metadata: dict[str, Any]) -> int | None:
+    """Publication year from embedded metadata, when an extractor provides one."""
+    for field_name in ("publication_year", "date", "pubdate"):
+        value = extracted_metadata.get(field_name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            match = re.search(r"\b(1[0-9]{3}|20[0-9]{2})\b", value)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 class OpenLibraryMetadataProvider:
@@ -411,7 +461,7 @@ def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandi
         normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
 
     normalized.sort(key=lambda item: item.score, reverse=True)
-    return normalized
+    return _apply_strong_match_rule(signals, normalized)
 
 
 def _query_provider(
@@ -640,3 +690,165 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+@dataclass(frozen=True)
+class StrongMatchSettings:
+    enabled: bool
+    min_title_score: float
+    min_author_score: float
+    tie_margin: float
+    year_tolerance: int
+
+
+def _strong_match_settings() -> StrongMatchSettings:
+    def setting(name: str, default: Any) -> Any:
+        return getattr(django_settings, f"BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_{name}", default)
+
+    return StrongMatchSettings(
+        enabled=bool(setting("ENABLED", True)),
+        min_title_score=float(setting("MIN_TITLE", 1.0)),
+        min_author_score=float(setting("MIN_AUTHOR", 0.9)),
+        tie_margin=float(setting("TIE_MARGIN", 0.05)),
+        year_tolerance=int(setting("YEAR_TOLERANCE", 2)),
+    )
+
+
+def _normalize_language(value: str) -> str:
+    code = normalize_text(value).replace("_", "-").split("-")[0]
+    return _LANGUAGE_ALIASES.get(code, code)
+
+
+def _candidate_languages(candidate: IdentificationCandidate) -> set[str]:
+    values = _as_str_list(candidate.raw.get("language"))
+    if candidate.language:
+        values.append(candidate.language)
+    return {_normalize_language(value) for value in values if normalize_text(value)}
+
+
+def _candidate_isbns(candidate: IdentificationCandidate) -> set[str]:
+    values = [candidate.isbn10 or "", candidate.isbn13 or ""]
+    values.extend(_as_str_list(candidate.raw.get("isbn")))
+    found: set[str] = set()
+    for value in values:
+        found.update(normalize_isbns(value))
+    return found
+
+
+def _strong_match_assessment(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+    config: StrongMatchSettings,
+) -> dict[str, Any]:
+    """Check one candidate against the exact-title + strong-author rule.
+
+    The author side reuses ``_author_match_score`` per author hint, so improvements to
+    author-name matching apply here too. Scoring each hint on its own avoids the
+    dilution a filename split causes ("Author - Title" yields both halves as author
+    hints), while the matched title and author must come from different hints.
+    """
+    title_score, title_hint = max(
+        ((_title_match_score(hint, candidate.title), hint) for hint in signals.title_hints),
+        default=(0.0, ""),
+    )
+    author_score, author_hint = max(
+        ((_author_match_score([hint], candidate.authors), hint) for hint in signals.author_hints),
+        default=(0.0, ""),
+    )
+    blocked_by: list[str] = []
+    if title_score < config.min_title_score:
+        blocked_by.append("title_not_exact")
+    if author_score < config.min_author_score:
+        blocked_by.append("author_not_strong")
+    if title_hint and default_process(title_hint) == default_process(author_hint):
+        blocked_by.append("title_and_author_from_same_hint")
+
+    if signals.isbns:
+        candidate_isbns = _candidate_isbns(candidate)
+        if not candidate_isbns:
+            blocked_by.append("file_isbn_unconfirmed")
+        elif not candidate_isbns.intersection(signals.isbns):
+            blocked_by.append("conflicting_isbn")
+
+    if signals.language:
+        candidate_languages = _candidate_languages(candidate)
+        if candidate_languages and _normalize_language(signals.language) not in candidate_languages:
+            blocked_by.append("conflicting_language")
+
+    if (
+        signals.publication_year is not None
+        and candidate.publication_year is not None
+        and signals.publication_year < candidate.publication_year - config.year_tolerance
+    ):
+        # A file dated before the work's first publication is a different book; a later
+        # year is normal for reprints and is not treated as a conflict.
+        blocked_by.append("publication_year_mismatch")
+
+    return {
+        "title_score": round(title_score, 4),
+        "title_hint": title_hint,
+        "author_score": round(author_score, 4),
+        "author_hint": author_hint,
+        "blocked_by": blocked_by,
+    }
+
+
+def _apply_strong_match_rule(
+    signals: IdentificationInput,
+    candidates: list[IdentificationCandidate],
+) -> list[IdentificationCandidate]:
+    """Let an unambiguous exact-title + strong-author match reach auto-accept.
+
+    Title and author alone score at most 0.85, below the auto-accept threshold, so
+    books without ISBN, language or publisher metadata (pre-ISBN books, plain-text
+    files) could never be accepted automatically. When the top candidate passes
+    ``_strong_match_assessment`` with no conflicting signal, and no other candidate is
+    near-tied with it or also passes, its score is raised to the auto-accept
+    threshold. The decision and its inputs are recorded in the candidate's raw payload
+    under ``STRONG_MATCH_EVIDENCE_KEY`` whether or not the rule applied.
+    """
+    if not candidates:
+        return candidates
+    config = _strong_match_settings()
+    top = candidates[0]
+    if not config.enabled or top.score >= AUTO_ACCEPT_SCORE:
+        return candidates
+
+    assessment = _strong_match_assessment(signals, top, config)
+    blocked_by = list(assessment["blocked_by"])
+    runner_up_score = candidates[1].score if len(candidates) > 1 else None
+    if runner_up_score is not None and top.score - runner_up_score <= config.tie_margin:
+        blocked_by.append("near_tied_candidate")
+    elif any(
+        not _strong_match_assessment(signals, other, config)["blocked_by"]
+        for other in candidates[1:]
+    ):
+        blocked_by.append("multiple_qualifying_candidates")
+
+    applied = not blocked_by
+    evidence = {
+        "rule": STRONG_MATCH_RULE,
+        "applied": applied,
+        "blocked_by": blocked_by,
+        "base_score": round(top.score, 4),
+        "auto_accept_threshold": AUTO_ACCEPT_SCORE,
+        "runner_up_score": round(runner_up_score, 4) if runner_up_score is not None else None,
+        "tie_margin": config.tie_margin,
+        "title_score": assessment["title_score"],
+        "title_hint": assessment["title_hint"],
+        "author_score": assessment["author_score"],
+        "author_hint": assessment["author_hint"],
+    }
+    if applied:
+        logger.info(
+            "identification_strong_match_applied",
+            rule=STRONG_MATCH_RULE,
+            provider_id=top.provider_id,
+            base_score=top.score,
+        )
+    promoted = replace(
+        top,
+        score=max(top.score, AUTO_ACCEPT_SCORE) if applied else top.score,
+        raw={**top.raw, STRONG_MATCH_EVIDENCE_KEY: evidence},
+    )
+    return [promoted, *candidates[1:]]
