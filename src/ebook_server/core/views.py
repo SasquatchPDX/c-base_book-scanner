@@ -13,6 +13,7 @@ from decimal import Decimal
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import redis
@@ -40,7 +41,7 @@ from django.http import (
 from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
 from django.utils import timezone
-from django.utils.http import url_has_allowed_host_and_scheme, urlencode
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
