@@ -139,6 +139,8 @@ def test_put_job_creates_open_job(device: tuple[ScannerDevice, str], settings: A
         "capture_layout": "single_page",
         "events": {"sans_last_line_no": 0},
         "pages": [],
+        # Registered by the OPF store (#130); null until the scanner sends one.
+        "metadata_opf": None,
         "open_rescans": 0,
     }
     job = ScanJob.objects.get(pk=JOB_ID)

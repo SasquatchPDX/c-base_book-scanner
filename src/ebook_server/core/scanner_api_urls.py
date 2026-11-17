@@ -16,6 +16,11 @@ urlpatterns = [
         name="scanner-api-capture-complete",
     ),
     re_path(r"^jobs/(?P<job_id>[^/]+)/abort/?$", scanner_api.abort, name="scanner-api-abort"),
+    re_path(
+        r"^jobs/(?P<job_id>[^/]+)/metadata/?$",
+        scanner_api.metadata,
+        name="scanner-api-metadata",
+    ),
     # Must stay last: everything else under the namespace is a JSON 404 (after auth).
     re_path(r"^(?P<path>.*)$", scanner_api.not_found, name="scanner-api-not-found"),
 ]

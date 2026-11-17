@@ -11,7 +11,12 @@ class CoreConfig(AppConfig):
     verbose_name = "Core"
 
     def ready(self) -> None:
-        from . import checks  # noqa: F401  (registers system checks)
+        from . import (
+            checks,  # noqa: F401  (registers system checks)
+            scanner_opf,
+        )
         from .search import connect_signals
 
         connect_signals()
+        # Scanner metadata.opf (#130): manifest source, raw-scan annotator, book linker.
+        scanner_opf.register()

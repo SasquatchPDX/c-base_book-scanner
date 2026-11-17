@@ -182,7 +182,89 @@ so far. Until a feature is stored on serif it is "nothing expected":
   `capture-complete` compares the request's `sans_last_line_no` with that `0`.
 
 S4 and S6 call `scan_manifest.register_manifest_source(...)`; S5 calls
-`scan_manifest.register_event_high_water_mark(...)`.
+`scan_manifest.register_event_high_water_mark(...)`. S6 (#130) registers `metadata_opf`:
+`GET jobs/{id}` reports `"metadata_opf": {"sha256", "version"}` (or `null`), and a
+capture-complete `metadata_opf: {"sha256"}` must match the current OPF version
+(`missing`/`mismatched` item key `metadata_opf`; `null` expects nothing).
+
+## Scanner `metadata.opf` (#130, contract D3, §4.5, §6.8)
+
+`PUT /api/scanner/v1/jobs/{job_id}/metadata` takes `multipart/form-data` with two parts:
+`metadata` (JSON `{"sha256": "<lowercase hex>"}`) and `opf`
+(`application/oebps-package+xml`, at most `BOOK_SCANNER_SCANNER_MAX_OPF_BYTES`, default
+1 MiB).
+
+| Status | Meaning |
+|---|---|
+| `201` | Stored as a new version (versions are immutable; the newest is current). |
+| `200` | The checksum equals the current version. Nothing changes. |
+| `400 invalid_request` | Not multipart, or the `metadata`/`opf` part is missing or malformed. |
+| `413 payload_too_large` | The OPF is larger than the limit. |
+| `422 checksum_mismatch` | The `opf` bytes do not match `sha256`. |
+| `422 invalid_opf` | Not well-formed XML, no `package/metadata`, or forbidden XML (DTD entities such as "billion laughs", external entities/XXE). Parsed with `defusedxml`; nothing is expanded or fetched. |
+| `409 job_state` | The job is `cancelled`. |
+| `404` | Unknown job, or not a scanner job. |
+
+The response carries `metadata_opf` (`sha256`, `version`) and the parsed `metadata`
+(title, authors, ISBN, language). Fields come from the intake OPF-sidecar parser
+(`intake.parse_opf_metadata`); the ISBN is stored in its ISBN-13 form. The raw bytes of every
+version are kept in `ScanJobOpf`. An OPF carrying the application's own marker
+`<meta name="ebook-server:generated" content="true"/>` is stored but never used as metadata.
+
+**While the scan is raw** the current OPF's title, authors, ISBN and language are shown on
+the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`) and in
+**Raw scans** (`/scan/raw/`, `metadata`). No Book is created.
+
+**At finish** (`scan_lifecycle.register_book_linker`, `scanner_opf.link_book_from_opf`):
+
+1. The OPF's ISBN matches exactly one Book: the job is linked to it and gains a new
+   variant. The OPF fills that Book's empty fields; a differing field opens a review.
+2. Otherwise a new Book is created from the OPF fields. Every field gets a provenance row
+   with source `scanner_opf` (`BookMetadataProvenance`).
+3. No OPF, or an OPF without a title: the existing scan identification and review queue
+   run, with the OPF's authors as hints.
+
+Two cases go to scan identification and its review instead of guessing (AGENTS.md):
+an ISBN that **several** Books carry, and an **ISBN-less** OPF whose normalised title and
+author set equal an existing Book's (a likely duplicate). The review page shows the
+scanner metadata, a "Link to existing book" button per possible duplicate and "Create a
+new book from the scanner metadata" (`POST /reviews/{id}/scanner-opf/`,
+`action=create_book`).
+
+**An OPF received after linking** is applied to the Book field by field:
+
+- an empty field is filled;
+- a field the scanner set last, and that nobody changed since, is updated (with a history
+  row holding the old and new value);
+- a field a reviewer edited by hand (admin edits are recorded as `reviewer` provenance),
+  or whose value came from another source or changed outside the scanner, is **not**
+  overwritten. The conflict opens a `quality_review` task listing scanner and current
+  values, with "keep the current values" preselected
+  (`POST /reviews/{id}/scanner-opf/`, `action=resolve`, `choice=current|scanner`).
+
+### Owner decision: scanner OPF is primary, and it is still verified externally
+
+Contract decision D3 says the scanner's OPF is authoritative and server-side
+identification only runs when the scanner sends no title. AGENTS.md says external
+metadata verification is mandatory for intake. The project owner decided to satisfy both:
+
+- The scanner OPF is the primary metadata source. Book creation and linking follow §4.5
+  as above, without waiting for providers.
+- After a Book is created or linked from an OPF (and after each later OPF version applied
+  to it), a background job (`ProcessingJob` type `scanner_opf_check`) looks the OPF's
+  title, authors and ISBN up through the existing provider abstraction. Provider calls
+  are rate-limited as always (`core/rate_limit.py`).
+- Provider records whose own identifiers carry the OPF's ISBN decide; without such a
+  record only candidates at or above `BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT` count.
+  - `confirmed` (one of them agrees with title and authors), `no_results`,
+    `inconclusive` (only weak matches) or `provider_error`: the scanner metadata stays.
+  - `contradicted` (a confident record names another title or other authors, for example
+    the record for the scanner's ISBN describes a different book): nothing is
+    overwritten. A `quality_review` task shows the scanner values next to the provider
+    record, with **the scanner OPF preselected** (`choice=scanner|provider`). Choosing
+    the provider record writes it as a reviewer edit, which later OPFs do not overwrite.
+- The result is recorded on the OPF version (`ScanJobOpf.provider_check`), in the Book's
+  provenance (`action=provider_check`) and in the processing job's details.
 
 ## Raw scans (#127, contract §5)
 

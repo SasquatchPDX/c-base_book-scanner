@@ -1,0 +1,596 @@
+"""Scanner ``metadata.opf`` (#130, libreflip contract D3, §4.5, §6.8).
+
+* ``PUT jobs/{id}/metadata``: versions, checksum, size, malformed and hostile XML;
+* raw scans show the OPF and create no Book;
+* the three finish linking paths (ISBN match, new Book, identification) and the
+  duplicate/ambiguous routes to review;
+* OPF updates after linking, hand-edited fields and their review task;
+* the background provider check (owner decision on D3 vs AGENTS.md).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from django.test import Client
+
+from ebook_server.core import identification, scan_identification, scan_pipeline, scanner_opf
+from ebook_server.core.models import (
+    Author,
+    Book,
+    BookMetadataProvenance,
+    FileVariant,
+    Identifier,
+    ProcessingJob,
+    ReviewTask,
+    ScanJob,
+    ScanJobOpf,
+    ScannerDevice,
+    get_or_create_profile,
+)
+from ebook_server.core.scanner_devices import create_device
+from tests.test_raw_scan_lifecycle import (
+    JOB_ID,
+    _add_page,
+    _auth,
+    _capture_complete,
+    _manifest,
+    _register,
+    _status,
+)
+
+ISBN = "9780306406157"
+OTHER_ISBN = "9780140449136"
+
+
+def _opf(
+    title: str | None = "The Physical Book",
+    authors: tuple[str, ...] = ("Ada Scanner",),
+    isbn: str | None = ISBN,
+    language: str | None = "en",
+    extra: str = "",
+) -> bytes:
+    parts = []
+    if title is not None:
+        parts.append(f"<dc:title>{title}</dc:title>")
+    for author in authors:
+        parts.append(f'<dc:creator opf:role="aut">{author}</dc:creator>')
+    if isbn is not None:
+        parts.append(f'<dc:identifier opf:scheme="ISBN">{isbn}</dc:identifier>')
+    if language is not None:
+        parts.append(f"<dc:language>{language}</dc:language>")
+    body = "".join(parts) + extra
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:opf="http://www.idpf.org/2007/opf">'
+        f"{body}</metadata></package>"
+    ).encode()
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _put_opf(key: str, payload: bytes, *, sha: str | None = None, job_id: str = JOB_ID) -> Any:
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
+
+    body = encode_multipart(
+        BOUNDARY,
+        {
+            "metadata": json.dumps({"sha256": sha or _sha(payload)}),
+            "opf": SimpleUploadedFile(
+                "metadata.opf", payload, content_type="application/oebps-package+xml"
+            ),
+        },
+    )
+    return Client().put(
+        f"/api/scanner/v1/jobs/{job_id}/metadata",
+        data=body,
+        content_type=MULTIPART_CONTENT,
+        headers=_auth(key),
+    )
+
+
+class _StubProvider:
+    provider_id = "opf-stub"
+
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        self.records = records
+
+    def search(self, title: str | None = None, **_kwargs: Any) -> list[dict[str, Any]]:
+        return list(self.records)
+
+
+@pytest.fixture(autouse=True)
+def providers(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
+    """Provider records every lookup returns; empty by default (no network in tests)."""
+    records: list[dict[str, Any]] = []
+    monkeypatch.setattr(identification, "_provider_instances", lambda: [_StubProvider(records)])
+    yield records
+
+
+@pytest.fixture
+def device(db: None) -> tuple[ScannerDevice, str]:
+    return create_device("libreflip-01")
+
+
+@pytest.fixture
+def admin_client(db: None) -> Client:
+    profile = get_or_create_profile("opf-admin")
+    profile.role = "admin"
+    profile.save()
+    client = Client()
+    client.force_login(profile.user)
+    return client
+
+
+def _finish(client: Client) -> Any:
+    return client.post(f"/scan/jobs/{JOB_ID}/finish/", data={"allow_raw_pages": "true"})
+
+
+# --- PUT jobs/{id}/metadata (§6.8) -------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_upload_is_versioned_and_idempotent(device: tuple[ScannerDevice, str]) -> None:
+    _, key = device
+    _register(key)
+    first = _opf()
+
+    created = _put_opf(key, first)
+    assert created.status_code == 201, created.content
+    assert created.json()["metadata_opf"] == {"sha256": _sha(first), "version": 1}
+    assert created.json()["metadata"]["title"] == "The Physical Book"
+    assert created.json()["metadata"]["isbn"] == ISBN
+
+    repeated = _put_opf(key, first)
+    assert repeated.status_code == 200
+    assert ScanJobOpf.objects.count() == 1
+
+    second = _opf(title="The Physical Book, Revised")
+    assert _put_opf(key, second).status_code == 201
+    assert _status(key).json()["metadata_opf"] == {"sha256": _sha(second), "version": 2}
+    versions = list(ScanJobOpf.objects.order_by("version"))
+    assert [v.version for v in versions] == [1, 2]
+    assert bytes(versions[0].content) == first  # earlier versions are kept
+    assert versions[1].source == "scanner"
+    # A raw scan creates no Book (D6).
+    assert Book.objects.count() == 0
+    assert ScanJob.objects.get(pk=JOB_ID).provisional_title == "The Physical Book, Revised"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        (b"not xml at all", "invalid_opf"),
+        (b"<package xmlns='http://www.idpf.org/2007/opf'/>", "invalid_opf"),
+        (b"<html><metadata/></html>", "invalid_opf"),
+        (
+            b'<?xml version="1.0"?><!DOCTYPE package [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+            b"<package><metadata><title>&xxe;</title></metadata></package>",
+            "invalid_opf",
+        ),
+        (
+            b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">'
+            b'<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+            b'<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">]>'
+            b"<package><metadata><title>&lol3;</title></metadata></package>",
+            "invalid_opf",
+        ),
+    ],
+    ids=["not-xml", "no-metadata", "not-package", "xxe", "billion-laughs"],
+)
+def test_malformed_or_hostile_opf_is_rejected(
+    device: tuple[ScannerDevice, str], payload: bytes, code: str
+) -> None:
+    _, key = device
+    _register(key)
+    response = _put_opf(key, payload)
+    assert response.status_code == 422, response.content
+    assert response.json()["error"]["code"] == code
+    assert ScanJobOpf.objects.count() == 0
+    assert b"passwd" not in response.content and b"lollol" not in response.content
+
+
+@pytest.mark.django_db
+def test_checksum_size_state_and_ownership(
+    device: tuple[ScannerDevice, str], settings: Any
+) -> None:
+    _, key = device
+    _register(key)
+    mismatch = _put_opf(key, _opf(), sha="0" * 64)
+    assert mismatch.status_code == 422
+    assert mismatch.json()["error"]["code"] == "checksum_mismatch"
+
+    settings.BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = 100
+    too_large = _put_opf(key, _opf())
+    assert too_large.status_code == 413
+    assert too_large.json()["error"]["code"] == "payload_too_large"
+    settings.BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = 1024 * 1024
+
+    missing = Client().put(
+        f"/api/scanner/v1/jobs/{JOB_ID}/metadata",
+        data=b"{}",
+        content_type="application/json",
+        headers=_auth(key),
+    )
+    assert missing.status_code == 400
+
+    _, other_key = create_device("libreflip-02")
+    assert _put_opf(other_key, _opf()).status_code == 404
+
+    ScanJob.objects.filter(pk=JOB_ID).update(state=ScanJob.State.CANCELLED)
+    cancelled = _put_opf(key, _opf())
+    assert cancelled.status_code == 409
+    assert cancelled.json()["error"]["code"] == "job_state"
+
+
+@pytest.mark.django_db
+def test_capture_complete_checks_the_opf_checksum(device: tuple[ScannerDevice, str]) -> None:
+    _, key = device
+    _register(key)
+    payload = _opf()
+    missing = _capture_complete(key, _manifest({}, metadata_opf={"sha256": _sha(payload)}))
+    assert missing.status_code == 409
+    assert missing.json()["error"]["details"]["missing"] == ["metadata_opf"]
+
+    assert _put_opf(key, payload).status_code == 201
+    wrong = _capture_complete(key, _manifest({}, metadata_opf={"sha256": "b" * 64}))
+    assert wrong.json()["error"]["details"]["mismatched"] == ["metadata_opf"]
+    assert (
+        _capture_complete(key, _manifest({}, metadata_opf={"sha256": _sha(payload)})).status_code
+        == 200
+    )
+
+
+@pytest.mark.django_db
+def test_raw_scan_shows_opf_on_job_page_and_raw_scans(
+    device: tuple[ScannerDevice, str], admin_client: Client
+) -> None:
+    _, key = device
+    _register(key)
+    assert _put_opf(key, _opf(language="ger")).status_code == 201
+    assert _capture_complete(key, _manifest({})).status_code == 200
+
+    page = admin_client.get(f"/scan/jobs/{JOB_ID}/workspace/?view=html").content.decode()
+    assert "The Physical Book" in page
+    assert "Ada Scanner" in page
+    assert ISBN in page
+    assert "data-opf-language>de<" in page
+
+    item = admin_client.get("/scan/raw/").json()["items"][0]
+    assert item["title"] == "The Physical Book"
+    assert item["metadata"]["authors"] == ["Ada Scanner"]
+    assert item["metadata"]["isbn"] == ISBN
+    assert item["metadata"]["language"] == "de"
+    assert ISBN in admin_client.get("/scan/raw/?view=html").content.decode()
+    assert Book.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_app_generated_opf_is_stored_but_not_used(device: tuple[ScannerDevice, str]) -> None:
+    _, key = device
+    _register(key)
+    _put_opf(key, _opf())
+    generated = _opf(
+        title="Our Own Output",
+        extra='<meta name="ebook-server:generated" content="true"/>',
+    )
+    assert _put_opf(key, generated).status_code == 201
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert scanner_opf.current_opf(job).app_generated is True  # type: ignore[union-attr]
+    assert scanner_opf.effective_opf(job).version == 1  # type: ignore[union-attr]
+    assert scanner_opf.display_metadata(job)["title"] == "The Physical Book"  # type: ignore[index]
+
+
+# --- finish: the three linking paths (§4.5) -----------------------------------------------
+
+
+def _prepare_finish(key: str, member: Client, payload: bytes | None) -> None:
+    _register(key)
+    _add_page(member, JOB_ID, 1, b"one")
+    if payload is not None:
+        assert _put_opf(key, payload).status_code == 201
+
+
+@pytest.mark.django_db(transaction=True)
+def test_finish_links_the_one_book_with_the_isbn(
+    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    _, key = device
+    existing = Book.objects.create(title="The Physical Book")
+    Identifier.objects.create(book=existing, kind="isbn13", value=ISBN, normalized_value=ISBN)
+    _prepare_finish(key, admin_client, _opf())
+    assert Book.objects.count() == 1  # still raw: nothing created
+
+    response = _finish(admin_client)
+
+    assert response.status_code == 202, response.content
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert job.book_id == existing.pk
+    assert job.state == ScanJob.State.COMPLETE
+    assert Book.objects.count() == 1
+    assert FileVariant.objects.filter(book=existing).exists()  # a new variant ("Book != File")
+    existing.refresh_from_db()
+    assert existing.language == "en"  # an empty field is filled from the OPF
+    assert job.notes["book_link"]["path"] == "isbn_match"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_finish_creates_a_book_from_the_opf(
+    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    _, key = device
+    _prepare_finish(key, admin_client, _opf())
+
+    response = _finish(admin_client)
+
+    assert response.status_code == 202, response.content
+    assert "requires_bibliographic_review" not in response.json()
+    book = Book.objects.get()
+    assert book.title == "The Physical Book"
+    assert [a.full_name for a in book.authors.all()] == ["Ada Scanner"]
+    assert book.language == "en"
+    assert set(book.identifiers.values_list("value", flat=True)) == {ISBN, "0306406152"}
+    sources = set(
+        BookMetadataProvenance.objects.filter(book=book, action="set").values_list(
+            "field", "source"
+        )
+    )
+    assert sources == {
+        ("title", "scanner_opf"),
+        ("authors", "scanner_opf"),
+        ("isbn", "scanner_opf"),
+        ("language", "scanner_opf"),
+    }
+    # The external check ran in the background and found nothing: scanner data stays.
+    check = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.SCANNER_OPF_CHECK)
+    assert check.state == ProcessingJob.JobState.SUCCESS
+    assert check.details["result"]["status"] == scanner_opf.CHECK_NO_RESULTS
+    assert BookMetadataProvenance.objects.filter(
+        book=book, action="provider_check", value="no_results"
+    ).exists()
+    assert not ReviewTask.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("payload", [None, _opf(title=None)], ids=["no-opf", "no-title"])
+def test_finish_without_opf_title_runs_scan_identification(
+    device: tuple[ScannerDevice, str],
+    admin_client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes | None,
+) -> None:
+    _, key = device
+    _prepare_finish(key, admin_client, payload)
+    calls: list[str] = []
+
+    def identify(*, scan_job: ScanJob, requested_by_user_id: int | None) -> Any:
+        calls.append(scan_job.pk)
+        raise scan_identification.ScanIdentificationError("identification queued (stub)")
+
+    monkeypatch.setattr(scan_identification, "request_scan_identification", identify)
+    response = _finish(admin_client)
+
+    assert calls == [JOB_ID]
+    assert response.status_code == 400
+    assert Book.objects.count() == 0
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert job.book_id is None
+    if payload is not None:
+        assert job.notes["scanner_opf"]["reason"] == "no_title"
+        assert job.provisional_authors == ["Ada Scanner"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_less_duplicate_routes_to_review_and_can_create_a_book(
+    device: tuple[ScannerDevice, str], admin_client: Client
+) -> None:
+    _, key = device
+    existing = Book.objects.create(title="The Physical Book")
+    existing.authors.add(Author.objects.create(full_name="Ada Scanner"))
+    _prepare_finish(key, admin_client, _opf(isbn=None))
+
+    response = _finish(admin_client)
+
+    assert response.status_code == 202, response.content
+    assert response.json()["requires_bibliographic_review"] is True
+    assert Book.objects.count() == 1  # no silent duplicate
+    job = ScanJob.objects.get(pk=JOB_ID)
+    assert job.notes["scanner_opf"]["reason"] == "possible_duplicate"
+    assert job.notes["scanner_opf"]["possible_duplicate_book_ids"] == [existing.pk]
+    task = ReviewTask.objects.get(scan_job=job)
+    assert task.embedded_metadata["scanner_opf"]["reason"] == "possible_duplicate"
+
+    detail = admin_client.get(f"/reviews/{task.pk}/")
+    assert detail.json()["scanner_opf"]["possible_duplicate_book_ids"] == [existing.pk]
+    html = admin_client.get(f"/reviews/{task.pk}/?view=html").content.decode()
+    assert "Create a new book from the scanner metadata" in html
+    assert f'data-possible-duplicate="{existing.pk}"' in html
+
+    created = admin_client.post(f"/reviews/{task.pk}/scanner-opf/", {"action": "create_book"})
+    assert created.status_code == 200, created.content
+    book = Book.objects.exclude(pk=existing.pk).get()
+    assert ScanJob.objects.get(pk=JOB_ID).book_id == book.pk
+    assert BookMetadataProvenance.objects.filter(book=book, source="scanner_opf").exists()
+    assert ReviewTask.objects.get(pk=task.pk).state == ReviewTask.State.RESOLVED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_on_several_books_routes_to_review(
+    device: tuple[ScannerDevice, str], admin_client: Client
+) -> None:
+    _, key = device
+    for title in ("Copy A", "Copy B"):
+        book = Book.objects.create(title=title)
+        Identifier.objects.create(book=book, kind="isbn13", value=ISBN, normalized_value=ISBN)
+    _prepare_finish(key, admin_client, _opf())
+
+    assert _finish(admin_client).json()["requires_bibliographic_review"] is True
+    assert Book.objects.count() == 2
+    assert ScanJob.objects.get(pk=JOB_ID).notes["scanner_opf"]["reason"] == "ambiguous_isbn"
+
+
+# --- OPF after linking ---------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_opf_after_linking_updates_scanner_fields_but_not_hand_edits(
+    device: tuple[ScannerDevice, str], admin_client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    _, key = device
+    _prepare_finish(key, admin_client, _opf())
+    assert _finish(admin_client).status_code == 202
+    book = Book.objects.get()
+
+    # A reviewer corrects the language by hand (the admin records this).
+    before = scanner_opf.snapshot_book(book)
+    book.language = "fr"
+    book.save()
+    scanner_opf.record_reviewer_edits(book, before, user=None)
+
+    newer = _opf(title="The Physical Book, Second Edition", language="de")
+    assert _put_opf(key, newer).status_code == 201
+
+    book.refresh_from_db()
+    assert book.title == "The Physical Book, Second Edition"  # scanner-owned: updated
+    assert book.language == "fr"  # hand-edited: kept
+    history = list(
+        BookMetadataProvenance.objects.filter(book=book, field="title", action="set").order_by("id")
+    )
+    assert [row.value for row in history] == [
+        "The Physical Book",
+        "The Physical Book, Second Edition",
+    ]
+    assert history[-1].previous_value == "The Physical Book"
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID, state=ReviewTask.State.OPEN)
+    review = task.decision_payload["scanner_opf"]
+    assert review["kind"] == scanner_opf.KIND_FIELD_CONFLICT
+    assert review["preselected"] == "current"
+    assert [c["field"] for c in review["conflicts"]] == ["language"]
+    html = admin_client.get(f"/reviews/{task.pk}/?view=html").content.decode()
+    assert 'data-scanner-opf-review="field_conflict"' in html
+    assert 'value="current" checked' in html
+
+    resolved = admin_client.post(
+        f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "scanner"}
+    )
+    assert resolved.status_code == 200, resolved.content
+    book.refresh_from_db()
+    assert book.language == "de"
+    assert ReviewTask.objects.get(pk=task.pk).state == ReviewTask.State.RESOLVED
+
+
+# --- external provider check --------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_provider_confirmation_keeps_scanner_metadata(
+    device: tuple[ScannerDevice, str],
+    admin_client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    providers: list[dict[str, Any]],
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    providers.append(
+        {
+            "key": "/works/OL1W",
+            "title": "The Physical Book: A Novel",
+            "author_name": ["Ada Scanner"],
+            "isbn": [ISBN],
+        }
+    )
+    _, key = device
+    _prepare_finish(key, admin_client, _opf())
+    assert _finish(admin_client).status_code == 202
+
+    opf = ScanJobOpf.objects.get()
+    assert opf.provider_check["status"] == scanner_opf.CHECK_CONFIRMED
+    assert opf.provider_check["basis"] == "isbn_record"
+    assert Book.objects.get().title == "The Physical Book"
+    assert not ReviewTask.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_provider_contradiction_opens_review_with_scanner_preselected(
+    device: tuple[ScannerDevice, str],
+    admin_client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    providers: list[dict[str, Any]],
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    providers.append(
+        {
+            "key": "/works/OL2W",
+            "title": "A Completely Different Book",
+            "author_name": ["Someone Else"],
+            "isbn": [ISBN],
+        }
+    )
+    _, key = device
+    _prepare_finish(key, admin_client, _opf())
+    assert _finish(admin_client).status_code == 202
+
+    book = Book.objects.get()
+    assert book.title == "The Physical Book"  # never overwritten automatically
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+    review = task.decision_payload["scanner_opf"]
+    assert review["kind"] == scanner_opf.KIND_PROVIDER_CONFLICT
+    assert review["preselected"] == "scanner"
+    assert review["provider"]["title"] == "A Completely Different Book"
+    assert ScanJobOpf.objects.get().provider_check["status"] == scanner_opf.CHECK_CONTRADICTED
+    html = admin_client.get(f"/reviews/{task.pk}/?view=html").content.decode()
+    assert 'value="scanner" checked' in html
+    assert "A Completely Different Book" in html
+
+    assert (
+        admin_client.post(
+            f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "bogus"}
+        ).status_code
+        == 400
+    )
+    resolved = admin_client.post(
+        f"/reviews/{task.pk}/scanner-opf/", {"action": "resolve", "choice": "provider"}
+    )
+    assert resolved.status_code == 200, resolved.content
+    book.refresh_from_db()
+    assert book.title == "A Completely Different Book"
+    assert [a.full_name for a in book.authors.all()] == ["Someone Else"]
+    # A reviewer's choice is now protected from later scanner OPFs.
+    assert scanner_opf.latest_set(book, "title").source == "reviewer"  # type: ignore[union-attr]
+    assert _put_opf(key, _opf(title="The Physical Book (again)")).status_code == 201
+    book.refresh_from_db()
+    assert book.title == "A Completely Different Book"
+
+
+def test_assess_ignores_weak_matches() -> None:
+    weak = identification.IdentificationCandidate(
+        provider_id="p",
+        provider_ref="r",
+        title="Unrelated",
+        authors=["X"],
+        isbn10=None,
+        isbn13=None,
+        language=None,
+        description=None,
+        publisher=None,
+        edition=None,
+        publication_year=None,
+        score=0.2,
+        raw={},
+    )
+    result = scanner_opf.assess_provider_result(
+        {"title": "The Physical Book", "authors": ["Ada Scanner"], "isbn": None}, [weak], []
+    )
+    assert result["status"] == scanner_opf.CHECK_INCONCLUSIVE
