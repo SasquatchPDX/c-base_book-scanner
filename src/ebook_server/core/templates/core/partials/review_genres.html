@@ -1,0 +1,34 @@
+{% comment %}
+  Genre picker inside a candidate's accept form (#50). Expects ``candidate`` (with the
+  view-attached ``genre_suggestion``) and ``all_genres``. Ticked genres are saved as
+  reviewer-set; unticking all of them accepts the candidate with no genres.
+{% endcomment %}
+{% with suggestion=candidate.genre_suggestion %}
+  <fieldset class="genre-picker" data-genre-source="{{ suggestion.source }}">
+    <legend>Genres</legend>
+    <input type="hidden" name="genres_reviewed" value="1">
+    {% for match in suggestion.matches %}
+      {% if match.genre %}<p class="muted genre-mapping">{{ match.tag }} → {{ match.genre.name }}</p>{% endif %}
+    {% endfor %}
+    {% if suggestion.source == "embedded" %}
+      <p class="muted">Suggested from the file's own tags; the provider's subjects map to no genre.</p>
+    {% elif not suggestion.source %}
+      <p class="muted">No tag maps to a known genre.</p>
+    {% endif %}
+    {% for genre in all_genres %}
+      {% if genre.pk in suggestion.genre_ids %}
+        <label class="checkbox"><input type="checkbox" name="genre_ids" value="{{ genre.pk }}" checked> {{ genre.name }}</label>
+      {% endif %}
+    {% endfor %}
+    {% if all_genres %}
+      <details>
+        <summary>Add genres</summary>
+        {% for genre in all_genres %}
+          {% if genre.pk not in suggestion.genre_ids %}
+            <label class="checkbox"><input type="checkbox" name="genre_ids" value="{{ genre.pk }}"> {{ genre.name }}</label>
+          {% endif %}
+        {% endfor %}
+      </details>
+    {% endif %}
+  </fieldset>
+{% endwith %}
