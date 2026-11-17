@@ -12,17 +12,21 @@ from django.contrib.auth import get_user_model
 from django.test import Client
 from django.urls import reverse
 
-from ebook_server.core.models import ScanJob, ScannerDevice, get_or_create_profile
+from ebook_server.core.models import ScanJob, get_or_create_profile
 from ebook_server.core.scan_job_ids import is_device_job_id, normalize_scan_job_id
-from ebook_server.core.scanner_devices import create_device
+from ebook_server.core.scanner_api import scanner_job
+from ebook_server.core.scanner_auth import generate_key, hash_key
 
 JOB_ID = "20261117T143201Z"
 STARTED = "2026-11-17T14:32:01Z"
 
 
 @pytest.fixture
-def device(db: None) -> tuple[ScannerDevice, str]:
-    return create_device("libreflip-01")
+def key(db: None, settings: Any) -> str:
+    """The scanner API key, configured as its SHA-256 (#125)."""
+    value = generate_key()
+    settings.BOOK_SCANNER_SCANNER_API_KEY_SHA256 = hash_key(value)
+    return value
 
 
 def _put(key: str, job_id: str, body: Any, *, raw: bool = False) -> Any:
@@ -123,9 +127,8 @@ def test_scan_session_routes_serve_device_jobs() -> None:
 
 
 @pytest.mark.django_db
-def test_put_job_creates_open_job(device: tuple[ScannerDevice, str], settings: Any) -> None:
+def test_put_job_creates_open_job(key: str, settings: Any) -> None:
     settings.BOOK_SCANNER_PUBLIC_BASE_URL = "https://serif.c-base.lan/"
-    scanner, key = device
 
     response = _put(key, JOB_ID, {"scan_started_at": STARTED, "capture_layout": "single_page"})
 
@@ -142,19 +145,15 @@ def test_put_job_creates_open_job(device: tuple[ScannerDevice, str], settings: A
         "open_rescans": 0,
     }
     job = ScanJob.objects.get(pk=JOB_ID)
-    assert job.device == scanner
-    assert job.scanner_id == "libreflip-01"
+    assert job.source == ScanJob.Source.SCANNER
     assert job.operator is None
     assert job.state == ScanJob.State.OPEN
     assert job.scan_started_at == datetime(2026, 11, 17, 14, 32, 1, tzinfo=UTC)
 
 
 @pytest.mark.django_db
-def test_put_job_defaults_layout_and_falls_back_to_request_host(
-    device: tuple[ScannerDevice, str], settings: Any
-) -> None:
+def test_put_job_defaults_layout_and_falls_back_to_request_host(key: str, settings: Any) -> None:
     settings.BOOK_SCANNER_PUBLIC_BASE_URL = ""
-    _, key = device
     response = _put(key, f"{JOB_ID}-2", {"scan_started_at": STARTED})
     assert response.status_code == 201
     assert response.json()["capture_layout"] == "single_page"
@@ -162,10 +161,9 @@ def test_put_job_defaults_layout_and_falls_back_to_request_host(
 
 
 @pytest.mark.django_db
-def test_put_job_repeat_by_same_device_is_200_and_changes_nothing(
-    device: tuple[ScannerDevice, str],
+def test_put_job_repeat_with_same_data_is_200_and_changes_nothing(
+    key: str,
 ) -> None:
-    _, key = device
     assert _put(key, JOB_ID, {"scan_started_at": STARTED}).status_code == 201
     before = ScanJob.objects.get(pk=JOB_ID)
 
@@ -180,9 +178,7 @@ def test_put_job_repeat_by_same_device_is_200_and_changes_nothing(
 
 
 @pytest.mark.django_db
-def test_put_job_conflicts_are_409(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
-    _, other_key = create_device("libreflip-02")
+def test_put_job_conflicts_are_409(key: str) -> None:
     assert _put(key, JOB_ID, {"scan_started_at": STARTED}).status_code == 201
 
     other_time = _put(key, JOB_ID, {"scan_started_at": "2026-11-17T14:32:02Z"})
@@ -191,25 +187,22 @@ def test_put_job_conflicts_are_409(device: tuple[ScannerDevice, str]) -> None:
 
     other_layout = _put(key, JOB_ID, {"scan_started_at": STARTED, "capture_layout": "spread"})
     assert other_layout.status_code == 409
-
-    other_device = _put(other_key, JOB_ID, {"scan_started_at": STARTED})
-    assert other_device.status_code == 409
-    assert _error_code(other_device) == "job_id_conflict"
+    assert _error_code(other_layout) == "job_id_conflict"
 
     job = ScanJob.objects.get(pk=JOB_ID)
     assert job.scan_started_at == datetime(2026, 11, 17, 14, 32, 1, tzinfo=UTC)
     assert job.capture_layout == "single_page"
-    assert job.device is not None and job.device.scanner_id == "libreflip-01"
+    assert job.source == ScanJob.Source.SCANNER
 
 
 @pytest.mark.django_db
-def test_put_job_conflicts_with_web_job_of_same_id(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_put_job_conflicts_with_web_job_of_same_id(key: str) -> None:
     ScanJob.objects.create(id=JOB_ID)
     response = _put(key, JOB_ID, {"scan_started_at": STARTED})
     assert response.status_code == 409
     assert _error_code(response) == "job_id_conflict"
-    assert ScanJob.objects.get(pk=JOB_ID).device is None
+    assert ScanJob.objects.get(pk=JOB_ID).source == ScanJob.Source.WEB
+    assert ScanJob.objects.get(pk=JOB_ID).scan_started_at is None
 
 
 @pytest.mark.django_db
@@ -223,8 +216,7 @@ def test_put_job_conflicts_with_web_job_of_same_id(device: tuple[ScannerDevice, 
         "20261117T143201Z-a1b2",
     ],
 )
-def test_put_job_rejects_bad_job_id_format(device: tuple[ScannerDevice, str], job_id: str) -> None:
-    _, key = device
+def test_put_job_rejects_bad_job_id_format(key: str, job_id: str) -> None:
     response = _put(key, job_id, {"scan_started_at": STARTED})
     assert response.status_code == 400
     assert _error_code(response) == "invalid_job_id"
@@ -242,10 +234,15 @@ def test_put_job_rejects_bad_job_id_format(device: tuple[ScannerDevice, str], jo
         json.dumps({"scan_started_at": "2026-11-17T14:32:01"}),
         json.dumps({"scan_started_at": 1763389921}),
         json.dumps({"scan_started_at": STARTED, "capture_layout": "triptych"}),
+        # ISO-shaped but not a calendar date/time (PDXDJN on #137): 400, never 500.
+        json.dumps({"scan_started_at": "2026-02-30T14:32:01Z"}),
+        json.dumps({"scan_started_at": "2026-13-01T14:32:01Z"}),
+        json.dumps({"scan_started_at": "2026-11-17T25:32:01Z"}),
+        json.dumps({"scan_started_at": "2026-11-17T14:32:01+25:00"}),
+        json.dumps({"scan_started_at": "0001-01-01T00:00:00+01:00"}),
     ],
 )
-def test_put_job_rejects_bad_bodies(device: tuple[ScannerDevice, str], body: str) -> None:
-    _, key = device
+def test_put_job_rejects_bad_bodies(key: str, body: str) -> None:
     response = _put(key, JOB_ID, body, raw=True)
     assert response.status_code == 400
     assert _error_code(response) in {"invalid_json", "invalid_request"}
@@ -253,7 +250,17 @@ def test_put_job_rejects_bad_bodies(device: tuple[ScannerDevice, str], body: str
 
 
 @pytest.mark.django_db
-def test_put_job_requires_device_key() -> None:
+def test_put_job_invalid_calendar_date_is_400_invalid_request(key: str) -> None:
+    response = _put(key, JOB_ID, {"scan_started_at": "2026-02-30T14:32:01Z"})
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert body["error"]["details"] == {"field": "scan_started_at"}
+    assert not ScanJob.objects.exists()
+
+
+@pytest.mark.django_db
+def test_put_job_requires_the_scanner_key(key: str) -> None:
     response = Client().put(
         f"/api/scanner/v1/jobs/{JOB_ID}",
         data=json.dumps({"scan_started_at": STARTED}),
@@ -264,8 +271,21 @@ def test_put_job_requires_device_key() -> None:
 
 
 @pytest.mark.django_db
-def test_job_route_only_accepts_put(device: tuple[ScannerDevice, str]) -> None:
-    _, key = device
+def test_scanner_job_lookup_serves_only_scanner_jobs(key: str) -> None:
+    """Scanner job routes resolve only ``source=scanner`` jobs; others are a 404."""
+    assert _put(key, JOB_ID, {"scan_started_at": STARTED}).status_code == 201
+    web_with_scanner_shaped_id = ScanJob.objects.create(id=f"{JOB_ID}-5")
+    web_job = ScanJob.objects.create()
+
+    found = scanner_job(JOB_ID)
+    assert found is not None and found.pk == JOB_ID
+    assert scanner_job(web_with_scanner_shaped_id.pk) is None
+    assert scanner_job(web_job.pk) is None
+    assert scanner_job(f"{JOB_ID}-9") is None
+
+
+@pytest.mark.django_db
+def test_job_route_only_accepts_put(key: str) -> None:
     response = Client().post(
         f"/api/scanner/v1/jobs/{JOB_ID}", headers={"Authorization": f"Bearer {key}"}
     )
