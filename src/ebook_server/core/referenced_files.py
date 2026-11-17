@@ -11,17 +11,20 @@ Nothing on a read-only location is ever written, moved or deleted.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
+from pathlib import Path, PurePath
+from typing import Any
 
 import structlog
 from django.db import transaction
 from django.utils import timezone
 
-from ebook_server.storage import LocalFilesystemStorage
+from ebook_server.jobs import get_queue, is_stale_running
+from ebook_server.storage import LocalFilesystemStorage, StorageUnavailableError, check_storage_root
 
-from .models import FileVariant, ImportJob, SourceLocation, StorageLocation
+from .models import FileVariant, ImportJob, ProcessingJob, SourceLocation, StorageLocation
 from .storage_registry import StorageConfigurationError, filesystem_backend_for_location
 
 logger = structlog.get_logger(__name__)
@@ -164,6 +167,9 @@ def ensure_reference_intact(variant: FileVariant) -> None:
         backend = filesystem_backend_for_location(variant.storage_location)
         size, mtime_ns = backend.stat(variant.storage_identifier)
     except FileNotFoundError as exc:
+        # A missing file on an unmounted share is an outage, not drift.
+        if location_unavailable_reason(variant.storage_location, backend) is not None:
+            raise ReferencedFileError("referenced storage is unavailable") from exc
         _flag(variant, FileVariant.ReferenceState.MISSING)
         raise ReferencedFileError("referenced file is missing") from exc
     except (OSError, ValueError, StorageConfigurationError) as exc:
@@ -174,6 +180,39 @@ def ensure_reference_intact(variant: FileVariant) -> None:
     ):
         _flag(variant, FileVariant.ReferenceState.CHANGED)
         raise ReferencedFileError("referenced file changed on storage")
+
+
+def location_unavailable_reason(
+    location: StorageLocation,
+    backend: LocalFilesystemStorage,
+) -> str | None:
+    """Why a read-only location does not count as mounted, or None when it is ready.
+
+    An unmounted mount point is usually still an (empty) directory, so ``is_dir()`` is
+    not enough. With ``sentinel_file`` set, that file must exist under the base path
+    (the same rule ``check_storage_root`` applies to the attached storage root).
+    Without one, an empty base directory counts as unmounted.
+    """
+    root = Path(backend.root)
+    sentinel = (location.sentinel_file or "").strip()
+    if sentinel:
+        pure = PurePath(sentinel)
+        if pure.is_absolute() or ".." in pure.parts or ":" in sentinel:
+            return f"storage location {location.identifier} has an invalid sentinel_file"
+    try:
+        check_storage_root(root=root, require_existing=True, sentinel=sentinel)
+        if not sentinel:
+            with os.scandir(root) as entries:
+                if next(entries, None) is None:
+                    return (
+                        f"storage location {location.identifier} base directory {root} is "
+                        "empty; is the share mounted? (configure a sentinel_file)"
+                    )
+    except StorageUnavailableError as exc:
+        return f"storage location {location.identifier}: {exc}"
+    except OSError as exc:
+        return f"storage location {location.identifier} is not readable: {exc}"
+    return None
 
 
 def _flag(variant: FileVariant, state: str) -> None:
@@ -197,6 +236,21 @@ class ReferenceCheckReport:
     changed: list[int] = field(default_factory=list)
     restored: list[int] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    unavailable_locations: list[str] = field(default_factory=list)
+
+    @property
+    def has_findings(self) -> bool:
+        return bool(self.missing or self.changed or self.errors)
+
+    def summary(self) -> str:
+        return (
+            f"checked={self.checked} ok={self.ok} missing={len(self.missing)} "
+            f"changed={len(self.changed)} restored={len(self.restored)} "
+            f"errors={len(self.errors)} unavailable_locations={len(self.unavailable_locations)}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _check_one(
@@ -226,36 +280,69 @@ def _check_one(
     return FileVariant.ReferenceState.OK
 
 
-def referenced_variants() -> Iterable[FileVariant]:
-    return (
-        FileVariant.objects.select_related("storage_location")
-        .filter(storage_location__read_only=True)
-        .order_by("pk")
-        .iterator()
+def referenced_variants(
+    *,
+    variant_ids: Iterable[int] | None = None,
+    storage_location_ids: Iterable[int] | None = None,
+) -> Iterable[FileVariant]:
+    queryset = FileVariant.objects.select_related("storage_location").filter(
+        storage_location__read_only=True,
     )
+    if variant_ids is not None:
+        queryset = queryset.filter(pk__in=list(variant_ids))
+    if storage_location_ids is not None:
+        queryset = queryset.filter(storage_location_id__in=list(storage_location_ids))
+    return queryset.order_by("pk").iterator()
 
 
-def check_referenced_files(*, verify_hashes: bool = False) -> ReferenceCheckReport:
-    """Compare every indexed-in-place variant with the file on storage.
+def check_referenced_files(
+    *,
+    verify_hashes: bool = False,
+    variant_ids: Iterable[int] | None = None,
+    storage_location_ids: Iterable[int] | None = None,
+) -> ReferenceCheckReport:
+    """Compare indexed-in-place variants with the files on storage.
 
-    Size/mtime mismatches are re-hashed, so a touched but identical file stays OK.
-    ``verify_hashes`` re-hashes every file (I/O heavy). A variant whose file is back
-    with the recorded content returns to OK. Unavailable storage is reported as an
-    error and does not flag variants, so an unmounted share cannot mass-flag a library.
+    Checks every referenced variant, or only ``variant_ids`` / those on
+    ``storage_location_ids`` when given. Size/mtime mismatches are re-hashed, so a
+    touched but identical file stays OK; ``verify_hashes`` re-hashes every file (I/O
+    heavy). This hashes, so call it from the CLI or a worker job
+    (``request_reference_check``), never inside a web request. A variant whose file is
+    back with the recorded content returns to OK.
+
+    A location that is not ready (see ``location_unavailable_reason``: missing base
+    directory, missing sentinel, or an empty bare mount point) is an outage: its
+    variants are reported as errors and none is flagged, so an unmounted share cannot
+    mass-flag a library.
     """
     report = ReferenceCheckReport()
     backends: dict[int, LocalFilesystemStorage] = {}
-    for variant in referenced_variants():
+    unavailable: dict[int, str] = {}
+    for variant in referenced_variants(
+        variant_ids=variant_ids,
+        storage_location_ids=storage_location_ids,
+    ):
         report.checked += 1
+        location_id = variant.storage_location_id
+        if location_id in unavailable:
+            report.errors.append(f"file_variant:{variant.pk}: {unavailable[location_id]}")
+            continue
         try:
-            backend = backends.get(variant.storage_location_id)
+            backend = backends.get(location_id)
             if backend is None:
                 backend = filesystem_backend_for_location(variant.storage_location)
-                if not Path(backend.root).is_dir():
-                    raise StorageConfigurationError(
-                        f"storage location {variant.storage_location.identifier} is not mounted",
+                reason = location_unavailable_reason(variant.storage_location, backend)
+                if reason is not None:
+                    unavailable[location_id] = reason
+                    report.unavailable_locations.append(variant.storage_location.identifier)
+                    logger.error(
+                        "referenced_storage_unavailable",
+                        storage_location=variant.storage_location.identifier,
+                        reason=reason,
                     )
-                backends[variant.storage_location_id] = backend
+                    report.errors.append(f"file_variant:{variant.pk}: {reason}")
+                    continue
+                backends[location_id] = backend
             state = _check_one(variant, backend, verify_hashes=verify_hashes)
         except (OSError, ValueError, StorageConfigurationError) as exc:
             report.errors.append(f"file_variant:{variant.pk}: {exc}")
@@ -283,3 +370,154 @@ def check_referenced_files(*, verify_hashes: bool = False) -> ReferenceCheckRepo
             variant.reference_checked_at = timezone.now()
             variant.save(update_fields=["reference_checked_at"])
     return report
+
+
+# Variant ids stored in a job's details are capped so a huge check stays a small row.
+REPORT_ID_LIMIT = 200
+
+
+class ReferenceCheckDispatchError(RuntimeError):
+    """The reference-check job was recorded but could not be handed to the queue."""
+
+
+def _details(job: ProcessingJob) -> dict[str, Any]:
+    return dict(job.details) if isinstance(job.details, dict) else {}
+
+
+def request_reference_check(
+    *,
+    variant_ids: Iterable[int] | None = None,
+    storage_location_ids: Iterable[int] | None = None,
+    verify_hashes: bool = False,
+    requested_by_user_id: int | None = None,
+) -> tuple[ProcessingJob, bool]:
+    """Record a persistent reference-check job and hand it to the worker queue.
+
+    Returns ``(job, dispatched)``. ``dispatched`` is False when no queue is configured:
+    the job then stays QUEUED for ``check_referenced_files --run-queued``. The check
+    itself never runs in the caller (it hashes; see AGENTS.md "Asynchronous Work").
+    """
+    scope_variants = sorted({int(pk) for pk in variant_ids}) if variant_ids is not None else None
+    scope_locations = (
+        sorted({int(pk) for pk in storage_location_ids})
+        if storage_location_ids is not None
+        else None
+    )
+    processing_job = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.REFERENCE_CHECK,
+        details={
+            "variant_ids": scope_variants,
+            "storage_location_ids": scope_locations,
+            "verify_hashes": verify_hashes,
+            "requested_by_user_id": requested_by_user_id,
+            "attempt_count": 0,
+            "error": "",
+        },
+    )
+    queue = get_queue()
+    if queue is None:
+        logger.warning(
+            "reference_check_not_dispatched",
+            processing_job_id=str(processing_job.job_id),
+            reason="no queue configured",
+        )
+        return processing_job, False
+    try:
+        queue.enqueue(process_reference_check_job, str(processing_job.job_id))
+    except Exception as exc:
+        processing_job.state = ProcessingJob.JobState.FAILED
+        processing_job.finished_at = timezone.now()
+        processing_job.details = {
+            **_details(processing_job),
+            "error": f"queue dispatch failed: {exc}",
+        }
+        processing_job.save(update_fields=["state", "finished_at", "details"])
+        raise ReferenceCheckDispatchError(str(exc)) from exc
+    processing_job.refresh_from_db()
+    return processing_job, True
+
+
+def process_reference_check_job(job_id: str) -> None:
+    """Worker entry point: run one recorded reference check and store its report."""
+    with transaction.atomic():
+        try:
+            processing_job = ProcessingJob.objects.select_for_update().get(job_id=job_id)
+        except ProcessingJob.DoesNotExist:
+            return
+        if processing_job.job_type != ProcessingJob.JobType.REFERENCE_CHECK:
+            return
+        if processing_job.state in {
+            ProcessingJob.JobState.SUCCESS,
+            ProcessingJob.JobState.FAILED,
+        }:
+            return
+        if processing_job.state == ProcessingJob.JobState.RUNNING and not is_stale_running(
+            processing_job,
+        ):
+            return
+        details = _details(processing_job)
+        details["attempt_count"] = int(details.get("attempt_count", 0)) + 1
+        details["error"] = ""
+        processing_job.state = ProcessingJob.JobState.RUNNING
+        processing_job.started_at = timezone.now()
+        processing_job.finished_at = None
+        processing_job.details = details
+        processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
+
+    try:
+        report = check_referenced_files(
+            verify_hashes=bool(details.get("verify_hashes")),
+            variant_ids=details.get("variant_ids"),
+            storage_location_ids=details.get("storage_location_ids"),
+        )
+    except Exception as exc:
+        details["error"] = str(exc)
+        processing_job.state = ProcessingJob.JobState.FAILED
+        processing_job.finished_at = timezone.now()
+        processing_job.details = details
+        processing_job.save(update_fields=["state", "finished_at", "details"])
+        logger.error("reference_check_failed", processing_job_id=job_id, error=str(exc))
+        raise
+
+    result = report.as_dict()
+    for key in ("missing", "changed", "restored", "errors"):
+        result[f"{key}_count"] = len(result[key])
+        result[key] = result[key][:REPORT_ID_LIMIT]
+    details["report"] = result
+    details["summary"] = report.summary()
+    # Drift is a successful check that found something. An outage or an unreadable
+    # file means the check could not do its job, so the job fails (and is counted by
+    # ebook_server_processing_jobs{job_type="reference_check",state="failed"}).
+    if report.errors:
+        details["error"] = (
+            "storage unavailable: " + ", ".join(report.unavailable_locations)
+            if report.unavailable_locations
+            else f"{len(report.errors)} variant(s) could not be checked"
+        )
+        processing_job.state = ProcessingJob.JobState.FAILED
+    else:
+        processing_job.state = ProcessingJob.JobState.SUCCESS
+    processing_job.finished_at = timezone.now()
+    processing_job.details = details
+    processing_job.save(update_fields=["state", "finished_at", "details"])
+    logger.info(
+        "reference_check_finished",
+        processing_job_id=job_id,
+        state=processing_job.state,
+        checked=report.checked,
+        missing=len(report.missing),
+        changed=len(report.changed),
+        errors=len(report.errors),
+    )
+
+
+def queued_reference_check_ids() -> list[str]:
+    return [
+        str(job_id)
+        for job_id in ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.REFERENCE_CHECK,
+            state=ProcessingJob.JobState.QUEUED,
+        )
+        .order_by("scheduled_at")
+        .values_list("job_id", flat=True)
+    ]

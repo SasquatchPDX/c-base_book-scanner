@@ -269,7 +269,9 @@ identifier, and nothing reads metadata back from a path. Consequences:
   it. Moving books into the folder their current metadata implies is an explicit,
   admin-run reorganize.
 - **Files waiting for review** are archived under `_unsorted/<import job id>/` and
-  moved (a rename on the same share) into the book folder when the review resolves.
+  moved into the book folder when identification or review settles the Book (a hard
+  link on the same share, with the `_unsorted` name removed after the database
+  commit; where hard links are unsupported the file stays under `_unsorted`).
 
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
@@ -334,6 +336,32 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Audio files and audiobooks
+
+This system does not manage audiobooks. The decision and its research are in
+`docs/design/32-audiobooks.md` (proposed in PR #107, issue #32): members who want
+audiobooks use a separate audiobook server such as Audiobookshelf, reading its own
+folder on the NAS. Intake therefore recognises audio files only to skip them:
+
+- Extensions `.m4b .m4a .mp3 .aac .ogg .oga .opus .flac .wav .wma .mka .ape .aif
+  .aiff .aa .aax .aaxc` are classified as `audio (not managed here)`. They never
+  create an `ImportJob`, are never hashed, copied, moved or converted, and a MOVE
+  source leaves them where they are.
+- Audible files (`.aa`, `.aax`, `.aaxc`) are DRM-protected and are reported as
+  such. This project never removes or works around DRM.
+- `ingest_sources --preview` lists them as `skipped [audio (not managed here)] =>
+  <path>` plus a `skipped_audio=N` total; with `--json` they are rows with
+  `"skipped": "audio"`, `"drm_protected"` and `"reason"` (no `source_type`).
+  A discovery run appends `skipped_audio=N` to its summary line.
+- Discovery logs one `intake_audio_files_skipped` event (source id and count, no
+  filenames) per source and pass. There is no Prometheus series for it, because
+  `/metrics/` only reports persisted state and skipped audio is not persisted.
+- Web uploads of audio files (by extension, or an `audio/*` content type on a
+  non-book extension) are refused with HTTP 415 before anything is staged. The
+  message links to `BOOK_SCANNER_AUDIOBOOK_SERVICE_URL` when it is set to an
+  `http(s)://` URL, and otherwise asks the member to contact the library admins.
+  The upload page shows the same pointer.
+
 ### Folder layouts (author/title from paths)
 
 Collections are organised differently, so each source can declare how its folders
@@ -373,6 +401,44 @@ Check a layout before importing; each preview row shows
 ```bash
 uv run python manage.py ingest_sources --source-id 1 --preview
 ```
+
+### Formats of one book (`group_sibling_formats`)
+
+Opt-in per source (admin → Source locations → "Formats of one book"), because
+generic same-name pairs such as `notes.txt` / `notes.pdf` are not one book in every
+collection. When enabled, files in the same folder with the same file name and
+different extensions (`Dune.epub`, `Dune.mobi`, `Dune.txt`; names compared
+case-insensitively) are *siblings*. Once one sibling is linked to a Book (automatic
+match, exact duplicate, or review decision), that Book becomes a strong candidate
+for the others. It never replaces verification:
+
+- every file is still looked up externally, and its provider candidates are stored;
+- the sibling's Book is scored like a provider candidate, plus
+  `BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS` (default 0.35), and must reach the
+  auto-accept threshold. An equal title is enough; the shared name alone is not;
+- the file goes to review instead when its embedded ISBN conflicts with the Book's
+  ISBNs (`conflicting_isbn`), when its embedded authors name different people than
+  the Book's (`author_conflict`), when a provider candidate confidently matches a
+  different book (`provider_match_differs`), or when the score stays below the
+  threshold (`below_threshold`);
+- siblings already waiting in review are re-assessed with the same rule when another
+  format is linked. An OPEN task that passes is resolved as "Merged with existing
+  book" without a reviewer, with `rule: group_sibling_formats` and the score in its
+  decision payload. A task a reviewer has CLAIMED is never resolved automatically;
+  it only gets a note under `decision_payload.format_sibling`.
+
+The assessment (sibling job, Book, score, accepted, reason) is stored in the import
+evidence under `format_sibling_of`. Decisions within one source are serialised with a
+row lock on the source, so two formats finishing at the same time cannot create two
+Books.
+
+The review queue (`/reviews/`) shows siblings waiting in review as one entry. The
+primary task is the one with the best candidate score, then the format most likely
+to carry embedded metadata (EPUB, AZW3, MOBI, FB2, PDF, DjVu, HTML, RTF, TXT), then
+the oldest. The other formats are listed under it with their own candidate counts and
+links. The JSON response keeps one item per task, so existing clients are unaffected.
+Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
+and the response gains `group_count`.
 
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
@@ -435,6 +501,7 @@ timer or cron, e.g. hourly; `--verify-hashes` off peak):
 ```bash
 uv run python manage.py check_referenced_files
 uv run python manage.py check_referenced_files --verify-hashes --json
+uv run python manage.py check_referenced_files --location source-3
 ```
 
 Files whose size or mtime changed are re-hashed: identical content stays served
@@ -442,13 +509,40 @@ Files whose size or mtime changed are re-hashed: identical content stays served
 file `missing` (`FileVariant.reference_state`). Every download, conversion and OCR
 request also compares size/mtime first and flags on mismatch. Flagged variants
 return HTTP 409 for downloads and are refused as conversion/OCR sources; they are
-never deleted. The command exits non-zero when it finds drift. If the share is not
-mounted it reports an error and flags nothing.
+never deleted. The command exits non-zero when it finds drift or an outage.
+
+**Mount readiness.** An unmounted share usually still leaves its mount point as an
+(empty) directory, so "the directory exists" proves nothing. Before checking any
+variant on a read-only location, the check requires:
+
+- the base directory to exist, and
+- the location's `sentinel_file` (set it in admin, `Storage locations`) to exist
+  under the base path, or, when no sentinel is configured, the base directory to be
+  non-empty.
+
+Configure a sentinel for every index share (e.g. create an empty
+`.ebook-index-sentinel` at the share root and enter that name): it also catches a
+mount point that has stray local files in it. A location that fails this check is
+an **outage**: nothing on it is flagged, its variants are reported as errors and
+listed as `UNAVAILABLE storage_location:<identifier>`, a
+`referenced_storage_unavailable` error is logged, and a queued check job ends
+`failed` (`ebook_server_processing_jobs{job_type="reference_check",state="failed"}`).
+A download or conversion that finds the file absent applies the same test, so it
+is refused (409) without flagging during an outage.
+
+**Re-checking from the admin.** The admin actions never check files in the web
+request (a check stats and may re-hash every file). "Queue re-check of selected
+referenced files" (`File variants`) and "Queue re-check of all referenced files on
+selected locations" (`Storage locations`) record a `reference_check`
+`ProcessingJob` scoped to the selection and hand it to the RQ worker; the message
+links the job, whose `details` hold the report (counts, affected variant ids)
+once it finishes. Without a configured queue the job stays `queued`; run
+`uv run python manage.py check_referenced_files --run-queued` to process it.
 
 Resolve flagged variants in Django admin (`File variants`, filter by reference
-state): restore the original file and run "Re-check referenced files", or delete
-the stale variant record and re-run `ingest_sources` so the new file is indexed as
-a new variant. A changed file at an already indexed path is not silently repointed;
+state): restore the original file and queue a re-check, or delete the stale
+variant record and re-run `ingest_sources` so the new file is indexed as a new
+variant. A changed file at an already indexed path is not silently repointed;
 its import fails with a message pointing at the drift check until the old record
 is resolved. `ebook_server_referenced_file_variants{reference_state=...}` exports
 the counts for alerting.

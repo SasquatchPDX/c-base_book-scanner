@@ -300,10 +300,13 @@ def place_pending_original(
 ) -> None:
     """Move an original archived under ``_unsorted/`` into ``book``'s folder.
 
-    Runs when a review resolves. The move stays inside one archive location (a rename,
-    no copy), is checked by size afterwards, and on any failure leaves the file where
-    it is: the variant then simply references the ``_unsorted`` path. ``storage`` is
-    the backend of ``job.storage_location``.
+    Runs when identification or a review settles the Book, possibly inside a database
+    transaction that may still roll back. So the file is first *hard-linked* into the
+    book folder (instant, same bytes, same share) and the ``_unsorted`` name is removed
+    only after the transaction commits. A rollback leaves the recorded ``_unsorted``
+    path valid (plus a harmless extra link). Where hard links are not supported, or
+    anything else fails, the file simply stays under ``_unsorted``. ``storage`` is the
+    backend of ``job.storage_location``.
     """
     location = job.storage_location
     source = job.storage_identifier
@@ -316,10 +319,8 @@ def place_pending_original(
     ):
         return
     try:
-        size_before, _ = storage.stat(source)
         destination = original_destination(storage, job, book)
-        storage.move(source, destination)
-        size_after, _ = storage.stat(destination)
+        storage.link(source, destination)
     except (OSError, ValueError, RuntimeError) as exc:
         logger.warning(
             "archive_pending_move_failed",
@@ -328,9 +329,14 @@ def place_pending_original(
             error_type=type(exc).__name__,
         )
         return
-    if size_after != size_before:
-        # Should not happen for a rename; keep pointing at whatever is there now.
-        logger.error("archive_pending_move_size_mismatch", import_job_id=str(job.id))
     job.storage_identifier = destination
-    storage.prune_empty_parents(source)
+
+    def _drop_pending_name() -> None:
+        try:
+            storage.delete(source)
+            storage.prune_empty_parents(source)
+        except OSError:
+            logger.warning("archive_pending_cleanup_failed", import_job_id=str(job.id))
+
+    transaction.on_commit(_drop_pending_name)
     logger.info("archive_pending_moved", import_job_id=str(job.id), book_id=book.pk)

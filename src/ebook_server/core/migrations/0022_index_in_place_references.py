@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0021_source_location_path_layouts"),
+        ("core", "0022_source_location_group_sibling_formats"),
     ]
 
     operations = [
@@ -64,6 +64,33 @@ class Migration(migrations.Migration):
                 ],
                 default="copy",
                 max_length=8,
+            ),
+        ),
+        migrations.AddField(
+            model_name="storagelocation",
+            name="sentinel_file",
+            field=models.CharField(
+                blank=True,
+                default="",
+                help_text="Read-only locations: a file name, relative to the base path, that must exist for the share to count as mounted (for example .ebook-index-sentinel). While it is absent, drift checks report a storage outage and flag nothing. Left empty, an empty base directory (a bare mount point) counts as unmounted.",
+                max_length=255,
+            ),
+        ),
+        migrations.AlterField(
+            model_name="processingjob",
+            name="job_type",
+            field=models.CharField(
+                choices=[
+                    ("ingestion", "Ingestion"),
+                    ("conversion", "Conversion"),
+                    ("ocr", "OCR"),
+                    ("stage", "ScanTailor Stage"),
+                    ("review_identification", "Review identification"),
+                    ("scan_identification", "Scan identification"),
+                    ("scan_finalization", "Scan finalization"),
+                    ("reference_check", "Referenced file check"),
+                ],
+                max_length=32,
             ),
         ),
     ]
