@@ -1254,6 +1254,16 @@ def _author_match_score(left: list[str], right: list[str]) -> float:
     return total / len(left_names)
 
 
+def title_similarity(left: str, right: str) -> float:
+    """Public form of the candidate title score, for comparing two metadata sources."""
+    return _title_match_score(left, right)
+
+
+def author_similarity(left: list[str], right: list[str]) -> float:
+    """Public form of the candidate author score (0.0 when no name corresponds)."""
+    return _author_match_score(left, right)
+
+
 # Creator values that say nothing about who wrote the book: office-suite and PDF
 # tool defaults, account names, and "unknown" in a few languages. Compared after
 # normalize_text().

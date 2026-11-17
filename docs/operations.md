@@ -845,6 +845,27 @@ for COPY *and* MOVE sources (MOVE removes only the verified book file), so a
 reviewed MOVE import can still use it later. Disable with
 `BOOK_SCANNER_SIDECAR_COVERS_ENABLED=false`.
 
+A sibling Calibre-style `metadata.opf` is read as extra identification evidence
+under the same single-book-folder rule (`intake.single_book_folder`), so the cover
+and metadata sidecars always agree about a folder. A stray OPF in a folder of
+several books is ignored (`sidecar_metadata_ignored`), and so is a `metadata.opf`
+the application generated itself, recognised by
+`<meta name="ebook-server:generated" content="true"/>`
+(`reason=generated_by_ebook_server`). The OPF is parsed by the same
+defusedxml parser used for `ebook-meta` output. Symlinks, files over 2 MiB,
+malformed XML, and entity declarations are rejected (`sidecar_metadata_rejected`)
+and treated as "no sidecar"; they never fail the import. Sidecar values are kept
+under `evidence.sidecar_metadata` (`fields`, `applied_fields`, `conflicts`). They
+only fill gaps: empty fields, placeholders, a title the extractor marked as a
+filename fallback, and an ISBN added as `isbn` when the file has none. Every
+extraction records `evidence.title_source` (`embedded`, `filename`, or `sidecar`
+once a sidecar filled it); an embedded title equal to the filename stem is still
+embedded and is never replaced. They never overwrite embedded metadata. If
+the sidecar's ISBN, title, or authors contradict the file's embedded metadata,
+nothing is merged and the import goes to manual review even when the top candidate
+clears the auto-accept threshold (`sidecar_metadata_conflict`). Disable with
+`BOOK_SCANNER_SIDECAR_METADATA_ENABLED=false`.
+
 Reviewers can edit title/author terms and use “Search providers again.” Repeat
 searches are durable `ProcessingJob` records and do not depend on the original
 staging file, which may already have been removed after verified archival. Poll
