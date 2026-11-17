@@ -16,7 +16,7 @@ from ...models import CoverImage
 class Command(BaseCommand):
     help = (
         "Generate WebP thumbnails for front covers that have none or whose cover changed. "
-        "Idempotent; run once after deploying migration 0025 and whenever "
+        "Idempotent; run once after deploying migration 0034 and whenever "
         'ebook_server_library_derived_rows_missing{kind="cover_thumbnails"} is above zero.'
     )
 

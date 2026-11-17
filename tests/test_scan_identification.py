@@ -70,7 +70,7 @@ def test_scan_identification_creates_shared_review_and_accept_links_book(
     assert payload["state"] == ProcessingJob.JobState.SUCCESS
     assert payload["candidate_count"] == 1
     task = ReviewTask.objects.get(pk=payload["review_task_id"])
-    candidate = MetadataCandidate.objects.get(scan_job=scan_job)
+    candidate = MetadataCandidate.objects.get(scan_job=scan_job, superseded_at__isnull=True)
     assert task.scan_job_id == scan_job.id
     assert task.import_job_id is None
     assert task.inferred_authors == ["Ada Scanner"]
@@ -208,7 +208,7 @@ def test_search_again_refreshes_scan_candidates_and_hints(
     assert response.json()["identification_job"]["state"] == ProcessingJob.JobState.SUCCESS
     scan_job.refresh_from_db()
     task.refresh_from_db()
-    candidate = MetadataCandidate.objects.get(scan_job=scan_job)
+    candidate = MetadataCandidate.objects.get(scan_job=scan_job, superseded_at__isnull=True)
     assert candidate.id != old_candidate_id
     assert candidate.title == "Refined Result"
     assert scan_job.provisional_title == "Refined Scan"

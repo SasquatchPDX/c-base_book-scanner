@@ -16,14 +16,17 @@ from django.db import connection, transaction
 from django.test import Client
 from django.utils import timezone
 
-from ebook_server.core import search
+from ebook_server.core import scan_pipeline, search
+from ebook_server.core.genres import assign_automatic
 from ebook_server.core.models import (
     Author,
     Book,
+    BookGenre,
     BookSearchDocument,
     BookSearchFacet,
     FileVariant,
     Genre,
+    GenreAlias,
     StorageLocation,
     get_or_create_profile,
 )
@@ -318,3 +321,72 @@ def test_postgres_landing_page_and_author_index() -> None:
     authors = client.get("/library/authors/", {"letter": "Z", "page_size": "3"}).json()
     assert [item["name"] for item in authors["items"]] == ["Zed 1", "Zed 3", "Zed 5"]
     assert authors["previous_cursor"] and authors["next_cursor"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rescan_invalidation_in_autocommit_removes_the_last_format() -> None:
+    """The reindex runs at once outside a transaction, so it must follow the update."""
+    book = _book("Rescanned Atlas", formats=("pdf",))
+    variant = FileVariant.objects.get(book=book)
+    client = _client()
+    assert _ids(client.get("/library/books/", {"format": "pdf"}).json()) == [book.pk]
+    assert connection.get_autocommit()
+
+    scan_pipeline._invalidate_file_variants_and_descendants({variant.pk})
+
+    assert not BookSearchFacet.objects.filter(book=book, kind="format").exists()
+    assert _ids(client.get("/library/books/", {"format": "pdf"}).json()) == []
+    facets = client.get("/library/books/", {"facets": "format"}).json()["facets"]["format"]
+    assert facets == []
+    assert search.verify_search_index(sample=100).ok
+
+
+@pytest.mark.django_db(transaction=True)
+def test_verifier_detects_stale_weighted_full_text_content() -> None:
+    book = _book("Quiet Harbour", description="lighthouse keepers")
+    other = _book("Busy Port", description="container cranes")
+    client = _client()
+    assert _ids(client.get("/library/books/", {"q": "lighthouse"}).json()) == [book.pk]
+    assert search.verify_search_index(sample=100).ok
+
+    # Bulk change: no signal, and only the weight-D (description) FTS text differs.
+    Book.objects.filter(pk=book.pk).update(description="smugglers tunnels")
+    assert _ids(client.get("/library/books/", {"q": "smugglers"}).json()) == []
+    report = search.verify_search_index(sample=100)
+    assert report.drifted_book_ids == [book.pk]
+
+    search.index_books(report.drifted_book_ids)
+    assert _ids(client.get("/library/books/", {"q": "smugglers"}).json()) == [book.pk]
+    assert search.verify_search_index(sample=100).ok
+
+    # A vector changed behind the digest's back (manual repair, other config) is drift too.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE core_booksearchdocument SET document = to_tsvector('simple', 'tampered') "
+            "WHERE book_id = %s",
+            [other.pk],
+        )
+    assert search.verify_search_index(sample=100).drifted_book_ids == [other.pk]
+    search.index_books([other.pk])
+    assert _ids(client.get("/library/books/", {"q": "cranes"}).json()) == [other.pk]
+    assert search.verify_search_index(sample=100).ok
+
+
+@pytest.mark.django_db(transaction=True)
+def test_book_genre_rows_and_aliases_on_postgresql() -> None:
+    book = _book("Green Towers")
+    genre = Genre.objects.create(name="Solarpunk utopias")
+    GenreAlias.objects.create(genre=genre, alias="Solar-Punk")
+
+    assert assign_automatic(book, provider_subjects=["SolarPunk"], embedded_subjects=None)
+    assert set(
+        BookSearchFacet.objects.filter(book=book, kind="genre").values_list("value", flat=True)
+    ) == {str(genre.pk)}
+    client = _client()
+    assert _ids(client.get("/library/books/", {"genre": "solar punk"}).json()) == [book.pk]
+    assert _ids(client.get("/library/books/", {"genre": "utopia"}).json()) == [book.pk]
+
+    BookGenre.objects.filter(book=book).delete()
+    assert not BookSearchFacet.objects.filter(book=book, kind="genre").exists()
+    assert _ids(client.get("/library/books/", {"genre": "solar punk"}).json()) == []
+    assert search.verify_search_index(sample=100).ok

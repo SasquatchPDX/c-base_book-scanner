@@ -27,7 +27,7 @@ from ebook_server.storage import StorageBackend
 
 from . import intake
 from .models import Book, CoverImage, FileVariant, ImportJob
-from .storage_registry import backend_for_location
+from .storage_registry import backend_for_location, writable_location_for
 
 logger = structlog.get_logger(__name__)
 
@@ -36,9 +36,7 @@ MAX_COVER_COMPRESSION_RATIO = 200
 COVER_SIZE = (1200, 1600)
 ARCHIVE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 # Sidecar covers (Calibre-style ``cover.jpg`` next to the book file), in preference order.
-SIDECAR_COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png")
-# Other sidecar files that never count as a separate book in the folder.
-SIDECAR_METADATA_NAMES = frozenset({"metadata.opf"})
+SIDECAR_COVER_NAMES = intake.SIDECAR_COVER_NAMES
 MAX_SIDECAR_COVER_BYTES = MAX_COVER_INPUT_BYTES
 MAX_SIDECAR_COVER_PIXELS = 40_000_000
 SIDECAR_EXTRACTOR_TOOL = "sidecar+pillow"
@@ -212,77 +210,22 @@ def sidecar_covers_enabled() -> bool:
     return bool(getattr(django_settings, "BOOK_SCANNER_SIDECAR_COVERS_ENABLED", True))
 
 
-def _book_stem(name: str) -> str:
-    return Path(name).stem.casefold()
-
-
-def _folder_stems_from_jobs(job: ImportJob, folder: Path) -> set[str]:
-    """Stems of files previously queued from ``folder``; MOVE sources may already be gone."""
-    stems: set[str] = set()
-    source_paths = ImportJob.objects.filter(
-        source_location=job.source_location,
-        source_path__startswith=str(folder),
-    ).values_list("source_path", flat=True)
-    for raw in source_paths:
-        path = Path(raw)
-        if path.parent == folder:
-            stems.add(_book_stem(path.name))
-    return stems
-
-
 def find_sidecar_cover(job: ImportJob) -> Path | None:
     """Return a sibling ``cover.jpg``/``cover.png`` only if its folder holds a single book.
 
-    The folder qualifies when every intake-supported file in it, plus every file
-    previously queued from it (MOVE sources are deleted after archiving), shares the
-    job file's stem, as in a Calibre book folder (``Title - Author.epub``,
-    ``Title - Author.pdf``, ``cover.jpg``, ``metadata.opf``). A folder holding several
-    distinct books never lends its cover to any of them. Uploads have no source folder
-    and are skipped. Symlinked covers and folders outside the source root are ignored.
+    The single-book rule is ``intake.single_book_folder``, shared with the
+    ``metadata.opf`` sidecar so both sidecars agree about a folder. Uploads, folders
+    outside the source root, and symlinked covers are ignored.
     """
-    if not sidecar_covers_enabled() or job.source_location is None or not job.source_path:
+    if not sidecar_covers_enabled():
         return None
-    source = Path(job.source_path)
-    folder = source.parent
-    try:
-        root = Path(job.source_location.root_path).expanduser().resolve(strict=True)
-        resolved_folder = folder.resolve(strict=True)
-    except OSError:
+    folder = intake.single_book_folder(job)
+    if folder is None:
         return None
-    if not resolved_folder.is_relative_to(root):
-        return None
-
-    stems = {_book_stem(source.name)}
-    covers: dict[str, os.DirEntry[str]] = {}
-    try:
-        with os.scandir(resolved_folder) as entries:
-            for entry in entries:
-                name = entry.name
-                if name.startswith((".", "~")):
-                    continue
-                lowered = name.casefold()
-                if lowered in SIDECAR_COVER_NAMES:
-                    covers.setdefault(lowered, entry)
-                elif lowered not in SIDECAR_METADATA_NAMES and intake._is_supported_file(
-                    Path(name)
-                ):
-                    stems.add(_book_stem(name))
-    except OSError:
-        return None
-    stems |= _folder_stems_from_jobs(job, folder)
-    if len(stems) != 1:
-        return None
-
     for name in SIDECAR_COVER_NAMES:
-        candidate = covers.get(name)
-        if candidate is None:
-            continue
-        try:
-            if candidate.is_symlink() or not candidate.is_file(follow_symlinks=False):
-                continue
-        except OSError:
-            continue
-        return resolved_folder / candidate.name
+        path = folder.sidecar_file(name)
+        if path is not None:
+            return path
     return None
 
 
@@ -402,7 +345,11 @@ def extract_front_cover(
     if existing is not None:
         return existing
 
-    storage = backend_for_location(variant.storage_location)
+    # Read from wherever the variant lives; write the cover to a writable location
+    # (never onto a read-only, indexed-in-place share).
+    source_storage = backend_for_location(variant.storage_location)
+    cover_location = writable_location_for(variant.storage_location)
+    storage = backend_for_location(cover_location)
     sidecar_payload = (
         _sidecar_cover_payload(import_job, variant) if import_job is not None else None
     )
@@ -411,7 +358,7 @@ def extract_front_cover(
         extractor_tool = SIDECAR_EXTRACTOR_TOOL
         extractor_version = f"Pillow {version('Pillow')}"
     else:
-        extracted = _format_cover_payload(variant, storage)
+        extracted = _format_cover_payload(variant, source_storage)
         if extracted is None:
             return None
         payload, extractor_tool, extractor_version = extracted
@@ -439,7 +386,7 @@ def extract_front_cover(
             cover = CoverImage.objects.create(
                 book=book,
                 position=CoverImage.CoverPosition.FRONT,
-                storage_location=variant.storage_location,
+                storage_location=cover_location,
                 storage_identifier=destination,
                 mime_type="image/jpeg",
                 size_bytes=len(payload),

@@ -17,6 +17,7 @@
         {% if book.publisher %}<div><dt>Publisher</dt><dd>{{ book.publisher }}</dd></div>{% endif %}
         {% if book.publication_date %}<div><dt>Published</dt><dd>{{ book.publication_date }}</dd></div>{% elif book.publication_year %}<div><dt>Published</dt><dd>{{ book.publication_year }}</dd></div>{% endif %}
         {% if book.edition %}<div><dt>Edition</dt><dd>{{ book.edition }}</dd></div>{% endif %}
+        {% if book.genres.all %}<div><dt>Genres</dt><dd>{% for genre in book.genres.all %}<a href="{% url 'library-books' %}?view=html&amp;genre={{ genre.name|urlencode }}">{{ genre.name }}</a>{% if not forloop.last %}, {% endif %}{% endfor %}</dd></div>{% endif %}
         {% for identifier in identifiers %}<div><dt>{{ identifier.kind|upper }}</dt><dd>{{ identifier.value }}</dd></div>{% endfor %}
       </dl>
       {% if book.description %}<section class="description"><h2>About</h2><p>{{ book.description|linebreaksbr }}</p></section>{% endif %}
@@ -24,11 +25,16 @@
         <h2>Available files</h2>
         <div class="variant-list">
           {% for variant in variants %}
-            <div><div><strong>{{ variant.format|upper }}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
+            <div><div><strong>{{ variant.format|upper }}{% if variant.part_index is not None %} · {{ variant.part_index }}. {{ variant.part_label|default:"Part" }}{% endif %}</strong><span>{{ variant.original_filename }} · {{ variant.size_bytes|filesizeformat }}</span></div><a class="button"
    href="{% url 'library-book-download' book.id %}?variant_id={{ variant.id }}">Download</a></div>
 {% empty %}<p>No downloadable variants are ready.</p>{% endfor %}
   </div>
   </section>
+  {% if combine_options %}<section><h2>Combine parts</h2><p class="muted">This book is stored as separate part files. A combined file is a new download built from the parts in the order shown above; the parts stay as they are.</p><div class="conversion-grid">
+    {% for option in combine_options %}{% if option.combined_variant_id %}<p>{{ option.format|upper }}: combined file available above.</p>{% else %}<form method="post" action="{% url 'library-book-combine-parts' book.id %}">{% csrf_token %}<input type="hidden" name="target_format" value="{{ option.format }}"><button type="submit">Combine {{ option.part_count }} {{ option.format|upper }} parts into one file</button></form>{% endif %}{% endfor %}
+    </div>
+    </section>
+  {% endif %}
   {% if conversion_options %}<section><h2>Convert</h2><div class="conversion-grid">
     {% for option in conversion_options %}<form method="post" action="{% url 'library-book-convert' book.id %}">{% csrf_token %}<input type="hidden"
        name="source_variant_id"

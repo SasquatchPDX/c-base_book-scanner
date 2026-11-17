@@ -120,11 +120,15 @@ def _invalidate_file_variants_and_descendants(variant_ids: set[int]) -> int:
         stale_ids.update(descendants)
 
     stale_variants = FileVariant.objects.filter(id__in=stale_ids)
-    # `.update()` sends no signals; the books' available formats change (#28).
-    schedule_reindex(stale_variants.values_list("book_id", flat=True))
-    return stale_variants.update(
+    book_ids = set(stale_variants.values_list("book_id", flat=True))
+    updated = stale_variants.update(
         processing_state=FileVariant.ProcessingState.FAILED,
     )
+    # `.update()` sends no signals, and the books' available formats just changed
+    # (#28). Schedule only after the write: outside a transaction `on_commit` runs
+    # the reindex immediately, and it must see the FAILED state, not COMPLETE.
+    schedule_reindex(book_ids)
+    return updated
 
 
 def invalidate_scan_job_library_artifacts(scan_job: ScanJob | str) -> int:

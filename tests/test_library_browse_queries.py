@@ -281,9 +281,11 @@ def test_library_books_query_count_is_independent_of_page_size(params: dict[str,
     html = _count_queries(client, "/library/books/", {**params, "page_size": 100, "view": "html"})
 
     assert len(small) == len(large)
-    assert len(html) == len(large)
-    # count + page + four prefetches, plus session/auth/profile lookups.
-    assert len(large) <= 10
+    # The HTML page adds one constant query: the genre picker's option list (#50).
+    assert len(html) == len(large) + 1
+    # count + page + four prefetches, plus session/auth/profile lookups. A genre filter
+    # adds two constant queries resolving the value through genre names and aliases.
+    assert len(large) <= (12 if "genre" in params else 10)
     assert not [sql for sql in large if "DISTINCT" in sql.upper()]
 
 

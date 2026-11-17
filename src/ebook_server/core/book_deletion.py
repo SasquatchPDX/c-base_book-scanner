@@ -102,6 +102,10 @@ def delete_book_safely(
             artifacts = _book_artifacts(locked_book)
             resolved: list[tuple[ArtifactToDelete, StorageBackend]] = []
             for artifact in artifacts:
+                if artifact.storage_location.read_only:
+                    # Indexed in place: the file belongs to its share, not to the
+                    # library. Deleting the book removes only the database record.
+                    continue
                 try:
                     backend = backend_for_location(artifact.storage_location)
                 except StorageConfigurationError as exc:
