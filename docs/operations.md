@@ -283,6 +283,46 @@ uv run python manage.py ingest_sources --source-id 1
 uv run python manage.py ingest_sources --source-id 1 --retry-failed
 ```
 
+### Folder layouts (author/title from paths)
+
+Collections are organised differently, so each source can declare how its folders
+are structured (Django admin → Source locations → "Folder layout"). This is opt-in:
+a source without layouts behaves as before, because not every folder names an
+author. `path_layouts` is an ordered JSON list of templates matched against the
+path relative to the source root, without the file extension. The first template
+that yields a non-ignored value supplies hints:
+
+| Collection | `path_layouts` |
+|---|---|
+| `Austen, Jane/Pride and Prejudice.txt` | `["{author}/**"]` |
+| Calibre library `Jane Austen/Emma (12)/Emma - Jane Austen.epub` | `["{author}/{title} ({*})/{*}"]` |
+| flat `Emma - Jane Austen.epub` | `["{title} - {author}"]` |
+| author folders plus loose `Author - Title` files | `["{author}/**", "{author} - {title}"]` |
+| `Genre/Weber, David & Evans, Linda/Hell's Gate.epub` | `["{*}/{authors}/{title}"]` |
+
+Placeholders: `{author}`, `{authors}` (split on `&`, `;`, `and`, `und`), `{title}`,
+`{series}`, and `{*}` (ignored text within one folder or file name). `**` spans
+whole folders: zero or more in the middle, one or more at the end. Limits keep
+matching cheap: at most 20 templates per source, 3 placeholders per folder/file
+name, 4 `{*}` and 2 `**` per template. Names longer than 255 characters and paths
+longer than 1024 characters never match.
+
+`author_name_order` controls reordering: `auto` turns `Last, First` into
+`First Last`, `last_first` also reorders names without a comma, and `first_last`
+never reorders. `layout_ignore_values` lists captured values that are not names,
+for example `["Unknown", "Misc", "Cliff Notes"]`.
+
+Path hints are stored in the import evidence under `path_layout` and are only
+*evidence* for the external lookup. A layout author replaces the ambiguous filename
+"A - B" split guesses but never outranks embedded authors. A layout title goes after
+the embedded title. Hints never bypass provider verification or review thresholds.
+Check a layout before importing; each preview row shows
+`[layout: author=[...] title=... series=...]` or `[layout: no match]`:
+
+```bash
+uv run python manage.py ingest_sources --source-id 1 --preview
+```
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
