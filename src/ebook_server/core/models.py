@@ -9,6 +9,7 @@ from typing import ClassVar, Final
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.timezone import now
 
@@ -111,6 +112,20 @@ class StorageLocation(models.Model):
         return self.identifier
 
 
+MAX_PUBLICATION_YEAR = 9999
+
+
+def clean_publication_year(value: object) -> int | None:
+    """Return a plausible publication year (1-9999) or ``None``."""
+    if isinstance(value, bool):
+        return None
+    try:
+        year = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+    return year if 1 <= year <= MAX_PUBLICATION_YEAR else None
+
+
 class SourceLocation(models.Model):
     """Configured input source for ingestion workflows."""
 
@@ -150,12 +165,31 @@ class Book(models.Model):
     title = models.CharField(max_length=255)
     subtitle = models.CharField(max_length=512, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
-    publication_date = models.DateField(null=True, blank=True)
+    # Providers only give a (first-)publication *year*; storing it as 1 January would
+    # fabricate day precision (#38). ``publication_date`` holds a genuinely known full
+    # date only (for example entered by an admin) and is empty otherwise.
+    publication_year = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(MAX_PUBLICATION_YEAR)],
+    )
+    publication_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Full publication date, only when the exact day is known.",
+    )
     edition = models.CharField(max_length=128, blank=True)
     language = models.CharField(max_length=32, blank=True)
     description = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def published_year(self) -> int | None:
+        """The publication year, whichever precision is stored."""
+        if self.publication_year is not None:
+            return self.publication_year
+        return self.publication_date.year if self.publication_date else None
 
     authors: models.ManyToManyField[Author, Author] = models.ManyToManyField(
         "Author",

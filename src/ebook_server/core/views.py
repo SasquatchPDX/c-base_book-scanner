@@ -80,6 +80,7 @@ from .models import (
     ScanTailorStageState,
     ScanTodo,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -1364,6 +1365,8 @@ def _serialize_book(
         "edition": book.edition,
         "language": book.language,
         "description": book.description,
+        # Year-only data (the usual case) leaves publication_date null (#38).
+        "publication_year": book.published_year,
         "publication_date": book.publication_date.isoformat() if book.publication_date else None,
         "authors": [author.full_name for author in book.authors.all()],
         "categories": [category.name for category in book.categories.all()],
@@ -3614,13 +3617,7 @@ def review_accept_candidate(
                 description=candidate.description or "",
                 edition=candidate_edition or "",
             )
-            if candidate.publication_year:
-                try:
-                    from datetime import date
-
-                    book.publication_date = date(candidate.publication_year, 1, 1)
-                except ValueError:
-                    pass
+            book.publication_year = clean_publication_year(candidate.publication_year)
             for author_name in candidate.authors:
                 if not isinstance(author_name, str):
                     continue

@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import shutil
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, cast
 from urllib.parse import unquote
 from zipfile import ZipFile, ZipInfo, is_zipfile
@@ -49,6 +50,7 @@ from .models import (
     ReviewTask,
     SourceLocation,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import backend_for_location
 
@@ -129,6 +131,13 @@ MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+# Formats whose metadata is read through Calibre's ``ebook-meta`` instead of a Python
+# parser. Only ``mobi`` is an accepted intake format today; the other Kindle-family
+# names are listed so they pick this path up as soon as detect_format accepts them.
+EBOOK_META_FORMATS = frozenset({"mobi", "azw", "azw3", "prc"})
+EBOOK_META_BINARY = "ebook-meta"
+EBOOK_META_TIMEOUT_SECONDS = 30.0
+DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
 
 # ImportJob.evidence keys written when a candidate scores high enough to be accepted
 # automatically but is routed to review anyway (shown on the review page).
@@ -745,6 +754,12 @@ def extract_metadata(
             return _extract_fb2_metadata(file_path, original_filename=original_filename)
         if detected_format == "cbz":
             return _extract_cbz_metadata(file_path, original_filename=original_filename)
+        if detected_format in EBOOK_META_FORMATS:
+            return _extract_ebook_meta_metadata(
+                file_path,
+                detected_format,
+                original_filename=original_filename,
+            )
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
@@ -885,6 +900,72 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
     }
 
 
+def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
+    """Return the OPF document Calibre's ``ebook-meta`` writes for ``file_path``.
+
+    ``None`` means "no usable metadata" (tool missing, failed, timed out, or wrote
+    nothing within the size cap); the caller then falls back to filename signals.
+    The command goes through the conversion runner, which kills the whole process
+    group on timeout so a hung Calibre helper cannot outlive the job.
+    """
+    # Imported here: conversion imports this module at load time.
+    from .conversion import ConversionError, _run_conversion_command
+
+    binary = shutil.which(EBOOK_META_BINARY)
+    if binary is None:
+        logger.warning("ebook_meta_unavailable", binary=EBOOK_META_BINARY)
+        return None
+    with TemporaryDirectory(prefix="ebook-meta-") as workdir:
+        opf_path = Path(workdir) / "metadata.opf"
+        try:
+            result = _run_conversion_command(
+                [binary, str(Path(file_path).resolve()), "--to-opf", str(opf_path)],
+                timeout=EBOOK_META_TIMEOUT_SECONDS,
+            )
+        except (OSError, ConversionError) as exc:
+            logger.warning("ebook_meta_failed", error_type=type(exc).__name__)
+            return None
+        if result.returncode != 0:
+            logger.warning("ebook_meta_failed", returncode=result.returncode)
+            return None
+        try:
+            if opf_path.stat().st_size > MAX_FORMAT_METADATA_BYTES:
+                logger.warning("ebook_meta_output_too_large")
+                return None
+            payload = opf_path.read_bytes()
+        except OSError:
+            return None
+    return payload or None
+
+
+def _extract_ebook_meta_metadata(
+    file_path: str,
+    detected_format: str,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    """MOBI and other Kindle-family metadata, read via ``ebook-meta --to-opf``."""
+    fallback: dict[str, Any] = {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {},
+        "container_type": detected_format,
+    }
+    payload = _run_ebook_meta_to_opf(file_path)
+    if payload is None:
+        return fallback
+    try:
+        fields = parse_opf_metadata(payload)
+    except (ET.ParseError, DefusedXmlException) as exc:
+        logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
+        return fallback
+    return {
+        **fields,
+        "title": fields["title"] or fallback["title"],
+        "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
+        "container_type": detected_format,
+    }
+
+
 def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     reader = PdfReader(file_path)
     metadata: Any = reader.metadata or {}
@@ -988,6 +1069,59 @@ def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
         if identification.normalize_isbns(text):
             return text
     return texts[0][1]
+
+
+def _opf_creator_is_author(element: Any) -> bool:
+    """True unless the dc:creator carries a non-author ``opf:role`` (editor, translator...)."""
+    role = next(
+        (str(value) for key, value in element.attrib.items() if _xml_local_name(key) == "role"),
+        "",
+    )
+    return not role or role.strip().lower() == "aut"
+
+
+def parse_opf_metadata(payload: bytes) -> dict[str, Any]:
+    """Parse the Dublin-Core fields of a standalone OPF package document.
+
+    Shared by every OPF this module reads outside an EPUB container: the document
+    ``ebook-meta --to-opf`` writes for Kindle-family files and a Calibre
+    ``metadata.opf`` sidecar. Parsing goes through defusedxml, so a document with
+    entity declarations raises ``DefusedXmlException``; malformed XML raises
+    ``ParseError``. Callers decide how to degrade.
+    """
+    root = ET.fromstring(payload)
+
+    def texts(name: str) -> list[str]:
+        values = []
+        for element in root.iterfind(f".//{DC_NAMESPACE}{name}"):
+            value = " ".join("".join(element.itertext()).split())
+            if value:
+                values.append(value)
+        return values
+
+    def first(name: str) -> str | None:
+        values = texts(name)
+        return values[0] if values else None
+
+    authors: list[str] = []
+    for element in root.iterfind(f".//{DC_NAMESPACE}creator"):
+        name = " ".join("".join(element.itertext()).split())
+        if name and name not in authors and _opf_creator_is_author(element):
+            authors.append(name)
+    return {
+        "title": first("title"),
+        "authors": authors,
+        "language": first("language"),
+        "description": first("description"),
+        "publisher": first("publisher"),
+        "subjects": identification.normalize_subjects(texts("subject")),
+        "identifier": _pick_epub_identifier(
+            [
+                (element.attrib, "".join(element.itertext()).strip())
+                for element in root.iterfind(f".//{DC_NAMESPACE}identifier")
+            ],
+        ),
+    }
 
 
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
@@ -1231,11 +1365,7 @@ def _provision_book_from_manual_metadata(
         description=description or "",
         edition=_fit(Book, "edition", edition),
     )
-    if publication_year:
-        try:
-            book.publication_date = date(publication_year, 1, 1)
-        except ValueError:
-            pass
+    book.publication_year = clean_publication_year(publication_year)
     for raw_author in authors or []:
         author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
@@ -1374,11 +1504,9 @@ def _provision_book_from_metadata(
             book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
-        if candidate.publication_year:
-            try:
-                book.publication_date = date(candidate.publication_year, 1, 1)
-            except ValueError:
-                pass
+        year = clean_publication_year(candidate.publication_year)
+        if year is not None:
+            book.publication_year = year
         book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book
