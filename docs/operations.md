@@ -338,7 +338,8 @@ for the others. It never replaces verification:
   `BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS` (default 0.35), and must reach the
   auto-accept threshold. An equal title is enough; the shared name alone is not;
 - the file goes to review instead when its embedded ISBN conflicts with the Book's
-  ISBNs (`conflicting_isbn`), when a provider candidate confidently matches a
+  ISBNs (`conflicting_isbn`), when its embedded authors name different people than
+  the Book's (`author_conflict`), when a provider candidate confidently matches a
   different book (`provider_match_differs`), or when the score stays below the
   threshold (`below_threshold`);
 - siblings already waiting in review are re-assessed with the same rule when another
@@ -508,6 +509,13 @@ encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP reader
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
 extraction still requires an explicitly configured external archive tool in a
 restricted worker environment.
+
+MOBI (and other Kindle-family formats once intake accepts them) metadata is read
+with Calibre's `ebook-meta --to-opf` when it is on `PATH`. It runs through the
+conversion runner with a 30 s timeout that kills the whole process group, and its
+OPF output (capped at 2 MiB) is parsed with defusedxml. A missing tool, timeout,
+failure, or unusable output falls back to filename signals and does not fail the
+import (`ebook_meta_unavailable` / `ebook_meta_failed` are logged).
 
 EPUB, PDF, and CBZ intake attempts front-cover extraction in the ingestion worker.
 PDF pages are rendered by liberal-licensed PDFium bindings; archive images are
