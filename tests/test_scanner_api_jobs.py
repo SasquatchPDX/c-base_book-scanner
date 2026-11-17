@@ -142,6 +142,7 @@ def test_put_job_creates_open_job(key: str, settings: Any) -> None:
         "capture_layout": "single_page",
         "events": {"sans_last_line_no": 0},
         "pages": [],
+        "covers": [],
         "open_rescans": 0,
     }
     job = ScanJob.objects.get(pk=JOB_ID)

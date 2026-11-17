@@ -26,6 +26,7 @@ from . import (
     conversion,
     intake,
     ocr,
+    scan_covers,
     scan_events,
     scan_lifecycle,
     scan_logs,
@@ -707,6 +708,9 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
                     if isinstance(details.get("request_options"), dict)
                     else None,
                 )
+
+        # The scanner's cover photos become the Book's covers (#128, §4.3).
+        scan_covers.apply_scan_covers_to_book(scan_job)
 
         finished_at = timezone.now()
         details = {

@@ -39,6 +39,7 @@ EXPECTED_REFERENCES = {
 # lists them too.
 ADDED_AFTER_0041 = {
     "ScanEvent",  # 0042_scan_events (#129)
+    "ScanCover",  # 0044_scanner_page_and_cover_upload (#128)
 }
 
 

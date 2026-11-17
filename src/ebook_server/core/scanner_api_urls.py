@@ -17,6 +17,16 @@ urlpatterns = [
     ),
     re_path(r"^jobs/(?P<job_id>[^/]+)/abort/?$", scanner_api.abort, name="scanner-api-abort"),
     re_path(
+        r"^jobs/(?P<job_id>[^/]+)/pages/(?P<sequence_number>[^/]+)/?$",
+        scanner_api.page,
+        name="scanner-api-page",
+    ),
+    re_path(
+        r"^jobs/(?P<job_id>[^/]+)/covers/(?P<position>[^/]+)/?$",
+        scanner_api.cover,
+        name="scanner-api-cover",
+    ),
+    re_path(
         r"^jobs/(?P<job_id>[^/]+)/events/?$",
         scanner_api.job_events,
         name="scanner-api-job-events",
