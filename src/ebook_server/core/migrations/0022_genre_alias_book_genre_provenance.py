@@ -12,7 +12,7 @@ class Migration(migrations.Migration):
     """
 
     dependencies = [
-        ("core", "0021_source_location_path_layouts"),
+        ("core", "0022_source_location_group_sibling_formats"),
     ]
 
     operations = [

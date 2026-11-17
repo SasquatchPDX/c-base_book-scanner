@@ -278,6 +278,17 @@ class SourceLocation(models.Model):
             "Compared case-insensitively; an ignored value yields no hint."
         ),
     )
+    # Opt-in (#39): generic same-name pairs ("notes.txt"/"notes.pdf") are not one book
+    # in every collection.
+    group_sibling_formats = models.BooleanField(
+        default=False,
+        help_text=(
+            "Treat files in the same folder with the same name and different extensions "
+            "(e.g. 'Dune.epub', 'Dune.mobi') as formats of one book: once one is linked "
+            "to a book, the others are offered that book as a strong candidate. They are "
+            "still looked up externally, and conflicting evidence goes to review."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

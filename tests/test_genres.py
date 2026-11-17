@@ -492,7 +492,7 @@ def test_migrations_keep_existing_links_as_admin_set_and_reverse() -> None:
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
-    before = [("core", "0021_source_location_path_layouts")]
+    before = [("core", "0022_source_location_group_sibling_formats")]
     after = [("core", "0023_seed_genres")]
     executor = MigrationExecutor(connection)
     executor.migrate(before)
