@@ -439,7 +439,10 @@ archiving `CANCELLED`. It then deletes their RQ jobs from the queue and from the
 started, scheduled, deferred and failed registries. A cancelled job never runs again,
 even if RQ redelivers it after a worker restart. A job that is running when it is
 cancelled stops at its next phase boundary without archiving, creating a review
-task, or creating a Book, and is not retried. Jobs already `ARCHIVING` are left
+task, or creating a Book, and is not retried. Cancelling clears the job's lease
+and locks its row. Each phase save of the worker locks the same row before
+checking the state, so a cancellation never commits between that check and the
+save. Jobs already `ARCHIVING` are left
 to finish, because a MOVE source may already be in the archive; `LOW_CONFIDENCE`
 jobs waiting for review are untouched. To import the cancelled files later,
 resume the source and run `ingest_sources`; they are discovered again.
