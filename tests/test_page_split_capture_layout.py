@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
-from django.test import override_settings
+from django.db import connection
+from django.test import Client, override_settings
 
 from ebook_server.core import scantailor
-from ebook_server.core.models import ProcessingJob, ScanJob, ScanPage, ScanTailorStageState
+from ebook_server.core.models import (
+    ProcessingJob,
+    ScanJob,
+    ScanPage,
+    ScanTailorStageState,
+    get_or_create_profile,
+)
 from tests.test_scan_jobs import _create_scan_job, _put_scan_page, _upload_scan_page
 from tests.test_scantailor import _facing_page_bytes, _stage_preview_size, _stage_url
 
@@ -209,3 +217,145 @@ def test_failed_dispatch_does_not_fail_the_upload(monkeypatch: pytest.MonkeyPatc
     assert ProcessingJob.objects.get(job_id=state.worker_job_id).state == (
         ProcessingJob.JobState.FAILED
     )
+
+
+def _manual_split_from_another_session(job: ScanJob, page: ScanPage) -> int:
+    """POST a manual split as a second user, on its own thread and DB connection."""
+    status: list[int] = []
+
+    def run() -> None:
+        try:
+            other = Client()
+            other.force_login(get_or_create_profile("layout-race-editor").user)
+            response = other.post(
+                _stage_url(str(job.id), str(page.id), "page_split"),
+                data=json.dumps({"parameters": {"split_mode": "manual", "split_x": 140}}),
+                content_type="application/json",
+            )
+            status.append(response.status_code)
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=60)
+    assert not thread.is_alive()
+    assert status, "manual split request did not complete"
+    return status[0]
+
+
+def _assert_manual_split_kept(job: ScanJob, page: ScanPage, manual_revision: int) -> None:
+    state = _split_state(job, page)
+    assert state.revision == manual_revision
+    assert state.parameters["split_mode"] == "manual"
+    assert state.algorithm == "manual_split"
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.parameters["resolved_split_x"] == 140
+    assert state.parameters["output_width"] < 420
+    assert not scantailor.is_auto_skipped_split(state)
+    assert f"/v{manual_revision}/" in state.output_storage_identifier
+    owner = ProcessingJob.objects.get(job_id=state.worker_job_id)
+    assert owner.details["automatic"] is False
+    assert owner.details["stage_revision"] == manual_revision
+    assert owner.state == ProcessingJob.JobState.SUCCESS
+    assert not owner.details.get("superseded")
+
+
+def run_reviewer_interleaving(monkeypatch: pytest.MonkeyPatch, user: str) -> None:
+    """Reviewer interleaving on PR #102, shared with the PostgreSQL suite.
+
+    During a rescan PUT the automatic passthrough reads the Page Split stage (mode
+    "none", revision N); a manual split POST then lands from another session
+    (revision N+1, cropped output). Automation must neither reset the mode nor reuse
+    revision N+1 nor replace the manual artifact.
+    """
+    client, job = _create_scan_job(user)
+    page = _upload(client, job, side="left", payload=_facing_page_bytes(split=230))
+    observed_revision = _split_state(job, page).revision
+
+    real_get_or_create = scantailor.get_or_create_stage_state
+    armed = [True]
+    manual_status: list[int] = []
+
+    def read_then_interleave(**kwargs: str) -> ScanTailorStageState:
+        state = real_get_or_create(**kwargs)
+        if armed[0] and kwargs.get("stage") == "page_split":
+            armed[0] = False
+            assert scantailor.effective_split_mode(state) == "none"
+            manual_status.append(_manual_split_from_another_session(job, page))
+        return state
+
+    monkeypatch.setattr(scantailor, "get_or_create_stage_state", read_then_interleave)
+    stage_jobs = ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE)
+    jobs_before = set(stage_jobs.values_list("job_id", flat=True))
+
+    assert _put_scan_page(client, page.id, _facing_page_bytes(split=232)).status_code == 201
+
+    assert manual_status == [202]
+    _assert_manual_split_kept(job, page, observed_revision + 1)
+    # Only the manual run was queued; automation queued nothing.
+    new_jobs = stage_jobs.exclude(job_id__in=jobs_before)
+    assert [row.details["automatic"] for row in new_jobs] == [False]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_manual_split_interleaved_after_passthrough_read_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_reviewer_interleaving(monkeypatch, "layout-race-read")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_late_automatic_job_is_a_noop_after_a_manual_edit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A passthrough job overtaken by a manual edit must not replace its artifact."""
+    client, job = _create_scan_job("layout-race-late")
+    page = _upload(client, job, side="left", payload=_facing_page_bytes(split=230))
+
+    real_dispatch = scantailor.dispatch_stage_job
+    held: list[str] = []
+
+    def hold_automatic(job_id: str) -> None:
+        row = ProcessingJob.objects.get(job_id=job_id)
+        if row.details.get("automatic"):
+            held.append(job_id)
+            return
+        real_dispatch(job_id)
+
+    monkeypatch.setattr(scantailor, "dispatch_stage_job", hold_automatic)
+    assert _put_scan_page(client, page.id, _facing_page_bytes(split=232)).status_code == 201
+    assert len(held) == 1
+    auto_revision = _split_state(job, page).revision
+
+    assert _manual_split_from_another_session(job, page) == 202
+    _assert_manual_split_kept(job, page, auto_revision + 1)
+
+    scantailor.process_stage_job(held[0])  # the queued passthrough finally runs
+
+    late = ProcessingJob.objects.get(job_id=held[0])
+    assert late.details["superseded"] is True
+    assert late.details["superseded_reason"] == "stage revision changed after dispatch"
+    _assert_manual_split_kept(job, page, auto_revision + 1)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_dispatch_for_a_stale_revision_is_superseded_without_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job queued for an old revision never takes over the stage's worker slot."""
+    client, job = _create_scan_job("layout-race-dispatch")
+    page = _upload(client, job, side="left", payload=_facing_page_bytes(split=230))
+    assert _manual_split_from_another_session(job, page) == 202
+    state = _split_state(job, page)
+    stale = ScanTailorStageState.objects.get(pk=state.pk)
+    stale.revision -= 1  # a copy read before the manual edit
+
+    ran: list[str] = []
+    monkeypatch.setattr(scantailor, "dispatch_stage_job", ran.append)
+    queued = scantailor.request_stage_job(state=stale, automatic=True)
+
+    assert ran == []
+    assert queued.details["superseded"] is True
+    assert queued.details["superseded_reason"] == "stage revision changed before dispatch"
+    _assert_manual_split_kept(job, page, state.revision)

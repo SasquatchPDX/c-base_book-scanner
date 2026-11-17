@@ -2307,6 +2307,39 @@ def _apply_stage_payload_to_state(
     state.status = ScanTailorStageState.StageStatus.QUEUED
 
 
+def _lock_stage_state(state: ScanTailorStageState) -> ScanTailorStageState:
+    """Re-read ``state`` under a row lock; call inside ``transaction.atomic()``."""
+    return (
+        ScanTailorStageState.objects.select_for_update()
+        .select_related("scan_job", "scan_page")
+        .get(pk=state.pk)
+    )
+
+
+def _apply_and_save_stage_edit(
+    state: ScanTailorStageState,
+    page: ScanPage,
+    stage: str,
+    payload: dict[str, Any],
+) -> None:
+    """Apply a user edit to a locked ``state`` and persist it as the next revision."""
+    _apply_stage_payload_to_state(state, page, stage, payload)
+    state.save(
+        update_fields=[
+            "algorithm",
+            "algorithm_version",
+            "parameters",
+            "input_stage_state",
+            "input_scan_page_version",
+            "input_storage_identifier",
+            "revision",
+            "last_error",
+            "status",
+            "updated_at",
+        ],
+    )
+
+
 @require_GET
 @scan_api_login_required
 def scan_job_workspace(
@@ -2475,29 +2508,20 @@ def scan_page_stage(
 
     payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
-    if expected_revision is not None and expected_revision != state.revision:
-        return _conflict_response(state, expected_revision)
-
-    _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-    state.save(
-        update_fields=[
-            "algorithm",
-            "algorithm_version",
-            "parameters",
-            "input_stage_state",
-            "input_scan_page_version",
-            "input_storage_identifier",
-            "revision",
-            "last_error",
-            "status",
-            "updated_at",
-        ],
-    )
-    scantailor.invalidate_downstream_states(
-        page,
-        from_stage=state.stage,
-        reason=f"{state.stage} updated",
-    )
+    # Check and bump the revision on the locked row, not on the copy read above: a
+    # concurrent writer (another user, or the automatic single-page passthrough)
+    # either finished first, so the expected_revision check sees it, or waits for
+    # this edit and then finds a newer revision and backs off (#55).
+    with transaction.atomic():
+        state = _lock_stage_state(state)
+        if expected_revision is not None and expected_revision != state.revision:
+            return _conflict_response(state, expected_revision)
+        _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+        scantailor.invalidate_downstream_states(
+            page,
+            from_stage=state.stage,
+            reason=f"{state.stage} updated",
+        )
 
     processing_job = scantailor.request_stage_job(
         state=state,
@@ -2575,30 +2599,17 @@ def scan_job_stage_batch(
             page_id=str(page.id),
             stage=normalized_stage,
         )
-        if preserve_exceptions and _is_manual_stage_state(state):
-            skipped.append(str(page.id))
-            continue
-
-        _apply_stage_payload_to_state(state, page, normalized_stage, payload)
-        state.save(
-            update_fields=[
-                "algorithm",
-                "algorithm_version",
-                "parameters",
-                "input_stage_state",
-                "input_scan_page_version",
-                "input_storage_identifier",
-                "revision",
-                "last_error",
-                "status",
-                "updated_at",
-            ],
-        )
-        scantailor.invalidate_downstream_states(
-            page,
-            from_stage=state.stage,
-            reason=f"{state.stage} updated via batch",
-        )
+        with transaction.atomic():
+            state = _lock_stage_state(state)
+            if preserve_exceptions and _is_manual_stage_state(state):
+                skipped.append(str(page.id))
+                continue
+            _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+            scantailor.invalidate_downstream_states(
+                page,
+                from_stage=state.stage,
+                reason=f"{state.stage} updated via batch",
+            )
         processing_job = scantailor.request_stage_job(
             state=state,
             requested_by_user_id=profile.user_id,

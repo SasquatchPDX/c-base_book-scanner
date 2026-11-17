@@ -2586,7 +2586,17 @@ def request_stage_job(
     *,
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
+    automatic: bool = False,
 ) -> ProcessingJob:
+    """Create and dispatch the worker job for ``state`` at its current revision.
+
+    The job records the stage revision it was dispatched for (``stage_revision``) and
+    only takes over the stage's ``worker_job_id`` while the row is still at that
+    revision. If an edit bumped the revision in between, the job is closed as
+    superseded right away and never dispatched, so it cannot replace the newer
+    edit's artifact; :func:`process_stage_job` repeats the check on execution.
+    """
+    revision = state.revision
     job = ProcessingJob.objects.create(
         job_type=ProcessingJob.JobType.STAGE,
         state=ProcessingJob.JobState.QUEUED,
@@ -2595,29 +2605,96 @@ def request_stage_job(
             "scan_tailor_stage_state_id": state.id,
             "requested_by_user_id": requested_by_user_id,
             "stage": state.stage,
+            "stage_revision": revision,
+            "automatic": automatic,
         },
     )
+    algorithm = state.algorithm or _default_algorithm(state.stage)
+    algorithm_version = state.algorithm_version or _default_algorithm_version(state.stage)
+    now = timezone.now()
+    claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(
+        worker_job_id=str(job.job_id),
+        status=ScanTailorStageState.StageStatus.QUEUED,
+        algorithm=algorithm,
+        algorithm_version=algorithm_version,
+        last_error="",
+        invalidated_reason="",
+        updated_at=now,
+    )
+    if not claimed:
+        _supersede_stage_job(job, dict(job.details), "stage revision changed before dispatch")
+        return job
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
     state.invalidated_reason = ""
-    if not state.algorithm:
-        state.algorithm = _default_algorithm(state.stage)
-    if not state.algorithm_version:
-        state.algorithm_version = _default_algorithm_version(state.stage)
-    state.save(
-        update_fields=[
-            "worker_job_id",
-            "status",
-            "algorithm",
-            "algorithm_version",
-            "last_error",
-            "invalidated_reason",
-            "updated_at",
-        ],
-    )
+    state.algorithm = algorithm
+    state.algorithm_version = algorithm_version
+    state.updated_at = now
     dispatch_stage_job(str(job.job_id))
     return job
+
+
+def _claim_automatic_single_page_split(
+    state: ScanTailorStageState,
+    observed_revision: int,
+) -> ScanTailorStageState | None:
+    """Atomically move an auto-owned Page Split stage to a new "no split" revision.
+
+    The decision is taken on the row as it is *now*, under a row lock, and the write
+    is conditional on the revision observed before the lock. Any edit that landed in
+    between (a manual split, a batch apply, another passthrough) bumped the revision,
+    so automation loses the race and changes nothing: the concurrent edit wins.
+    Returns the updated state, or ``None`` when automation must stay out.
+    """
+    with transaction.atomic():
+        locked = (
+            ScanTailorStageState.objects.select_for_update()
+            .select_related("scan_job")
+            .filter(id=state.id)
+            .first()
+        )
+        if locked is None or locked.revision != observed_revision:
+            return None
+        if effective_split_mode(locked) != "none":
+            return None
+        parameters = dict(locked.parameters or {})
+        parameters["split_mode"] = "none"
+        algorithm = split_algorithm_for_mode("none")
+        new_revision = observed_revision + 1
+        now = timezone.now()
+        updated = ScanTailorStageState.objects.filter(
+            id=locked.id,
+            revision=observed_revision,
+        ).update(
+            parameters=parameters,
+            algorithm=algorithm,
+            revision=new_revision,
+            status=ScanTailorStageState.StageStatus.QUEUED,
+            last_error="",
+            updated_at=now,
+        )
+        if not updated:
+            return None
+        # A new page version has normally invalidated everything already ("source
+        # changed"); keep that reason and only catch stages that are still current.
+        ScanTailorStageState.objects.filter(
+            scan_job_id=locked.scan_job_id,
+            scan_page_id=locked.scan_page_id,
+            stage__in=downstream_stages(locked.stage),
+        ).exclude(status=ScanTailorStageState.StageStatus.INVALIDATED).update(
+            status=ScanTailorStageState.StageStatus.INVALIDATED,
+            invalidated_reason="page_split updated",
+            last_error="",
+            updated_at=now,
+        )
+    locked.parameters = parameters
+    locked.algorithm = algorithm
+    locked.revision = new_revision
+    locked.status = ScanTailorStageState.StageStatus.QUEUED
+    locked.last_error = ""
+    locked.updated_at = now
+    return locked
 
 
 def auto_complete_single_page_split(
@@ -2632,35 +2709,37 @@ def auto_complete_single_page_split(
     page whose split was switched to another mode (manual/auto/single) is a per-page
     override and is left for the user to re-run. Returns the queued job, or ``None``
     when nothing was queued.
+
+    Concurrency: automation never wins against a user. The mode/revision decision is
+    a locked, revision-conditional update (:func:`_claim_automatic_single_page_split`),
+    and the dispatched job only runs while the stage is still at the revision it was
+    queued for, so a manual edit that interleaves at any point keeps its parameters,
+    its revision and its artifact.
     """
     if page.scan_job.capture_layout != ScanJob.CaptureLayout.SINGLE_PAGE:
         return None
-    state = get_or_create_stage_state(
+    observed = get_or_create_stage_state(
         scan_job_id=str(page.scan_job_id),
         page_id=str(page.id),
         stage=ScanTailorStageState.Stage.PAGE_SPLIT.value,
     )
-    if effective_split_mode(state) != "none":
+    if effective_split_mode(observed) != "none":
         return None
-    state.parameters = {"split_mode": "none"}
-    state.algorithm = split_algorithm_for_mode("none")
-    state.revision += 1
-    state.status = ScanTailorStageState.StageStatus.QUEUED
-    state.save(update_fields=["parameters", "algorithm", "revision", "status", "updated_at"])
-    # A new page version has normally invalidated everything already ("source
-    # changed"); keep that reason and only catch stages that are still current.
-    ScanTailorStageState.objects.filter(
-        scan_job_id=page.scan_job_id,
-        scan_page=page,
-        stage__in=downstream_stages(state.stage),
-    ).exclude(status=ScanTailorStageState.StageStatus.INVALIDATED).update(
-        status=ScanTailorStageState.StageStatus.INVALIDATED,
-        invalidated_reason="page_split updated",
-        last_error="",
-        updated_at=timezone.now(),
-    )
+    state = _claim_automatic_single_page_split(observed, observed.revision)
+    if state is None:
+        logger.info(
+            "scantailor_auto_split_skipped_concurrent_edit",
+            scan_job_id=str(page.scan_job_id),
+            scan_page_id=str(page.id),
+            observed_revision=observed.revision,
+        )
+        return None
     try:
-        return request_stage_job(state=state, requested_by_user_id=requested_by_user_id)
+        job = request_stage_job(
+            state=state,
+            requested_by_user_id=requested_by_user_id,
+            automatic=True,
+        )
     except Exception as exc:  # the page upload itself must still succeed
         logger.warning(
             "scantailor_auto_split_dispatch_failed",
@@ -2681,6 +2760,10 @@ def auto_complete_single_page_split(
             updated_at=now,
         )
         return None
+    details = job.details if isinstance(job.details, dict) else {}
+    if details.get("superseded"):
+        return None
+    return job
 
 
 def dispatch_stage_job(job_id: str) -> None:
@@ -2730,6 +2813,16 @@ def process_stage_job(job_id: str) -> None:
     )
     if state is None:
         _fail_stage_job(job, f"stage state not found: {stage_state_id}")
+        return
+
+    # A job only ever produces the artifact of the revision it was queued for. A late
+    # job (e.g. an automatic passthrough overtaken by a manual edit) is a no-op.
+    dispatched_revision = details.get("stage_revision")
+    if isinstance(dispatched_revision, int) and dispatched_revision != state.revision:
+        _supersede_stage_job(job, details, "stage revision changed after dispatch")
+        return
+    if details.get("automatic") is True and effective_split_mode(state) != "none":
+        _supersede_stage_job(job, details, "stage is no longer an automatic passthrough")
         return
 
     if state.input_stage_state is not None:
