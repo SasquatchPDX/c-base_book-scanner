@@ -144,8 +144,7 @@ Weak matches must route to review workflow instead of auto-linking.
 
 ## Subject / genre evidence
 
-Subject tags are captured as evidence only; they do not affect candidate scoring and
-are not yet written to `Book.categories` / `Book.genres`.
+Subject tags are captured as evidence; they do not affect candidate scoring.
 
 - Embedded: EPUB `dc:subject` and CBZ `ComicInfo.xml` `Genre` (comma-separated) land
   in `ImportJob.evidence["subjects"]` (and therefore the review task's embedded
@@ -155,11 +154,73 @@ are not yet written to `Book.categories` / `Book.genres`.
   `categories`). Open Library search requests `subject` explicitly via `fields`,
   because the default search field set omits it.
 - Tags are trimmed, de-duplicated case-insensitively, limited to 25 per source and
-  128 characters each (`Category.name` / `Genre.name` length), and otherwise kept as
-  free text. Reviewers see candidate subjects on the review page.
+  128 characters each, and otherwise kept as free text. The raw tags are never
+  rewritten; mapping them to genres (below) is a separate step.
 
-Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
-whether review gates it) is an open owner decision tracked in issue #50.
+## Genres and categories (#50)
+
+**Genre vs Category.** `Genre` is the literary genre facet (fiction and nonfiction:
+Science fiction, Mystery, Biography & memoir, History, ...) and is the only target of
+tag-derived classification. `Category` is library shelving (for example "Reference",
+"Hackerspace manuals") and stays manual: only admins set it, in the Django admin.
+Free-text subject tags never create or assign categories.
+
+**Normalization.** A tag matches a genre when its key equals the key of a `Genre` name
+or a `GenreAlias`. The key (`models.genre_key`) folds case, accents, `&`/"and",
+punctuation and whitespace, so "SciFi", "Sci-Fi" and "sci fi" are the same key. On
+top of the exact key the resolver only:
+
+- drops trailing "General" segments ("Fiction / Science Fiction / General",
+  "Fiction, science fiction, general");
+- walks up BISAC-style `/` hierarchies one level at a time ("FICTION / Science
+  Fiction / Space Opera" -> "FICTION / Science Fiction").
+
+Comma-separated Open Library strings are not truncated further, because "Science
+fiction, history and criticism" is not a science fiction book. There is no fuzzy
+matching.
+
+**Unknown tags are not auto-created.** A tag that maps to nothing stays evidence
+only. Admins promote it by adding a `Genre`, or a `GenreAlias` on an existing genre,
+in the Django admin (Genre change page, "Genre aliases" inline, or the Genre aliases
+list). The admin rejects an alias that duplicates another alias or another genre's
+name. Migration `0023_seed_genres` ships a small starter set (about 20 genres, with
+common fiction spellings and BISAC/Open Library strings) that admins may edit or
+delete.
+
+**Assignment and precedence.** When an import is linked to a Book through an
+accepted candidate (auto-accept in intake, or a reviewer's "Accept"):
+
+1. Reviewer choice wins. The review page shows, for each candidate, which tags map
+   to which genres, with the suggested genres ticked. Reviewers can untick
+   suggestions or tick other existing genres; the ticked set is saved with
+   `source="reviewer"` (an empty set is a valid choice). API clients do the same with
+   `genre_ids: [...]`; omitting `genre_ids` means "no choice" and step 2 applies.
+2. Otherwise genres come from the accepted candidate's provider subjects
+   (`source="provider"`), and only if none of those map to a genre, from the file's
+   embedded subjects (`source="embedded"`).
+3. Manual entry has no provider record, so only embedded subjects apply (or the
+   reviewer's `genre_ids`). Merging into an existing book changes no genres.
+
+Automatic assignment only adds links. It never removes a link, and it does nothing
+for a Book that already has a reviewer- or admin-set genre. A reviewer's choice turns
+matching automatic links into reviewer links but never changes admin-set ones, and it
+does not remove genres the existing Book already has from other files.
+
+**Provenance.** `Book.genres` uses the `BookGenre` through model (same
+`core_book_genres` table) with `source` (`provider`, `embedded`, `reviewer`, `admin`),
+`source_tag` (the tag that matched) and `created_at`. Links that existed before
+migration `0022` and links added in the admin are `admin`. The review task's
+`decision_payload` records `reviewer_genres` or `automatic_genres`.
+
+**Browse.** `/library/books/?genre=...` matches a genre name or alias exactly
+("sci-fi" finds Science fiction books); any other value is a substring match on genre
+names, as before. Book pages list their genres as browse links.
+
+**Backfill.** `python manage.py assign_genres` applies the automatic rules to
+already imported books (books with curated genres are skipped); re-run it after
+adding genres or aliases. `--dry-run` reports without writing, and `--unmapped N`
+lists the N most frequent tags that map to no genre, which are candidates for new
+aliases.
 
 ## Publication year
 

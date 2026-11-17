@@ -39,7 +39,7 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import identification, source_layout
+from . import genres, identification, source_layout
 from .models import (
     Author,
     Book,
@@ -1645,6 +1645,11 @@ def process_import_job(job_id: str) -> None:
             candidate=top_candidate,
             fallback_title=top_candidate.title,
             extra_metadata=metadata,
+        )
+        genres.assign_automatic(
+            book,
+            provider_subjects=top_candidate.subjects,
+            embedded_subjects=genres.embedded_subjects(metadata),
         )
         job.storage_identifier = destination
         job.storage_location = storage_location

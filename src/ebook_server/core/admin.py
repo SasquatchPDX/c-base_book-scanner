@@ -8,10 +8,12 @@ from .models import (
     AppUserProfile,
     Author,
     Book,
+    BookGenre,
     Category,
     CoverImage,
     FileVariant,
     Genre,
+    GenreAlias,
     Identifier,
     ImportJob,
     MetadataCandidate,
@@ -33,11 +35,22 @@ class AppUserProfileAdmin(admin.ModelAdmin[AppUserProfile]):
     list_filter = ("role", "is_disabled")
 
 
+class BookGenreInline(admin.TabularInline):  # type: ignore[type-arg]
+    """Genres with provenance; rows added here are recorded as admin-set."""
+
+    model = BookGenre
+    extra = 0
+    fields = ("genre", "source", "source_tag", "created_at")
+    readonly_fields = ("source_tag", "created_at")
+    autocomplete_fields = ("genre",)
+
+
 @admin.register(Book)
 class BookAdmin(admin.ModelAdmin[Book]):
     list_display = ("title", "publisher", "publication_year", "publication_date")
     search_fields = ("title", "subtitle", "publisher")
-    filter_horizontal = ("authors", "categories", "genres")
+    filter_horizontal = ("authors", "categories")
+    inlines = (BookGenreInline,)
 
 
 @admin.register(Author)
@@ -50,9 +63,26 @@ class CategoryAdmin(admin.ModelAdmin[Category]):
     list_display = ("name",)
 
 
+class GenreAliasInline(admin.TabularInline):  # type: ignore[type-arg]
+    model = GenreAlias
+    extra = 1
+    fields = ("alias", "key")
+    readonly_fields = ("key",)
+
+
 @admin.register(Genre)
 class GenreAdmin(admin.ModelAdmin[Genre]):
     list_display = ("name",)
+    search_fields = ("name", "aliases__alias")
+    inlines = (GenreAliasInline,)
+
+
+@admin.register(GenreAlias)
+class GenreAliasAdmin(admin.ModelAdmin[GenreAlias]):
+    list_display = ("alias", "genre", "key")
+    search_fields = ("alias", "genre__name")
+    list_select_related = ("genre",)
+    readonly_fields = ("key",)
 
 
 @admin.register(Identifier)
