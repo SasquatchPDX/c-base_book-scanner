@@ -6,7 +6,7 @@ import hashlib
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from math import hypot
+from math import ceil, hypot
 from pathlib import Path
 from typing import Any, Final
 
@@ -50,7 +50,8 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     "deskew": "projection-v1",
     "select_content": "projection-v1",
     "margins": "padding-v1",
-    "dewarping": "opencv-v1",
+    # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
+    "dewarping": "opencv-v2",
     "output": "opencv-v1",
 }
 
@@ -1223,6 +1224,106 @@ def _estimate_target_dimensions(
     return width, height
 
 
+# How far (as a multiple of the input's own width/height) the dewarped canvas may
+# extend beyond the rectified quad on each side. Only an extreme, nearly degenerate
+# quad gets near this; it guards against unbounded canvases (vanishing points).
+DEWARP_MAX_CANVAS_OVERHANG: Final[float] = 1.0
+
+
+@dataclass(frozen=True)
+class DewarpGeometry:
+    """Perspective transform from the input onto an output canvas holding all of it."""
+
+    matrix: Any
+    canvas_width: int
+    canvas_height: int
+    quad_width: int
+    quad_height: int
+    offset_x: int
+    offset_y: int
+    clipped: bool
+
+
+def _ceil_tolerant(value: float, tolerance: float = 1e-3) -> int:
+    return int(ceil(value - tolerance))
+
+
+def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGeometry:
+    """Map ``quad`` to an upright rectangle without discarding the rest of the image.
+
+    The quad only defines the correction (which four points should become a
+    rectangle). The output canvas is sized to the bounding box of the whole
+    transformed input, so content outside the quad -- page numbers, a line that
+    runs past a corner point, the margins added by the Margins stage -- is kept.
+    """
+    if cv2 is None or np is None:
+        raise RuntimeError("dewarping requires OpenCV and NumPy")
+    quad_width, quad_height = _estimate_target_dimensions(quad)
+    source_matrix = np.array(quad, dtype=np.float64)
+    # Corner distances are preserved (no "-1"), so an already-upright quad is a pure
+    # translation and the output equals the input.
+    destination_matrix = np.array(
+        [
+            [0, 0],
+            [quad_width, 0],
+            [quad_width, quad_height],
+            [0, quad_height],
+        ],
+        dtype=np.float64,
+    )
+    transform = cv2.getPerspectiveTransform(
+        source_matrix.astype(np.float32),
+        destination_matrix.astype(np.float32),
+    ).astype(np.float64)
+
+    width, height = image_size
+    corners = np.array(
+        [[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]],
+        dtype=np.float64,
+    ).T
+    projected = transform @ corners
+    weights = projected[2]
+    overhang_x = DEWARP_MAX_CANVAS_OVERHANG * width
+    overhang_y = DEWARP_MAX_CANVAS_OVERHANG * height
+    limit_left, limit_right = -overhang_x, quad_width + overhang_x
+    limit_top, limit_bottom = -overhang_y, quad_height + overhang_y
+
+    clipped = False
+    if np.all(weights > 1e-9):
+        xs = projected[0] / weights
+        ys = projected[1] / weights
+        left, right = float(min(xs.min(), 0.0)), float(max(xs.max(), quad_width))
+        top, bottom = float(min(ys.min(), 0.0)), float(max(ys.max(), quad_height))
+    else:
+        # A corner lies beyond the vanishing line: the image has no finite bounds.
+        left, right, top, bottom = limit_left, limit_right, limit_top, limit_bottom
+        clipped = True
+    if left < limit_left or right > limit_right or top < limit_top or bottom > limit_bottom:
+        clipped = True
+    left, right = max(left, limit_left), min(right, limit_right)
+    top, bottom = max(top, limit_top), min(bottom, limit_bottom)
+
+    # Round up, but tolerate the solver's float noise (520.0001 must not add a pixel).
+    offset_x = _ceil_tolerant(-left)
+    offset_y = _ceil_tolerant(-top)
+    canvas_width = max(1, _ceil_tolerant(right) + offset_x)
+    canvas_height = max(1, _ceil_tolerant(bottom) + offset_y)
+    translate = np.array(
+        [[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]],
+        dtype=np.float64,
+    )
+    return DewarpGeometry(
+        matrix=translate @ transform,
+        canvas_width=canvas_width,
+        canvas_height=canvas_height,
+        quad_width=quad_width,
+        quad_height=quad_height,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        clipped=clipped,
+    )
+
+
 def _run_perspective_dewarp(
     state: ScanTailorStageState,
     source_path: Path,
@@ -1275,24 +1376,13 @@ def _run_perspective_dewarp(
             }
 
     try:
-        width, height = _estimate_target_dimensions(source_quad)
+        geometry = _dewarp_output_geometry(source_quad, source.size)
         src = np.array(source.convert("RGB"))
         paper = _paper_fill(source.convert("RGB"))
-        source_matrix = np.array(source_quad, dtype=np.float32)
-        destination_matrix = np.array(
-            [
-                [0, 0],
-                [width - 1, 0],
-                [width - 1, height - 1],
-                [0, height - 1],
-            ],
-            dtype=np.float32,
-        )
-        transform = cv2.getPerspectiveTransform(source_matrix, destination_matrix)
         warped = cv2.warpPerspective(
             src,
-            transform,
-            (width, height),
+            geometry.matrix,
+            (geometry.canvas_width, geometry.canvas_height),
             flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=paper,
@@ -1301,12 +1391,19 @@ def _run_perspective_dewarp(
         _save_png(output, output_path, _dpi_of(source))
         _save_preview(output, preview_path)
         recorded_mode = "manual" if mode == "manual" else "auto"
-        return {
+        recorded: dict[str, Any] = {
             "dewarp_mode": recorded_mode,
             "dewarp_source_points": source_quad,
-            "dewarp_width": width,
-            "dewarp_height": height,
+            "dewarp_width": geometry.quad_width,
+            "dewarp_height": geometry.quad_height,
+            "dewarp_canvas_width": geometry.canvas_width,
+            "dewarp_canvas_height": geometry.canvas_height,
+            "dewarp_quad_offset": [geometry.offset_x, geometry.offset_y],
+            "dewarp_canvas_clipped": geometry.clipped,
         }
+        if geometry.clipped:
+            recorded["dewarp_warning"] = "extreme_quad_canvas_clipped"
+        return recorded
     except Exception as exc:  # pragma: no cover - geometry failures
         return _copy_fallback(source_path, output_path, preview_path) | {
             "dewarp_mode": "processing_error_fallback",
@@ -1886,8 +1983,12 @@ def process_stage_job(job_id: str) -> None:
             state.status = ScanTailorStageState.StageStatus.SUCCESS
             state.finished_at = timezone.now()
             state.last_error = ""
+            # Provenance: record the version of the implementation that actually ran,
+            # not whatever version was current when this state row was first created.
+            state.algorithm_version = _default_algorithm_version(state.stage)
             state.save(
                 update_fields=[
+                    "algorithm_version",
                     "output_storage_location",
                     "preview_storage_location",
                     "output_storage_identifier",
