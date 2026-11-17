@@ -37,7 +37,7 @@
   </form>
   {% if active_filters %}
     <ul class="filter-chips" aria-label="Active filters">
-      {% for chip in active_filters %}<li>{{ chip.label }} <a href="{{ chip.remove_url }}" aria-label="Remove filter {{ chip.label }}">×</a></li>{% endfor %}
+      {% for chip in active_filters %}<li>{{ chip.label }} <a href="{{ chip.remove_url }}" aria-label="Remove {{ chip.name }} filter">×</a></li>{% endfor %}
     </ul>
   {% endif %}
   {% if fuzzy %}<p class="muted">No exact matches. Showing books with similar titles or authors.</p>{% endif %}

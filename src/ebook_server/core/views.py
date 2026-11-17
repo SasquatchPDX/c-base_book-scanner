@@ -1810,7 +1810,7 @@ def _active_filter_chips(
     request: HttpRequest, search_request: search.SearchRequest
 ) -> list[dict[str, str]]:
     """Removable labels for the filters in effect (one name query per entity filter)."""
-    chips: list[tuple[str, str]] = []
+    chips: list[tuple[str, str, str]] = []
     for param, label, value in (
         ("q", "Search", search_request.query),
         ("title", "Title", search_request.title),
@@ -1821,7 +1821,7 @@ def _active_filter_chips(
         ("format", "Format", search_request.book_format.upper()),
     ):
         if value:
-            chips.append((param, f"{label}: {value}"))
+            chips.append((param, label, f"{label}: {value}"))
     for param, label, model, field_name, entity_id in (
         ("author_id", "Author", Author, "full_name", search_request.author_id),
         ("genre_id", "Genre", Genre, "name", search_request.genre_id),
@@ -1829,17 +1829,19 @@ def _active_filter_chips(
     ):
         if entity_id is not None:
             name = model.objects.filter(pk=entity_id).values_list(field_name, flat=True).first()
-            chips.append((param, f"{label}: {name or 'unknown'}"))
+            chips.append((param, label, f"{label}: {name or 'unknown'}"))
     if search_request.decade is not None:
-        chips.append(("decade", f"Decade: {search_request.decade}s"))
+        chips.append(("decade", "Decade", f"Decade: {search_request.decade}s"))
     if search_request.has_cover is not None:
-        chips.append(("has_cover", "With cover" if search_request.has_cover else "Without cover"))
+        chips.append(
+            ("has_cover", "Cover", "With cover" if search_request.has_cover else "Without cover")
+        )
     result = []
-    for param, text in chips:
+    for param, name, text in chips:
         params = request.GET.copy()
-        for name in (param, "cursor", "page"):
-            params.pop(name, None)
-        result.append({"label": text, "remove_url": f"?{params.urlencode()}"})
+        for dropped in (param, "cursor", "page"):
+            params.pop(dropped, None)
+        result.append({"label": text, "name": name.lower(), "remove_url": f"?{params.urlencode()}"})
     return result
 
 

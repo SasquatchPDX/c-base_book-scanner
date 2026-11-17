@@ -271,7 +271,10 @@ def test_browse_list_shows_removable_filter_chips_and_keeps_exact_filters() -> N
 
     assert "Author: Ada Lovelace" in page
     assert "Format: EPUB" in page
-    removal = re.search(r'href="([^"]+)" aria-label="Remove filter Author: Ada Lovelace"', page)
+    # The remove link's name is generic, so it never repeats a book title or author.
+    removal = re.search(
+        r'Author: Ada Lovelace <a href="([^"]+)" aria-label="Remove author filter"', page
+    )
     assert removal is not None
     assert "author_id" not in unescape(removal.group(1))
     # The search form keeps the exact filters as hidden inputs.
