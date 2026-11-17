@@ -476,6 +476,11 @@ class ScanJob(models.Model):
     provisional_authors = models.JSONField(default=list, blank=True)
     expected_page_count = models.PositiveIntegerField(null=True, blank=True)
     notes = models.JSONField(default=dict, blank=True)
+    # Fencing token for provider searches: only the search job named here may
+    # publish candidates for this source. Moved under this row's lock whenever a
+    # new search supersedes an older one, so a stale queue entry or a late worker
+    # can never make its results current (#104).
+    current_search_job_id = models.UUIDField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -847,6 +852,11 @@ class ImportJob(models.Model):
     attempt_count = models.PositiveIntegerField(default=0)
     last_error = models.TextField(blank=True)
     evidence = models.JSONField(default=dict, blank=True)
+    # Fencing token for provider searches: only the search job named here may
+    # publish candidates for this source. Moved under this row's lock whenever a
+    # new search supersedes an older one, so a stale queue entry or a late worker
+    # can never make its results current (#104).
+    current_search_job_id = models.UUIDField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     next_retry_at = models.DateTimeField(null=True, blank=True)
@@ -897,6 +907,9 @@ class MetadataSearch(models.Model):
     class State(models.TextChoices):
         COMPLETE = "complete", "Complete"
         FAILED = "failed", "Failed"
+        # Finished, but its results were kept as history only: a newer search
+        # replaced it or the review was resolved while it ran. ``error`` says which.
+        DISCARDED = "discarded", "Not applied"
 
     PROVIDER_STATUS_LABELS: ClassVar[dict[str, str]] = {
         "results": "Results",

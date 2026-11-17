@@ -74,6 +74,7 @@ from .models import (
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ProcessingJob,
     ReviewTask,
     ScanJob,
@@ -1077,7 +1078,10 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
     searches = metadata_search.searches_for_task(task)
     active_job = metadata_search.active_search_job(task)
     latest_job = metadata_search.latest_search_job(task)
-    latest_search = searches[0] if searches else None
+    # A discarded run (superseded, or finished after the review was resolved) is
+    # history only; the latest search shown is the latest one that was applied.
+    applied = [search for search in searches if search.state != MetadataSearch.State.DISCARDED]
+    latest_search = applied[0] if applied else None
     current_ids = set(_review_candidates(task).values_list("id", flat=True))
     # A failed job that recorded no run (dispatch failure, stale worker) must still
     # be visible; one that did record a run is shown through that run.
@@ -1097,7 +1101,7 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
     return {
         "searches": searches,
         "latest_search": latest_search,
-        "earlier_searches": searches[1:],
+        "earlier_searches": [search for search in searches if search is not latest_search],
         "active_search_job": active_job,
         "search_running": (
             active_job is not None and active_job.state == ProcessingJob.JobState.RUNNING

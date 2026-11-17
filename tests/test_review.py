@@ -17,6 +17,7 @@ from ebook_server.core.models import (
     ReviewTask,
     get_or_create_profile,
 )
+from ebook_server.jobs import RQ_ENQUEUE_OPTIONS
 from ebook_server.storage import LocalFilesystemStorage
 
 
@@ -423,7 +424,9 @@ def test_completed_repeat_search_never_reopens_task_resolved_while_queued(
         call: tuple[Any, tuple[Any, ...], dict[str, Any]] | None = None
 
         def enqueue(self, function: Any, *args: Any, **kwargs: Any) -> None:
-            self.call = (function, args, kwargs)
+            # Like RQ, keep its own options (e.g. job_id) away from the function.
+            job_kwargs = {k: v for k, v in kwargs.items() if k not in RQ_ENQUEUE_OPTIONS}
+            self.call = (function, args, job_kwargs)
 
     queue = DeferredQueue()
     client = Client()

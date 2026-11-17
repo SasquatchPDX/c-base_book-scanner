@@ -27,6 +27,7 @@ from ebook_server.core.models import (
     ScanJob,
     get_or_create_profile,
 )
+from ebook_server.jobs import RQ_ENQUEUE_OPTIONS
 from tests.test_review import _start_low_confidence_import
 
 HTML = {"Accept": "text/html"}
@@ -579,3 +580,197 @@ def test_later_scan_identification_does_not_overwrite_saved_review_terms(
     latest = MetadataSearch.objects.filter(scan_job=scan_job).order_by("-finished_at").first()
     assert latest is not None
     assert latest.query["title_hints"] == ["Scanner Hint"]
+
+
+# ------------------------------------------------- stale jobs and resolved reviews
+
+
+class _CapturingQueue:
+    """Records enqueued work like RQ would, without running it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, tuple[Any, ...], dict[str, Any], dict[str, Any]]] = []
+
+    def enqueue(self, function: Any, *args: Any, **kwargs: Any) -> None:
+        options = {k: v for k, v in kwargs.items() if k in RQ_ENQUEUE_OPTIONS}
+        job_kwargs = {k: v for k, v in kwargs.items() if k not in RQ_ENQUEUE_OPTIONS}
+        self.calls.append((function, args, job_kwargs, options))
+
+    def deliver(self, index: int) -> None:
+        function, args, kwargs, _options = self.calls[index]
+        function(*args, **kwargs)
+
+
+class _CallbackProvider(_RecordingProvider):
+    """Runs ``on_search`` while "the providers are running" (first call only)."""
+
+    def __init__(self, records: list[dict[str, Any]], on_search: Any) -> None:
+        super().__init__("stub", records)
+        self.on_search = on_search
+
+    def search(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        callback, self.on_search = self.on_search, None
+        if callback is not None:
+            callback()
+        return super().search(*args, **kwargs)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_superseded_queue_entry_delivered_late_cannot_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reviewer's probe: Old Terms queued, superseded by New Terms, delivered last."""
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "search-fence-queued")
+    queue = _CapturingQueue()
+    monkeypatch.setattr("ebook_server.core.review_identification.get_queue", lambda: queue)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        metadata_search, "cancel_queue_entry", lambda job: cancelled.append(str(job.job_id))
+    )
+
+    old = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "Old Terms"})
+    old_job = ProcessingJob.objects.get(job_id=old.json()["identification_job"]["job_id"])
+    assert queue.calls[0][3]["job_id"] == metadata_search.rq_job_id(old_job)
+    # The queue entry looks lost (queued for longer than any job may wait): stale.
+    ProcessingJob.objects.filter(pk=old_job.pk).update(
+        scheduled_at=timezone.now() - timedelta(days=1)
+    )
+    new = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "New Terms"})
+    new_job_id = new.json()["identification_job"]["job_id"]
+    assert new_job_id != str(old_job.job_id)
+    old_job.refresh_from_db()
+    assert old_job.state == ProcessingJob.JobState.FAILED
+    assert cancelled == [str(old_job.job_id)]  # best-effort removal of the RQ entry
+
+    provider = _RecordingProvider("stub", [{"title": "Result", "key": "/works/R"}])
+    _use_providers(monkeypatch, provider)
+    queue.deliver(1)  # the new search completes
+    queue.deliver(0)  # ...then the old entry is delivered anyway
+
+    assert [call["title"] for call in provider.calls] == ["New Terms"]  # old never ran
+    current = _current(import_job)
+    assert [candidate.search.query["title_hints"] for candidate in current] == [["New Terms"]]
+    old_job.refresh_from_db()
+    assert old_job.state == ProcessingJob.JobState.FAILED
+    assert not MetadataSearch.objects.filter(processing_job_id=old_job.job_id).exists()
+    import_job.refresh_from_db()
+    assert str(import_job.current_search_job_id) == new_job_id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_running_worker_finishing_after_being_superseded_keeps_results_as_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "search-fence-late")
+
+    def supersede_while_running() -> None:
+        # The first worker looks dead (started long ago); a new search replaces it
+        # and completes while the first worker is still inside the providers.
+        ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.REVIEW_IDENTIFICATION,
+            state=ProcessingJob.JobState.RUNNING,
+        ).update(started_at=timezone.now() - timedelta(hours=1))
+        _use_providers(monkeypatch, _RecordingProvider("stub", [{"title": "New Result"}]))
+        response = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "New"})
+        assert response.status_code == 202
+
+    _use_providers(
+        monkeypatch, _CallbackProvider([{"title": "Old Result"}], supersede_while_running)
+    )
+    response = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "Old"})
+    assert response.status_code == 202
+
+    assert [candidate.title for candidate in _current(import_job)] == ["New Result"]
+    late = MetadataSearch.objects.get(import_job=import_job, query__title_hints=["Old"])
+    assert late.state == MetadataSearch.State.DISCARDED
+    assert late.error.startswith("not applied:")
+    assert [candidate.title for candidate in late.candidates.all()] == ["Old Result"]
+    assert all(candidate.superseded_at is not None for candidate in late.candidates.all())
+    task.refresh_from_db()
+    assert task.decision_payload["search_id"] != str(late.id)
+    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    latest_block = page.split("<h2>Latest search</h2>", 1)[1].split("<h2>", 1)[0]
+    assert "Not applied" not in latest_block
+    assert "Not applied" in page
+
+
+@pytest.mark.django_db(transaction=True)
+def test_review_resolved_while_providers_run_keeps_its_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "search-fence-resolved")
+    original = _current(import_job)
+
+    def resolve_meanwhile() -> None:
+        assert client.post(f"/reviews/{task.id}/unidentified/").status_code == 200
+
+    _use_providers(monkeypatch, _CallbackProvider([{"title": "Late Result"}], resolve_meanwhile))
+    assert client.post(f"/reviews/{task.id}/search-again/").status_code == 202
+
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.RESOLVED
+    assert task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED
+    assert task.decision_payload == {"mark": "unidentified"}
+    assert [candidate.id for candidate in _current(import_job)] == [original[0].id]
+    late = MetadataSearch.objects.get(import_job=import_job, trigger="review")
+    assert late.state == MetadataSearch.State.DISCARDED
+    assert "resolved" in late.error
+    assert [candidate.title for candidate in late.candidates.all()] == ["Late Result"]
+    assert late.candidates.get().superseded_at is not None
+    job = ProcessingJob.objects.get(job_type=ProcessingJob.JobType.REVIEW_IDENTIFICATION)
+    assert job.state == ProcessingJob.JobState.SUCCESS
+    assert job.details["published"] is False
+
+
+@pytest.mark.django_db(transaction=True)
+def test_scan_review_resolved_while_providers_run_is_not_reopened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, scan_job = _scan_review(monkeypatch, "scan-fence-resolved")
+    task = ReviewTask.objects.get(scan_job=scan_job)
+
+    def resolve_meanwhile() -> None:
+        assert client.post(f"/reviews/{task.id}/unidentified/").status_code == 200
+
+    _use_providers(monkeypatch, _CallbackProvider([{"title": "Late Scan"}], resolve_meanwhile))
+    assert client.post(f"/reviews/{task.id}/search-again/").status_code == 202
+
+    states = list(ReviewTask.objects.filter(scan_job=scan_job).values_list("state", flat=True))
+    assert states == [ReviewTask.State.RESOLVED]
+    task.refresh_from_db()
+    assert task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED
+    current = list(scan_job.metadata_candidates.filter(superseded_at__isnull=True))
+    assert [candidate.title for candidate in current] == ["Scan Result"]
+    late = MetadataSearch.objects.filter(scan_job=scan_job).order_by("-finished_at").first()
+    assert late is not None
+    assert late.state == MetadataSearch.State.DISCARDED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_superseded_scan_queue_entry_cannot_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _client, scan_job = _scan_review(monkeypatch, "scan-fence-queued")
+    queue = _CapturingQueue()
+    monkeypatch.setattr("ebook_server.core.scan_identification.get_queue", lambda: queue)
+    old_job = scan_identification.request_scan_identification(
+        scan_job=scan_job, requested_by_user_id=None, terms={"title": "Old Scan", "authors": []}
+    )
+    ProcessingJob.objects.filter(pk=old_job.pk).update(
+        scheduled_at=timezone.now() - timedelta(days=1)
+    )
+    scan_identification.request_scan_identification(
+        scan_job=scan_job, requested_by_user_id=None, terms={"title": "New Scan", "authors": []}
+    )
+    _use_providers(monkeypatch, _RecordingProvider("stub", [{"title": "Fresh", "key": "/w/F"}]))
+    queue.deliver(1)
+    queue.deliver(0)
+
+    current = list(scan_job.metadata_candidates.filter(superseded_at__isnull=True))
+    assert [candidate.search.query["title_hints"] for candidate in current] == [["New Scan"]]
+    old_job.refresh_from_db()
+    assert old_job.state == ProcessingJob.JobState.FAILED
+    assert not MetadataSearch.objects.filter(processing_job_id=old_job.job_id).exists()
