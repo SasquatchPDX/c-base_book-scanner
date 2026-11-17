@@ -3545,6 +3545,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
     tasks = ReviewTask.objects.select_related(
         "import_job",
         "import_job__uploader",
+        "import_job__source_location",
         "scan_job",
         "scan_job__operator",
     ).filter(state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED])
@@ -3552,7 +3553,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
         tasks = tasks.filter(
             Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
         )
-    tasks = tasks.order_by("-created_at")
+    task_list = list(tasks.order_by("-created_at"))
 
     payload = [
         {
@@ -3562,15 +3563,97 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
                 _serialize_candidate(candidate) for candidate in _review_candidates(task)
             ],
         }
-        for task in tasks
+        for task in task_list
     ]
+    groups = _group_sibling_review_tasks(task_list, payload)
     if _wants_html(request):
         return render(
             request,
             "core/review_queue.html",
-            {"tasks": list(tasks), "items": payload, "count": len(payload)},
+            {
+                "tasks": task_list,
+                "items": payload,
+                "groups": groups,
+                "count": len(payload),
+            },
         )
-    return JsonResponse({"items": payload, "count": len(payload)})
+    # The JSON list stays one item per task (non-breaking); items are only annotated
+    # with their sibling group so clients can collapse them like the HTML queue.
+    return JsonResponse({"items": payload, "count": len(payload), "group_count": len(groups)})
+
+
+# Formats most likely to carry real embedded metadata first: the primary entry of a
+# sibling group should be the most informative file to review (#49).
+REVIEW_FORMAT_PRIORITY = ("epub", "azw3", "mobi", "fb2", "pdf", "djvu", "html", "rtf", "txt")
+
+
+@dataclass
+class ReviewQueueGroup:
+    primary: ReviewTask
+    primary_item: dict[str, Any]
+    others: list[tuple[ReviewTask, dict[str, Any]]]
+
+    @property
+    def other_count(self) -> int:
+        return len(self.others)
+
+
+def _group_sibling_review_tasks(
+    tasks: list[ReviewTask],
+    items: list[dict[str, Any]],
+) -> list[ReviewQueueGroup]:
+    """Collapse open review tasks for formats of one book into one queue entry.
+
+    Uses the sibling key of ``intake._sibling_jobs`` (source, folder, case-folded name;
+    only for sources with ``group_sibling_formats``). The primary entry is the task with
+    the best candidate score, then the most metadata-rich format, then the oldest. Each
+    item in ``items`` gains ``sibling_group`` (``None`` when it stands alone).
+    """
+    keyed: dict[tuple[int, str, str], list[int]] = {}
+    order: list[tuple[int, str, str] | int] = []
+    for index, task in enumerate(tasks):
+        key = intake.sibling_group_key(task.import_job) if task.import_job else None
+        if key is None:
+            order.append(index)
+            continue
+        if key not in keyed:
+            keyed[key] = []
+            order.append(key)
+        keyed[key].append(index)
+
+    def rank(index: int) -> tuple[float, int, datetime]:
+        scores = [candidate["score"] for candidate in items[index]["candidates"]]
+        job = tasks[index].import_job
+        fmt = job.detected_format if job is not None else ""
+        priority = (
+            REVIEW_FORMAT_PRIORITY.index(fmt)
+            if fmt in REVIEW_FORMAT_PRIORITY
+            else len(REVIEW_FORMAT_PRIORITY)
+        )
+        return (-max(scores, default=0.0), priority, tasks[index].created_at)
+
+    groups: list[ReviewQueueGroup] = []
+    for entry in order:
+        members = sorted(keyed[entry], key=rank) if isinstance(entry, tuple) else [entry]
+        primary, *others = members
+        if len(members) > 1:
+            annotation = {
+                "primary_task_id": str(tasks[primary].id),
+                "task_ids": [str(tasks[index].id) for index in members],
+                "size": len(members),
+            }
+            for index in members:
+                items[index]["sibling_group"] = annotation
+        else:
+            items[primary]["sibling_group"] = None
+        groups.append(
+            ReviewQueueGroup(
+                primary=tasks[primary],
+                primary_item=items[primary],
+                others=[(tasks[index], items[index]) for index in others],
+            )
+        )
+    return groups
 
 
 @require_GET
