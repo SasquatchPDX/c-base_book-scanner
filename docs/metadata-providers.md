@@ -70,7 +70,35 @@ A Book record stands for the edition it was matched to:
 
 The ISBN path (`/isbn/<isbn>.json`) runs first whenever the file has an ISBN, so
 in practice the work-level comparison matters only when that lookup misses.
-`publication_year` is still the work's `first_publish_year` (see #38).
+`publication_year` is still the work's `first_publish_year` (see "Publication year").
+
+### Author checks before auto-accept
+
+A score at or above the auto-accept threshold is necessary but not sufficient. An
+exact ISBN match alone reaches it, and an ISBN says nothing about who wrote the book,
+so intake (`intake.decide_auto_accept`) also checks the top candidate's authors:
+
+- **No provider authors** (`no_provider_authors`): the candidate names no authors,
+  or only placeholders such as "Unknown" or "Multiple Authors". The import goes to
+  review instead of creating, or attaching to, a Book whose authors nobody checked.
+  The file's embedded authors are never written onto the Book automatically, also
+  not when an existing Book matched by ISBN has no authors yet.
+- **Author conflict** (`author_conflict`): both sides name authors and none of the
+  candidate's authors is the same person as any of the file's embedded authors,
+  using the name matching above. A bare surname on one side ("Tolkien") agrees with
+  a full name that ends in it. Missing file authors are not a conflict.
+
+Either case sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
+`REVIEW` state (none is shown as a `MATCH`), and records in the import's evidence:
+`auto_accept_blocked` (the reason above), `auto_accept_block_details` (provider,
+score, candidate and file authors) and `suggested_authors` (the file's embedded
+authors without placeholder creators such as "Microsoft Office User", "Owner" or
+"Administrator"). The review page explains the reason and pre-fills the suggested
+authors. They are applied only when a reviewer accepts a candidate that has no
+authors of its own, and only to a Book without authors; provider authors always win.
+
+For Open Library ISBN lookups, an edition record without `authors` falls back to the
+authors of its first work record (`works[0]`), where Open Library usually keeps them.
 
 ## Provider options identified
 
@@ -160,3 +188,20 @@ are not yet written to `Book.categories` / `Book.genres`.
 
 Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
 whether review gates it) is an open owner decision tracked in issue #50.
+
+## Publication year
+
+Providers report a publication *year*, never a reliable day: Open Library's
+`first_publish_year` (the work's first publication, not necessarily the edition on
+file, and sometimes simply wrong) or Hardcover's `release_year`. It is stored in
+`Book.publication_year`. `Book.publication_date` is kept only for a genuinely known
+full date (for example entered in the admin) and is otherwise empty, so the book
+page shows "2003" instead of a fabricated "Jan. 1, 2003".
+
+Migration `0020_book_publication_year` copies the year of every existing
+`publication_date` into `publication_year` and clears dates on 1 January, because
+every automated writer stored a year that way; other dates are kept. The book API
+(`GET /library/books/<id>/`) gains `publication_year` (from the year field, or the
+year of a full date) next to `publication_date`, which is now `null` for year-only
+books. Clients that read the year from `publication_date` must switch to
+`publication_year`.

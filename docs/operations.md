@@ -350,6 +350,33 @@ lock (`rq:scheduler-lock:<queue>`) at enqueue time and uses immediate retries
 Treat that log line as a deployment bug. `recover_stale_jobs` also warns when
 no scheduler lock is present.
 
+### Worker concurrency (ScanTailor-Web batches)
+
+One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
+job per page and stage, so a stage batch over a realistic book (hundreds of
+pages) on a single worker takes as long as the sum of all pages (#54). Run
+several worker processes against the same Redis queue to process pages in
+parallel; this is standard RQ and needs no code change. With the
+`deploy/systemd/` template unit, for example:
+
+```bash
+systemctl enable --now book-scanner-worker@2 book-scanner-worker@3 book-scanner-worker@4
+```
+
+Size the count to the VM's cores and memory: each stage job decodes a
+full-resolution page (a 600 dpi colour scan is tens of MB decoded), and other
+job types (conversion, OCR orchestration, finalization) share the same queue.
+Keep `--with-scheduler` on at least one of them (several is fine; they
+coordinate through a Redis lock).
+
+Stage jobs are safe to run concurrently: each claims its stage row by revision
+and only writes its result if that revision is still current. The one ordering
+caveat is between stages of the same page. A stage job whose upstream stage has
+not finished yet fails with `upstream stage <name> not complete` instead of
+waiting. With one worker, FIFO order hides this. With several, wait for a stage
+batch to finish before you start the next stage's batch, or re-run the affected
+pages afterwards.
+
 ### Recovering from killed workers
 
 A worker killed mid-job (OOM, `kill -9`, host restart) leaves its
@@ -412,6 +439,13 @@ encodings, RarFile recognizes CBR containers, and bounded defused XML/ZIP reader
 handle FB2 and CBZ metadata. Intake never extracts a whole archive. CBR page
 extraction still requires an explicitly configured external archive tool in a
 restricted worker environment.
+
+MOBI (and other Kindle-family formats once intake accepts them) metadata is read
+with Calibre's `ebook-meta --to-opf` when it is on `PATH`. It runs through the
+conversion runner with a 30 s timeout that kills the whole process group, and its
+OPF output (capped at 2 MiB) is parsed with defusedxml. A missing tool, timeout,
+failure, or unusable output falls back to filename signals and does not fail the
+import (`ebook_meta_unavailable` / `ebook_meta_failed` are logged).
 
 EPUB, PDF, and CBZ intake attempts front-cover extraction in the ingestion worker.
 PDF pages are rendered by liberal-licensed PDFium bindings; archive images are
