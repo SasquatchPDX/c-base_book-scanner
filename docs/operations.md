@@ -432,6 +432,30 @@ links. The JSON response keeps one item per task, so existing clients are unaffe
 Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
 and the response gains `group_count`.
 
+### Stopping (cancelling) a source import
+
+Do not stop a bulk import with `rq empty`: it leaves DISCOVERED rows behind, and
+RQ's abandoned-job handling can still re-run the job that was in progress when
+the worker stopped. Instead run:
+
+```bash
+uv run python manage.py cancel_source_import --source-id 1          # dry run
+uv run python manage.py cancel_source_import --source-id 1 --apply  # act
+```
+
+`--apply` pauses the source and marks its import jobs that have not started
+archiving `CANCELLED`. It then deletes their RQ jobs from the queue and from the
+started, scheduled, deferred and failed registries. A cancelled job never runs again,
+even if RQ redelivers it after a worker restart. A job that is running when it is
+cancelled stops at its next phase boundary without archiving, creating a review
+task, or creating a Book, and is not retried. Cancelling clears the job's lease
+and locks its row. Each phase save of the worker locks the same row before
+checking the state, so a cancellation never commits between that check and the
+save. Jobs already `ARCHIVING` are left
+to finish, because a MOVE source may already be in the archive; `LOW_CONFIDENCE`
+jobs waiting for review are untouched. To import the cancelled files later,
+resume the source and run `ingest_sources`; they are discovered again.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for

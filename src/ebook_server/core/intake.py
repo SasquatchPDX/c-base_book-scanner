@@ -2258,6 +2258,10 @@ class ImportLeaseLostError(Exception):
     """This worker no longer owns the import job; it must stop without writing."""
 
 
+class ImportCancelledError(ImportLeaseLostError):
+    """An operator cancelled the running import (``cancel_source_imports``)."""
+
+
 def import_lease_duration() -> timedelta:
     """How long a claim stays valid without a phase transition renewing it.
 
@@ -2314,10 +2318,13 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
 
     A job without a lease (review decisions, sibling bookkeeping) is saved normally. For
     an owned job the row is fetched and locked by primary key (``SELECT ... FOR
-    UPDATE``, unconditionally, so the lock is held whatever the row contains), the
-    owner is compared in Python, and the save happens inside that same transaction. It
-    renews the lease, or with ``release`` clears it (the job leaves the active phases).
-    Raises ``ImportLeaseLostError`` when this worker's token is no longer the owner.
+    UPDATE``, unconditionally, so the lock is held whatever the row contains), its
+    state and owner are inspected in Python, and the save happens inside that same
+    transaction. ``cancel_source_imports`` locks the same row, so a cancellation cannot
+    commit between the check and the save. The save renews the lease, or with
+    ``release`` clears it (the job leaves the active phases). Raises
+    ``ImportCancelledError`` when the job was cancelled and ``ImportLeaseLostError``
+    when this worker's token is no longer the owner; nothing is written then.
     """
     token = job.lease_owner
     if not token:
@@ -2325,6 +2332,8 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
         return
     with transaction.atomic():
         locked = ImportJob.objects.select_for_update().filter(pk=job.pk).first()
+        if locked is not None and locked.state == ImportJob.State.CANCELLED:
+            raise ImportCancelledError(f"import job {job.pk} was cancelled")
         if locked is None or locked.lease_owner != token:
             raise ImportLeaseLostError(str(job.pk))
         if release:
@@ -2333,6 +2342,52 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
         else:
             job.lease_expires_at = timezone.now() + import_lease_duration()
         job.save(update_fields=[*update_fields, "lease_owner", "lease_expires_at"])
+
+
+# Cancellable: queued or running, but not yet ARCHIVING (its source may already be in
+# the archive). LOW_CONFIDENCE jobs are archived and waiting for review.
+CANCELLABLE_IMPORT_STATES = tuple(
+    state for state in IN_FLIGHT_STATES if state != ImportJob.State.ARCHIVING
+)
+
+
+def cancel_source_imports(source_location: SourceLocation) -> list[str]:
+    """Pause a source and cancel its import jobs that have not started archiving.
+
+    Returns the ids of the cancelled jobs. Jobs already ARCHIVING are allowed to
+    finish, because their source file may already have been moved into the archive.
+    LOW_CONFIDENCE jobs are archived and waiting for review, so they are untouched.
+    Cancelled files are rediscovered by ``ingest_sources`` once the source is resumed.
+
+    The jobs' rows are locked (``SELECT ... FOR UPDATE``) and their lease cleared in
+    the same transaction. A worker in the middle of an owned save holds the row lock,
+    so the cancellation waits for that save to commit and then re-reads the state: a
+    job that just reached ARCHIVING is no longer cancelled. A worker whose job was
+    cancelled stops at its next save (``ImportCancelledError``) without writing.
+    """
+    with transaction.atomic():
+        SourceLocation.objects.filter(pk=source_location.pk).update(is_paused=True)
+        source_location.is_paused = True
+        ids = [
+            str(pk)
+            for pk in ImportJob.objects.select_for_update()
+            .filter(source_location=source_location, state__in=CANCELLABLE_IMPORT_STATES)
+            .values_list("pk", flat=True)
+        ]
+        ImportJob.objects.filter(pk__in=ids, state__in=CANCELLABLE_IMPORT_STATES).update(
+            state=ImportJob.State.CANCELLED,
+            last_error="cancelled by operator",
+            next_retry_at=None,
+            lease_owner="",
+            lease_expires_at=None,
+            updated_at=timezone.now(),
+        )
+    logger.info(
+        "intake_source_cancelled",
+        source_location_id=source_location.pk,
+        cancelled=len(ids),
+    )
+    return ids
 
 
 def stale_import_jobs(now: datetime | None = None) -> list[ImportJob]:
@@ -2385,7 +2440,8 @@ def process_import_job(job_id: str) -> None:
     any work, and it stops as soon as it loses the lease.
     """
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
-    if job.state == ImportJob.State.COMPLETE:
+    if job.state in (ImportJob.State.COMPLETE, ImportJob.State.CANCELLED):
+        # CANCELLED: RQ may redeliver an abandoned job after a worker restart.
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
@@ -2408,6 +2464,9 @@ def process_import_job(job_id: str) -> None:
         return
     try:
         _process_claimed_import_job(job)
+    except ImportCancelledError:
+        # Keep CANCELLED; failing would schedule an RQ retry of a cancelled job.
+        logger.info("intake_cancelled", import_job_id=str(job.id))
     except ImportLeaseLostError:
         logger.warning("intake_lease_lost", import_job_id=str(job.id))
 
