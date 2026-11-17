@@ -396,7 +396,7 @@ def create_cleaned_variant_for_scan_job(
         return existing
 
     # Into the book's archive folder on the attached storage (<Author>/<Title>/ by
-    # default), next to its other formats, cover and scan.log.
+    # default), next to its other formats, cover and uploaded scanner logs.
     assert job.book is not None
     try:
         destination = archive_layout.publish_derived(

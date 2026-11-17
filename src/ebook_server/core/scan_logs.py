@@ -1,4 +1,4 @@
-"""Scanner logs (libreflip ``scan.log``) kept next to the book they belong to (#7).
+"""Scanner logs uploaded as whole files, kept next to the book they belong to (#7).
 
 Uploading a log only stages it: the request writes the (size-bounded) bytes into scan
 staging, records a ``ScanLog`` in state ``queued`` together with a ``ProcessingJob``
@@ -9,10 +9,15 @@ log's ``state`` (``queued`` -> ``stored`` / ``duplicate`` / ``failed``) is repor
 the scan job's API.
 
 When the scan job is already linked to a Book the worker writes the log straight into
-that book's archive folder on the attached storage (``<Author>/<Title>/scan.log`` under
-the default layout). Otherwise it waits in scan storage and
-``place_scan_logs_in_book_folder`` moves it there during finalization, deleting the
-scan-storage copy only after the archive copy's SHA-256 is verified.
+that book's archive folder on the attached storage
+(``<Author>/<Title>/scan-upload-<sha8>.log`` under the default layout). Otherwise it waits
+in scan storage and ``place_scan_logs_in_book_folder`` moves it there during
+finalization. Every copy is verified: the published file's SHA-256 must equal the staged
+upload's before the log is marked ``stored`` and before any original is deleted.
+
+Uploads never use the name ``scan.jsonl``: in the book folder that name belongs to the
+scanner event file rendered from the events endpoint (#129, S5). Each upload is an
+immutable original, so it gets its own content-derived name instead.
 """
 
 from __future__ import annotations
@@ -39,7 +44,8 @@ logger = structlog.get_logger(__name__)
 # Logs are small text files; anything bigger is not a scanner log.
 MAX_SCAN_LOG_BYTES = 8 * 1024 * 1024
 SCAN_STORAGE_DIRNAME = "scan-artifacts"
-SCAN_LOG_FILENAME = "scan.log"
+# Fallback for the recorded original filename when the client sends none.
+DEFAULT_UPLOAD_NAME = "scan.log"
 # Staged uploads live in scan storage under this namespace until the worker runs.
 STAGING_NAMESPACE = "uploads/scan-logs"
 
@@ -67,17 +73,52 @@ def _scan_location() -> StorageLocation:
     return location
 
 
-def _publish_to_book_folder(storage: LocalFilesystemStorage, job: ScanJob, source: str) -> str:
+def scan_log_filename(sha256: str) -> str:
+    """Storage name of an uploaded log: ``scan-upload-<first 8 hex of its SHA-256>.log``.
+
+    Deliberately not ``scan.jsonl``, which is reserved for the rendered event file (#129).
+    """
+    return f"scan-upload-{sha256[:8]}.log"
+
+
+def _publish_to_book_folder(
+    storage: LocalFilesystemStorage, job: ScanJob, source: str, sha256: str
+) -> str:
     """Write ``source`` into the job's book folder; never overwrites an existing file."""
     assert job.book is not None
+    filename = scan_log_filename(sha256)
     return archive_layout.publish_derived(
         storage,
         job.book,
         source,
-        SCAN_LOG_FILENAME,
+        filename,
         legacy_namespace=f"books/{job.book_id}/scan-logs",
-        legacy_filename=f"{uuid.uuid4().hex[:8]}-{SCAN_LOG_FILENAME}",
+        legacy_filename=f"{uuid.uuid4().hex[:8]}-{filename}",
     )
+
+
+class PublishedCopyMismatchError(Exception):
+    """The bytes written to the destination do not hash to the staged upload's SHA-256."""
+
+
+def _verify_published_copy(storage: LocalFilesystemStorage, destination: str, sha256: str) -> None:
+    """Hash the copy just written through the storage service and compare it.
+
+    On a mismatch, or when the copy cannot even be hashed, the copy is removed again:
+    ``publish_unique`` (and the per-job legacy name) allocated ``destination`` exclusively
+    for this write, so it is ours and nothing references it yet. The staged original is
+    left alone.
+    """
+    try:
+        published = storage.hash(destination)
+    except BaseException:
+        storage.delete(destination)
+        raise
+    if published != sha256:
+        storage.delete(destination)
+        raise PublishedCopyMismatchError(
+            f"published copy failed SHA-256 verification (expected {sha256}, got {published})"
+        )
 
 
 def _stage_bounded(uploaded_file: Any) -> tuple[str, int]:
@@ -122,7 +163,7 @@ def stage_scan_log(job: ScanJob, uploaded_file: Any, uploader_id: int | None) ->
     if isinstance(declared_size, int) and declared_size > MAX_SCAN_LOG_BYTES:
         raise ScanLogError("log too large")
     staging_identifier, size = _stage_bounded(uploaded_file)
-    original = Path(str(getattr(uploaded_file, "name", "") or SCAN_LOG_FILENAME)).name
+    original = Path(str(getattr(uploaded_file, "name", "") or DEFAULT_UPLOAD_NAME)).name
     try:
         with transaction.atomic():
             processing_job = ProcessingJob.objects.create(
@@ -133,7 +174,7 @@ def stage_scan_log(job: ScanJob, uploaded_file: Any, uploader_id: int | None) ->
                 scan_job=job,
                 state=ScanLog.State.QUEUED,
                 staging_identifier=staging_identifier,
-                original_filename=original[:255] or SCAN_LOG_FILENAME,
+                original_filename=original[:255] or DEFAULT_UPLOAD_NAME,
                 size_bytes=size,
                 uploader_id=uploader_id,
                 processing_job=processing_job,
@@ -242,15 +283,25 @@ def process_scan_log_job(job_id: str) -> None:
             storage = intake._default_storage()
             location = intake._default_storage_location()
             storage.ensure_free_space(staged.stat().st_size)
-            destination = _publish_to_book_folder(storage, job, str(staged))
+            destination = _publish_to_book_folder(storage, job, str(staged), sha256)
         else:
             storage = scan_storage
             location = _scan_location()
             destination = storage.publish_unique(
-                staged_identifier,
-                f"scanning/{job.pk}/logs",
-                f"{uuid.uuid4().hex[:8]}-{SCAN_LOG_FILENAME}",
+                staged_identifier, f"scanning/{job.pk}/logs", scan_log_filename(sha256)
             )
+        # Atomic publication does not prove the copy is intact: hash what was written
+        # and only then record it as stored and drop the staged original.
+        try:
+            _verify_published_copy(storage, destination, sha256)
+        except PublishedCopyMismatchError as exc:
+            logger.error(
+                "scan_log_publish_verification_failed",
+                scan_log_id=log.pk,
+                scan_job_id=str(job.pk),
+            )
+            _fail(log, processing_job, str(exc), retryable=True, staging_retained=True)
+            return
         try:
             with transaction.atomic():
                 locked = ScanLog.objects.select_for_update().get(pk=log.pk)
@@ -304,8 +355,15 @@ def process_scan_log_job(job_id: str) -> None:
         _fail(log, processing_job, str(exc))
         scan_storage.delete(staged_identifier)
     except Exception as exc:
-        # Storage trouble: keep the staged bytes so an operator can re-run the job.
-        _fail(log, processing_job, f"{type(exc).__name__}: {exc}")
+        # Storage trouble: keep the staged bytes so an operator can re-run the job
+        # (``retry_failed_scan_log``, admin action "Retry failed logs").
+        _fail(
+            log,
+            processing_job,
+            f"{type(exc).__name__}: {exc}",
+            retryable=True,
+            staging_retained=True,
+        )
         logger.exception("scan_log_processing_failed", scan_log_id=log.pk)
         raise
 
@@ -324,11 +382,48 @@ def _mark_duplicate(log: ScanLog, existing: ScanLog, sha256: str) -> None:
     )
 
 
-def _fail(log: ScanLog, processing_job: ProcessingJob, error: str) -> None:
+def _fail(log: ScanLog, processing_job: ProcessingJob, error: str, **extra: Any) -> None:
     ScanLog.objects.filter(pk=log.pk).update(
         state=ScanLog.State.FAILED, error=error[:500], updated_at=timezone.now()
     )
-    _finish(processing_job, failed=True, error=error)
+    _finish(processing_job, failed=True, error=error, **extra)
+
+
+def retry_failed_scan_log(log: ScanLog) -> bool:
+    """Queue a failed log again when its staged upload is still there.
+
+    A failed copy verification, a storage error or ``recover_stale_jobs`` leave the staged
+    bytes in place; this puts the log and its processing job back to ``queued`` and hands
+    the job to the queue after commit. Returns False (and changes nothing) for a log that
+    is not failed, has no processing job, or whose staged upload is gone.
+    """
+    if not log.staging_identifier or log.processing_job_id is None:
+        return False
+    if not _scan_storage().exists(log.staging_identifier):
+        return False
+    with transaction.atomic():
+        locked = (
+            ScanLog.objects.select_for_update()
+            .select_related("processing_job")
+            .filter(pk=log.pk, state=ScanLog.State.FAILED)
+            .first()
+        )
+        if locked is None or locked.processing_job is None:
+            return False
+        processing_job = locked.processing_job
+        locked.state = ScanLog.State.QUEUED
+        locked.error = ""
+        locked.save(update_fields=["state", "error", "updated_at"])
+        details = dict(processing_job.details) if isinstance(processing_job.details, dict) else {}
+        details.pop("retryable", None)
+        details.pop("staging_retained", None)
+        processing_job.state = ProcessingJob.JobState.QUEUED
+        processing_job.finished_at = None
+        processing_job.details = {**details, "error": ""}
+        processing_job.save(update_fields=["state", "finished_at", "details"])
+        transaction.on_commit(lambda: _dispatch(processing_job, locked))
+    logger.info("scan_log_requeued", scan_log_id=log.pk)
+    return True
 
 
 def queued_scan_log_job_ids() -> list[str]:
@@ -407,7 +502,7 @@ def place_scan_logs_in_book_folder(job: ScanJob) -> int:
                 else filesystem_backend_for_location(source_location)
             )
             destination = _publish_to_book_folder(
-                library, job, str(source.resolve_location(log.storage_identifier))
+                library, job, str(source.resolve_location(log.storage_identifier)), log.sha256
             )
             if library.hash(destination) != log.sha256:
                 library.delete(destination)

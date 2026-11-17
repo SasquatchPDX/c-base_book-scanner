@@ -244,6 +244,25 @@ class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
         "processing_job",
         "error",
     )
+    actions = ("retry_failed_logs",)
+
+    @admin.action(description="Retry selected failed logs (staged upload kept)")
+    def retry_failed_logs(self, request: HttpRequest, queryset: QuerySet[ScanLog]) -> None:
+        from .scan_logs import ScanLogDispatchError, retry_failed_scan_log
+
+        requeued = 0
+        try:
+            for log in queryset.filter(state=ScanLog.State.FAILED):
+                if retry_failed_scan_log(log):
+                    requeued += 1
+        except ScanLogDispatchError as exc:
+            self.message_user(request, f"Queue unavailable: {exc}", messages.ERROR)
+            return
+        self.message_user(
+            request,
+            f"Queued {requeued} log(s) again; failed logs without a staged upload were skipped.",
+            messages.SUCCESS if requeued else messages.WARNING,
+        )
 
 
 @admin.register(ScanPage)
