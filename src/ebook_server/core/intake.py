@@ -5,14 +5,17 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import shutil
 import time
-from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+import uuid
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, cast
 from urllib.parse import unquote
 from zipfile import ZipFile, ZipInfo, is_zipfile
@@ -26,6 +29,8 @@ from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.db import models as django_models
+from django.db import transaction
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
 
@@ -34,9 +39,10 @@ from ebook_server.storage import (
     StorageBackend,
     cap_filename,
     ensure_path_storage_ready,
+    min_free_bytes,
 )
 
-from . import identification
+from . import identification, source_layout
 from .models import (
     Author,
     Book,
@@ -47,6 +53,7 @@ from .models import (
     ReviewTask,
     SourceLocation,
     StorageLocation,
+    clean_publication_year,
 )
 from .storage_registry import backend_for_location
 
@@ -79,6 +86,24 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
     ".mobi": SupportedFormat(
         format_name="mobi",
         mime_type="application/x-mobipocket-ebook",
+    ),
+    # Kindle/Mobipocket family (#23). These share the PalmDB container the MOBI
+    # signature check already understands; Calibre handles them downstream.
+    ".azw": SupportedFormat(
+        format_name="azw",
+        mime_type="application/vnd.amazon.ebook",
+    ),
+    ".azw3": SupportedFormat(
+        format_name="azw3",
+        mime_type="application/x-mobi8-ebook",
+    ),
+    ".prc": SupportedFormat(
+        format_name="prc",
+        mime_type="application/x-mobipocket-ebook",
+    ),
+    ".rtf": SupportedFormat(
+        format_name="rtf",
+        mime_type="application/rtf",
     ),
     ".txt": SupportedFormat(
         format_name="txt",
@@ -114,6 +139,88 @@ SUPPORTED_FORMATS: dict[str, SupportedFormat] = {
     ),
 }
 
+# PalmDB type+creator codes (bytes 60..68) accepted per MOBI-family format.
+# Plain PalmDOC (``TEXtREAd``) is the historical ``.prc`` payload.
+PALMDB_SIGNATURES: dict[str, frozenset[bytes]] = {
+    "mobi": frozenset({b"BOOKMOBI"}),
+    "azw": frozenset({b"BOOKMOBI"}),
+    "azw3": frozenset({b"BOOKMOBI"}),
+    "prc": frozenset({b"BOOKMOBI", b"TEXtREAd"}),
+}
+
+# Audiobooks are not managed by this system (docs/design/32-audiobooks.md): members
+# are pointed to a separate audiobook server. Intake recognises audio files only so
+# it can skip them with a clear reason instead of lumping them in with unknown files.
+AUDIO_EXTENSIONS = frozenset(
+    {
+        ".m4b",
+        ".m4a",
+        ".mp3",
+        ".aac",
+        ".ogg",
+        ".oga",
+        ".opus",
+        ".flac",
+        ".wav",
+        ".wma",
+        ".mka",
+        ".ape",
+        ".aif",
+        ".aiff",
+        ".aa",
+        ".aax",
+        ".aaxc",
+    }
+)
+# Audible files carry DRM. They are never read, hashed, copied or converted here.
+DRM_AUDIO_EXTENSIONS = frozenset({".aa", ".aax", ".aaxc"})
+AUDIO_SKIP_REASON = "audio (not managed here)"
+DRM_AUDIO_SKIP_REASON = "audio (not managed here; DRM-protected Audible file)"
+
+
+def is_audio_filename(filename: str, mime_type: str | None = None) -> bool:
+    """True for audio/audiobook files, which intake skips (see docs/design/32-audiobooks.md).
+
+    The extension decides; a declared ``audio/*`` MIME type only counts when the
+    extension is not a supported book format.
+    """
+    extension = Path(filename).suffix.lower()
+    if extension in AUDIO_EXTENSIONS:
+        return True
+    if extension in SUPPORTED_FORMATS:
+        return False
+    return bool(mime_type and mime_type.lower().startswith("audio/"))
+
+
+def is_drm_audio_filename(filename: str) -> bool:
+    return Path(filename).suffix.lower() in DRM_AUDIO_EXTENSIONS
+
+
+def audio_skip_reason(filename: str) -> str:
+    return DRM_AUDIO_SKIP_REASON if is_drm_audio_filename(filename) else AUDIO_SKIP_REASON
+
+
+def audiobook_service_url() -> str:
+    """The configured audiobook service URL, or "" when unset or not http(s)."""
+    value = str(getattr(django_settings, "BOOK_SCANNER_AUDIOBOOK_SERVICE_URL", "") or "").strip()
+    return value if value.startswith(("https://", "http://")) else ""
+
+
+def audio_upload_rejection_message(filename: str) -> str:
+    """Message shown when a member uploads an audio file through the web form."""
+    if is_drm_audio_filename(filename):
+        lead = (
+            "This is a DRM-protected Audible file. This library does not accept or "
+            "process DRM-protected files."
+        )
+    else:
+        lead = "Audiobooks and other audio files are not managed by this e-book library."
+    service_url = audiobook_service_url()
+    if service_url:
+        return f"{lead} Please use the hackerspace audiobook service: {service_url}"
+    return f"{lead} Please ask the library admins where audiobooks are shared."
+
+
 MAX_UPLOAD_BYTES = getattr(
     django_settings,
     "BOOK_SCANNER_MAX_UPLOAD_BYTES",
@@ -126,6 +233,79 @@ MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
+# Formats whose metadata is read through Calibre's ``ebook-meta`` instead of a Python
+# parser: MOBI and the Kindle-family intake formats (AZW, AZW3, PRC; #23).
+EBOOK_META_FORMATS = frozenset({"mobi", "azw", "azw3", "prc"})
+EBOOK_META_BINARY = "ebook-meta"
+EBOOK_META_TIMEOUT_SECONDS = 30.0
+DC_NAMESPACE = "{http://purl.org/dc/elements/1.1/}"
+
+# ImportJob.evidence keys written when a candidate scores high enough to be accepted
+# automatically but is routed to review anyway (shown on the review page).
+AUTO_ACCEPT_BLOCKED_KEY = "auto_accept_blocked"
+AUTO_ACCEPT_BLOCK_DETAILS_KEY = "auto_accept_block_details"
+# Authors from the file's own metadata, offered to the reviewer; never applied
+# to a Book without a person confirming them.
+SUGGESTED_AUTHORS_KEY = "suggested_authors"
+# The provider record names no authors (e.g. an edition without them): accepting it
+# would create, or attach to, a Book whose authors nobody verified.
+BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
+# The provider's authors and the file's embedded authors name different people.
+BLOCK_AUTHOR_CONFLICT = "author_conflict"
+
+
+@dataclass(frozen=True)
+class AutoAcceptDecision:
+    """Outcome of the auto-accept check: the candidate to accept, or why not."""
+
+    candidate: identification.IdentificationCandidate | None
+    blocked_reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def _block_details(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "score": float(candidate.score),
+        "candidate_authors": list(candidate.authors),
+        "file_authors": list(file_authors),
+    }
+
+
+def decide_auto_accept(
+    candidates: list[identification.IdentificationCandidate],
+    file_authors: list[str],
+) -> AutoAcceptDecision:
+    """Pick the candidate to accept without review, or record why there is none.
+
+    A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
+    candidate must also name at least one real author, and its authors must not
+    contradict the file's own embedded authors. A high score from an ISBN match alone
+    is no evidence about authorship.
+    """
+    top = candidates[0] if candidates else None
+    if top is None or top.score < AUTO_ACCEPT_SCORE:
+        return AutoAcceptDecision(candidate=None)
+    provider_authors = [
+        name for name in top.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
+            details=_block_details(top, file_authors),
+        )
+    if identification.authors_conflict(provider_authors, file_authors):
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_AUTHOR_CONFLICT,
+            details=_block_details(top, file_authors),
+        )
+    return AutoAcceptDecision(candidate=top)
 
 
 def normalize_filename(raw: str) -> str:
@@ -215,11 +395,19 @@ def validate_container_signature(file_path: str, detected_format: str) -> None:
             if "META-INF/container.xml" not in {info.filename for info in members}:
                 raise ValidationError("EPUB package metadata is missing")
         return
-    if detected_format == "mobi":
+    if detected_format in PALMDB_SIGNATURES:
         with path.open("rb") as source:
             header = source.read(68)
-        if len(header) < 68 or header[60:68] != b"BOOKMOBI":
-            raise ValidationError("file content is not a MOBI container")
+        if len(header) < 68 or header[60:68] not in PALMDB_SIGNATURES[detected_format]:
+            raise ValidationError(
+                f"file content is not a {detected_format.upper()} (PalmDB/MOBI) container"
+            )
+        return
+    if detected_format == "rtf":
+        with path.open("rb") as source:
+            header = source.read(8)
+        if not header.removeprefix(b"\xef\xbb\xbf").startswith(b"{\\rtf"):
+            raise ValidationError("file content is not RTF")
         return
     if detected_format in {"txt", "html", "fb2"}:
         sample = _read_metadata_sample(path)
@@ -386,6 +574,8 @@ def create_source_import_job(
 ) -> ImportJob:
     if not path.is_file():
         raise IntakeError(f"source path is not a file: {path}")
+    if is_audio_filename(path.name):
+        raise IntakeError(f"{audio_skip_reason(path.name)}: {path.name}")
     if not _is_supported_file(path):
         raise IntakeError(f"unsupported file format: {path.name}")
     safe_name = normalize_filename(path.name)
@@ -437,14 +627,130 @@ def _already_handled(source_location: SourceLocation, path: Path, normalized: st
     return False
 
 
+@dataclass
+class ByteBudget:
+    """Archive bytes that may still be queued before the free-space reserve is reached."""
+
+    remaining: int
+    exhausted: bool = False
+
+    def take(self, size: int) -> bool:
+        if size > self.remaining:
+            self.exhausted = True
+            return False
+        self.remaining -= size
+        return True
+
+
+# Jobs whose source file has not been archived yet; their size is still owed to
+# the archive volume.
+PENDING_ARCHIVE_STATES = (
+    ImportJob.State.DISCOVERED,
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+# States in which an import job still holds a slot of its source's batch: queued or
+# being processed by a worker. LOW_CONFIDENCE is excluded because those jobs are
+# already archived and only wait for a human reviewer.
+IN_FLIGHT_STATES = PENDING_ARCHIVE_STATES
+
+
+def _source_limit(value: int | None, setting_name: str) -> int | None:
+    """Per-source override, else the global setting; ``None`` means unlimited."""
+    limit = value if value is not None else int(getattr(django_settings, setting_name, 0) or 0)
+    return limit if limit > 0 else None
+
+
+def source_ingest_capacity(
+    source_location: SourceLocation,
+    *,
+    batch_size: int | None = None,
+) -> int | None:
+    """How many new import jobs may be queued for a source right now.
+
+    Bounded by the source's batch size (jobs in flight at once) and its hourly rate.
+    ``batch_size`` overrides the configured batch size (``ingest_sources --limit``;
+    0 means unlimited). Returns ``None`` when neither limit applies.
+    """
+    if source_location.is_paused:
+        return 0
+    limits: list[int] = []
+    batch = (
+        (batch_size or None)
+        if batch_size is not None
+        else _source_limit(source_location.ingest_batch_size, "BOOK_SCANNER_INGEST_BATCH_SIZE")
+    )
+    jobs = ImportJob.objects.filter(source_location=source_location)
+    if batch is not None:
+        in_flight = jobs.filter(state__in=IN_FLIGHT_STATES).count()
+        limits.append(max(batch - in_flight, 0))
+    per_hour = _source_limit(
+        source_location.ingest_max_per_hour, "BOOK_SCANNER_INGEST_MAX_PER_HOUR"
+    )
+    if per_hour is not None:
+        recent = jobs.filter(created_at__gte=timezone.now() - timedelta(hours=1)).count()
+        limits.append(max(per_hour - recent, 0))
+    return min(limits) if limits else None
+
+
+def archive_space_budget() -> ByteBudget | None:
+    """Bytes that new imports may add to the archive before hitting the reserve.
+
+    Free space on the archive volume, minus ``BOOK_SCANNER_STORAGE_MIN_FREE_BYTES``,
+    minus the (approximate) size of imports already queued but not yet archived.
+    ``None`` when the check is disabled or free space cannot be determined.
+    """
+    reserve = min_free_bytes()
+    if reserve <= 0:
+        return None
+    free = _default_storage().free_bytes()
+    if free is None:
+        return None
+    pending = ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES).aggregate(
+        total=django_models.Sum(Coalesce("source_size", "size_bytes")),
+    )["total"]
+    return ByteBudget(remaining=max(free - reserve - int(pending or 0), 0))
+
+
 def discover_source_jobs_for_location(
     source_location: SourceLocation,
     *,
     uploader: Any | None = None,
+    limit: int | None = None,
+    byte_budget: ByteBudget | None = None,
+    skipped_audio: list[int] | None = None,
 ) -> list[ImportJob]:
+    """Create DISCOVERED jobs for new files, stopping after ``limit`` jobs if given.
+
+    Audio files are never turned into jobs. Pass ``skipped_audio`` to receive how
+    many were seen (one count appended per call).
+
+    With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
+    would not fit, so a bulk import cannot queue more than the archive can hold.
+    """
     jobs: list[ImportJob] = []
+    skipped: list[Path] = []
+    audio_skipped = 0
+    if limit is not None and limit <= 0:
+        if skipped_audio is not None:
+            skipped_audio.append(0)
+        return jobs
     for candidate in discover_source_paths(source_location):
+        if is_audio_filename(candidate.name):
+            audio_skipped += 1
+            logger.debug(
+                "intake_audio_skipped",
+                source_location_id=source_location.pk,
+                drm_protected=is_drm_audio_filename(candidate.name),
+            )
+            continue
         if not _is_supported_file(candidate):
+            skipped.append(candidate)
             continue
         normalized = str(candidate.resolve())
         active_job_exists = ImportJob.objects.filter(
@@ -463,25 +769,141 @@ def discover_source_jobs_for_location(
         ).exists()
         if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
+        if byte_budget is not None:
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            if not byte_budget.take(size):
+                logger.warning(
+                    "intake_space_budget_exhausted",
+                    source_location_id=source_location.pk,
+                    queued=len(jobs),
+                )
+                break
         try:
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
             continue
+        if limit is not None and len(jobs) >= limit:
+            break
+    if skipped:
+        # Unsupported files are never imported, but they must not vanish silently (#23).
+        logger.warning(
+            "source_files_skipped_unsupported",
+            source_location_id=str(source_location.id),
+            skipped_count=len(skipped),
+            skipped_by_extension=skipped_extension_counts(skipped),
+        )
+    if audio_skipped:
+        logger.info(
+            "intake_audio_files_skipped",
+            source_location_id=source_location.pk,
+            count=audio_skipped,
+            reason=AUDIO_SKIP_REASON,
+        )
+    if skipped_audio is not None:
+        skipped_audio.append(audio_skipped)
     return jobs
+
+
+def skipped_extension_label(path: Path) -> str:
+    """Return the lowercase extension used to group unsupported files in reports."""
+    return path.suffix.lower() or "(no extension)"
+
+
+def skipped_extension_counts(paths: Iterable[Path]) -> dict[str, int]:
+    """Count unsupported files per extension, most common first."""
+    counts: dict[str, int] = {}
+    for path in paths:
+        label = skipped_extension_label(path)
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+UNSUPPORTED_SKIP_REASON = "unsupported format"
+
+
+@dataclass(frozen=True)
+class SourcePreview:
+    """What discovery would do with every file in one source, without creating jobs.
+
+    ``jobs`` are importable files. ``skipped`` are files that are never imported:
+    unsupported formats (``"skipped": "unsupported"``, #23) and audio files
+    (``"skipped": "audio"``, see docs/design/32-audiobooks.md). ``rows`` keeps
+    discovery order.
+    """
+
+    rows: list[dict[str, Any]]
+
+    @property
+    def jobs(self) -> list[dict[str, Any]]:
+        return [row for row in self.rows if "skipped" not in row]
+
+    @property
+    def skipped(self) -> list[dict[str, Any]]:
+        return [row for row in self.rows if "skipped" in row]
+
+    @property
+    def skipped_audio(self) -> int:
+        return sum(1 for row in self.rows if row.get("skipped") == "audio")
+
+    @property
+    def skipped_by_extension(self) -> dict[str, int]:
+        return skipped_extension_counts(Path(row["path"]) for row in self.skipped)
+
+
+def preview_source_location(source_location: SourceLocation) -> SourcePreview:
+    """Classify every candidate file in a source without creating jobs."""
+    rows: list[dict[str, Any]] = []
+    for candidate in discover_source_paths(source_location):
+        base: dict[str, Any] = {
+            "source_location_id": str(source_location.id),
+            "path": str(candidate),
+            "filename": candidate.name,
+        }
+        if is_audio_filename(candidate.name):
+            rows.append(
+                {
+                    **base,
+                    "skipped": "audio",
+                    "extension": skipped_extension_label(candidate),
+                    "drm_protected": is_drm_audio_filename(candidate.name),
+                    "reason": audio_skip_reason(candidate.name),
+                }
+            )
+            continue
+        if not _is_supported_file(candidate):
+            rows.append(
+                {
+                    **base,
+                    "skipped": "unsupported",
+                    "extension": skipped_extension_label(candidate),
+                    "reason": UNSUPPORTED_SKIP_REASON,
+                }
+            )
+            continue
+        row: dict[str, Any] = {**base, "source_type": source_location.default_source_type}
+        if source_location.path_layouts:
+            # Lets an admin check a folder layout before importing anything.
+            hints = source_layout.hints_for_source_file(source_location, str(candidate))
+            row["path_layout"] = hints.as_evidence() if hints is not None else None
+        rows.append(row)
+    return SourcePreview(rows=rows)
 
 
 def preview_source_jobs(
     source_location: SourceLocation,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
+    """Rows for files discovery would import, plus rows for skipped audio files.
+
+    Audio rows carry ``"skipped": "audio"`` and a ``reason``; they never become jobs.
+    Unsupported-format files are listed by ``preview_source_location``.
+    """
     return [
-        {
-            "source_location_id": str(source_location.id),
-            "path": str(candidate),
-            "filename": candidate.name,
-            "source_type": source_location.default_source_type,
-        }
-        for candidate in discover_source_paths(source_location)
-        if _is_supported_file(candidate)
+        row
+        for row in preview_source_location(source_location).rows
+        if row.get("skipped") != "unsupported"
     ]
 
 
@@ -537,6 +959,12 @@ def extract_metadata(
             return _extract_fb2_metadata(file_path, original_filename=original_filename)
         if detected_format == "cbz":
             return _extract_cbz_metadata(file_path, original_filename=original_filename)
+        if detected_format in EBOOK_META_FORMATS:
+            return _extract_ebook_meta_metadata(
+                file_path,
+                detected_format,
+                original_filename=original_filename,
+            )
     except (ValidationError, DefusedXmlException):
         raise
     except Exception:
@@ -677,6 +1105,72 @@ def _extract_cbz_metadata(file_path: str, *, original_filename: str) -> dict[str
     }
 
 
+def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
+    """Return the OPF document Calibre's ``ebook-meta`` writes for ``file_path``.
+
+    ``None`` means "no usable metadata" (tool missing, failed, timed out, or wrote
+    nothing within the size cap); the caller then falls back to filename signals.
+    The command goes through the conversion runner, which kills the whole process
+    group on timeout so a hung Calibre helper cannot outlive the job.
+    """
+    # Imported here: conversion imports this module at load time.
+    from .conversion import ConversionError, _run_conversion_command
+
+    binary = shutil.which(EBOOK_META_BINARY)
+    if binary is None:
+        logger.warning("ebook_meta_unavailable", binary=EBOOK_META_BINARY)
+        return None
+    with TemporaryDirectory(prefix="ebook-meta-") as workdir:
+        opf_path = Path(workdir) / "metadata.opf"
+        try:
+            result = _run_conversion_command(
+                [binary, str(Path(file_path).resolve()), "--to-opf", str(opf_path)],
+                timeout=EBOOK_META_TIMEOUT_SECONDS,
+            )
+        except (OSError, ConversionError) as exc:
+            logger.warning("ebook_meta_failed", error_type=type(exc).__name__)
+            return None
+        if result.returncode != 0:
+            logger.warning("ebook_meta_failed", returncode=result.returncode)
+            return None
+        try:
+            if opf_path.stat().st_size > MAX_FORMAT_METADATA_BYTES:
+                logger.warning("ebook_meta_output_too_large")
+                return None
+            payload = opf_path.read_bytes()
+        except OSError:
+            return None
+    return payload or None
+
+
+def _extract_ebook_meta_metadata(
+    file_path: str,
+    detected_format: str,
+    *,
+    original_filename: str,
+) -> dict[str, Any]:
+    """MOBI and other Kindle-family metadata, read via ``ebook-meta --to-opf``."""
+    fallback: dict[str, Any] = {
+        "title": Path(original_filename).stem,
+        "raw_metadata": {},
+        "container_type": detected_format,
+    }
+    payload = _run_ebook_meta_to_opf(file_path)
+    if payload is None:
+        return fallback
+    try:
+        fields = parse_opf_metadata(payload)
+    except (ET.ParseError, DefusedXmlException) as exc:
+        logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
+        return fallback
+    return {
+        **fields,
+        "title": fields["title"] or fallback["title"],
+        "raw_metadata": {"metadata_tool": EBOOK_META_BINARY},
+        "container_type": detected_format,
+    }
+
+
 def _extract_pdf_metadata(file_path: str, *, original_filename: str) -> dict[str, Any]:
     reader = PdfReader(file_path)
     metadata: Any = reader.metadata or {}
@@ -782,6 +1276,59 @@ def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
     return texts[0][1]
 
 
+def _opf_creator_is_author(element: Any) -> bool:
+    """True unless the dc:creator carries a non-author ``opf:role`` (editor, translator...)."""
+    role = next(
+        (str(value) for key, value in element.attrib.items() if _xml_local_name(key) == "role"),
+        "",
+    )
+    return not role or role.strip().lower() == "aut"
+
+
+def parse_opf_metadata(payload: bytes) -> dict[str, Any]:
+    """Parse the Dublin-Core fields of a standalone OPF package document.
+
+    Shared by every OPF this module reads outside an EPUB container: the document
+    ``ebook-meta --to-opf`` writes for Kindle-family files and a Calibre
+    ``metadata.opf`` sidecar. Parsing goes through defusedxml, so a document with
+    entity declarations raises ``DefusedXmlException``; malformed XML raises
+    ``ParseError``. Callers decide how to degrade.
+    """
+    root = ET.fromstring(payload)
+
+    def texts(name: str) -> list[str]:
+        values = []
+        for element in root.iterfind(f".//{DC_NAMESPACE}{name}"):
+            value = " ".join("".join(element.itertext()).split())
+            if value:
+                values.append(value)
+        return values
+
+    def first(name: str) -> str | None:
+        values = texts(name)
+        return values[0] if values else None
+
+    authors: list[str] = []
+    for element in root.iterfind(f".//{DC_NAMESPACE}creator"):
+        name = " ".join("".join(element.itertext()).split())
+        if name and name not in authors and _opf_creator_is_author(element):
+            authors.append(name)
+    return {
+        "title": first("title"),
+        "authors": authors,
+        "language": first("language"),
+        "description": first("description"),
+        "publisher": first("publisher"),
+        "subjects": identification.normalize_subjects(texts("subject")),
+        "identifier": _pick_epub_identifier(
+            [
+                (element.attrib, "".join(element.itertext()).strip())
+                for element in root.iterfind(f".//{DC_NAMESPACE}identifier")
+            ],
+        ),
+    }
+
+
 def _read_epub_metadata_member(archive: ZipFile, member_name: str) -> bytes:
     """Read a small EPUB metadata member while rejecting archive-bomb inputs."""
     return _read_zip_metadata_member(archive, member_name, container_name="EPUB")
@@ -819,12 +1366,15 @@ def _find_text_any(root: ET.Element, expression: str) -> str | None:
 def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
+    *,
+    allow_match: bool = True,
 ) -> None:
+    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
     # Ensure idempotence if jobs are retried.
     MetadataCandidate.objects.filter(import_job=job).delete()
     for candidate in candidates:
         state = MetadataCandidate.CandidateState.REVIEW
-        if candidate.score >= AUTO_ACCEPT_SCORE:
+        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             import_job=job,
@@ -918,6 +1468,16 @@ def _create_review_task(
     return existing
 
 
+def variant_source_type_for_job(job: ImportJob) -> str:
+    """FileVariant provenance for an import: upload, incoming folder, or network source."""
+    mapping: dict[str, str] = {
+        ImportJob.SourceType.UPLOAD: FileVariant.SourceType.UPLOAD,
+        ImportJob.SourceType.INCOMING_FOLDER: FileVariant.SourceType.INCOMING_FOLDER,
+        ImportJob.SourceType.NETWORK_SOURCE: FileVariant.SourceType.NETWORK_SOURCE,
+    }
+    return mapping.get(str(job.source_type), FileVariant.SourceType.UPLOAD)
+
+
 def _create_or_reuse_file_variant(
     job: ImportJob,
     book: Book,
@@ -926,7 +1486,7 @@ def _create_or_reuse_file_variant(
     source_type: str = "",
 ) -> FileVariant:
     if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+        source_type = variant_source_type_for_job(job)
     duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
     if duplicate_variant is not None:
         return duplicate_variant
@@ -937,6 +1497,7 @@ def _create_or_reuse_file_variant(
         if Path(job.source_path).exists():
             storage_location = _default_storage_location()
             storage_id = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+            storage.ensure_free_space(Path(job.source_path).stat().st_size)
             storage.store(job.source_path, storage_id)
             job.storage_location = storage_location
             job.storage_identifier = storage_id
@@ -965,11 +1526,11 @@ def _create_or_reuse_file_variant(
     )
 
 
-def _try_extract_front_cover(variant: FileVariant) -> None:
+def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None) -> None:
     from . import covers
 
     try:
-        cover = covers.extract_front_cover(variant)
+        cover = covers.extract_front_cover(variant, import_job=job)
     except Exception as exc:  # cover generation is optional; preserve successful intake
         logger.warning(
             "cover_extraction_failed",
@@ -1008,11 +1569,7 @@ def _provision_book_from_manual_metadata(
         description=description or "",
         edition=_fit(Book, "edition", edition),
     )
-    if publication_year:
-        try:
-            book.publication_date = date(publication_year, 1, 1)
-        except ValueError:
-            pass
+    book.publication_year = clean_publication_year(publication_year)
     for raw_author in authors or []:
         author, _ = Author.objects.get_or_create(full_name=_fit(Author, "full_name", raw_author))
         book.authors.add(author)
@@ -1039,19 +1596,52 @@ def resolve_import_with_review_data(
     job: ImportJob,
     review_task: ReviewTask,
     book: Book,
-    source_type: str,
+    source_type: str = "",
     selected_candidate: MetadataCandidate | None = None,
     reviewer: Any | None = None,
     decision: str = "",
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    propagate_to_siblings: bool = True,
 ) -> FileVariant:
-    if not source_type:
-        source_type = cast(str, FileVariant.SourceType.UPLOAD)
+    """Resolve a reviewed import; ``source_type`` defaults to the job's origin.
+
+    Other formats of the same book waiting in review are then offered ``book``
+    (``_propagate_book_to_siblings``), under the same sibling-group lock.
+    """
+    with _sibling_group_lock(job):
+        variant = _resolve_import(
+            job=job,
+            review_task=review_task,
+            book=book,
+            source_type=source_type,
+            selected_candidate=selected_candidate,
+            reviewer=reviewer,
+            decision=decision,
+            decision_notes=decision_notes,
+            decision_payload=decision_payload,
+        )
+        if propagate_to_siblings:
+            _propagate_book_to_siblings(job, book)
+    return variant
+
+
+def _resolve_import(
+    *,
+    job: ImportJob,
+    review_task: ReviewTask,
+    book: Book,
+    source_type: str,
+    selected_candidate: MetadataCandidate | None,
+    reviewer: Any | None,
+    decision: str,
+    decision_notes: str,
+    decision_payload: dict[str, Any] | None,
+) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    _try_extract_front_cover(variant)
+    _try_extract_front_cover(variant, job)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -1088,6 +1678,447 @@ def resolve_import_with_review_data(
             "storage_identifier",
             "updated_at",
         ],
+    )
+    return variant
+
+
+# --- Formats of one book (#39) ---------------------------------------------------------
+#
+# With ``SourceLocation.group_sibling_formats`` (opt-in), files in one source folder with
+# the same case-folded file name and different extensions are "siblings": probably
+# formats of one book. A sibling's already linked Book is offered as one more, strong
+# candidate; it is never a bypass of verification:
+#
+# * the file is still looked up externally, and its candidates are stored;
+# * the Book is scored with the provider scorer plus ``SIBLING_FORMAT_BONUS`` and must
+#   reach the auto-accept threshold;
+# * embedded ISBNs that conflict with the Book's ISBNs, or a confident provider match for
+#   a different book, send the file to review instead;
+# * a review task a reviewer has CLAIMED is never resolved automatically.
+
+SIBLING_EVIDENCE_KEY = "format_sibling_of"
+SIBLING_REVIEW_PAYLOAD_KEY = "format_sibling"
+
+
+@dataclass(frozen=True)
+class SiblingAssessment:
+    sibling: ImportJob
+    book: Book
+    score: float
+    accepted: bool
+    reason: str
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "import_job": str(self.sibling.id),
+            "filename": self.sibling.original_filename,
+            "book_id": self.book.pk,
+            "score": round(self.score, 4),
+            "accepted": self.accepted,
+            "reason": self.reason,
+        }
+
+
+def _groups_sibling_formats(job: ImportJob) -> bool:
+    location = job.source_location
+    return bool(location is not None and location.group_sibling_formats and job.source_path)
+
+
+@contextmanager
+def _sibling_group_lock(job: ImportJob) -> Iterator[None]:
+    """Serialise sibling decisions for one source (short database sections only).
+
+    Without it, two formats auto-accepted at the same time could provision two Books,
+    and a file reaching review just after its sibling was linked would be missed.
+    Locks the SourceLocation row; a no-op for sources without format grouping.
+    """
+    if not _groups_sibling_formats(job):
+        yield
+        return
+    with transaction.atomic():
+        list(
+            SourceLocation.objects.select_for_update()
+            .filter(pk=job.source_location_id)
+            .values_list("pk", flat=True)
+        )
+        yield
+
+
+def _sibling_jobs(job: ImportJob) -> list[ImportJob]:
+    """Import jobs for other formats of the same book: same folder, same file name."""
+    if not _groups_sibling_formats(job):
+        return []
+    path = Path(job.source_path)
+    stem = path.stem.casefold()
+    # ``source_path`` is stored with the OS separator (``str(Path.resolve())``), so
+    # compare Path objects rather than "/"-joined string prefixes.
+    candidates = (
+        ImportJob.objects.filter(
+            source_location_id=job.source_location_id,
+            source_path__startswith=str(path.parent),
+        )
+        .exclude(pk=job.pk)
+        .exclude(source_path=job.source_path)
+        .select_related("book", "source_location")
+        .order_by("created_at", "id")
+    )
+    return [
+        candidate
+        for candidate in candidates
+        if Path(candidate.source_path).parent == path.parent
+        and Path(candidate.source_path).stem.casefold() == stem
+    ]
+
+
+def sibling_group_key(job: ImportJob) -> tuple[int, str, str] | None:
+    """Key shared by all formats of one book (``_sibling_jobs``), or ``None``.
+
+    ``(source location id, parent folder, case-folded file stem)``; only for sources with
+    ``group_sibling_formats``.
+    """
+    if not _groups_sibling_formats(job) or job.source_location_id is None:
+        return None
+    path = Path(job.source_path)
+    return (job.source_location_id, str(path.parent), path.stem.casefold())
+
+
+def _resolved_sibling(job: ImportJob) -> ImportJob | None:
+    for sibling in _sibling_jobs(job):
+        if sibling.state == ImportJob.State.COMPLETE and sibling.book is not None:
+            return sibling
+    return None
+
+
+def _isbn13s(values: Iterable[str]) -> set[str]:
+    return {
+        isbn
+        for value in values
+        for isbn in identification.normalize_isbns(value)
+        if len(isbn) == 13
+    }
+
+
+def _book_as_candidate(
+    book: Book, *, prefer_isbns: set[str]
+) -> identification.IdentificationCandidate:
+    identifiers = list(
+        book.identifiers.filter(
+            kind__in=(Identifier.IdentifierType.ISBN10, Identifier.IdentifierType.ISBN13)
+        ).values_list("value", flat=True)
+    )
+    # Use the Book's ISBN that equals the file's when there is one, so scoring sees it.
+    matching = [value for value in identifiers if _isbn13s([value]) & prefer_isbns]
+    ordered = matching + [value for value in identifiers if value not in matching]
+    isbn10 = next((value for value in ordered if len(value) == 10), None)
+    isbn13 = next((value for value in ordered if len(value) == 13), None)
+    return identification.IdentificationCandidate(
+        provider_id="library",
+        provider_ref=f"book:{book.pk}",
+        title=book.title,
+        authors=[author.full_name for author in book.authors.all()],
+        isbn10=isbn10,
+        isbn13=isbn13,
+        language=book.language or None,
+        description=None,
+        publisher=book.publisher or None,
+        edition=book.edition or None,
+        publication_year=None,
+        score=0.0,
+        raw={},
+    )
+
+
+def _assess_sibling_book(
+    *,
+    signals: identification.IdentificationInput,
+    sibling: ImportJob,
+    book: Book,
+    top_candidate: identification.IdentificationCandidate | None,
+    file_authors: list[str],
+) -> SiblingAssessment:
+    """Whether a file may join its sibling's Book (see the block comment above)."""
+    file_isbns = _isbn13s(signals.isbns)
+    book_isbns = _isbn13s(
+        book.identifiers.filter(
+            kind__in=(Identifier.IdentifierType.ISBN10, Identifier.IdentifierType.ISBN13)
+        ).values_list("value", flat=True)
+    )
+    book_candidate = _book_as_candidate(book, prefer_isbns=file_isbns)
+    score = min(
+        1.0,
+        identification.score_candidate(signals, book_candidate).score
+        + identification.SIBLING_FORMAT_BONUS,
+    )
+    if file_isbns and book_isbns and not file_isbns & book_isbns:
+        reason, accepted = "conflicting_isbn", False
+    elif identification.authors_conflict(book_candidate.authors, file_authors):
+        reason, accepted = BLOCK_AUTHOR_CONFLICT, False
+    elif (
+        top_candidate is not None
+        and top_candidate.score >= AUTO_ACCEPT_SCORE
+        and not identification.same_book(top_candidate, book_candidate)
+    ):
+        reason, accepted = "provider_match_differs", False
+    elif score < AUTO_ACCEPT_SCORE:
+        reason, accepted = "below_threshold", False
+    else:
+        reason, accepted = "accepted", True
+    return SiblingAssessment(
+        sibling=sibling, book=book, score=score, accepted=accepted, reason=reason
+    )
+
+
+def _record_sibling_evidence(job: ImportJob, assessment: SiblingAssessment) -> None:
+    evidence = dict(job.evidence) if isinstance(job.evidence, dict) else {}
+    evidence[SIBLING_EVIDENCE_KEY] = assessment.as_evidence()
+    job.evidence = evidence
+    _save_job(job, update_fields=["evidence", "updated_at"])
+
+
+def _top_saved_candidate(job: ImportJob) -> identification.IdentificationCandidate | None:
+    row = job.metadata_candidates.order_by("-score", "id").first()
+    if row is None:
+        return None
+    return identification.IdentificationCandidate(
+        provider_id=row.provider_id,
+        provider_ref=row.provider_ref,
+        title=row.title,
+        authors=[author for author in row.authors or [] if isinstance(author, str)],
+        isbn10=row.isbn10 or None,
+        isbn13=row.isbn13 or None,
+        language=row.language or None,
+        description=row.description or None,
+        publisher=row.publisher or None,
+        edition=None,
+        publication_year=row.publication_year,
+        score=float(row.score),
+        raw={},
+    )
+
+
+def _annotate_review_task(task: ReviewTask, payload: dict[str, Any]) -> None:
+    decision_payload = (
+        dict(task.decision_payload) if isinstance(task.decision_payload, dict) else {}
+    )
+    decision_payload[SIBLING_REVIEW_PAYLOAD_KEY] = payload
+    task.decision_payload = decision_payload
+    task.save(update_fields=["decision_payload", "updated_at"])
+
+
+def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: ImportJob) -> bool:
+    """Resolve a sibling waiting in review with ``book`` if the evidence allows it.
+
+    Call under ``_sibling_group_lock``. Returns whether the job was linked.
+    """
+    if waiting.state != ImportJob.State.LOW_CONFIDENCE or not waiting.storage_identifier:
+        return False
+    task = (
+        ReviewTask.objects.select_for_update()
+        .filter(
+            import_job=waiting,
+            state__in=(ReviewTask.State.OPEN, ReviewTask.State.CLAIMED),
+        )
+        .first()
+    )
+    if task is None:
+        return False
+    if task.state == ReviewTask.State.CLAIMED:
+        # A reviewer is working on it: never decide for them, only point at the Book.
+        _annotate_review_task(
+            task,
+            {
+                "import_job": str(source_job.id),
+                "filename": source_job.original_filename,
+                "book_id": book.pk,
+                "accepted": False,
+                "reason": "claimed_by_reviewer",
+            },
+        )
+        return False
+    evidence = waiting.evidence if isinstance(waiting.evidence, dict) else {}
+    signals = identification.build_identification_input(
+        source_path=waiting.source_path,
+        original_filename=waiting.original_filename,
+        extracted_metadata=evidence,
+    )
+    assessment = _assess_sibling_book(
+        signals=signals,
+        sibling=source_job,
+        book=book,
+        top_candidate=_top_saved_candidate(waiting),
+        file_authors=identification.evidence_author_names(evidence),
+    )
+    _record_sibling_evidence(waiting, assessment)
+    if not assessment.accepted:
+        _annotate_review_task(task, assessment.as_evidence())
+        logger.info(
+            "intake_format_sibling_not_linked",
+            import_job_id=str(waiting.id),
+            sibling_import_job_id=str(source_job.id),
+            book_id=book.pk,
+            reason=assessment.reason,
+        )
+        return False
+    _resolve_import(
+        job=waiting,
+        review_task=task,
+        book=book,
+        source_type="",
+        selected_candidate=None,
+        reviewer=None,
+        decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
+        decision_notes=(
+            f"Another format of '{source_job.original_filename}' (same folder and file "
+            f"name); linked automatically at score {assessment.score:.2f}."
+        ),
+        decision_payload={
+            "rule": "group_sibling_formats",
+            SIBLING_REVIEW_PAYLOAD_KEY: assessment.as_evidence(),
+        },
+    )
+    logger.info(
+        "intake_linked_format_sibling",
+        import_job_id=str(waiting.id),
+        sibling_import_job_id=str(source_job.id),
+        book_id=book.pk,
+        score=assessment.score,
+        from_review=True,
+    )
+    return True
+
+
+def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
+    """Offer ``book`` to other formats of it that wait in review.
+
+    Siblings not processed yet consider it themselves in ``process_import_job``. A
+    failure here never undoes the already completed ``job``.
+    """
+    if not _groups_sibling_formats(job):
+        return
+    with _sibling_group_lock(job):
+        for sibling in _sibling_jobs(job):
+            if sibling.state != ImportJob.State.LOW_CONFIDENCE:
+                continue
+            try:
+                with transaction.atomic():
+                    _offer_book_to_waiting_job(sibling, book, source_job=job)
+            except Exception:
+                logger.exception(
+                    "intake_sibling_propagation_failed",
+                    import_job_id=str(job.id),
+                    sibling_import_job_id=str(sibling.id),
+                )
+
+
+def _archive_for_review(
+    job: ImportJob,
+    candidates: list[identification.IdentificationCandidate],
+) -> None:
+    """Create the review task, archive the original, and leave the job LOW_CONFIDENCE."""
+    with transaction.atomic():
+        # Rolled back with the task if this worker no longer owns the job.
+        _create_review_task(job=job, candidates=candidates)
+        job.state = ImportJob.State.LOW_CONFIDENCE
+        _save_job(job, update_fields=["state", "updated_at"])
+    job.state = ImportJob.State.ARCHIVING
+    _save_job(job, update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(_default_storage(), job)
+    job.storage_identifier = destination
+    job.storage_location = _default_storage_location()
+    _save_job(
+        job,
+        update_fields=[
+            "storage_identifier",
+            "storage_location_id",
+            "state",
+            "updated_at",
+        ],
+    )
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    _save_job(
+        job,
+        update_fields=[
+            "state",
+            "storage_identifier",
+            "storage_location_id",
+            "updated_at",
+        ],
+        release=True,
+    )
+    if not _groups_sibling_formats(job):
+        return
+    with _sibling_group_lock(job):
+        # A sibling linked while this file was being identified did not see it waiting;
+        # offer its Book now. A sibling already assessed above is not offered again.
+        if SIBLING_EVIDENCE_KEY in (job.evidence or {}):
+            return
+        sibling = _resolved_sibling(job)
+        if sibling is not None and sibling.book is not None:
+            _offer_book_to_waiting_job(job, sibling.book, source_job=sibling)
+
+
+def _complete_with_book(
+    job: ImportJob,
+    book: Book,
+    *,
+    destination: str,
+    storage_location: StorageLocation,
+) -> FileVariant:
+    """Link an archived, verified job to ``book`` as a new FileVariant.
+
+    Atomic, so the FileVariant is rolled back if this worker lost the job meanwhile.
+    """
+    with transaction.atomic():
+        return _link_variant_and_complete(
+            job, book, destination=destination, storage_location=storage_location
+        )
+
+
+def _link_variant_and_complete(
+    job: ImportJob,
+    book: Book,
+    *,
+    destination: str,
+    storage_location: StorageLocation,
+) -> FileVariant:
+    job.storage_identifier = destination
+    job.storage_location = storage_location
+    job.normalized_filename = normalize_filename(
+        f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
+    )
+    variant = FileVariant.objects.create(
+        book=book,
+        format=job.detected_format,
+        mime_type=job.mime_type,
+        original_filename=job.original_filename,
+        storage_location=storage_location,
+        storage_identifier=destination,
+        size_bytes=job.size_bytes,
+        sha256=job.sha256,
+        source_type=variant_source_type_for_job(job),
+        uploader=job.uploader,
+        imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    _try_extract_front_cover(variant, job)
+    job.book = book
+    job.file_variant = variant
+    job.state = ImportJob.State.COMPLETE
+    _save_job(
+        job,
+        update_fields=[
+            "state",
+            "book_id",
+            "file_variant_id",
+            "storage_location_id",
+            "storage_identifier",
+            "normalized_filename",
+            "updated_at",
+        ],
+        release=True,
     )
     return variant
 
@@ -1152,11 +2183,9 @@ def _provision_book_from_metadata(
             book.language = _fit(Book, "language", candidate.language)
         if candidate.description:
             book.description = candidate.description
-        if candidate.publication_year:
-            try:
-                book.publication_date = date(candidate.publication_year, 1, 1)
-            except ValueError:
-                pass
+        year = clean_publication_year(candidate.publication_year)
+        if year is not None:
+            book.publication_year = year
         book.edition = _fit(Book, "edition", candidate.edition) or book.edition
         book.save()
         return book
@@ -1169,6 +2198,8 @@ def _provision_book_from_metadata(
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
     storage_location = _default_storage_location()
     destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
+    # Checked per file, so a bulk import already queued still stops before the disk fills.
+    storage.ensure_free_space(job.size_bytes or Path(job.source_path).stat().st_size)
     if _archive_should_preserve_source(job):
         storage.copy(job.source_path, destination)
     else:
@@ -1200,25 +2231,258 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     return job.next_retry_at is not None and job.attempt_count <= max_retries
 
 
+# --- Exclusive ownership of an import job ---------------------------------------------
+#
+# More than one queue delivery may exist for one ImportJob: ``ingest_sources`` re-queues
+# DISCOVERED jobs it cannot see in RQ (the snapshot can be stale), RQ retries a job, an
+# operator re-queues it. Only one delivery may ever process it. A delivery therefore
+# claims the job with one conditional UPDATE that sets ``lease_owner`` to a fresh token,
+# and every later write of the job (each phase transition, the archive location, the
+# final state) is a conditional UPDATE ``WHERE lease_owner = <token>`` that also renews
+# the lease. A delivery that cannot claim the job returns without touching it, whatever
+# state it loaded (DISCOVERED, HASHING, ... ARCHIVING). A worker whose lease was taken
+# away (``recover_stale_jobs``) stops at its next write instead of overwriting the row.
+
+# A worker owns the job (holds its lease) while it is in one of these states.
+ACTIVE_IMPORT_STATES = (
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+
+class ImportLeaseLostError(Exception):
+    """This worker no longer owns the import job; it must stop without writing."""
+
+
+class ImportCancelledError(ImportLeaseLostError):
+    """An operator cancelled the running import (``cancel_source_imports``)."""
+
+
+def import_lease_duration() -> timedelta:
+    """How long a claim stays valid without a phase transition renewing it.
+
+    Defaults to the RQ job timeout plus five minutes: RQ kills a work horse at its job
+    timeout, so once a lease has expired its worker is gone and the job is stale.
+    """
+    seconds = int(getattr(django_settings, "BOOK_SCANNER_INGEST_LEASE_SECONDS", 0) or 0)
+    if seconds <= 0:
+        timeout = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS", 1800))
+        seconds = max(timeout, 60) + 300
+    return timedelta(seconds=seconds)
+
+
+def claim_import_job(job: ImportJob) -> bool:
+    """Atomically take exclusive ownership of ``job`` and move it to HASHING.
+
+    Only an unowned job that is waiting to run can be claimed: DISCOVERED, or FAILED
+    with a queue retry due. One conditional UPDATE decides, so of any number of
+    concurrent deliveries exactly one wins. Jobs in an active phase are never claimed
+    by a delivery, even when their lease has expired; ``recover_stale_jobs`` handles
+    those explicitly. On success ``job`` carries the lease token used by later writes.
+    """
+    now = timezone.now()
+    token = uuid.uuid4().hex
+    expires = now + import_lease_duration()
+    max_retries = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_RETRY_MAX", 0))
+    waiting = django_models.Q(state=ImportJob.State.DISCOVERED) | django_models.Q(
+        state=ImportJob.State.FAILED,
+        next_retry_at__isnull=False,
+        attempt_count__lte=max_retries,
+    )
+    unowned = django_models.Q(lease_owner="") | django_models.Q(lease_expires_at__lt=now)
+    claimed = (
+        ImportJob.objects.filter(pk=job.pk)
+        .filter(waiting & unowned)
+        .update(
+            state=ImportJob.State.HASHING,
+            lease_owner=token,
+            lease_expires_at=expires,
+            updated_at=now,
+        )
+    )
+    if not claimed:
+        return False
+    job.state = ImportJob.State.HASHING
+    job.lease_owner = token
+    job.lease_expires_at = expires
+    job.updated_at = now
+    return True
+
+
+def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False) -> None:
+    """Persist ``update_fields`` of ``job``, only while this worker still owns it.
+
+    A job without a lease (review decisions, sibling bookkeeping) is saved normally. For
+    an owned job the row is fetched and locked by primary key (``SELECT ... FOR
+    UPDATE``, unconditionally, so the lock is held whatever the row contains), its
+    state and owner are inspected in Python, and the save happens inside that same
+    transaction. ``cancel_source_imports`` locks the same row, so a cancellation cannot
+    commit between the check and the save. The save renews the lease, or with
+    ``release`` clears it (the job leaves the active phases). Raises
+    ``ImportCancelledError`` when the job was cancelled and ``ImportLeaseLostError``
+    when this worker's token is no longer the owner; nothing is written then.
+    """
+    token = job.lease_owner
+    if not token:
+        job.save(update_fields=update_fields)
+        return
+    with transaction.atomic():
+        locked = ImportJob.objects.select_for_update().filter(pk=job.pk).first()
+        if locked is not None and locked.state == ImportJob.State.CANCELLED:
+            raise ImportCancelledError(f"import job {job.pk} was cancelled")
+        if locked is None or locked.lease_owner != token:
+            raise ImportLeaseLostError(str(job.pk))
+        if release:
+            job.lease_owner = ""
+            job.lease_expires_at = None
+        else:
+            job.lease_expires_at = timezone.now() + import_lease_duration()
+        job.save(update_fields=[*update_fields, "lease_owner", "lease_expires_at"])
+
+
+# Cancellable: queued or running, but not yet ARCHIVING (its source may already be in
+# the archive). LOW_CONFIDENCE jobs are archived and waiting for review.
+CANCELLABLE_IMPORT_STATES = tuple(
+    state for state in IN_FLIGHT_STATES if state != ImportJob.State.ARCHIVING
+)
+
+
+def cancel_source_imports(source_location: SourceLocation) -> list[str]:
+    """Pause a source and cancel its import jobs that have not started archiving.
+
+    Returns the ids of the cancelled jobs. Jobs already ARCHIVING are allowed to
+    finish, because their source file may already have been moved into the archive.
+    LOW_CONFIDENCE jobs are archived and waiting for review, so they are untouched.
+    Cancelled files are rediscovered by ``ingest_sources`` once the source is resumed.
+
+    The jobs' rows are locked (``SELECT ... FOR UPDATE``) and their lease cleared in
+    the same transaction. A worker in the middle of an owned save holds the row lock,
+    so the cancellation waits for that save to commit and then re-reads the state: a
+    job that just reached ARCHIVING is no longer cancelled. A worker whose job was
+    cancelled stops at its next save (``ImportCancelledError``) without writing.
+    """
+    with transaction.atomic():
+        SourceLocation.objects.filter(pk=source_location.pk).update(is_paused=True)
+        source_location.is_paused = True
+        ids = [
+            str(pk)
+            for pk in ImportJob.objects.select_for_update()
+            .filter(source_location=source_location, state__in=CANCELLABLE_IMPORT_STATES)
+            .values_list("pk", flat=True)
+        ]
+        ImportJob.objects.filter(pk__in=ids, state__in=CANCELLABLE_IMPORT_STATES).update(
+            state=ImportJob.State.CANCELLED,
+            last_error="cancelled by operator",
+            next_retry_at=None,
+            lease_owner="",
+            lease_expires_at=None,
+            updated_at=timezone.now(),
+        )
+    logger.info(
+        "intake_source_cancelled",
+        source_location_id=source_location.pk,
+        cancelled=len(ids),
+    )
+    return ids
+
+
+def stale_import_jobs(now: datetime | None = None) -> list[ImportJob]:
+    """Jobs in an active phase whose worker is gone: lease expired, or never leased.
+
+    Rows without a lease date predate leases (or were written by an older worker);
+    they count as stale once untouched for a lease duration.
+    """
+    now = now or timezone.now()
+    lease = import_lease_duration()
+    return list(
+        ImportJob.objects.filter(state__in=ACTIVE_IMPORT_STATES)
+        .filter(
+            django_models.Q(lease_expires_at__lt=now)
+            | django_models.Q(lease_expires_at__isnull=True, updated_at__lt=now - lease),
+        )
+        .order_by("updated_at"),
+    )
+
+
+def recover_stale_import_job(job: ImportJob, reason: str) -> bool:
+    """Mark a stale job FAILED and drop its lease; False if it changed meanwhile.
+
+    Conditional on the owner, state and expiry read by ``stale_import_jobs``, so a
+    worker that renewed its lease in the meantime is not touched. The worker that held
+    the lease, if it is somehow still running, stops at its next write. The job is not
+    retried automatically (its source may be half moved): ``ingest_sources
+    --retry-failed`` re-queues it once the operator has checked the source.
+    """
+    recovered = ImportJob.objects.filter(
+        pk=job.pk,
+        state=job.state,
+        lease_owner=job.lease_owner,
+        lease_expires_at=job.lease_expires_at,
+    ).update(
+        state=ImportJob.State.FAILED,
+        last_error=f"recovered by recover_stale_jobs: {reason}",
+        next_retry_at=None,
+        lease_owner="",
+        lease_expires_at=None,
+        updated_at=timezone.now(),
+    )
+    return bool(recovered)
+
+
 def process_import_job(job_id: str) -> None:
-    """Process one intake job from staging file to durable archive and optional matching."""
+    """Process one intake job from staging file to durable archive and optional matching.
+
+    Safe to deliver more than once: only the delivery that claims the job's lease does
+    any work, and it stops as soon as it loses the lease.
+    """
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
-    if job.state == ImportJob.State.COMPLETE:
+    if job.state in (ImportJob.State.COMPLETE, ImportJob.State.CANCELLED):
+        # CANCELLED: RQ may redeliver an abandoned job after a worker restart.
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
+    if (
+        job.state == ImportJob.State.DISCOVERED
+        and job.source_location is not None
+        and job.source_location.is_paused
+    ):
+        # Leave the job DISCOVERED; ingest_sources re-queues it after resume.
+        logger.info("intake_skipped_paused_source", import_job_id=str(job.id))
+        return
+    loaded_state = job.state
+    if not claim_import_job(job):
+        # Another delivery owns the job (or it is no longer waiting to run).
+        logger.info(
+            "intake_duplicate_delivery_skipped",
+            import_job_id=str(job.id),
+            loaded_state=loaded_state,
+        )
+        return
+    try:
+        _process_claimed_import_job(job)
+    except ImportCancelledError:
+        # Keep CANCELLED; failing would schedule an RQ retry of a cancelled job.
+        logger.info("intake_cancelled", import_job_id=str(job.id))
+    except ImportLeaseLostError:
+        logger.warning("intake_lease_lost", import_job_id=str(job.id))
 
+
+def _process_claimed_import_job(job: ImportJob) -> None:
+    """Run intake for a job this worker has claimed (``job.lease_owner`` is set)."""
     source_path = Path(job.source_path)
     if not source_path.exists():
         job.last_error = "source file missing"
         job.state = ImportJob.State.FAILED
-        job.save(update_fields=["state", "last_error", "updated_at"])
+        _save_job(job, update_fields=["state", "last_error", "updated_at"], release=True)
         return
 
     try:
-        job.state = ImportJob.State.HASHING
-        job.save(update_fields=["state", "updated_at"])
-
+        # The claim was a bulk UPDATE; save once so HASHING is observable (post_save).
+        _save_job(job, update_fields=["state", "updated_at"])
         job.sha256 = compute_sha256(job.source_path)
         job.size_bytes = source_path.stat().st_size
         detected_format, mime_type = detect_format(job.original_filename, job.mime_type or None)
@@ -1228,7 +2492,8 @@ def process_import_job(job_id: str) -> None:
         if not job.normalized_filename:
             job.normalized_filename = normalize_filename(job.original_filename)
         job.state = ImportJob.State.METADATA_EXTRACTION
-        job.save(
+        _save_job(
+            job,
             update_fields=[
                 "state",
                 "sha256",
@@ -1246,7 +2511,8 @@ def process_import_job(job_id: str) -> None:
             job.storage_identifier = duplicate_variant.storage_identifier
             job.storage_location = duplicate_variant.storage_location
             job.state = ImportJob.State.COMPLETE
-            job.save(
+            _save_job(
+                job,
                 update_fields=[
                     "state",
                     "book_id",
@@ -1255,6 +2521,7 @@ def process_import_job(job_id: str) -> None:
                     "storage_location_id",
                     "updated_at",
                 ],
+                release=True,
             )
             _finalize_source_cleanup(
                 job,
@@ -1264,7 +2531,8 @@ def process_import_job(job_id: str) -> None:
                     job.sha256,
                 ),
             )
-            _try_extract_front_cover(duplicate_variant)
+            _try_extract_front_cover(duplicate_variant, job)
+            _propagate_book_to_siblings(job, duplicate_variant.book)
             return
 
         metadata = extract_metadata(
@@ -1272,9 +2540,14 @@ def process_import_job(job_id: str) -> None:
             detected_format,
             original_filename=job.original_filename,
         )
+        if job.source_location is not None:
+            path_hints = source_layout.hints_for_source_file(job.source_location, job.source_path)
+            if path_hints is not None:
+                metadata[identification.PATH_LAYOUT_EVIDENCE_KEY] = path_hints.as_evidence()
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
-        job.save(
+        _save_job(
+            job,
             update_fields=[
                 "evidence",
                 "state",
@@ -1288,101 +2561,133 @@ def process_import_job(job_id: str) -> None:
             extracted_metadata=metadata,
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
-        _save_metadata_candidates(job, candidates)
+        file_authors = identification.evidence_author_names(metadata)
+        decision = decide_auto_accept(candidates, file_authors)
+        if decision.blocked_reason is not None:
+            metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
+            metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
+            metadata[SUGGESTED_AUTHORS_KEY] = file_authors
+            job.evidence = metadata
+            _save_job(job, update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_blocked",
+                import_job_id=str(job.id),
+                reason=decision.blocked_reason,
+                provider_id=decision.details.get("provider_id"),
+                score=decision.details.get("score"),
+            )
+        _save_metadata_candidates(
+            job,
+            candidates,
+            allow_match=decision.blocked_reason is None,
+        )
 
-        top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
-            _create_review_task(job=job, candidates=candidates)
-            job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(update_fields=["state", "updated_at"])
-            job.state = ImportJob.State.ARCHIVING
-            job.save(update_fields=["state", "updated_at"])
-            destination, verified = _archive_source(_default_storage(), job)
-            job.storage_identifier = destination
-            job.storage_location = _default_storage_location()
-            job.save(
-                update_fields=[
-                    "storage_identifier",
-                    "storage_location_id",
-                    "state",
-                    "updated_at",
-                ],
+        # The provider candidate allowed to auto-accept (None below the threshold or when
+        # the author checks block it), and the raw top candidate for comparisons.
+        top_candidate = decision.candidate
+        raw_top_candidate = candidates[0] if candidates else None
+        # Another format of this book may already be linked (#39): its Book becomes a
+        # strong candidate, but only joins when the evidence agrees.
+        assessment: SiblingAssessment | None = None
+        sibling = _resolved_sibling(job)
+        if sibling is not None and sibling.book is not None:
+            assessment = _assess_sibling_book(
+                signals=signals,
+                sibling=sibling,
+                book=sibling.book,
+                top_candidate=raw_top_candidate,
+                file_authors=file_authors,
             )
-            _finalize_source_cleanup(job, verified)
-            if not verified:
-                raise RuntimeError("archive verification failed")
-            job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(
-                update_fields=[
-                    "state",
-                    "storage_identifier",
-                    "storage_location_id",
-                    "updated_at",
-                ],
-            )
+            _record_sibling_evidence(job, assessment)
+
+        if assessment is not None:
+            # Accepted: join the sibling's Book. Rejected: the evidence conflicts with
+            # it, so a human decides even if a provider candidate scored high.
+            needs_review = not assessment.accepted
+        else:
+            needs_review = top_candidate is None
+        if needs_review:
+            _archive_for_review(job, candidates)
             return
 
         job.state = ImportJob.State.MATCHED
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         storage = _default_storage()
         storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         destination, verified = _archive_source(storage, job)
+        # Record where the archive copy went and confirm this worker still owns the
+        # job before a MOVE source is deleted.
+        _save_job(job, update_fields=["storage_identifier", "storage_location_id", "updated_at"])
         _finalize_source_cleanup(job, verified)
         if not verified:
             raise RuntimeError("archive verification failed")
 
-        book = _provision_book_from_metadata(
-            candidate=top_candidate,
-            fallback_title=top_candidate.title,
-            extra_metadata=metadata,
-        )
-        job.storage_identifier = destination
-        job.storage_location = storage_location
-        job.normalized_filename = normalize_filename(
-            f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
-        )
-        variant = FileVariant.objects.create(
-            book=book,
-            format=detected_format,
-            mime_type=mime_type,
-            original_filename=job.original_filename,
-            storage_location=storage_location,
-            storage_identifier=destination,
-            size_bytes=job.size_bytes,
-            sha256=job.sha256,
-            source_type=FileVariant.SourceType.UPLOAD,
-            uploader=job.uploader,
-            imported_at=timezone.now(),
-            processing_state=FileVariant.ProcessingState.COMPLETE,
-        )
-        _try_extract_front_cover(variant)
-
-        job.book = book
-        job.file_variant = variant
-        job.storage_location = storage_location
-        job.storage_identifier = destination
-        job.state = ImportJob.State.COMPLETE
-        job.save(
-            update_fields=[
-                "state",
-                "book_id",
-                "file_variant_id",
-                "storage_location_id",
-                "storage_identifier",
-                "normalized_filename",
-                "updated_at",
-            ],
-        )
+        with _sibling_group_lock(job), transaction.atomic():
+            book: Book | None = assessment.book if assessment is not None else None
+            if book is None and _groups_sibling_formats(job):
+                # A sibling may have been linked while this file was being archived.
+                late = _resolved_sibling(job)
+                if late is not None and late.book is not None:
+                    late_assessment = _assess_sibling_book(
+                        signals=signals,
+                        sibling=late,
+                        book=late.book,
+                        top_candidate=raw_top_candidate,
+                        file_authors=file_authors,
+                    )
+                    _record_sibling_evidence(job, late_assessment)
+                    if not late_assessment.accepted:
+                        _create_review_task(job=job, candidates=candidates)
+                        job.storage_identifier = destination
+                        job.storage_location = storage_location
+                        job.state = ImportJob.State.LOW_CONFIDENCE
+                        _save_job(
+                            job,
+                            update_fields=[
+                                "state",
+                                "storage_identifier",
+                                "storage_location_id",
+                                "updated_at",
+                            ],
+                            release=True,
+                        )
+                        return
+                    assessment = late_assessment
+                    book = late.book
+            if book is None:
+                assert top_candidate is not None
+                book = _provision_book_from_metadata(
+                    candidate=top_candidate,
+                    fallback_title=top_candidate.title,
+                    extra_metadata=metadata,
+                )
+            _complete_with_book(
+                job, book, destination=destination, storage_location=storage_location
+            )
+            if assessment is not None:
+                logger.info(
+                    "intake_linked_format_sibling",
+                    import_job_id=str(job.id),
+                    sibling_import_job_id=str(assessment.sibling.id),
+                    book_id=book.pk,
+                    score=assessment.score,
+                    from_review=False,
+                )
+            _propagate_book_to_siblings(job, book)
+    except ImportLeaseLostError:
+        raise
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
         job.last_error = str(exc)
         job.state = ImportJob.State.FAILED
         job.attempt_count += 1
         job.next_retry_at = datetime.now(tz=UTC)
-        job.save(
+        # Raises ImportLeaseLostError (no retry) if another owner took over meanwhile.
+        _save_job(
+            job,
             update_fields=[
                 "state",
                 "last_error",
@@ -1390,6 +2695,7 @@ def process_import_job(job_id: str) -> None:
                 "next_retry_at",
                 "updated_at",
             ],
+            release=True,
         )
         logger.error(
             "intake_failed",
