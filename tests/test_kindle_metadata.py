@@ -8,8 +8,18 @@ from typing import Any
 
 import pytest
 from defusedxml.common import DefusedXmlException
+from django.conf import settings as django_settings
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, override_settings
 
 from ebook_server.core import conversion, intake
+from ebook_server.core.models import (
+    ImportJob,
+    ReviewTask,
+    SourceLocation,
+    StorageLocation,
+    get_or_create_profile,
+)
 
 KINDLE_OPF = b"""<?xml version='1.0' encoding='utf-8'?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uuid_id" version="2.0">
@@ -187,6 +197,212 @@ def test_ebook_meta_staging_name_title_is_not_embedded_evidence(
     assert metadata["title"] == "Kindle Story"
     assert metadata["title_source"] == "filename"
     assert metadata["authors"] == ["Megan Mobi"]
+
+
+@pytest.mark.usefixtures("ebook_meta_installed")
+def test_ebook_meta_title_equal_to_ordinary_source_stem_stays_embedded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A source-folder file is read in place: "Midworld.mobi" really titled "Midworld"
+    # is embedded evidence, not Calibre's untitled-book placeholder.
+    source = _kindle_file(tmp_path, "Midworld.mobi")
+    opf = KINDLE_OPF.replace(b"Mobi Book", b"Midworld")
+    monkeypatch.setattr(conversion, "_run_conversion_command", FakeEbookMeta(opf))
+
+    metadata = intake.extract_metadata(str(source), "mobi", original_filename=source.name)
+
+    assert metadata["title"] == "Midworld"
+    assert metadata["title_source"] == "embedded"
+
+
+@pytest.mark.parametrize(
+    ("file_name", "original_filename", "expected"),
+    [
+        ("upload-qe6h_xjg9.tmp", "Kindle Story.azw3", True),
+        ("upload-qe6h_xjg9.tmp", "upload-qe6h_xjg9.tmp", False),  # the real file itself
+        ("Midworld.mobi", "Midworld.mobi", False),
+        ("upload-notes.mobi", "Other.mobi", False),  # not the staging suffix
+        ("Upload-ABC.tmp", "Other.mobi", False),  # not NamedTemporaryFile's alphabet
+    ],
+)
+def test_is_upload_staging_path(file_name: str, original_filename: str, expected: bool) -> None:
+    path = str(Path("staging") / file_name)
+    assert intake.is_upload_staging_path(path, original_filename) is expected
+
+
+MIDWORLD_EBOOK_META_OPF = b"""<?xml version='1.0' encoding='utf-8'?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uuid_id" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Midworld</dc:title>
+    <dc:creator opf:role="aut" opf:file-as="Foster, Alan Dean">Alan Dean Foster</dc:creator>
+    <dc:identifier id="uuid_id" opf:scheme="uuid">0c9d6f2e-midworld</dc:identifier>
+    <dc:language>eng</dc:language>
+  </metadata>
+</package>
+"""
+
+STALE_PHYLOGENESIS_SIDECAR = """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Phylogenesis</dc:title>
+    <dc:creator opf:role="aut">Alan Dean Foster</dc:creator>
+    <dc:language>en</dc:language>
+    <dc:identifier opf:scheme="ISBN">034549427X</dc:identifier>
+  </metadata>
+</package>
+"""
+
+
+class _EchoProvider:
+    """Returns Phylogenesis for an ISBN query and echoes the title otherwise."""
+
+    provider_id = "kindle-echo"
+
+    def __init__(self) -> None:
+        self.isbn_queries: list[str] = []
+
+    def search(
+        self,
+        title: str | None = None,
+        *,
+        author: str | None = None,
+        isbn: str | None = None,
+        folder_hint: str | None = None,
+    ) -> list[dict[str, Any]]:
+        del folder_hint
+        if isbn:
+            self.isbn_queries.append(isbn)
+            return [
+                {
+                    "key": f"isbn:{isbn}",
+                    "title": "Phylogenesis",
+                    "author_name": ["Alan Dean Foster"],
+                    "isbn_13": ["9780345494276"],
+                }
+            ]
+        return [{"key": "echo", "title": title or "Unknown", "author_name": [author or "?"]}]
+
+
+def _mobi_bytes() -> bytes:
+    payload = bytearray(256)
+    payload[60:68] = b"BOOKMOBI"
+    return bytes(payload)
+
+
+def _default_storage() -> None:
+    StorageLocation.objects.get_or_create(
+        identifier="default",
+        defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("ebook_meta_installed")
+def test_source_kindle_title_equal_to_basename_survives_stale_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR #81 verifier probe: incoming Midworld.mobi embeds Midworld / Alan Dean Foster
+    # next to a stale metadata.opf for Phylogenesis (ISBN 034549427X). The genuine
+    # embedded title equals the file stem; it must stay embedded so the sidecar
+    # contradiction goes to review instead of importing the book as Phylogenesis.
+    provider = _EchoProvider()
+    monkeypatch.setattr(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        conversion, "_run_conversion_command", FakeEbookMeta(MIDWORLD_EBOOK_META_OPF)
+    )
+    _default_storage()
+    root = tmp_path / "library"
+    book_dir = root / "Alan Dean Foster" / "Midworld"
+    book_dir.mkdir(parents=True)
+    (book_dir / "metadata.opf").write_text(STALE_PHYLOGENESIS_SIDECAR, encoding="utf-8")
+    (book_dir / "Midworld.mobi").write_bytes(_mobi_bytes())
+    location = SourceLocation.objects.create(
+        name="kindle-midworld",
+        root_path=str(root),
+        transfer_mode=SourceLocation.TransferMode.COPY,
+        recursive=True,
+        default_source_type=SourceLocation.SourceType.INCOMING_FOLDER,
+        is_active=True,
+    )
+
+    with override_settings(APP_DATA_DIR=tmp_path / "app-data"):
+        (discovered,) = intake.discover_source_jobs_for_location(location)
+        intake.process_import_job(str(discovered.id))
+    job = ImportJob.objects.get(pk=discovered.pk)
+
+    assert job.evidence["title"] == "Midworld"
+    assert job.evidence["title_source"] == "embedded"
+    assert intake.sidecar_conflicts_in(job.evidence)
+    assert provider.isbn_queries == []
+    assert job.book is None or job.book.title != "Phylogenesis"
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert ReviewTask.objects.filter(import_job=job, state=ReviewTask.State.OPEN).exists()
+
+
+class _StagingNameEbookMeta:
+    """ebook-meta on an untitled book: Calibre reports the file's own stem ("_" -> " ")."""
+
+    def __call__(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        stem = Path(command[1]).stem.replace("_", " ")
+        opf = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+            '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:opf="http://www.idpf.org/2007/opf">'
+            f'<dc:title>{stem}</dc:title><dc:creator opf:role="aut">Jane Doe</dc:creator>'
+            "</metadata></package>"
+        )
+        Path(command[command.index("--to-opf") + 1]).write_text(opf, encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, None, "")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("ebook_meta_installed")
+def test_untitled_kindle_upload_staging_name_is_not_embedded_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubProvider:
+        provider_id = "stub"
+
+        def search(self, title: str | None = None, **kwargs: Any) -> list[dict[str, Any]]:
+            del title, kwargs
+            return [{"title": "Kindle Story", "author_name": ["Jane Doe"]}]
+
+    monkeypatch.setattr(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [StubProvider()],
+    )
+    monkeypatch.setattr(conversion, "_run_conversion_command", _StagingNameEbookMeta())
+    # Same thresholds as test_intake's azw3 upload test.
+    monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", 0.5)
+    monkeypatch.setattr("ebook_server.core.intake.REVIEW_SCORE", 0.3)
+    monkeypatch.setattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED", True)
+    _default_storage()
+    client = Client()
+    client.force_login(get_or_create_profile("kindle-staging-user").user)
+
+    response = client.post(
+        "/imports/upload/",
+        {
+            "file": SimpleUploadedFile(
+                "Kindle Story.azw3", _mobi_bytes(), content_type="application/octet-stream"
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    assert job.evidence["title"] == "Kindle Story"
+    assert job.evidence["title_source"] == "filename"
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None and job.book.title == "Kindle Story"
 
 
 def test_parse_opf_metadata_rejects_entity_declarations() -> None:

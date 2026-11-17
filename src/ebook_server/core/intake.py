@@ -1422,14 +1422,34 @@ def compute_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+UPLOAD_STAGING_PREFIX = "upload-"
+UPLOAD_STAGING_SUFFIX = ".tmp"
+# NamedTemporaryFile's random part: lower-case letters, digits and "_".
+_UPLOAD_STAGING_NAME = re.compile(
+    re.escape(UPLOAD_STAGING_PREFIX) + r"[a-z0-9_]+" + re.escape(UPLOAD_STAGING_SUFFIX)
+)
+
+
+def is_upload_staging_path(file_path: str, original_filename: str) -> bool:
+    """True only when ``file_path`` is a temporary name ``write_upload_to_staging`` made.
+
+    A source-folder import reads the member's real file, whose name is the original
+    filename, so it is never a staging artifact even if it looks like one.
+    """
+    name = Path(file_path).name
+    if name == Path(original_filename).name:
+        return False
+    return _UPLOAD_STAGING_NAME.fullmatch(name) is not None
+
+
 def write_upload_to_staging(uploaded_file: Any, staging_root: Path) -> tuple[str, int]:
     ensure_path_storage_ready(staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         delete=False,
         dir=staging_root,
-        prefix="upload-",
-        suffix=".tmp",
+        prefix=UPLOAD_STAGING_PREFIX,
+        suffix=UPLOAD_STAGING_SUFFIX,
     ) as upload_temp:
         total = 0
         for chunk in uploaded_file.chunks():
@@ -1714,11 +1734,18 @@ def _extract_ebook_meta_metadata(
         logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
         return fallback
     title = fields["title"]
-    if isinstance(title, str) and _name_key(title) == _name_key(Path(file_path).stem):
+    if (
+        isinstance(title, str)
+        and is_upload_staging_path(file_path, original_filename)
+        and _name_key(title) == _name_key(Path(file_path).stem)
+    ):
         # Calibre reports the file's own name when the book has no title (with "_"
-        # turned into spaces); that is the staging path (e.g. "upload-ab_c123"), not
-        # embedded evidence. Leave the title to the original-filename fallback instead
-        # of ranking it as embedded.
+        # turned into spaces). For an upload that is the staging name (e.g.
+        # "upload-ab_c123"), not embedded evidence: leave the title to the
+        # original-filename fallback instead of ranking it as embedded. Only a proven
+        # staging name qualifies: a real embedded title that happens to equal an
+        # ordinary source file's stem ("Midworld.mobi" titled "Midworld") stays
+        # embedded evidence.
         title = None
     return {
         **fields,
