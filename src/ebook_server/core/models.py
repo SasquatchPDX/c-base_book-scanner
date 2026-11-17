@@ -21,6 +21,8 @@ from django.db.models.fields.json import KT
 from django.db.models.functions import Lower
 from django.utils.timezone import now
 
+from .scan_job_ids import MAX_SCAN_JOB_ID_LENGTH, new_scan_job_id
+
 
 class UserRole(models.TextChoices):
     NORMAL_USER = "normal", "Normal user"
@@ -814,9 +816,27 @@ class ScanJob(models.Model):
         SINGLE_PAGE = "single_page", "One page per image"
         SPREAD = "spread", "Two facing pages per image"
 
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # An opaque, immutable string (#126, libreflip contract §4.1/D1): the scanner-assigned
+    # ID (YYYYMMDDTHHMMSSZ[-N]) for jobs registered over /api/scanner/v1/, a canonical
+    # UUID string for jobs created in the web UI. See core.scan_job_ids.
+    id = models.CharField(
+        primary_key=True,
+        max_length=MAX_SCAN_JOB_ID_LENGTH,
+        default=new_scan_job_id,
+        editable=False,
+    )
     state = models.CharField(max_length=16, choices=State.choices, default=State.OPEN)
     scanner_id = models.CharField(max_length=64, blank=True)
+    # The scanner device that registered the job; NULL for web-created jobs.
+    device = models.ForeignKey(
+        ScannerDevice,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="scan_jobs",
+    )
+    # When the scanner started the job (§6.3); part of the registration identity.
+    scan_started_at = models.DateTimeField(null=True, blank=True)
     capture_layout = models.CharField(
         max_length=16,
         choices=CaptureLayout.choices,

@@ -260,8 +260,19 @@ class ScannerDeviceAdmin(admin.ModelAdmin[ScannerDevice]):
 
 @admin.register(ScanJob)
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
-    list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
+    list_display = (
+        "id",
+        "state",
+        "scanner_id",
+        "device",
+        "operator",
+        "book",
+        "scan_started_at",
+        "created_at",
+        "finished_at",
+    )
     list_filter = ("state",)
+    search_fields = ("id", "scanner_id")
 
 
 @admin.register(ScanPage)

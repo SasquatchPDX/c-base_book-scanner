@@ -2,7 +2,9 @@
 
 ## Core resources
 
-- `ScanJob`: server-generated UUID, metadata hints, status, operator, scanner id.
+- `ScanJob`: string ID (a server-generated UUID for web-created jobs, the scanner-assigned
+  `YYYYMMDDTHHMMSSZ[-N]` for jobs registered over the device API), metadata hints, status,
+  operator, scanner id.
 - `ScanPage`: logical page identity and one or more immutable artifacts.
 - `ScanTodo`: optional tasks like `RESCAN`.
 
@@ -123,3 +125,51 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 - Upload endpoints require an authenticated session (401 JSON for API clients).
 - Filenames are sanitized before storage.
 - Parser/extractor boundaries remain server-side behind size and timeout controls.
+
+## Scan job IDs and the device API (`/api/scanner/v1/`)
+
+The libreflip device API is specified by the contract in
+[libreflip/serif#37](https://github.com/libreflip/serif/pull/37) (`docs/sans-serif-interface.md`).
+Devices authenticate with their own key (`Authorization: Bearer`, see `docs/operations.md`).
+
+- A `ScanJob` ID is an opaque, immutable string of at most 64 characters. Web-created jobs
+  keep a server-generated UUID in canonical form (`str(uuid4())`). Jobs registered by a
+  scanner use the scanner's ID, which must match `^[0-9]{8}T[0-9]{6}Z(-[1-9][0-9]{0,3})?$`.
+- Every `/scan/jobs/{job_id}/...` route accepts both forms (path converter `scan_job_id`).
+- `PUT /api/scanner/v1/jobs/{job_id}` with `{"scan_started_at": "<ISO 8601>",
+  "capture_layout": "single_page"}` (layout optional) registers a job:
+  - `201`: created in state `open`, owned by the calling device (`operator` is empty).
+  - `200`: the same device repeats the same `scan_started_at` and layout; nothing changes.
+  - `409 job_id_conflict`: the ID exists for another device, with another
+    `scan_started_at` or layout, or as a web-created job. Nothing is overwritten.
+  - `400 invalid_job_id`: the ID does not match the format above (UUIDs included).
+  - `400 invalid_json` / `invalid_request`: the body is not a JSON object, or
+    `scan_started_at` lacks a time zone, or the layout is unknown.
+
+  The response body is the job status (`job_id`, `state`, `portal_url`,
+  `scan_started_at`, `capture_layout`, `pages`, `open_rescans`). `portal_url` is built
+  from `BOOK_SCANNER_PUBLIC_BASE_URL`.
+
+### Upgrade note: migration `0038_scanjob_string_pk`
+
+The migration changes `core_scanjob.id` from `uuid` to `varchar(64)`, together with every
+column that references it: `ScanPage`, `ScanTodo`, `ScanTailorStageState`,
+`MetadataSearch`, `MetadataCandidate`, `ReviewTask`, `LLMSuggestion` and
+`ContributionEvent`. Existing IDs keep their value in canonical string form, so links,
+storage paths and `scan_job_id` values in JSON details stay valid. The JSON fields are
+`ProcessingJob.details`, `FileVariant.converter_options`, `ScanJob.notes`,
+`ReviewTask.decision_payload` and `ContributionEvent.outcome`. Any non-canonical spelling
+in them is rewritten.
+
+- **PostgreSQL** casts `uuid::varchar` and rewrites all nine tables and every index on
+  the changed columns (primary key, foreign-key indexes, the composite and unique indexes
+  that contain `scan_job_id`) under an `ACCESS EXCLUSIVE` lock. Stop the web and worker
+  units while `migrate` runs. The string keys are 36 bytes instead of 16, so these
+  indexes grow by roughly a factor of two. Measured on PostgreSQL 17 (local Docker,
+  synthetic data): about 1.5 s for 200 jobs with 10,000 pages and 10,000 stage states, and about 33 s for 2,000 jobs with 600,000 pages and 600,000 stage states (the other referencing tables were empty). The time grows linearly with the number of pages
+  and stage states.
+- **SQLite** rebuilds the tables and the migration rewrites the stored 32-digit hex IDs
+  into the canonical form.
+- **Reversal** works while every job ID is still a UUID. Once a scanner-assigned ID
+  exists, reversing raises `IrreversibleError` instead of dropping or corrupting jobs.
+
