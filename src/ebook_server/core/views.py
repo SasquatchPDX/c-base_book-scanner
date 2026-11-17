@@ -82,6 +82,7 @@ from .models import (
     StorageLocation,
     clean_publication_year,
 )
+from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
@@ -1629,6 +1630,12 @@ def library_book_download(
     if variant is None:
         return HttpResponseNotFound("variant not available")
 
+    try:
+        ensure_reference_intact(variant)
+    except ReferencedFileError:
+        # Indexed-in-place file is missing or changed on its share: never serve
+        # different bytes under this record. The variant is flagged for an admin.
+        return HttpResponse("file changed or missing on storage", status=409)
     try:
         storage = backend_for_location(variant.storage_location)
     except StorageConfigurationError:

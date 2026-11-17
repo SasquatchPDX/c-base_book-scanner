@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from django.contrib import admin
+from django.contrib import admin, messages
+from django.db.models import QuerySet
+from django.http import HttpRequest
 
 from .models import (
     AppUserProfile,
@@ -79,7 +81,31 @@ class FileVariantAdmin(admin.ModelAdmin[FileVariant]):
         "original_filename",
         "source_type",
         "processing_state",
+        "storage_location",
+        "reference_state",
     )
+    list_filter = ("reference_state", "storage_location", "source_type", "format")
+    actions = ("recheck_referenced_files",)
+
+    @admin.action(description="Re-check referenced (indexed-in-place) files now")
+    def recheck_referenced_files(
+        self,
+        request: HttpRequest,
+        queryset: QuerySet[FileVariant],
+    ) -> None:
+        del queryset  # the check is cheap per file and covers every referenced variant
+        from .referenced_files import check_referenced_files
+
+        report = check_referenced_files()
+        self.message_user(
+            request,
+            f"checked={report.checked} ok={report.ok} missing={len(report.missing)} "
+            f"changed={len(report.changed)} restored={len(report.restored)} "
+            f"errors={len(report.errors)}",
+            messages.WARNING
+            if report.missing or report.changed or report.errors
+            else messages.SUCCESS,
+        )
 
 
 @admin.register(ScanJob)
@@ -124,7 +150,8 @@ class ScanPageVersionAdmin(admin.ModelAdmin[ScanPageVersion]):
 
 @admin.register(StorageLocation)
 class StorageLocationAdmin(admin.ModelAdmin[StorageLocation]):
-    list_display = ("identifier", "backend", "base_path")
+    list_display = ("identifier", "backend", "base_path", "read_only")
+    list_filter = ("read_only", "backend")
 
 
 @admin.register(SourceLocation)
@@ -133,10 +160,12 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "name",
         "root_path",
         "transfer_mode",
+        "index_storage_location",
         "recursive",
         "default_source_type",
         "is_active",
     )
+    list_filter = ("transfer_mode", "is_active")
     fieldsets = (
         (
             None,
@@ -145,6 +174,7 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
                     "name",
                     "root_path",
                     "transfer_mode",
+                    "index_storage_location",
                     "recursive",
                     "default_source_type",
                     "is_active",

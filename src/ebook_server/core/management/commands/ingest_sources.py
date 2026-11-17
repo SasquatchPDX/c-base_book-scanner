@@ -7,6 +7,8 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Count, Sum
+from django.db.models.functions import Coalesce
 
 from ebook_server.core import intake
 from ebook_server.core.intake import IntakeError
@@ -35,6 +37,14 @@ class Command(BaseCommand):
             help="Retry previously failed jobs for selected source locations.",
         )
         parser.add_argument(
+            "--status",
+            action="store_true",
+            help=(
+                "Show per-source progress: files and bytes still waiting to be copied "
+                "(or, for index-in-place sources, hashed), plus done/review/failed counts."
+            ),
+        )
+        parser.add_argument(
             "--system-user",
             default="system-source-ingest",
             help="Fallback username for source jobs when no uploader is assigned.",
@@ -60,6 +70,21 @@ class Command(BaseCommand):
 
         if not locations:
             raise CommandError("No active source locations found")
+
+        if options.get("status", False):
+            rows = [self._source_status(location) for location in locations]
+            if output_json:
+                self.stdout.write(json.dumps(rows, indent=2))
+            else:
+                for row in rows:
+                    self.stdout.write(
+                        f"source {row['source_location_id']} ({row['name']}, "
+                        f"{row['transfer_mode']}): pending={row['pending_files']} "
+                        f"pending_bytes={row['pending_bytes']} "
+                        f"needs_review={row['needs_review']} complete={row['complete']} "
+                        f"failed={row['failed']}",
+                    )
+            return
 
         if retry_failed:
             retried = []
@@ -161,3 +186,21 @@ class Command(BaseCommand):
                 "imports to keep BOOK_SCANNER_STORAGE_MIN_FREE_BYTES free. Free space "
                 "(or enlarge the volume) and run ingest_sources again.",
             )
+
+    @staticmethod
+    def _source_status(location: SourceLocation) -> dict[str, Any]:
+        jobs = ImportJob.objects.filter(source_location=location)
+        pending = jobs.filter(state__in=intake.PENDING_ARCHIVE_STATES).aggregate(
+            files=Count("id"),
+            total=Sum(Coalesce("source_size", "size_bytes")),
+        )
+        return {
+            "source_location_id": location.id,
+            "name": location.name,
+            "transfer_mode": location.transfer_mode,
+            "pending_files": pending["files"] or 0,
+            "pending_bytes": int(pending["total"] or 0),
+            "needs_review": jobs.filter(state=ImportJob.State.LOW_CONFIDENCE).count(),
+            "complete": jobs.filter(state=ImportJob.State.COMPLETE).count(),
+            "failed": jobs.filter(state=ImportJob.State.FAILED).count(),
+        }

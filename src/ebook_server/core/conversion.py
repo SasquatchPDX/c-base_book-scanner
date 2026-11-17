@@ -23,7 +23,12 @@ from ebook_server.jobs import get_queue, is_stale_running, tunable_setting
 
 from . import intake
 from .models import Book, FileVariant, ProcessingJob
-from .storage_registry import StorageConfigurationError, backend_for_location
+from .referenced_files import ReferencedFileError, ensure_reference_intact
+from .storage_registry import (
+    StorageConfigurationError,
+    backend_for_location,
+    writable_location_for,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -408,7 +413,14 @@ def _execute_plan(
         route=route,
     )
     try:
+        ensure_reference_intact(source_variant)
+    except ReferencedFileError as exc:
+        raise ConversionError(str(exc)) from exc
+    # Converted output never goes onto a read-only (indexed-in-place) location.
+    output_location = writable_location_for(source_variant.storage_location)
+    try:
         storage = backend_for_location(source_variant.storage_location)
+        output_storage = backend_for_location(output_location)
     except StorageConfigurationError as exc:
         raise ConversionError("source storage is unavailable") from exc
 
@@ -466,18 +478,18 @@ def _execute_plan(
             return existing
 
         output_name = f"{uuid.uuid4()}.{target_format}"
-        storage_identifier = storage.generate_destination(
+        storage_identifier = output_storage.generate_destination(
             f"books/{source_variant.book_id}/converted",
             output_name,
         )
-        storage.store(str(current_path), storage_identifier)
+        output_storage.store(str(current_path), storage_identifier)
 
         return FileVariant.objects.create(
             book=source_variant.book,
             format=target_format,
             mime_type=FORMAT_TO_MIME.get(target_format, "application/octet-stream"),
             original_filename=Path(storage_identifier).name,
-            storage_location=source_variant.storage_location,
+            storage_location=output_location,
             storage_identifier=storage_identifier,
             size_bytes=output_size,
             sha256=output_sha,

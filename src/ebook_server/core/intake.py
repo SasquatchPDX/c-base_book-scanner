@@ -39,7 +39,7 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import identification, source_layout
+from . import identification, referenced_files, source_layout
 from .models import (
     Author,
     Book,
@@ -52,7 +52,7 @@ from .models import (
     StorageLocation,
     clean_publication_year,
 )
-from .storage_registry import backend_for_location
+from .storage_registry import archive_root, backend_for_location, default_archive_location
 
 logger = structlog.get_logger(__name__)
 
@@ -375,19 +375,11 @@ def _decode_text_sample(payload: bytes) -> tuple[str, str]:
 
 
 def _default_storage() -> LocalFilesystemStorage:
-    base = django_settings.APP_DATA_DIR
-    return LocalFilesystemStorage(str(base / "library-artifacts"))
+    return LocalFilesystemStorage(str(archive_root()))
 
 
 def _default_storage_location() -> StorageLocation:
-    location, _ = StorageLocation.objects.get_or_create(
-        identifier="default",
-        defaults={
-            "backend": StorageLocation.BackendType.LOCAL,
-            "base_path": "default",
-        },
-    )
-    return location
+    return default_archive_location()
 
 
 def _source_transfer_mode(job: ImportJob) -> str:
@@ -397,7 +389,10 @@ def _source_transfer_mode(job: ImportJob) -> str:
 
 
 def _archive_should_preserve_source(job: ImportJob) -> bool:
-    return _source_transfer_mode(job) == "copy"
+    return _source_transfer_mode(job) in {
+        SourceLocation.TransferMode.COPY,
+        SourceLocation.TransferMode.INDEX_IN_PLACE,
+    }
 
 
 def _verify_archive(storage: StorageBackend, location: str, expected_sha: str) -> bool:
@@ -556,9 +551,13 @@ def archive_space_budget() -> ByteBudget | None:
     free = _default_storage().free_bytes()
     if free is None:
         return None
-    pending = ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES).aggregate(
-        total=django_models.Sum(Coalesce("source_size", "size_bytes")),
-    )["total"]
+    pending = (
+        ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES)
+        .exclude(source_location__transfer_mode=SourceLocation.TransferMode.INDEX_IN_PLACE)
+        .aggregate(
+            total=django_models.Sum(Coalesce("source_size", "size_bytes")),
+        )["total"]
+    )
     return ByteBudget(remaining=max(free - reserve - int(pending or 0), 0))
 
 
@@ -594,7 +593,7 @@ def discover_source_jobs_for_location(
         ).exists()
         if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
-        if byte_budget is not None:
+        if byte_budget is not None and not referenced_files.is_index_in_place(source_location):
             try:
                 size = candidate.stat().st_size
             except OSError:
@@ -1250,6 +1249,7 @@ def _create_or_reuse_file_variant(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        **referenced_files.reference_fields_for_job(job),
     )
 
 
@@ -1448,6 +1448,14 @@ def _provision_book_from_metadata(
 
 
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
+    """Archive the source (COPY/MOVE) or reference it in place (INDEX_IN_PLACE).
+
+    Sets ``job.storage_location``/``storage_identifier``; callers must use those rather
+    than assuming the default archive location.
+    """
+    if referenced_files.is_index_in_place(job.source_location):
+        verified = referenced_files.index_source_file(job)
+        return job.storage_identifier, verified
     storage_location = _default_storage_location()
     destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
     # Checked per file, so a bulk import already queued still stops before the disk fills.
@@ -1539,9 +1547,12 @@ def process_import_job(job_id: str) -> None:
                     "updated_at",
                 ],
             )
+            # A duplicate that is only referenced in place lives on storage the
+            # application does not control, so it never authorizes deleting a MOVE source.
             _finalize_source_cleanup(
                 job,
-                _verify_archive(
+                not duplicate_variant.storage_location.read_only
+                and _verify_archive(
                     backend_for_location(duplicate_variant.storage_location),
                     duplicate_variant.storage_identifier,
                     job.sha256,
@@ -1607,7 +1618,6 @@ def process_import_job(job_id: str) -> None:
             job.save(update_fields=["state", "updated_at"])
             destination, verified = _archive_source(_default_storage(), job)
             job.storage_identifier = destination
-            job.storage_location = _default_storage_location()
             job.save(
                 update_fields=[
                     "storage_identifier",
@@ -1633,10 +1643,10 @@ def process_import_job(job_id: str) -> None:
         job.state = ImportJob.State.MATCHED
         job.save(update_fields=["state", "updated_at"])
         storage = _default_storage()
-        storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
         job.save(update_fields=["state", "updated_at"])
         destination, verified = _archive_source(storage, job)
+        storage_location = job.storage_location or _default_storage_location()
         _finalize_source_cleanup(job, verified)
         if not verified:
             raise RuntimeError("archive verification failed")
@@ -1664,6 +1674,7 @@ def process_import_job(job_id: str) -> None:
             uploader=job.uploader,
             imported_at=timezone.now(),
             processing_state=FileVariant.ProcessingState.COMPLETE,
+            **referenced_files.reference_fields_for_job(job),
         )
         _try_extract_front_cover(variant, job)
 

@@ -244,6 +244,15 @@ LOGIN_REDIRECT_URL = "/library/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 APP_DATA_DIR = Path(settings.storage_root)
+# The one attached storage: a writable network share mounted on the VM. It holds the
+# archive (copied/moved/uploaded originals plus every derived artifact: conversions,
+# covers, OCR output), scan artifacts and upload staging. The VM disk keeps only the
+# database, Redis and caches. Files indexed in place are read from their own
+# read-only StorageLocation and are never copied here.
+# The archive root is APP_DATA_DIR / BOOK_SCANNER_ARCHIVE_DIRNAME. It is deliberately
+# not separately configurable: keeping it under the storage root keeps it behind the
+# mount/sentinel check, and renaming it would orphan every archived artifact.
+BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes

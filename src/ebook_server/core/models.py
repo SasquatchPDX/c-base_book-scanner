@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import ClassVar, Final
 
 from django.conf import settings
@@ -105,6 +106,14 @@ class StorageLocation(models.Model):
         max_length=1024,
         help_text="Logical mount/path prefix, implementation specific",
     )
+    read_only = models.BooleanField(
+        default=False,
+        help_text=(
+            "The application only reads from this location (files indexed in place). "
+            "It never writes, moves or deletes files here; derived artifacts go to the "
+            "default archive location instead."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -134,8 +143,9 @@ class SourceLocation(models.Model):
         NETWORK_SOURCE = "network_source", "Network source"
 
     class TransferMode(models.TextChoices):
-        COPY = "copy", "Copy"
-        MOVE = "move", "Move"
+        COPY = "copy", "Copy into archive (keep source)"
+        MOVE = "move", "Move into archive (delete source after verified copy)"
+        INDEX_IN_PLACE = "index", "Index in place (no copy; source stays read-only)"
 
     name = models.CharField(max_length=128, unique=True)
     root_path = models.CharField(max_length=1024)
@@ -143,6 +153,18 @@ class SourceLocation(models.Model):
         max_length=8,
         choices=TransferMode.choices,
         default=TransferMode.COPY,
+    )
+    index_storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="indexed_sources",
+        help_text=(
+            "Index in place only: the read-only storage location the files are referenced "
+            "through. Its base path must contain this source's root path. Left empty, one "
+            "is created from the root path on first import."
+        ),
     )
     is_active = models.BooleanField(default=True)
     recursive = models.BooleanField(default=True)
@@ -187,6 +209,27 @@ class SourceLocation(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def _clean_index_storage_location(self) -> None:
+        from django.core.exceptions import ValidationError
+
+        location = self.index_storage_location
+        if location is None:
+            return
+        if self.transfer_mode != self.TransferMode.INDEX_IN_PLACE:
+            raise ValidationError(
+                {"index_storage_location": "Only used by the index-in-place transfer mode."},
+            )
+        if not location.read_only:
+            raise ValidationError(
+                {"index_storage_location": "Index-in-place storage locations must be read-only."},
+            )
+        root = Path(self.root_path).expanduser().resolve()
+        base = Path(location.base_path).expanduser().resolve()
+        if root != base and base not in root.parents:
+            raise ValidationError(
+                {"index_storage_location": "The source root path must lie inside its base path."},
+            )
+
     def __str__(self) -> str:
         return self.name
 
@@ -202,6 +245,7 @@ class SourceLocation(models.Model):
             isinstance(value, str) for value in self.layout_ignore_values
         ):
             raise ValidationError({"layout_ignore_values": "Must be a JSON list of strings."})
+        self._clean_index_storage_location()
 
 
 class Book(models.Model):
@@ -416,6 +460,21 @@ class FileVariant(models.Model):
         default=ProcessingState.DISCOVERED,
     )
     job_id = models.UUIDField(default=None, null=True, blank=True)
+
+    class ReferenceState(models.TextChoices):
+        OK = "ok", "OK"
+        MISSING = "missing", "Missing from storage"
+        CHANGED = "changed", "Changed on storage"
+
+    # Drift tracking for variants referenced in place on a read-only location. Archived
+    # variants keep the defaults; the storage verification command covers those.
+    source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    reference_state = models.CharField(
+        max_length=16,
+        choices=ReferenceState.choices,
+        default=ReferenceState.OK,
+    )
+    reference_checked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [
