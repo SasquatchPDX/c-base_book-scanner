@@ -13,7 +13,7 @@
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
-- `POST /scan/jobs/{job_id}/logs/` -> upload the scanner's `scan.log` (202, processed by a worker)
+- `POST /scan/jobs/{job_id}/logs/` -> upload a scanner log file (202, processed by a worker)
 - `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
 - `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
@@ -106,22 +106,29 @@ A runnable version of this flow is `scripts/scanner_client_example.py`.
 
 ## Scanner logs and where scan output is stored
 
-`POST /scan/jobs/{job_id}/logs/` takes a multipart `file` field holding the scanner's
-log (libreflip `scan.log`): plain text, at most 8 MiB. The request only writes the
+`POST /scan/jobs/{job_id}/logs/` takes a multipart `file` field holding a whole
+scanner log file: plain text, at most 8 MiB. The request only writes the
 bounded upload to scan staging (an empty or oversized upload is refused with 400) and
 records the log with a `scan_log` processing job, which is queued once the request's
 transaction commits; it answers `202` with the log (`state: queued`) and a
 `status_url`. A worker then checks that the content is text, hashes it and stores it.
-The log's `state` becomes `stored`, `duplicate` (the same content is already stored
-for the job; `duplicate_of` names that log, and no second file is written) or
-`failed` (with `error`). `GET /scan/jobs/{job_id}/logs/` and the scan job detail
-(`logs`) report it. The client filename is only kept as provenance; the server picks
-the storage name.
+It hashes the stored copy again and compares it with the upload before it records the
+log as stored and deletes the staged upload; a copy that does not match is removed, the
+staged upload is kept and the log becomes `failed` (an admin can retry it). The log's
+`state` becomes `stored`, `duplicate` (the same content is already stored for the job;
+`duplicate_of` names that log, and no second file is written) or `failed` (with
+`error`). `GET /scan/jobs/{job_id}/logs/` and the scan job detail (`logs`) report it.
+The client filename is only kept as provenance; the server stores each upload as
+`scan-upload-<first 8 hex digits of its SHA-256>.log`.
+
+Uploaded log files never take the name `scan.jsonl`. In the book folder that name is
+reserved for the scanner event log rendered from the events endpoint (#129, S5), which
+is rewritten as events arrive; `/logs/` uploads are immutable originals.
 
 Everything the library keeps from a scan goes into the book's archive folder on the
 attached storage (`<Author>/<Title>/` under the default `BOOK_SCANNER_ARCHIVE_LAYOUT`):
 the cleaned PDF (`<Title> - <Author>.pdf`), OCR output and conversions derived from it,
-the cover, and `scan.log` (further logs get a short suffix). A log uploaded before the
+the cover, and uploaded scanner logs (`scan-upload-<sha8>.log`). A log uploaded before the
 job is linked to a book waits in scan storage and is moved into the book folder during
 finalization; the scan-storage copy is deleted only after the archive copy's SHA-256 is
 verified. Raw page captures and ScanTailor stage outputs stay in `scan-artifacts/`,

@@ -120,6 +120,29 @@
       "targets": [{"expr": "ebook_server_metadata_confidence_bucket_population{le=\"+Inf\"}", "legendFormat": "{{provider}} candidates", "refId": "A"}],
       "title": "Metadata candidates by provider",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (outcome) (ebook_server_llm_requests_recent{window=\"24h\"})", "legendFormat": "{{outcome}} (24h)", "refId": "A"},
+        {"expr": "ebook_server_queue{queue=\"llm\",measure=\"depth\"}", "legendFormat": "llm queue depth", "refId": "B"}
+      ],
+      "title": "LLM identification assist",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"}}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "id": 13,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "ebook_server_llm_assisted_reviews", "legendFormat": "{{resolution}}", "refId": "A"}],
+      "title": "LLM-assisted review resolutions",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

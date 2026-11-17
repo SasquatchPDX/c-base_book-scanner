@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0033_book_archive_folder"),
+        ("core", "0036_book_search_document"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -24,6 +24,7 @@ class Migration(migrations.Migration):
                     ("review_identification", "Review identification"),
                     ("scan_identification", "Scan identification"),
                     ("scan_finalization", "Scan finalization"),
+                    ("llm_identification", "LLM identification assist"),
                     ("combine_parts", "Combine multi-part work"),
                     ("reference_check", "Referenced file check"),
                     ("scan_log", "Scanner log"),

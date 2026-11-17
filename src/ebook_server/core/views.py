@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,7 +27,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
-from django.db.models import Count, F, OuterRef, Prefetch, Q, QuerySet, Subquery
+from django.db.models import Count, F, OuterRef, Prefetch, Q, Subquery
 from django.db.models.functions import Coalesce
 from django.http import (
     FileResponse,
@@ -60,10 +61,13 @@ from ebook_server.storage import (
 from . import (
     book_deletion,
     combine,
+    contributions,
     conversion,
     genres,
     intake,
     intake_progress,
+    llm,
+    llm_identification,
     metadata_search,
     multipart,
     ocr,
@@ -74,6 +78,7 @@ from . import (
     scan_logs,
     scan_pipeline,
     scantailor,
+    search,
 )
 from .metrics import PersistentStateCollector
 from .models import (
@@ -83,9 +88,11 @@ from .models import (
     FileVariant,
     Genre,
     ImportJob,
+    LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
+    ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
     ScanPage,
@@ -1109,6 +1116,15 @@ def _review_owner_id(task: ReviewTask) -> int | None:
     return None
 
 
+def _note_review_redecided(task: ReviewTask, profile: AppUserProfile) -> None:
+    """A resolved review decided again: the earlier decision no longer stands (#27)."""
+    contributions.record_review_reversal(
+        task,
+        source=ReviewDecisionCorrection.Source.RE_RESOLVED,
+        found_by=profile.user,
+    )
+
+
 def _review_candidates(task: ReviewTask) -> Any:
     """Current candidates only; superseded runs are history, not acceptable choices."""
     return metadata_search.current_candidates(task)
@@ -1240,6 +1256,10 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
     "author_conflict": (
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
+    ),
+    "llm_derived": (
+        "The best match was found through search terms suggested by the local AI "
+        "server. AI suggestions are unverified, so a person must confirm the match."
     ),
     "ambiguous_tie": (
         "Several different books tied for the best score, so none was accepted "
@@ -1581,154 +1601,159 @@ def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
     return value
 
 
-_LIBRARY_SORTS: dict[str, tuple[str, str]] = {
-    "created_at": ("created_at", "id"),
-    "-created_at": ("-created_at", "-id"),
-    "title": ("title", "id"),
-    "-title": ("-title", "-id"),
-}
+_LIBRARY_FILTER_PARAMS: Final = (
+    ("q", "query"),
+    ("title", "title"),
+    ("author", "author"),
+    ("category", "category"),
+    ("genre", "genre"),
+    ("language", "language"),
+    ("format", "book_format"),
+)
 
 
-def _book_ids_with_author(name: str) -> QuerySet[Any]:
-    return Book.authors.through.objects.filter(author__full_name__icontains=name).values("book_id")
-
-
-def _filtered_library_books(
-    *,
-    query: str = "",
-    title: str = "",
-    author: str = "",
-    category: str = "",
-    genre: str = "",
-    language: str = "",
-    book_format: str = "",
-    sort: str = "-created_at",
-) -> QuerySet[Book]:
-    """Build the browse/search queryset for `/library/books/`.
-
-    Filters over to-many relations are `pk IN (subquery)` conditions rather
-    than joins, so no row is duplicated and no `DISTINCT` is needed. The page
-    query and the paginator's `COUNT(*)` therefore stay narrow instead of
-    de-duplicating every column, `description` included (#28 phase 0). The
-    subqueries are uncorrelated, so PostgreSQL hashes each one once (and can
-    still scan books in parallel), which measured faster than correlated
-    `EXISTS` inside the `?q=` disjunction.
-
-    Each relation filter matches on its own, as the separate join per
-    `.filter()` call did before: `?q=` and `?author=` may match different
-    authors of the same book. The format filter keeps the format and the
-    COMPLETE state on one variant, as before.
-    """
-    books = Book.objects.select_related("front_cover", "back_cover").prefetch_related(
-        *_book_list_prefetches()
+def _library_search_request(request: HttpRequest) -> search.SearchRequest:
+    raw_page = request.GET.get("page")
+    page_size = min(_as_positive_int(request.GET.get("page_size"), 25), 100)
+    filters = {
+        attribute: request.GET.get(param, "").strip() for param, attribute in _LIBRARY_FILTER_PARAMS
+    }
+    return search.SearchRequest(
+        query=filters["query"],
+        title=filters["title"],
+        author=filters["author"],
+        category=filters["category"],
+        genre=filters["genre"],
+        language=filters["language"],
+        book_format=filters["book_format"],
+        sort=request.GET.get("sort", "").strip(),
+        cursor=request.GET.get("cursor", "").strip(),
+        page=_as_positive_int(raw_page, 1) if raw_page is not None else None,
+        page_size=page_size,
     )
-    if query:
-        books = books.filter(
-            Q(title__icontains=query)
-            | Q(subtitle__icontains=query)
-            | Q(description__icontains=query)
-            | Q(pk__in=_book_ids_with_author(query)),
-        )
-    if title:
-        books = books.filter(title__icontains=title)
-    if author:
-        books = books.filter(pk__in=_book_ids_with_author(author))
-    if category:
-        books = books.filter(
-            pk__in=Book.categories.through.objects.filter(
-                category__name__icontains=category,
-            ).values("book_id"),
-        )
-    if genre:
-        # A genre name or alias ("sci-fi") selects that genre; anything else is a
-        # substring match on genre names, as before.
-        genre_match = genres.genre_from_filter(genre)
-        genre_links = (
-            Book.genres.through.objects.filter(genre=genre_match)
-            if genre_match is not None
-            else Book.genres.through.objects.filter(genre__name__icontains=genre)
-        )
-        books = books.filter(pk__in=genre_links.values("book_id"))
-    if language:
-        books = books.filter(language__iexact=language)
-    if book_format:
-        books = books.filter(
-            pk__in=FileVariant.objects.filter(
-                format__iexact=book_format,
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            ).values("book_id"),
-        )
-    # The id tiebreaker keeps offset pages stable when sort keys collide.
-    return books.order_by(*_LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["-created_at"]))
+
+
+def _library_books_url(request: HttpRequest, **changes: str) -> str:
+    params = request.GET.copy()
+    for name in ("cursor", "page"):
+        params.pop(name, None)
+    for name, value in changes.items():
+        params[name] = value
+    return f"?{params.urlencode()}"
+
+
+def _next_page_url(request: HttpRequest, result: search.SearchPage, page_size: int) -> str | None:
+    if result.next_cursor:
+        return _library_books_url(request, cursor=result.next_cursor)
+    if result.page is not None and not result.previous_cursor:
+        cap = min(result.count, int(result.extra.get("max_results", result.count)))
+        if result.page * page_size < cap:
+            return _library_books_url(request, page=str(result.page + 1))
+    return None
+
+
+def _previous_page_url(request: HttpRequest, result: search.SearchPage) -> str | None:
+    if result.previous_cursor:
+        return _library_books_url(request, cursor=result.previous_cursor)
+    if result.page is not None and result.page > 1:
+        return _library_books_url(request, page=str(result.page - 1))
+    return None
 
 
 @require_GET
 @login_required
 def library_books(request: HttpRequest) -> HttpResponseBase:
+    """Browse/search the library (#28): keyset cursors for browsing, ranked search by offset.
+
+    `?cursor=` (from `next_cursor`/`previous_cursor`) pages at constant cost at
+    any depth. `?page=` still works for one release and is marked deprecated
+    for browse sorts. `?facets=language,format,...` adds facet counts.
+    """
     profile = _active_library_profile(request)
     if profile is None:
         return HttpResponseForbidden()
 
-    query = request.GET.get("q", "").strip()
-    title = request.GET.get("title", "").strip()
-    author = request.GET.get("author", "").strip()
-    category = request.GET.get("category", "").strip()
-    genre = request.GET.get("genre", "").strip()
-    language = request.GET.get("language", "").strip()
-    book_format = request.GET.get("format", "").strip()
-    sort = request.GET.get("sort", "-created_at").strip()
-
-    books = _filtered_library_books(
-        query=query,
-        title=title,
-        author=author,
-        category=category,
-        genre=genre,
-        language=language,
-        book_format=book_format,
-        sort=sort,
+    search_request = _library_search_request(request)
+    backend = search.get_search_backend()
+    started = time.perf_counter()
+    try:
+        result = backend.search(search_request)
+    except search.InvalidCursorError:
+        return JsonResponse({"detail": "invalid_cursor"}, status=400)
+    books_by_id = (
+        Book.objects.select_related("front_cover", "back_cover")
+        .prefetch_related(*_book_list_prefetches())
+        .in_bulk(result.book_ids)
     )
-
-    page = _as_positive_int(request.GET.get("page"), 1)
-    page_size = _as_positive_int(request.GET.get("page_size"), 25)
-    page_size = min(page_size, 100)
-    paginator = Paginator(books, page_size)
-    page_object = paginator.get_page(page)
-    page_books = list(page_object.object_list)
-    total = paginator.count
-    serialized = [_serialize_book(book, include_variants=False) for book in page_books]
+    serialized = [
+        _serialize_book(books_by_id[book_id], include_variants=False)
+        for book_id in result.book_ids
+        if book_id in books_by_id
+    ]
+    requested_facets = [
+        name.strip()
+        for name in request.GET.get("facets", "").split(",")
+        if name.strip() in search.FACETS
+    ]
+    facet_payload = {
+        name: [{"value": item.value, "count": item.count} for item in counts]
+        for name, counts in (
+            backend.facet_counts(search_request, requested_facets).items()
+            if requested_facets
+            else ()
+        )
+    }
+    # Never log the query text itself (#28 privacy).
+    logger.info(
+        "library_search",
+        backend=result.backend,
+        kind="search" if search_request.query else "browse",
+        sort=result.sort,
+        result_count=result.count,
+        fuzzy=result.fuzzy,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+    )
     if _wants_html(request):
-        filters = {
-            "q": query,
-            "title": title,
-            "author": author,
-            "category": category,
-            "genre": genre,
-            "language": language,
-            "format": book_format,
-            "sort": sort,
-        }
         return render(
             request,
             "core/library_books.html",
             {
                 "books": serialized,
-                "page_object": page_object,
-                "count": total,
+                "count": result.count,
+                "fuzzy": result.fuzzy,
+                "page_number": result.page,
+                "next_url": _next_page_url(request, result, search_request.page_size),
+                "previous_url": _previous_page_url(request, result),
+                "filters": {
+                    "q": search_request.query,
+                    "title": search_request.title,
+                    "author": search_request.author,
+                    "category": search_request.category,
+                    "genre": search_request.genre,
+                    "language": search_request.language,
+                    "format": search_request.book_format,
+                    "sort": result.sort,
+                },
                 "all_genres": list(Genre.objects.order_by("name")),
-                "filters": filters,
-                # Pagination links keep every active filter, not just ``q``.
-                "filter_query": urlencode({key: value for key, value in filters.items() if value}),
             },
         )
-    return JsonResponse(
-        {
-            "count": total,
-            "page": page,
-            "page_size": len(serialized),
-            "items": serialized,
-        },
-    )
+    payload: dict[str, Any] = {
+        "count": result.count,
+        "page": result.page,
+        "page_size": len(serialized),
+        "sort": result.sort,
+        "next_cursor": result.next_cursor,
+        "previous_cursor": result.previous_cursor,
+        "fuzzy": result.fuzzy,
+        "items": serialized,
+    }
+    if requested_facets:
+        payload["facets"] = facet_payload
+    response = JsonResponse(payload)
+    if search_request.page is not None and result.sort != search.RELEVANCE:
+        # Offset pages over the whole collection give way to cursors (#28).
+        response["Deprecation"] = "true"
+    return response
 
 
 @require_GET
@@ -4115,6 +4140,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    llm_panel = _llm_panel(task)
+    payload["llm_suggestion"] = llm_panel["suggestion_payload"] if llm_panel else None
     multipart_group = multipart.group_for_task(task)
     payload["multipart"] = multipart_group
     search_context = _review_search_context(task)
@@ -4160,10 +4187,71 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "candidates": candidates,
                 "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
+                "llm_panel": llm_panel,
+                "llm_candidate_ids": _llm_candidate_ids(task),
                 **search_context,
             },
         )
     return JsonResponse(payload)
+
+
+def _llm_candidate_ids(task: ReviewTask) -> set[int]:
+    """Candidates found only through LLM-proposed search terms (labelled on the page)."""
+    if task.import_job_id is None:
+        return set()
+    return {
+        candidate.pk
+        for candidate in MetadataCandidate.objects.filter(import_job_id=task.import_job_id)
+        if isinstance(candidate.raw_payload, dict)
+        and candidate.raw_payload.get(llm_identification.HINT_SOURCE_KEY)
+        == llm_identification.HINT_SOURCE_LLM
+    }
+
+
+def _llm_suggestion_payload(suggestion: LLMSuggestion) -> dict[str, Any]:
+    output = suggestion.output if isinstance(suggestion.output, dict) else {}
+    grounding = suggestion.grounding if isinstance(suggestion.grounding, dict) else {}
+    return {
+        "id": suggestion.pk,
+        "label": "AI suggestion, unverified",
+        "trigger": suggestion.trigger,
+        "outcome": suggestion.outcome,
+        "model": suggestion.model,
+        "model_version": suggestion.model_version,
+        "prompt_template_version": suggestion.prompt_template_version,
+        "created_at": suggestion.created_at.isoformat(),
+        "new_candidate_count": suggestion.new_candidate_count,
+        "output": output,
+        "grounding": grounding,
+    }
+
+
+def _llm_panel(task: ReviewTask) -> dict[str, Any] | None:
+    """The "AI suggestion (unverified)" panel for an import review task, or None."""
+    if task.import_job_id is None:
+        return None
+    suggestion = llm_identification.latest_suggestion(task)
+    enabled = llm.llm_enabled()
+    if suggestion is None and not enabled:
+        return None
+    grounding = (
+        suggestion.grounding if suggestion and isinstance(suggestion.grounding, dict) else {}
+    )
+    output = suggestion.output if suggestion and isinstance(suggestion.output, dict) else {}
+    active = llm_identification.active_job(task)
+    return {
+        "enabled": enabled,
+        "suggestion": suggestion,
+        "suggestion_payload": _llm_suggestion_payload(suggestion) if suggestion else None,
+        "output": output,
+        "title_hints": grounding.get("title_hints", []),
+        "author_hints": grounding.get("author_hints", []),
+        "isbn_hints_kept": grounding.get("isbn_hints_kept", []),
+        "isbn_hints_dropped": grounding.get("isbn_hints_dropped", []),
+        "first_title": (output.get("title_hints") or [""])[0],
+        "authors_text": ", ".join(output.get("author_hints") or []),
+        "active_job": active,
+    }
 
 
 _book_for_candidate = review_accept.book_for_candidate
@@ -4243,6 +4331,7 @@ def review_accept_candidate(
         return HttpResponseBadRequest(str(exc))
 
     try:
+        _note_review_redecided(task, profile)
         book, variant = review_accept.accept_candidate(
             task=task,
             candidate=candidate,
@@ -4251,6 +4340,7 @@ def review_accept_candidate(
             reviewer_genres=reviewer_genres,
             decision_notes=f"Accepted candidate {candidate.id}",
         )
+        contributions.record_review_resolution(task)
         return _review_action_response(
             request,
             {
@@ -4338,6 +4428,7 @@ def _batch_accept_one(
                 # Up to BATCH_MAX_TASKS books: covers are background jobs only.
                 inline_cover_fallback=False,
             )
+            contributions.record_review_resolution(task)
     except Exception as exc:  # one failing task must not abort the rest of the batch
         logger.warning(
             "review_batch_accept_task_failed",
@@ -4429,6 +4520,7 @@ def review_mark_unidentified(
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
+    _note_review_redecided(task, profile)
     task.state = ReviewTask.State.RESOLVED
     task.decision = ReviewTask.Decision.MARK_UNIDENTIFIED
     task.reviewer = profile.user
@@ -4446,6 +4538,7 @@ def review_mark_unidentified(
             "updated_at",
         ],
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(request, {"task_id": str(task.id), "state": task.state})
 
 
@@ -4558,6 +4651,83 @@ def _queue_review_search(
         },
         status=202,
     )
+
+
+@require_POST
+@login_required
+def review_ask_llm(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Queue the local-LLM identification assist for one import review task (#26)."""
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return HttpResponseBadRequest("forbidden")
+    try:
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
+    except ReviewTask.DoesNotExist:
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    if not llm.llm_enabled():
+        return HttpResponseBadRequest("the AI identification assist is disabled")
+    try:
+        processing_job = llm_identification.request_llm_identification(
+            review_task=task,
+            trigger=LLMSuggestion.Trigger.REVIEWER,
+            requested_by_user_id=profile.user_id,
+        )
+    except llm_identification.LLMIdentificationError as exc:
+        return HttpResponseBadRequest(str(exc))
+    if _wants_html(request):
+        if processing_job.state in {
+            ProcessingJob.JobState.SUCCESS,
+            ProcessingJob.JobState.FAILED,
+        }:
+            return redirect("review-detail", task_id=task.id)
+        return redirect("llm-identification-job-status", job_id=processing_job.job_id)
+    return JsonResponse(
+        {
+            "task_id": str(task.id),
+            "llm_job": llm_identification.job_payload(processing_job),
+        },
+        status=202,
+    )
+
+
+@require_GET
+@login_required
+def llm_identification_job_status(
+    request: HttpRequest,
+    job_id: str,
+) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.LLM_IDENTIFICATION:
+        return HttpResponseNotFound()
+    payload = llm_identification.job_payload(job)
+    try:
+        task = ReviewTask.objects.select_related("import_job", "scan_job").get(
+            pk=payload.get("review_task_id"),
+        )
+    except (ReviewTask.DoesNotExist, ValueError, TypeError):
+        return HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return HttpResponseForbidden()
+    if _wants_html(request):
+        if job.state in {ProcessingJob.JobState.SUCCESS, ProcessingJob.JobState.FAILED}:
+            return redirect("review-detail", task_id=task.id)
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "AI identification assist"},
+        )
+    return JsonResponse(payload)
 
 
 @require_POST
@@ -4676,6 +4846,12 @@ def review_edit_search_terms(
     if posted_terms is not None:
         _save_review_terms(task, posted_terms)
 
+    contributions.record_review_reversal(
+        task,
+        source=ReviewDecisionCorrection.Source.REOPENED,
+        found_by=profile.user,
+        note="search terms edited on a resolved review",
+    )
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS
     task.reviewer = profile.user
@@ -4737,6 +4913,7 @@ def review_manual_entry(
         reviewer=request.user,
     )
 
+    _note_review_redecided(task, profile)
     variant = _resolve_review_source(
         task=task,
         book=book,
@@ -4744,6 +4921,7 @@ def review_manual_entry(
         decision=cast(str, ReviewTask.Decision.MANUAL_ENTRY),
         decision_payload=payload,
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(
         request,
         {
@@ -4787,6 +4965,7 @@ def review_merge_existing(
     if blocker is not None:
         return HttpResponseBadRequest(blocker)
 
+    _note_review_redecided(task, profile)
     _resolve_review_source(
         task=task,
         book=book,
@@ -4794,6 +4973,7 @@ def review_merge_existing(
         decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
         decision_payload={"book_id": book_id},
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(
         request,
         {"task_id": str(task.id), "book_id": str(book.id)},

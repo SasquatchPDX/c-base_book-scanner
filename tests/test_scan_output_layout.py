@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,9 @@ from tests.test_scan_jobs import (
 )
 
 LOG = b"2026-11-17 10:00:01 capture start\n2026-11-17 10:12:44 capture done, 212 pages\n"
+LOG_SHA256 = hashlib.sha256(LOG).hexdigest()
+# Uploaded logs are stored as scan-upload-<sha8>.log; scan.jsonl is reserved for #129.
+LOG_NAME = f"scan-upload-{LOG_SHA256[:8]}.log"
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +131,7 @@ def test_log_upload_only_stages_and_queues_work(
     assert log.processing_job.job_type == ProcessingJob.JobType.SCAN_LOG
     assert log.processing_job.state == ProcessingJob.JobState.QUEUED
     assert (tmp_path / "scan-artifacts" / log.staging_identifier).read_bytes() == LOG
-    assert not (tmp_path / "library-artifacts" / FOLDER / "scan.log").exists()
+    assert not (tmp_path / "library-artifacts" / FOLDER / LOG_NAME).exists()
     assert len(log_queue.calls) == 1  # enqueued once the request transaction committed
 
     _run_log_jobs(log_queue)
@@ -154,8 +158,8 @@ def test_log_for_linked_job_goes_straight_into_the_book_folder(
     _run_log_jobs(log_queue)
     log = ScanLog.objects.get(scan_job=job)
     assert log.state == ScanLog.State.STORED
-    assert log.storage_identifier == f"{FOLDER}/scan.log"
-    assert (tmp_path / "library-artifacts" / FOLDER / "scan.log").read_bytes() == LOG
+    assert log.storage_identifier == f"{FOLDER}/{LOG_NAME}"
+    assert (tmp_path / "library-artifacts" / FOLDER / LOG_NAME).read_bytes() == LOG
 
     again = _post_log(client, job, LOG)
     assert again.status_code == 202
@@ -165,11 +169,14 @@ def test_log_for_linked_job_goes_straight_into_the_book_folder(
     assert duplicate.duplicate_of_id == log.pk
     assert ScanLog.objects.filter(scan_job=job, state=ScanLog.State.STORED).count() == 1
 
-    second = _post_log(client, job, LOG + b"rescan of page 17\n")
+    longer = LOG + b"rescan of page 17\n"
+    second = _post_log(client, job, longer)
     assert second.status_code == 202
     _run_log_jobs(log_queue)
     names = sorted(p.name for p in (tmp_path / "library-artifacts" / FOLDER).iterdir())
-    assert names[0] == "scan-" + names[0][5:] and names[1] == "scan.log"
+    longer_name = f"scan-upload-{hashlib.sha256(longer).hexdigest()[:8]}.log"
+    assert names == sorted([LOG_NAME, longer_name])
+    assert "scan.jsonl" not in names
     # Every staged upload was cleaned up by its worker.
     assert not list((tmp_path / "scan-artifacts" / scan_logs.STAGING_NAMESPACE).iterdir())
 
@@ -196,8 +203,8 @@ def test_log_before_book_link_moves_into_folder_on_finalization(
     waiting.refresh_from_db()
     assert waiting.storage_location is not None
     assert waiting.storage_location.identifier == "default"
-    assert waiting.storage_identifier == f"{FOLDER}/scan.log"
-    assert (tmp_path / "library-artifacts" / FOLDER / "scan.log").read_bytes() == LOG
+    assert waiting.storage_identifier == f"{FOLDER}/{LOG_NAME}"
+    assert (tmp_path / "library-artifacts" / FOLDER / LOG_NAME).read_bytes() == LOG
     assert not staged.exists()
 
 
@@ -250,4 +257,108 @@ def test_scan_log_upload_ignores_client_path_in_filename(
     _run_log_jobs(log_queue)
     log = ScanLog.objects.get(scan_job=job)
     assert log.original_filename == "scan.log"
-    assert log.storage_identifier == f"{FOLDER}/scan.log"
+    assert log.storage_identifier == f"{FOLDER}/{LOG_NAME}"
+
+
+def _corrupt_after_publish(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Make every publication silently write bad bytes, as a faulty network copy would.
+
+    The real publication runs first; the destination is then overwritten before the
+    worker gets to verify it. Returns the corrupted paths.
+    """
+    corrupted: list[Path] = []
+    real_publish = LocalFilesystemStorage.publish_unique
+
+    def _publish(self: LocalFilesystemStorage, *args: Any, **kwargs: Any) -> str:
+        destination = real_publish(self, *args, **kwargs)
+        path = self.resolve_location(destination)
+        path.write_bytes(b"CORRUPTED")
+        corrupted.append(path)
+        return destination
+
+    monkeypatch.setattr(LocalFilesystemStorage, "publish_unique", _publish)
+    return corrupted
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("linked", [True, False], ids=["book-folder", "scan-storage"])
+def test_corrupted_published_copy_fails_and_keeps_the_staged_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_queue: _DeferredQueue, linked: bool
+) -> None:
+    """A copy that does not hash to the staged upload is never recorded as stored."""
+    book_id = _book().id if linked else None
+    client, job = _create_scan_job_with_book(f"scan-log-corrupt-{linked}", book_id=book_id)
+    response = _post_log(client, job, LOG)
+    assert response.status_code == 202
+    log = ScanLog.objects.get(scan_job=job)
+    staged = tmp_path / "scan-artifacts" / log.staging_identifier
+
+    with monkeypatch.context() as patched:
+        corrupted = _corrupt_after_publish(patched)
+        _run_log_jobs(log_queue)
+    assert len(corrupted) == 1
+
+    log.refresh_from_db()
+    assert log.state == ScanLog.State.FAILED
+    assert "SHA-256 verification" in log.error
+    assert log.sha256 == ""
+    assert log.storage_identifier == ""
+    assert log.processing_job is not None
+    assert log.processing_job.state == ProcessingJob.JobState.FAILED
+    assert log.processing_job.details["retryable"] is True
+    assert log.processing_job.details["staging_retained"] is True
+    # The staged original is intact and still recorded; only the bad copy was removed.
+    assert staged.read_bytes() == LOG
+    assert log.staging_identifier
+    assert not corrupted[0].exists()
+    assert client.get(f"/scan/jobs/{job.id}/logs/").json()["logs"][0]["state"] == "failed"
+
+    # Retrying without the fault stores a verified copy and only then drops staging.
+    assert scan_logs.retry_failed_scan_log(log) is True
+    _run_log_jobs(log_queue)
+    log.refresh_from_db()
+    assert log.state == ScanLog.State.STORED
+    assert log.sha256 == LOG_SHA256
+    assert log.processing_job is not None
+    assert log.processing_job.state == ProcessingJob.JobState.SUCCESS
+    root = tmp_path / ("library-artifacts" if linked else "scan-artifacts")
+    assert (root / log.storage_identifier).read_bytes() == LOG
+    assert not staged.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_retry_refuses_a_log_whose_staged_upload_is_gone(
+    tmp_path: Path, log_queue: _DeferredQueue
+) -> None:
+    client, job = _create_scan_job_with_book("scan-log-no-retry", book_id=_book().id)
+    assert _post_log(client, job, b"\x89PNG\x00\x00binary").status_code == 202
+    _run_log_jobs(log_queue)
+    log = ScanLog.objects.get(scan_job=job)
+    assert log.state == ScanLog.State.FAILED  # invalid content: staging was discarded
+    assert scan_logs.retry_failed_scan_log(log) is False
+    log.refresh_from_db()
+    assert log.state == ScanLog.State.FAILED
+    assert not log_queue.calls
+
+
+@pytest.mark.django_db(transaction=True)
+def test_move_into_book_folder_with_corrupted_copy_keeps_the_scan_storage_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_queue: _DeferredQueue
+) -> None:
+    client, job = _create_scan_job_with_book("scan-log-move-corrupt")
+    assert _post_log(client, job, LOG).status_code == 202
+    _run_log_jobs(log_queue)
+    waiting = ScanLog.objects.get(scan_job=job)
+    original = tmp_path / "scan-artifacts" / waiting.storage_identifier
+    job.book = _book()
+    job.save(update_fields=["book"])
+
+    with monkeypatch.context() as patched:
+        corrupted = _corrupt_after_publish(patched)
+        assert scan_logs.place_scan_logs_in_book_folder(job) == 0
+    assert len(corrupted) == 1 and not corrupted[0].exists()
+    waiting.refresh_from_db()
+    assert waiting.state == ScanLog.State.STORED
+    assert waiting.storage_location is not None
+    assert waiting.storage_location.identifier == "scan"
+    assert original.read_bytes() == LOG
