@@ -71,6 +71,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Candidates scoring within this margin of the best one are treated as tied when
+# choosing a candidate to accept automatically.
+TIE_MARGIN = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN", 0.02)
 # Evidence key for title/author hints read from the first lines of plain-text books
 # (see core.text_header); written by intake, read when building signals.
 TEXT_HEADER_EVIDENCE_KEY = "text_header"
@@ -1392,6 +1395,10 @@ def _normalize_candidate(
         isbn13 = _normalize_identifier(payload["isbn_13"])
 
     queried_isbn = _normalize_identifier(str(payload.get("_queried_isbn") or ""))
+    if queried_isbn is not None and not _record_lists_isbn(payload, queried_isbn):
+        # The echoed query is no evidence: a record that does not itself list the
+        # ISBN we asked for keeps its own identifiers (#108 review).
+        queried_isbn = None
     if queried_isbn is not None:
         # Edition records can list several ISBNs; the one we looked up must be the one
         # the candidate carries, otherwise the ISBN-match score bonus is lost.
@@ -1532,6 +1539,23 @@ def _normalize_candidate(
         concrete_edition=concrete_edition,
     )
     return _apply_scoring(signals, candidate)
+
+
+def _isbn13_form(value: str) -> str | None:
+    normalized = _normalize_identifier(value)
+    if normalized is None:
+        return None
+    return _isbn10_to_isbn13(normalized) if len(normalized) == 10 else normalized
+
+
+def _record_lists_isbn(payload: dict[str, Any], isbn: str) -> bool:
+    """True when the provider record's own ISBN fields list ``isbn`` (10/13 equivalent)."""
+    wanted = _isbn13_form(isbn)
+    return wanted is not None and any(
+        _isbn13_form(value) == wanted
+        for key in ("isbn_10", "isbn_13", "isbn")
+        for value in _as_str_list(payload.get(key))
+    )
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -1887,6 +1911,36 @@ def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) 
     return not any(
         _author_names_agree(candidate, other) for candidate in candidates for other in evidence
     )
+
+
+def candidates_describe_same_book(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """True when two provider records evidently describe the same book (edition).
+
+    They share an ISBN (10/13-equivalent). Otherwise both must name the same title
+    (full title score) and agreeing authors, and nothing may tell their editions apart:
+    when both list ISBNs those sets are disjoint here, i.e. two different editions, and
+    when both name languages these must overlap. Used to tell a harmless tie (two
+    providers returning one book) from an ambiguous one (two different books or
+    editions scoring the same).
+    """
+    left_isbns = _edition_isbn13s(left)
+    right_isbns = _edition_isbn13s(right)
+    if left_isbns & right_isbns:
+        return True
+    if left_isbns and right_isbns:
+        return False
+    left_languages = _candidate_languages(left)
+    right_languages = _candidate_languages(right)
+    if left_languages and right_languages and not left_languages & right_languages:
+        return False
+    if _title_match_score(left.title, right.title) < 1.0:
+        return False
+    if not left.authors or not right.authors:
+        return False
+    return not authors_conflict(left.authors, right.authors)
 
 
 # Reasons an otherwise acceptable candidate stands for another edition than the file.
