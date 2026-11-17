@@ -143,37 +143,14 @@ Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
 - PostgreSQL and Redis URLs are supplied;
 - the authentication mode is `ldap` or `local` (`stub` is rejected);
 - HTTPS redirect, secure cookies, and HSTS are enabled;
-- `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
+- if the scanner API is enabled (`BOOK_SCANNER_SCANNER_API_KEY_SHA256` is set),
+  `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
+  Without a scanner key neither setting is needed.
 
 When TLS terminates at a trusted reverse proxy, set
 `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` and ensure that untrusted clients
 cannot inject `X-Forwarded-Proto`. HSTS preload is optional and should only be
 enabled after its long-lived operational consequences are understood.
-
-## Scanner devices
-
-The libreflip scanner authenticates to the device API `/api/scanner/v1/` with its own
-API key (`Authorization: Bearer`), never with a member session. Manage devices with:
-
-```bash
-uv run python manage.py scanner_device create libreflip-01 --name "libreflip at c-base"
-uv run python manage.py scanner_device rotate libreflip-01   # old key stops working at once
-uv run python manage.py scanner_device revoke libreflip-01
-uv run python manage.py scanner_device list
-```
-
-`create` and `rotate` print the key exactly once; the database keeps only its SHA-256.
-`rotate` also re-activates a revoked device. Admins can list devices and revoke them in
-`/admin/`. A device key authorises nothing outside `/api/scanner/v1/`, and a browser
-session cannot use that namespace (it answers `401`).
-
-Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP example listener in
-`deploy/nginx/book-scanner.conf` (and any lab install without TLS) must not expose it,
-because the key travels in every request header; block the prefix there (for example
-`location ^~ /api/scanner/ { return 403; }`). `BOOK_SCANNER_SCANNER_API_ENABLED=false`
-switches the whole namespace off (`503`). `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and
-`BOOK_SCANNER_SCANNER_MAX_OPF_BYTES` are the upload limits reported to the scanner by
-`GET /api/scanner/v1/ping`.
 
 ## libreflip scanner deployment
 
@@ -191,11 +168,34 @@ rules this section implements:
   internal CA; sans verifies the chain and the host name and cannot skip that;
 - serif (or the site's NTP server) gives the LAN NTP, because sans refuses to
   start a job without a synchronised clock;
-- each scanner has its own API key, created with `manage.py scanner_device`.
+- there is exactly one scanner, and it has one API key, created with
+  `manage.py generate_scanner_key`. serif keeps only the key's SHA-256 in
+  `BOOK_SCANNER_SCANNER_API_KEY_SHA256`.
 
 All names and addresses below are placeholders: `serif.lan.example` is the
-VM's LAN host name, `192.0.2.0/24` stands for the LAN range(s), and
-`libreflip-01` is the scanner ID. Replace them with the site's values.
+VM's LAN host name and `192.0.2.0/24` stands for the LAN range(s). Replace
+them with the site's values.
+
+### The scanner API key
+
+The scanner authenticates to `/api/scanner/v1/` with `Authorization: Bearer
+<key>`, never with a member session. A browser session cannot use that
+namespace (it answers `401`), and the key authorises nothing outside it (it
+gets `403` on every other route). The API is off until a key hash is
+configured: with `BOOK_SCANNER_SCANNER_API_KEY_SHA256` empty (the default),
+every `/api/scanner/v1/` request answers `503`, and production does not
+require `BOOK_SCANNER_PUBLIC_BASE_URL`. With a key hash configured, production
+startup requires `BOOK_SCANNER_PUBLIC_BASE_URL` to be the server's `https://`
+base URL (it builds the portal links handed to the scanner).
+
+`BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and `BOOK_SCANNER_SCANNER_MAX_OPF_BYTES`
+are the upload limits reported by `GET /api/scanner/v1/ping`. Every API request
+writes one log line (`scanner_api_request`: route, status, job ID); the key is
+never logged.
+
+Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP listener in
+`deploy/nginx/book-scanner.conf` already refuses `/api/scanner/` with `403`,
+because the key travels in every request header.
 
 ### nginx
 
@@ -330,18 +330,19 @@ timedatectl show -p NTPSynchronized --value   # must print "yes"
 
 ### Onboarding a scanner
 
-`manage.py scanner_device` is added by #125 (scanner device keys); the
-subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
-
-1. **Create the device key on the VM.** As the service user, from the checkout:
+1. **Generate the key on the VM.** As the service user, from the checkout:
 
    ```bash
-   uv run python manage.py scanner_device create libreflip-01 --name "libreflip scanner"
+   uv run python manage.py generate_scanner_key
    ```
 
-   The key is printed once; serif stores only its SHA-256 hash. If it is lost,
-   run `scanner_device rotate libreflip-01` (the old key stops working
-   immediately) and repeat step 2.
+   The command prints the key and the line
+   `BOOK_SCANNER_SCANNER_API_KEY_SHA256=<hex>`; it writes nothing anywhere.
+   Add that line to the server environment (`.env` or the systemd
+   `EnvironmentFile`), set `BOOK_SCANNER_PUBLIC_BASE_URL`, and restart the web
+   service. serif never stores the key itself. If it is lost or leaked, generate
+   a new one, replace the line, restart (the old key answers `401` from then
+   on), and repeat step 2.
 
 2. **Put the key and the CA on the Pi**, as the user that runs sans. Paste the
    key into a file that is created with mode 0600, so it never lands in shell
@@ -380,8 +381,7 @@ subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
      https://serif.lan.example/api/scanner/v1/ping
    ```
 
-   Expect `200` with `"api_version": 1`, `"scanner_id": "libreflip-01"`, a
-   `server_time` within a few seconds of `date -u`, and the `limits`. The idle
+   Expect `200` with `"api_version": 1`, a `server_time` within a few seconds of `date -u`, and the `limits`. The idle
    screen of sans should then show "All books uploaded" rather than "Upload
    not configured" or "serif rejects this scanner's key".
 
@@ -391,12 +391,12 @@ subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
 | curl exit 35 (handshake) | client cannot do TLS 1.3, or wrong port |
 | curl exit 60 (certificate) | wrong `ca_file`, or host name not in the certificate's subjectAltName |
 | `403` HTML page from nginx | the scanner's address is not in the `allow` lines |
-| `401` JSON error | key wrong, rotated or revoked; re-run step 1/2 |
-| `503` | `BOOK_SCANNER_SCANNER_API_ENABLED=false` |
+| `401` JSON error | key wrong or replaced; re-run step 1/2 |
+| `503` | `BOOK_SCANNER_SCANNER_API_KEY_SHA256` is empty (API disabled), or the web service was not restarted after setting it |
 | sans: "Clock not synchronised" | NTP on the Pi; check `timedatectl` |
 
-To take a scanner out of service, run `scanner_device revoke libreflip-01`;
-`scanner_device list` shows the registered devices.
+To take the scanner out of service, empty `BOOK_SCANNER_SCANNER_API_KEY_SHA256`
+and restart the web service; the API then answers `503`.
 
 ### Acceptance on the VM
 
