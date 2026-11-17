@@ -6,7 +6,8 @@ import hashlib
 import mimetypes
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,6 +27,7 @@ from defusedxml.common import DefusedXmlException
 from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.db import models as django_models
+from django.db import transaction
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from pypdf import PdfReader
@@ -1126,8 +1128,42 @@ def resolve_import_with_review_data(
     decision: str = "",
     decision_notes: str = "",
     decision_payload: dict[str, Any] | None = None,
+    propagate_to_siblings: bool = True,
 ) -> FileVariant:
-    """Resolve a reviewed import; ``source_type`` defaults to the job's origin."""
+    """Resolve a reviewed import; ``source_type`` defaults to the job's origin.
+
+    Other formats of the same book waiting in review are then offered ``book``
+    (``_propagate_book_to_siblings``), under the same sibling-group lock.
+    """
+    with _sibling_group_lock(job):
+        variant = _resolve_import(
+            job=job,
+            review_task=review_task,
+            book=book,
+            source_type=source_type,
+            selected_candidate=selected_candidate,
+            reviewer=reviewer,
+            decision=decision,
+            decision_notes=decision_notes,
+            decision_payload=decision_payload,
+        )
+        if propagate_to_siblings:
+            _propagate_book_to_siblings(job, book)
+    return variant
+
+
+def _resolve_import(
+    *,
+    job: ImportJob,
+    review_task: ReviewTask,
+    book: Book,
+    source_type: str,
+    selected_candidate: MetadataCandidate | None,
+    reviewer: Any | None,
+    decision: str,
+    decision_notes: str,
+    decision_payload: dict[str, Any] | None,
+) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
     variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
@@ -1166,6 +1202,407 @@ def resolve_import_with_review_data(
             "file_variant_id",
             "storage_location_id",
             "storage_identifier",
+            "updated_at",
+        ],
+    )
+    return variant
+
+
+# --- Formats of one book (#39) ---------------------------------------------------------
+#
+# With ``SourceLocation.group_sibling_formats`` (opt-in), files in one source folder with
+# the same case-folded file name and different extensions are "siblings": probably
+# formats of one book. A sibling's already linked Book is offered as one more, strong
+# candidate; it is never a bypass of verification:
+#
+# * the file is still looked up externally, and its candidates are stored;
+# * the Book is scored with the provider scorer plus ``SIBLING_FORMAT_BONUS`` and must
+#   reach the auto-accept threshold;
+# * embedded ISBNs that conflict with the Book's ISBNs, or a confident provider match for
+#   a different book, send the file to review instead;
+# * a review task a reviewer has CLAIMED is never resolved automatically.
+
+SIBLING_EVIDENCE_KEY = "format_sibling_of"
+SIBLING_REVIEW_PAYLOAD_KEY = "format_sibling"
+
+
+@dataclass(frozen=True)
+class SiblingAssessment:
+    sibling: ImportJob
+    book: Book
+    score: float
+    accepted: bool
+    reason: str
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "import_job": str(self.sibling.id),
+            "filename": self.sibling.original_filename,
+            "book_id": self.book.pk,
+            "score": round(self.score, 4),
+            "accepted": self.accepted,
+            "reason": self.reason,
+        }
+
+
+def _groups_sibling_formats(job: ImportJob) -> bool:
+    location = job.source_location
+    return bool(location is not None and location.group_sibling_formats and job.source_path)
+
+
+@contextmanager
+def _sibling_group_lock(job: ImportJob) -> Iterator[None]:
+    """Serialise sibling decisions for one source (short database sections only).
+
+    Without it, two formats auto-accepted at the same time could provision two Books,
+    and a file reaching review just after its sibling was linked would be missed.
+    Locks the SourceLocation row; a no-op for sources without format grouping.
+    """
+    if not _groups_sibling_formats(job):
+        yield
+        return
+    with transaction.atomic():
+        list(
+            SourceLocation.objects.select_for_update()
+            .filter(pk=job.source_location_id)
+            .values_list("pk", flat=True)
+        )
+        yield
+
+
+def _sibling_jobs(job: ImportJob) -> list[ImportJob]:
+    """Import jobs for other formats of the same book: same folder, same file name."""
+    if not _groups_sibling_formats(job):
+        return []
+    path = Path(job.source_path)
+    stem = path.stem.casefold()
+    # ``source_path`` is stored with the OS separator (``str(Path.resolve())``), so
+    # compare Path objects rather than "/"-joined string prefixes.
+    candidates = (
+        ImportJob.objects.filter(
+            source_location_id=job.source_location_id,
+            source_path__startswith=str(path.parent),
+        )
+        .exclude(pk=job.pk)
+        .exclude(source_path=job.source_path)
+        .select_related("book", "source_location")
+        .order_by("created_at", "id")
+    )
+    return [
+        candidate
+        for candidate in candidates
+        if Path(candidate.source_path).parent == path.parent
+        and Path(candidate.source_path).stem.casefold() == stem
+    ]
+
+
+def _resolved_sibling(job: ImportJob) -> ImportJob | None:
+    for sibling in _sibling_jobs(job):
+        if sibling.state == ImportJob.State.COMPLETE and sibling.book is not None:
+            return sibling
+    return None
+
+
+def _isbn13s(values: Iterable[str]) -> set[str]:
+    return {
+        isbn
+        for value in values
+        for isbn in identification.normalize_isbns(value)
+        if len(isbn) == 13
+    }
+
+
+def _book_as_candidate(
+    book: Book, *, prefer_isbns: set[str]
+) -> identification.IdentificationCandidate:
+    identifiers = list(
+        book.identifiers.filter(
+            kind__in=(Identifier.IdentifierType.ISBN10, Identifier.IdentifierType.ISBN13)
+        ).values_list("value", flat=True)
+    )
+    # Use the Book's ISBN that equals the file's when there is one, so scoring sees it.
+    matching = [value for value in identifiers if _isbn13s([value]) & prefer_isbns]
+    ordered = matching + [value for value in identifiers if value not in matching]
+    isbn10 = next((value for value in ordered if len(value) == 10), None)
+    isbn13 = next((value for value in ordered if len(value) == 13), None)
+    return identification.IdentificationCandidate(
+        provider_id="library",
+        provider_ref=f"book:{book.pk}",
+        title=book.title,
+        authors=[author.full_name for author in book.authors.all()],
+        isbn10=isbn10,
+        isbn13=isbn13,
+        language=book.language or None,
+        description=None,
+        publisher=book.publisher or None,
+        edition=book.edition or None,
+        publication_year=None,
+        score=0.0,
+        raw={},
+    )
+
+
+def _assess_sibling_book(
+    *,
+    signals: identification.IdentificationInput,
+    sibling: ImportJob,
+    book: Book,
+    top_candidate: identification.IdentificationCandidate | None,
+) -> SiblingAssessment:
+    """Whether a file may join its sibling's Book (see the block comment above)."""
+    file_isbns = _isbn13s(signals.isbns)
+    book_isbns = _isbn13s(
+        book.identifiers.filter(
+            kind__in=(Identifier.IdentifierType.ISBN10, Identifier.IdentifierType.ISBN13)
+        ).values_list("value", flat=True)
+    )
+    book_candidate = _book_as_candidate(book, prefer_isbns=file_isbns)
+    score = min(
+        1.0,
+        identification.score_candidate(signals, book_candidate).score
+        + identification.SIBLING_FORMAT_BONUS,
+    )
+    if file_isbns and book_isbns and not file_isbns & book_isbns:
+        reason, accepted = "conflicting_isbn", False
+    elif (
+        top_candidate is not None
+        and top_candidate.score >= AUTO_ACCEPT_SCORE
+        and not identification.same_book(top_candidate, book_candidate)
+    ):
+        reason, accepted = "provider_match_differs", False
+    elif score < AUTO_ACCEPT_SCORE:
+        reason, accepted = "below_threshold", False
+    else:
+        reason, accepted = "accepted", True
+    return SiblingAssessment(
+        sibling=sibling, book=book, score=score, accepted=accepted, reason=reason
+    )
+
+
+def _record_sibling_evidence(job: ImportJob, assessment: SiblingAssessment) -> None:
+    evidence = dict(job.evidence) if isinstance(job.evidence, dict) else {}
+    evidence[SIBLING_EVIDENCE_KEY] = assessment.as_evidence()
+    job.evidence = evidence
+    job.save(update_fields=["evidence", "updated_at"])
+
+
+def _top_saved_candidate(job: ImportJob) -> identification.IdentificationCandidate | None:
+    row = job.metadata_candidates.order_by("-score", "id").first()
+    if row is None:
+        return None
+    return identification.IdentificationCandidate(
+        provider_id=row.provider_id,
+        provider_ref=row.provider_ref,
+        title=row.title,
+        authors=[author for author in row.authors or [] if isinstance(author, str)],
+        isbn10=row.isbn10 or None,
+        isbn13=row.isbn13 or None,
+        language=row.language or None,
+        description=row.description or None,
+        publisher=row.publisher or None,
+        edition=None,
+        publication_year=row.publication_year,
+        score=float(row.score),
+        raw={},
+    )
+
+
+def _annotate_review_task(task: ReviewTask, payload: dict[str, Any]) -> None:
+    decision_payload = (
+        dict(task.decision_payload) if isinstance(task.decision_payload, dict) else {}
+    )
+    decision_payload[SIBLING_REVIEW_PAYLOAD_KEY] = payload
+    task.decision_payload = decision_payload
+    task.save(update_fields=["decision_payload", "updated_at"])
+
+
+def _offer_book_to_waiting_job(waiting: ImportJob, book: Book, *, source_job: ImportJob) -> bool:
+    """Resolve a sibling waiting in review with ``book`` if the evidence allows it.
+
+    Call under ``_sibling_group_lock``. Returns whether the job was linked.
+    """
+    if waiting.state != ImportJob.State.LOW_CONFIDENCE or not waiting.storage_identifier:
+        return False
+    task = (
+        ReviewTask.objects.select_for_update()
+        .filter(
+            import_job=waiting,
+            state__in=(ReviewTask.State.OPEN, ReviewTask.State.CLAIMED),
+        )
+        .first()
+    )
+    if task is None:
+        return False
+    if task.state == ReviewTask.State.CLAIMED:
+        # A reviewer is working on it: never decide for them, only point at the Book.
+        _annotate_review_task(
+            task,
+            {
+                "import_job": str(source_job.id),
+                "filename": source_job.original_filename,
+                "book_id": book.pk,
+                "accepted": False,
+                "reason": "claimed_by_reviewer",
+            },
+        )
+        return False
+    signals = identification.build_identification_input(
+        source_path=waiting.source_path,
+        original_filename=waiting.original_filename,
+        extracted_metadata=waiting.evidence if isinstance(waiting.evidence, dict) else {},
+    )
+    assessment = _assess_sibling_book(
+        signals=signals,
+        sibling=source_job,
+        book=book,
+        top_candidate=_top_saved_candidate(waiting),
+    )
+    _record_sibling_evidence(waiting, assessment)
+    if not assessment.accepted:
+        _annotate_review_task(task, assessment.as_evidence())
+        logger.info(
+            "intake_format_sibling_not_linked",
+            import_job_id=str(waiting.id),
+            sibling_import_job_id=str(source_job.id),
+            book_id=book.pk,
+            reason=assessment.reason,
+        )
+        return False
+    _resolve_import(
+        job=waiting,
+        review_task=task,
+        book=book,
+        source_type="",
+        selected_candidate=None,
+        reviewer=None,
+        decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
+        decision_notes=(
+            f"Another format of '{source_job.original_filename}' (same folder and file "
+            f"name); linked automatically at score {assessment.score:.2f}."
+        ),
+        decision_payload={
+            "rule": "group_sibling_formats",
+            SIBLING_REVIEW_PAYLOAD_KEY: assessment.as_evidence(),
+        },
+    )
+    logger.info(
+        "intake_linked_format_sibling",
+        import_job_id=str(waiting.id),
+        sibling_import_job_id=str(source_job.id),
+        book_id=book.pk,
+        score=assessment.score,
+        from_review=True,
+    )
+    return True
+
+
+def _propagate_book_to_siblings(job: ImportJob, book: Book) -> None:
+    """Offer ``book`` to other formats of it that wait in review.
+
+    Siblings not processed yet consider it themselves in ``process_import_job``. A
+    failure here never undoes the already completed ``job``.
+    """
+    if not _groups_sibling_formats(job):
+        return
+    with _sibling_group_lock(job):
+        for sibling in _sibling_jobs(job):
+            if sibling.state != ImportJob.State.LOW_CONFIDENCE:
+                continue
+            try:
+                with transaction.atomic():
+                    _offer_book_to_waiting_job(sibling, book, source_job=job)
+            except Exception:
+                logger.exception(
+                    "intake_sibling_propagation_failed",
+                    import_job_id=str(job.id),
+                    sibling_import_job_id=str(sibling.id),
+                )
+
+
+def _archive_for_review(
+    job: ImportJob,
+    candidates: list[identification.IdentificationCandidate],
+) -> None:
+    """Create the review task, archive the original, and leave the job LOW_CONFIDENCE."""
+    _create_review_task(job=job, candidates=candidates)
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    job.save(update_fields=["state", "updated_at"])
+    job.state = ImportJob.State.ARCHIVING
+    job.save(update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(_default_storage(), job)
+    job.storage_identifier = destination
+    job.storage_location = _default_storage_location()
+    job.save(
+        update_fields=[
+            "storage_identifier",
+            "storage_location_id",
+            "state",
+            "updated_at",
+        ],
+    )
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    job.save(
+        update_fields=[
+            "state",
+            "storage_identifier",
+            "storage_location_id",
+            "updated_at",
+        ],
+    )
+    if not _groups_sibling_formats(job):
+        return
+    with _sibling_group_lock(job):
+        # A sibling linked while this file was being identified did not see it waiting;
+        # offer its Book now. A sibling already assessed above is not offered again.
+        if SIBLING_EVIDENCE_KEY in (job.evidence or {}):
+            return
+        sibling = _resolved_sibling(job)
+        if sibling is not None and sibling.book is not None:
+            _offer_book_to_waiting_job(job, sibling.book, source_job=sibling)
+
+
+def _complete_with_book(
+    job: ImportJob,
+    book: Book,
+    *,
+    destination: str,
+    storage_location: StorageLocation,
+) -> FileVariant:
+    """Link an archived, verified job to ``book`` as a new FileVariant."""
+    job.storage_identifier = destination
+    job.storage_location = storage_location
+    job.normalized_filename = normalize_filename(
+        f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
+    )
+    variant = FileVariant.objects.create(
+        book=book,
+        format=job.detected_format,
+        mime_type=job.mime_type,
+        original_filename=job.original_filename,
+        storage_location=storage_location,
+        storage_identifier=destination,
+        size_bytes=job.size_bytes,
+        sha256=job.sha256,
+        source_type=variant_source_type_for_job(job),
+        uploader=job.uploader,
+        imported_at=timezone.now(),
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    _try_extract_front_cover(variant, job)
+    job.book = book
+    job.file_variant = variant
+    job.state = ImportJob.State.COMPLETE
+    job.save(
+        update_fields=[
+            "state",
+            "book_id",
+            "file_variant_id",
+            "storage_location_id",
+            "storage_identifier",
+            "normalized_filename",
             "updated_at",
         ],
     )
@@ -1345,6 +1782,7 @@ def process_import_job(job_id: str) -> None:
                 ),
             )
             _try_extract_front_cover(duplicate_variant, job)
+            _propagate_book_to_siblings(job, duplicate_variant.book)
             return
 
         metadata = extract_metadata(
@@ -1377,35 +1815,24 @@ def process_import_job(job_id: str) -> None:
         _save_metadata_candidates(job, candidates)
 
         top_candidate = candidates[0] if candidates else None
-        if top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE:
-            _create_review_task(job=job, candidates=candidates)
-            job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(update_fields=["state", "updated_at"])
-            job.state = ImportJob.State.ARCHIVING
-            job.save(update_fields=["state", "updated_at"])
-            destination, verified = _archive_source(_default_storage(), job)
-            job.storage_identifier = destination
-            job.storage_location = _default_storage_location()
-            job.save(
-                update_fields=[
-                    "storage_identifier",
-                    "storage_location_id",
-                    "state",
-                    "updated_at",
-                ],
+        # Another format of this book may already be linked (#39): its Book becomes a
+        # strong candidate, but only joins when the evidence agrees.
+        assessment: SiblingAssessment | None = None
+        sibling = _resolved_sibling(job)
+        if sibling is not None and sibling.book is not None:
+            assessment = _assess_sibling_book(
+                signals=signals, sibling=sibling, book=sibling.book, top_candidate=top_candidate
             )
-            _finalize_source_cleanup(job, verified)
-            if not verified:
-                raise RuntimeError("archive verification failed")
-            job.state = ImportJob.State.LOW_CONFIDENCE
-            job.save(
-                update_fields=[
-                    "state",
-                    "storage_identifier",
-                    "storage_location_id",
-                    "updated_at",
-                ],
-            )
+            _record_sibling_evidence(job, assessment)
+
+        if assessment is not None:
+            # Accepted: join the sibling's Book. Rejected: the evidence conflicts with
+            # it, so a human decides even if a provider candidate scored high.
+            needs_review = not assessment.accepted
+        else:
+            needs_review = top_candidate is None or top_candidate.score < AUTO_ACCEPT_SCORE
+        if needs_review:
+            _archive_for_review(job, candidates)
             return
 
         job.state = ImportJob.State.MATCHED
@@ -1419,48 +1846,52 @@ def process_import_job(job_id: str) -> None:
         if not verified:
             raise RuntimeError("archive verification failed")
 
-        book = _provision_book_from_metadata(
-            candidate=top_candidate,
-            fallback_title=top_candidate.title,
-            extra_metadata=metadata,
-        )
-        job.storage_identifier = destination
-        job.storage_location = storage_location
-        job.normalized_filename = normalize_filename(
-            f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
-        )
-        variant = FileVariant.objects.create(
-            book=book,
-            format=detected_format,
-            mime_type=mime_type,
-            original_filename=job.original_filename,
-            storage_location=storage_location,
-            storage_identifier=destination,
-            size_bytes=job.size_bytes,
-            sha256=job.sha256,
-            source_type=variant_source_type_for_job(job),
-            uploader=job.uploader,
-            imported_at=timezone.now(),
-            processing_state=FileVariant.ProcessingState.COMPLETE,
-        )
-        _try_extract_front_cover(variant, job)
-
-        job.book = book
-        job.file_variant = variant
-        job.storage_location = storage_location
-        job.storage_identifier = destination
-        job.state = ImportJob.State.COMPLETE
-        job.save(
-            update_fields=[
-                "state",
-                "book_id",
-                "file_variant_id",
-                "storage_location_id",
-                "storage_identifier",
-                "normalized_filename",
-                "updated_at",
-            ],
-        )
+        with _sibling_group_lock(job):
+            book: Book | None = assessment.book if assessment is not None else None
+            if book is None and _groups_sibling_formats(job):
+                # A sibling may have been linked while this file was being archived.
+                late = _resolved_sibling(job)
+                if late is not None and late.book is not None:
+                    late_assessment = _assess_sibling_book(
+                        signals=signals, sibling=late, book=late.book, top_candidate=top_candidate
+                    )
+                    _record_sibling_evidence(job, late_assessment)
+                    if not late_assessment.accepted:
+                        _create_review_task(job=job, candidates=candidates)
+                        job.storage_identifier = destination
+                        job.storage_location = storage_location
+                        job.state = ImportJob.State.LOW_CONFIDENCE
+                        job.save(
+                            update_fields=[
+                                "state",
+                                "storage_identifier",
+                                "storage_location_id",
+                                "updated_at",
+                            ],
+                        )
+                        return
+                    assessment = late_assessment
+                    book = late.book
+            if book is None:
+                assert top_candidate is not None
+                book = _provision_book_from_metadata(
+                    candidate=top_candidate,
+                    fallback_title=top_candidate.title,
+                    extra_metadata=metadata,
+                )
+            _complete_with_book(
+                job, book, destination=destination, storage_location=storage_location
+            )
+            if assessment is not None:
+                logger.info(
+                    "intake_linked_format_sibling",
+                    import_job_id=str(job.id),
+                    sibling_import_job_id=str(assessment.sibling.id),
+                    book_id=book.pk,
+                    score=assessment.score,
+                    from_review=False,
+                )
+            _propagate_book_to_siblings(job, book)
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
         job.last_error = str(exc)
         job.state = ImportJob.State.FAILED

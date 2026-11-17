@@ -56,6 +56,16 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Added to an already linked Book's score when the file is another format of it (same
+# source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
+# title (0.55) it clears auto-accept; alone it does not (#39).
+SIBLING_FORMAT_BONUS = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS",
+    0.35,
+)
+# Title similarity above which two candidates may describe the same book.
+SAME_BOOK_TITLE_MIN_SCORE = 0.9
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -820,3 +830,30 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+def score_candidate(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> IdentificationCandidate:
+    """Score any candidate (e.g. an existing library Book) with the provider scorer."""
+    return _apply_scoring(signals, candidate)
+
+
+def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> bool:
+    """Whether two candidates describe the same book.
+
+    Shared ISBN, or near-equal titles with compatible authors (authors are only
+    compared when both sides list some).
+    """
+    left_isbns = {value for value in (left.isbn10, left.isbn13) if value}
+    right_isbns = {value for value in (right.isbn10, right.isbn13) if value}
+    expanded_left = {isbn for value in left_isbns for isbn in normalize_isbns(value)}
+    expanded_right = {isbn for value in right_isbns for isbn in normalize_isbns(value)}
+    if expanded_left & expanded_right:
+        return True
+    if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
+        return False
+    if left.authors and right.authors:
+        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+    return True
