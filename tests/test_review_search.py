@@ -601,6 +601,11 @@ class _CapturingQueue:
         function(*args, **kwargs)
 
 
+def _query_titles(candidate: MetadataCandidate) -> Any:
+    assert candidate.search is not None
+    return candidate.search.query["title_hints"]
+
+
 class _CallbackProvider(_RecordingProvider):
     """Runs ``on_search`` while "the providers are running" (first call only)."""
 
@@ -650,7 +655,7 @@ def test_superseded_queue_entry_delivered_late_cannot_publish(
 
     assert [call["title"] for call in provider.calls] == ["New Terms"]  # old never ran
     current = _current(import_job)
-    assert [candidate.search.query["title_hints"] for candidate in current] == [["New Terms"]]
+    assert [_query_titles(candidate) for candidate in current] == [["New Terms"]]
     old_job.refresh_from_db()
     assert old_job.state == ProcessingJob.JobState.FAILED
     assert not MetadataSearch.objects.filter(processing_job_id=old_job.job_id).exists()
@@ -770,7 +775,7 @@ def test_superseded_scan_queue_entry_cannot_publish(
     queue.deliver(0)
 
     current = list(scan_job.metadata_candidates.filter(superseded_at__isnull=True))
-    assert [candidate.search.query["title_hints"] for candidate in current] == [["New Scan"]]
+    assert [_query_titles(candidate) for candidate in current] == [["New Scan"]]
     old_job.refresh_from_db()
     assert old_job.state == ProcessingJob.JobState.FAILED
     assert not MetadataSearch.objects.filter(processing_job_id=old_job.job_id).exists()
