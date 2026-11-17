@@ -23,7 +23,8 @@
       Category<input name="category" value="{{ filters.category }}">
     </label>
     <label>
-      Genre<input name="genre" value="{{ filters.genre }}">
+      Genre<input name="genre" value="{{ filters.genre }}" list="genre-options">
+      <datalist id="genre-options">{% for genre in all_genres %}<option value="{{ genre.name }}">{% endfor %}</datalist>
     </label>
     <label>
       Language<input name="language" value="{{ filters.language }}">
@@ -49,9 +50,9 @@
   </div>
   {% if page_object.paginator.num_pages > 1 %}
     <nav class="pagination" aria-label="Pagination">
-      {% if page_object.has_previous %}<a href="?view=html&q={{ filters.q|urlencode }}&page={{ page_object.previous_page_number }}">Previous</a>{% endif %}
+      {% if page_object.has_previous %}<a href="?view=html&amp;{{ filter_query }}&amp;page={{ page_object.previous_page_number }}">Previous</a>{% endif %}
       <span>Page {{ page_object.number }} of {{ page_object.paginator.num_pages }}</span>
-      {% if page_object.has_next %}<a href="?view=html&q={{ filters.q|urlencode }}&page={{ page_object.next_page_number }}">Next</a>{% endif %}
+      {% if page_object.has_next %}<a href="?view=html&amp;{{ filter_query }}&amp;page={{ page_object.next_page_number }}">Next</a>{% endif %}
     </nav>
   {% endif %}
 {% endblock %}
