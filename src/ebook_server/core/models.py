@@ -114,6 +114,17 @@ class StorageLocation(models.Model):
             "default archive location instead."
         ),
     )
+    sentinel_file = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "Read-only locations: a file name, relative to the base path, that must exist "
+            "for the share to count as mounted (for example .ebook-index-sentinel). While "
+            "it is absent, drift checks report a storage outage and flag nothing. Left "
+            "empty, an empty base directory (a bare mount point) counts as unmounted."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -810,6 +821,7 @@ class ProcessingJob(models.Model):
         REVIEW_IDENTIFICATION = "review_identification", "Review identification"
         SCAN_IDENTIFICATION = "scan_identification", "Scan identification"
         SCAN_FINALIZATION = "scan_finalization", "Scan finalization"
+        REFERENCE_CHECK = "reference_check", "Referenced file check"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"

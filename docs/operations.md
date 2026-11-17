@@ -468,6 +468,7 @@ timer or cron, e.g. hourly; `--verify-hashes` off peak):
 ```bash
 uv run python manage.py check_referenced_files
 uv run python manage.py check_referenced_files --verify-hashes --json
+uv run python manage.py check_referenced_files --location source-3
 ```
 
 Files whose size or mtime changed are re-hashed: identical content stays served
@@ -475,13 +476,40 @@ Files whose size or mtime changed are re-hashed: identical content stays served
 file `missing` (`FileVariant.reference_state`). Every download, conversion and OCR
 request also compares size/mtime first and flags on mismatch. Flagged variants
 return HTTP 409 for downloads and are refused as conversion/OCR sources; they are
-never deleted. The command exits non-zero when it finds drift. If the share is not
-mounted it reports an error and flags nothing.
+never deleted. The command exits non-zero when it finds drift or an outage.
+
+**Mount readiness.** An unmounted share usually still leaves its mount point as an
+(empty) directory, so "the directory exists" proves nothing. Before checking any
+variant on a read-only location, the check requires:
+
+- the base directory to exist, and
+- the location's `sentinel_file` (set it in admin, `Storage locations`) to exist
+  under the base path, or, when no sentinel is configured, the base directory to be
+  non-empty.
+
+Configure a sentinel for every index share (e.g. create an empty
+`.ebook-index-sentinel` at the share root and enter that name): it also catches a
+mount point that has stray local files in it. A location that fails this check is
+an **outage**: nothing on it is flagged, its variants are reported as errors and
+listed as `UNAVAILABLE storage_location:<identifier>`, a
+`referenced_storage_unavailable` error is logged, and a queued check job ends
+`failed` (`ebook_server_processing_jobs{job_type="reference_check",state="failed"}`).
+A download or conversion that finds the file absent applies the same test, so it
+is refused (409) without flagging during an outage.
+
+**Re-checking from the admin.** The admin actions never check files in the web
+request (a check stats and may re-hash every file). "Queue re-check of selected
+referenced files" (`File variants`) and "Queue re-check of all referenced files on
+selected locations" (`Storage locations`) record a `reference_check`
+`ProcessingJob` scoped to the selection and hand it to the RQ worker; the message
+links the job, whose `details` hold the report (counts, affected variant ids)
+once it finishes. Without a configured queue the job stays `queued`; run
+`uv run python manage.py check_referenced_files --run-queued` to process it.
 
 Resolve flagged variants in Django admin (`File variants`, filter by reference
-state): restore the original file and run "Re-check referenced files", or delete
-the stale variant record and re-run `ingest_sources` so the new file is indexed as
-a new variant. A changed file at an already indexed path is not silently repointed;
+state): restore the original file and queue a re-check, or delete the stale
+variant record and re-run `ingest_sources` so the new file is indexed as a new
+variant. A changed file at an already indexed path is not silently repointed;
 its import fails with a message pointing at the drift check until the old record
 is resolved. `ebook_server_referenced_file_variants{reference_state=...}` exports
 the counts for alerting.
