@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from django.conf import settings
-from django.db.models import Count, Exists, OuterRef
+from django.db.models import Count, Exists, Min, OuterRef
 from django.utils import timezone
 from prometheus_client.core import GaugeMetricFamily
 from redis import Redis
@@ -105,6 +105,23 @@ class PersistentStateCollector:
             .count(),
         )
         yield library
+
+        # Search rows are written after commit, so nothing is normally pending; a book
+        # without a row means indexing failed. Its age is the index lag (#28).
+        oldest_unindexed = Book.objects.filter(search_document__isnull=True).aggregate(
+            oldest=Min("updated_at")
+        )["oldest"]
+        lag = GaugeMetricFamily(
+            "ebook_server_search_index_lag_seconds",
+            "Age of the oldest book that has no search row (0 when the index is complete).",
+        )
+        lag.add_metric(
+            [],
+            max(0.0, (timezone.now() - oldest_unindexed).total_seconds())
+            if oldest_unindexed
+            else 0.0,
+        )
+        yield lag
 
         yield _group_count_metrics(
             name="ebook_server_processing_jobs",

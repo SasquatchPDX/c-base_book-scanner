@@ -631,6 +631,9 @@ still works for one release and answers with a `Deprecation: true` header.
 Global facet counts and the unfiltered total are cached for up to five minutes.
 Search logs record the backend, sort, result count and duration, never the
 query text.
+`ebook_server_search_index_lag_seconds` (age of the oldest book without a search
+row) and `ebook_server_library_derived_rows_missing{kind="search_documents"}`
+should stay at 0; anything else means indexing failed for those books.
 
 ### Landing page and author index
 

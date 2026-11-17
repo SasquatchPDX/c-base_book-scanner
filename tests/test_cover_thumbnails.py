@@ -349,3 +349,4 @@ def test_metrics_report_missing_thumbnails_and_search_rows() -> None:
 
     assert 'ebook_server_library_derived_rows_missing{kind="cover_thumbnails"} 1.0' in body
     assert 'ebook_server_library_derived_rows_missing{kind="search_documents"}' in body
+    assert "ebook_server_search_index_lag_seconds " in body
