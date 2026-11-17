@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
+import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +21,7 @@ from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
 from rapidfuzz.utils import default_process
 
-from .rate_limit import throttle_provider
+from .rate_limit import RateLimitWaitExceeded, throttle_provider
 
 logger = structlog.get_logger(__name__)
 
@@ -59,6 +60,16 @@ REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.
 # Candidates scoring within this margin of the best one are treated as tied when
 # choosing a candidate to accept automatically.
 TIE_MARGIN = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN", 0.02)
+# Added to an already linked Book's score when the file is another format of it (same
+# source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
+# title (0.55) it clears auto-accept; alone it does not (#39).
+SIBLING_FORMAT_BONUS = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS",
+    0.35,
+)
+# Title similarity above which two candidates may describe the same book.
+SAME_BOOK_TITLE_MIN_SCORE = 0.9
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -79,6 +90,64 @@ class MetadataProvider(Protocol):
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return raw candidate dicts from external metadata source."""
+
+
+class ProviderRequestError(OSError):
+    """A metadata provider could not answer the request.
+
+    Distinct from "no results": the provider timed out, was unreachable, answered
+    with an HTTP error, rate limited us or returned a malformed response. ``reason``
+    is a short, safe description (never a URL, query string or credential), shown
+    to reviewers and recorded on the search run.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def describe_provider_error(exc: BaseException) -> str:
+    """Short, credential-free reason for a provider failure, for reviewers and logs."""
+    if isinstance(exc, ProviderRequestError):
+        return exc.reason
+    if isinstance(exc, RateLimitWaitExceeded):
+        return "rate limited (local request budget exhausted)"
+    if isinstance(exc, HTTPError):
+        if exc.code == 429:
+            return "rate limited (HTTP 429)"
+        return f"HTTP {exc.code}"
+    if isinstance(exc, URLError):
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return "timed out"
+        return "unreachable"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timed out"
+    if isinstance(exc, (UnicodeDecodeError, json.JSONDecodeError)):
+        return "malformed response"
+    if isinstance(exc, OSError) and type(exc).__name__.endswith("ProviderError"):
+        # Provider-specific errors (e.g. Hardcover's) promise credential-free messages.
+        return str(exc)[:200] or type(exc).__name__
+    return type(exc).__name__
+
+
+@dataclass(frozen=True)
+class ProviderOutcome:
+    """What one provider did during one search run."""
+
+    provider_id: str
+    status: str  # "results" | "no_results" | "error"
+    result_count: int
+    duration_seconds: float
+    error: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "status": self.status,
+            "result_count": self.result_count,
+            "duration_seconds": round(self.duration_seconds, 3),
+            "error": self.error,
+        }
 
 
 @dataclass(frozen=True)
@@ -245,6 +314,11 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+# Evidence key holding hints from the source's configured folder layout (#35); written
+# by intake from ``core.source_layout``, read here when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -267,6 +341,10 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    title_hints, author_hints = _apply_path_layout_hints(
+        extracted_metadata, list(title_hints), list(author_hints)
+    )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -297,6 +375,45 @@ def build_identification_input(
     )
 
 
+def _apply_path_layout_hints(
+    extracted_metadata: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge folder-layout hints (evidence, not truth) into the title/author hints.
+
+    A layout title goes after an embedded title (usually the best signal) and before
+    the raw filename guesses. A layout author replaces the filename "A - B" split
+    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    """
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if not isinstance(layout, dict):
+        return title_hints, author_hints
+
+    metadata_title = extracted_metadata.get("title")
+    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
+    layout_title = layout.get("title")
+    if isinstance(layout_title, str) and layout_title.strip():
+        title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
+
+    raw_layout_authors = layout.get("authors")
+    layout_authors = [
+        author.strip()
+        for author in (raw_layout_authors if isinstance(raw_layout_authors, list) else [])
+        if isinstance(author, str) and author.strip()
+    ]
+    if layout_authors:
+        raw_embedded = extracted_metadata.get("authors")
+        embedded = [
+            author.strip()
+            for author in (raw_embedded if isinstance(raw_embedded, list) else [])
+            if isinstance(author, str) and author.strip()
+        ]
+        known = {normalize_text(author) for author in embedded}
+        author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+    return title_hints, author_hints
+
+
 class OpenLibraryMetadataProvider:
     """Public Open Library metadata provider (primary external source)."""
 
@@ -310,8 +427,15 @@ class OpenLibraryMetadataProvider:
         isbn: str | None = None,
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
+        isbn_error: ProviderRequestError | None = None
         if isbn:
-            isbn_candidate = self._query_isbn(isbn)
+            try:
+                isbn_candidate = self._query_isbn(isbn)
+            except ProviderRequestError as exc:
+                # Still try the text search; the failure is reported only if that
+                # finds nothing either, so it is never mistaken for "no results".
+                isbn_error = exc
+                isbn_candidate = None
             if isbn_candidate:
                 return [isbn_candidate]
 
@@ -321,21 +445,24 @@ class OpenLibraryMetadataProvider:
         if not query_parts and folder_hint:
             query_parts = [folder_hint]
         if not query_parts:
+            if isbn_error is not None:
+                raise isbn_error
             return []
-        return self._query_search(" ".join(query_parts))
+        hits = self._query_search(" ".join(query_parts))
+        if not hits and isbn_error is not None:
+            raise isbn_error
+        return hits
 
     def _query_isbn(self, isbn: str) -> dict[str, Any] | None:
         url = f"https://openlibrary.org/isbn/{isbn}.json"
         try:
             payload = self._get_json(url)
+        except HTTPError as exc:
+            if exc.code == 404:  # unknown ISBN: a genuine miss, not a failure
+                return None
+            raise self._request_error("isbn", exc) from exc
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="isbn",
-                error_type=type(exc).__name__,
-            )
-            return None
+            raise self._request_error("isbn", exc) from exc
         if not isinstance(payload, dict):
             return None
         payload = dict(payload)
@@ -401,15 +528,22 @@ class OpenLibraryMetadataProvider:
         try:
             payload = self._get_json(url)
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="search",
-                error_type=type(exc).__name__,
-            )
-            return []
-        docs = payload.get("docs", []) if isinstance(payload, dict) else []
-        return docs if isinstance(docs, list) else []
+            raise self._request_error("search", exc) from exc
+        docs = payload.get("docs", []) if isinstance(payload, dict) else None
+        if not isinstance(docs, list):
+            raise self._request_error("search", ProviderRequestError("malformed response"))
+        return [doc for doc in docs if isinstance(doc, dict)]
+
+    def _request_error(self, operation: str, exc: BaseException) -> ProviderRequestError:
+        reason = describe_provider_error(exc)
+        logger.warning(
+            "metadata_provider_request_failed",
+            provider_id=self.provider_id,
+            operation=operation,
+            error_type=type(exc).__name__,
+            reason=reason,
+        )
+        return ProviderRequestError(reason)
 
     def _get_json(self, url: str) -> Any:
         user_agent = str(
@@ -490,24 +624,60 @@ def _provider_instances() -> list[MetadataProvider]:
 
 
 def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandidate]:
+    candidates, _outcomes = resolve_candidates_with_report(signals)
+    return candidates
+
+
+def resolve_candidates_with_report(
+    signals: IdentificationInput,
+) -> tuple[list[IdentificationCandidate], list[ProviderOutcome]]:
+    """Ranked candidates plus what every configured provider did.
+
+    A failing provider never aborts the run: it is reported as ``error`` with a
+    short reason, so a reviewer can tell "the provider was down" from "no match".
+    """
     raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
+    outcomes: list[ProviderOutcome] = []
     for provider in _provider_instances():
         started_at = perf_counter()
         try:
             raw_list = _query_provider(provider, signals)
         except Exception as exc:  # provider boundary: one provider must not abort intake
-            logger.exception(
+            duration = perf_counter() - started_at
+            reason = describe_provider_error(exc)
+            # Network-level failures are expected; only unexpected ones need a traceback.
+            log = logger.warning if isinstance(exc, OSError) else logger.exception
+            log(
                 "metadata_provider_failed",
                 provider_id=provider.provider_id,
-                duration_seconds=perf_counter() - started_at,
+                duration_seconds=duration,
                 error_type=type(exc).__name__,
+                reason=reason,
+            )
+            outcomes.append(
+                ProviderOutcome(
+                    provider_id=provider.provider_id,
+                    status="error",
+                    result_count=0,
+                    duration_seconds=duration,
+                    error=reason,
+                )
             )
             continue
+        duration = perf_counter() - started_at
         logger.info(
             "metadata_provider_completed",
             provider_id=provider.provider_id,
             candidate_count=len(raw_list),
-            duration_seconds=perf_counter() - started_at,
+            duration_seconds=duration,
+        )
+        outcomes.append(
+            ProviderOutcome(
+                provider_id=provider.provider_id,
+                status="results" if raw_list else "no_results",
+                result_count=len(raw_list),
+                duration_seconds=duration,
+            )
         )
         for candidate in raw_list:
             raw_candidates.append((provider, candidate))
@@ -517,7 +687,7 @@ def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandi
         normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
 
     normalized.sort(key=lambda item: item.score, reverse=True)
-    return normalized
+    return normalized, outcomes
 
 
 def _query_provider(
@@ -930,3 +1100,30 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+def score_candidate(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> IdentificationCandidate:
+    """Score any candidate (e.g. an existing library Book) with the provider scorer."""
+    return _apply_scoring(signals, candidate)
+
+
+def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> bool:
+    """Whether two candidates describe the same book.
+
+    Shared ISBN, or near-equal titles with compatible authors (authors are only
+    compared when both sides list some).
+    """
+    left_isbns = {value for value in (left.isbn10, left.isbn13) if value}
+    right_isbns = {value for value in (right.isbn10, right.isbn13) if value}
+    expanded_left = {isbn for value in left_isbns for isbn in normalize_isbns(value)}
+    expanded_right = {isbn for value in right_isbns for isbn in normalize_isbns(value)}
+    if expanded_left & expanded_right:
+        return True
+    if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
+        return False
+    if left.authors and right.authors:
+        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+    return True

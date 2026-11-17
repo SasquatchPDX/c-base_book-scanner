@@ -51,7 +51,8 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
 }
 
 DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
-    "page_split": "splitter-v1",
+    # v2: a single-page capture layout records a "no split" passthrough (#55).
+    "page_split": "splitter-v2",
     "deskew": "projection-v1",
     "select_content": "projection-v1",
     "margins": "padding-v1",
@@ -894,18 +895,122 @@ def _auto_split_position(
     return result.x
 
 
+SPLIT_MODES: Final[frozenset[str]] = frozenset({"auto", "manual", "single", "none"})
+SINGLE_PAGE_SPLIT_ALGORITHM: Final[str] = "single_page_passthrough"
+SINGLE_PAGE_SPLIT_REASON: Final[str] = (
+    "single-page capture layout: the image already holds exactly one page, no split"
+)
+# Recorded by a split run; dropped when another mode runs so none of them goes stale.
+_SPLIT_RESULT_KEYS: Final[tuple[str, ...]] = (
+    "algorithm",
+    "split_skipped",
+    "split_skipped_reason",
+    "capture_layout",
+    "resolved_split_x",
+    "resolved_width",
+    "split_confidence",
+    "split_method",
+)
+
+
+def _capture_layout(state: ScanTailorStageState) -> str:
+    """The capture layout of the state's scan job (#55).
+
+    A state that is not attached to a saved job (direct unit-level runs) keeps the
+    gutter-detecting behaviour, i.e. it is treated as ``spread``.
+    """
+    if state.scan_job_id is None:
+        return str(ScanJob.CaptureLayout.SPREAD)
+    return str(state.scan_job.capture_layout)
+
+
+def default_split_mode(capture_layout: str) -> str:
+    """Page Split mode used when a page has no explicit ``split_mode`` (#55)."""
+    return "none" if capture_layout == ScanJob.CaptureLayout.SINGLE_PAGE else "auto"
+
+
+def _explicit_split_mode(parameters: dict[str, Any] | None) -> str | None:
+    raw = (parameters or {}).get("split_mode")
+    if raw is None:
+        return None
+    mode = str(raw).strip().lower()
+    return mode if mode in SPLIT_MODES else None
+
+
+def effective_split_mode(state: ScanTailorStageState) -> str:
+    """The split mode a Page Split run of ``state`` uses."""
+    return _explicit_split_mode(state.parameters) or default_split_mode(_capture_layout(state))
+
+
+def split_algorithm_for_mode(split_mode: str) -> str:
+    """Stage ``algorithm`` recorded for a Page Split mode."""
+    if split_mode == "none":
+        return SINGLE_PAGE_SPLIT_ALGORITHM
+    if split_mode == "manual":
+        return "manual_split"
+    return "auto_split"
+
+
+def is_auto_skipped_split(state: ScanTailorStageState) -> bool:
+    """True for a Page Split stage that completed as a recorded "no split" passthrough."""
+    return (
+        state.stage == ScanTailorStageState.Stage.PAGE_SPLIT.value
+        and state.status == ScanTailorStageState.StageStatus.SUCCESS
+        and (state.parameters or {}).get("resolved_split_mode") == "none"
+    )
+
+
+def _run_single_page_split(
+    state: ScanTailorStageState,
+    parameters: dict[str, Any],
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+) -> dict[str, Any]:
+    """Record Page Split as "no split": the input is copied through unchanged.
+
+    Uses the shared passthrough helper (#54): a normalised PNG input is byte-copied,
+    anything else is normalised once, and no gutter detection runs. The stage still
+    gets its own output artifact, checksum and provenance, so downstream stages and
+    their invalidation behave exactly as after a real split.
+    """
+    image = _load_image(source_path)
+    _write_unchanged(image, source_path, output_path, preview_path)
+    recorded = {
+        key: value
+        for key, value in parameters.items()
+        if key not in _SPLIT_RESULT_KEYS and key != "split_x"
+    }
+    recorded.update(
+        {
+            "split_mode": "none",
+            "resolved_split_mode": "none",
+            "resolved_split_side": "single",
+            "algorithm": SINGLE_PAGE_SPLIT_ALGORITHM,
+            "split_skipped": True,
+            "split_skipped_reason": SINGLE_PAGE_SPLIT_REASON,
+            "capture_layout": _capture_layout(state),
+            "source_width": image.width,
+            "source_height": image.height,
+        },
+    )
+    return recorded
+
+
 def _run_page_split(
     state: ScanTailorStageState,
     source_path: Path,
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
-    source = _load_image(source_path)
-
     parameters = dict(state.parameters or {})
-    split_mode = str(parameters.get("split_mode", "auto")).strip().lower()
-    if split_mode not in {"auto", "manual", "single"}:
-        split_mode = "auto"
+    split_mode = effective_split_mode(state)
+    if split_mode == "none":
+        return _run_single_page_split(state, parameters, source_path, output_path, preview_path)
+    for key in _SPLIT_RESULT_KEYS:
+        parameters.pop(key, None)
+
+    source = _load_image(source_path)
     side = state.scan_page.side
 
     dpi = _dpi_of(source)
@@ -2412,6 +2517,7 @@ _STAGE_RUNNERS: dict[
         "copy": _run_copy,
         "auto_split": _run_page_split,
         "manual_split": _run_page_split,
+        SINGLE_PAGE_SPLIT_ALGORITHM: _run_page_split,
     },
     ScanTailorStageState.Stage.DESKEW.value: {
         "copy": _run_copy,
@@ -2480,7 +2586,17 @@ def request_stage_job(
     *,
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
+    automatic: bool = False,
 ) -> ProcessingJob:
+    """Create and dispatch the worker job for ``state`` at its current revision.
+
+    The job records the stage revision it was dispatched for (``stage_revision``) and
+    only takes over the stage's ``worker_job_id`` while the row is still at that
+    revision. If an edit bumped the revision in between, the job is closed as
+    superseded right away and never dispatched, so it cannot replace the newer
+    edit's artifact; :func:`process_stage_job` repeats the check on execution.
+    """
+    revision = state.revision
     job = ProcessingJob.objects.create(
         job_type=ProcessingJob.JobType.STAGE,
         state=ProcessingJob.JobState.QUEUED,
@@ -2489,28 +2605,164 @@ def request_stage_job(
             "scan_tailor_stage_state_id": state.id,
             "requested_by_user_id": requested_by_user_id,
             "stage": state.stage,
+            "stage_revision": revision,
+            "automatic": automatic,
         },
     )
+    algorithm = state.algorithm or _default_algorithm(state.stage)
+    algorithm_version = state.algorithm_version or _default_algorithm_version(state.stage)
+    now = timezone.now()
+    claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(
+        worker_job_id=str(job.job_id),
+        status=ScanTailorStageState.StageStatus.QUEUED,
+        algorithm=algorithm,
+        algorithm_version=algorithm_version,
+        last_error="",
+        invalidated_reason="",
+        updated_at=now,
+    )
+    if not claimed:
+        _supersede_stage_job(job, dict(job.details), "stage revision changed before dispatch")
+        return job
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
     state.invalidated_reason = ""
-    if not state.algorithm:
-        state.algorithm = _default_algorithm(state.stage)
-    if not state.algorithm_version:
-        state.algorithm_version = _default_algorithm_version(state.stage)
-    state.save(
-        update_fields=[
-            "worker_job_id",
-            "status",
-            "algorithm",
-            "algorithm_version",
-            "last_error",
-            "invalidated_reason",
-            "updated_at",
-        ],
-    )
+    state.algorithm = algorithm
+    state.algorithm_version = algorithm_version
+    state.updated_at = now
     dispatch_stage_job(str(job.job_id))
+    return job
+
+
+def _claim_automatic_single_page_split(
+    state: ScanTailorStageState,
+    observed_revision: int,
+) -> ScanTailorStageState | None:
+    """Atomically move an auto-owned Page Split stage to a new "no split" revision.
+
+    The decision is taken on the row as it is *now*, under a row lock, and the write
+    is conditional on the revision observed before the lock. Any edit that landed in
+    between (a manual split, a batch apply, another passthrough) bumped the revision,
+    so automation loses the race and changes nothing: the concurrent edit wins.
+    Returns the updated state, or ``None`` when automation must stay out.
+    """
+    with transaction.atomic():
+        locked = (
+            ScanTailorStageState.objects.select_for_update()
+            .select_related("scan_job")
+            .filter(id=state.id)
+            .first()
+        )
+        if locked is None or locked.revision != observed_revision:
+            return None
+        if effective_split_mode(locked) != "none":
+            return None
+        parameters = dict(locked.parameters or {})
+        parameters["split_mode"] = "none"
+        algorithm = split_algorithm_for_mode("none")
+        new_revision = observed_revision + 1
+        now = timezone.now()
+        updated = ScanTailorStageState.objects.filter(
+            id=locked.id,
+            revision=observed_revision,
+        ).update(
+            parameters=parameters,
+            algorithm=algorithm,
+            revision=new_revision,
+            status=ScanTailorStageState.StageStatus.QUEUED,
+            last_error="",
+            updated_at=now,
+        )
+        if not updated:
+            return None
+        # A new page version has normally invalidated everything already ("source
+        # changed"); keep that reason and only catch stages that are still current.
+        ScanTailorStageState.objects.filter(
+            scan_job_id=locked.scan_job_id,
+            scan_page_id=locked.scan_page_id,
+            stage__in=downstream_stages(locked.stage),
+        ).exclude(status=ScanTailorStageState.StageStatus.INVALIDATED).update(
+            status=ScanTailorStageState.StageStatus.INVALIDATED,
+            invalidated_reason="page_split updated",
+            last_error="",
+            updated_at=now,
+        )
+    locked.parameters = parameters
+    locked.algorithm = algorithm
+    locked.revision = new_revision
+    locked.status = ScanTailorStageState.StageStatus.QUEUED
+    locked.last_error = ""
+    locked.updated_at = now
+    return locked
+
+
+def auto_complete_single_page_split(
+    page: ScanPage,
+    *,
+    requested_by_user_id: int | None = None,
+) -> ProcessingJob | None:
+    """Queue the recorded "no split" Page Split run for a page of a single-page job (#55).
+
+    Called when a new page version arrives. In a ``single_page`` job Page Split needs
+    no human input, so it completes on its own as a background passthrough job. A
+    page whose split was switched to another mode (manual/auto/single) is a per-page
+    override and is left for the user to re-run. Returns the queued job, or ``None``
+    when nothing was queued.
+
+    Concurrency: automation never wins against a user. The mode/revision decision is
+    a locked, revision-conditional update (:func:`_claim_automatic_single_page_split`),
+    and the dispatched job only runs while the stage is still at the revision it was
+    queued for, so a manual edit that interleaves at any point keeps its parameters,
+    its revision and its artifact.
+    """
+    if page.scan_job.capture_layout != ScanJob.CaptureLayout.SINGLE_PAGE:
+        return None
+    observed = get_or_create_stage_state(
+        scan_job_id=str(page.scan_job_id),
+        page_id=str(page.id),
+        stage=ScanTailorStageState.Stage.PAGE_SPLIT.value,
+    )
+    if effective_split_mode(observed) != "none":
+        return None
+    state = _claim_automatic_single_page_split(observed, observed.revision)
+    if state is None:
+        logger.info(
+            "scantailor_auto_split_skipped_concurrent_edit",
+            scan_job_id=str(page.scan_job_id),
+            scan_page_id=str(page.id),
+            observed_revision=observed.revision,
+        )
+        return None
+    try:
+        job = request_stage_job(
+            state=state,
+            requested_by_user_id=requested_by_user_id,
+            automatic=True,
+        )
+    except Exception as exc:  # the page upload itself must still succeed
+        logger.warning(
+            "scantailor_auto_split_dispatch_failed",
+            scan_job_id=str(page.scan_job_id),
+            scan_page_id=str(page.id),
+            error=str(exc),
+        )
+        now = timezone.now()
+        message = f"automatic page split could not be queued: {exc}"
+        if state.worker_job_id:
+            ProcessingJob.objects.filter(
+                job_id=state.worker_job_id,
+                state=ProcessingJob.JobState.QUEUED,
+            ).update(state=ProcessingJob.JobState.FAILED, finished_at=now)
+        ScanTailorStageState.objects.filter(id=state.id, revision=state.revision).update(
+            status=ScanTailorStageState.StageStatus.FAILED,
+            last_error=message,
+            updated_at=now,
+        )
+        return None
+    details = job.details if isinstance(job.details, dict) else {}
+    if details.get("superseded"):
+        return None
     return job
 
 
@@ -2561,6 +2813,16 @@ def process_stage_job(job_id: str) -> None:
     )
     if state is None:
         _fail_stage_job(job, f"stage state not found: {stage_state_id}")
+        return
+
+    # A job only ever produces the artifact of the revision it was queued for. A late
+    # job (e.g. an automatic passthrough overtaken by a manual edit) is a no-op.
+    dispatched_revision = details.get("stage_revision")
+    if isinstance(dispatched_revision, int) and dispatched_revision != state.revision:
+        _supersede_stage_job(job, details, "stage revision changed after dispatch")
+        return
+    if details.get("automatic") is True and effective_split_mode(state) != "none":
+        _supersede_stage_job(job, details, "stage is no longer an automatic passthrough")
         return
 
     if state.input_stage_state is not None:
