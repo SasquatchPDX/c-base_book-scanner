@@ -235,6 +235,8 @@ AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+# Bound for short OPF evidence values (publisher, date) copied into job evidence.
+MAX_EPUB_TEXT_FIELD = 255
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -284,6 +286,9 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# The provider record stands for another edition than the file: its ISBNs, language or
+# publisher contradict the file's (see identification.edition_conflicts).
+BLOCK_EDITION_CONFLICT = "edition_conflict"
 
 
 @dataclass(frozen=True)
@@ -311,13 +316,18 @@ def _block_details(
 def decide_auto_accept(
     candidates: list[identification.IdentificationCandidate],
     file_authors: list[str],
+    *,
+    file_evidence: identification.IdentificationInput,
 ) -> AutoAcceptDecision:
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
-    is no evidence about authorship.
+    is no evidence about authorship. Finally the candidate must be the file's edition:
+    ``file_evidence`` (the normalised file signals) is checked with
+    ``identification.edition_conflicts``, so a file ISBN must be one of the edition's
+    own ISBNs and the file's language/publisher must not contradict the edition's.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
@@ -336,6 +346,17 @@ def decide_auto_accept(
             candidate=None,
             blocked_reason=BLOCK_AUTHOR_CONFLICT,
             details=_block_details(top, file_authors),
+        )
+    conflicts = identification.edition_conflicts(top, file_evidence)
+    if conflicts:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_EDITION_CONFLICT,
+            details={
+                **_block_details(top, file_authors),
+                "edition_conflicts": conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            },
         )
     return AutoAcceptDecision(candidate=top)
 
@@ -1620,6 +1641,9 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         authors = _epub_creator_authors(opf_root)
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        # Publisher and date are evidence for the publisher bonus and later review (#37).
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
         subjects = identification.normalize_subjects(
             [
                 "".join(element.itertext())
@@ -1639,6 +1663,8 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "description": description,
             "subjects": subjects,
             "identifier": identifier,
+            "publisher": publisher[:MAX_EPUB_TEXT_FIELD] if publisher else None,
+            "date": raw_date[:MAX_EPUB_TEXT_FIELD] if raw_date else None,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },
@@ -3223,7 +3249,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_job(job, update_fields=["state", "updated_at"])
         candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
-        decision = decide_auto_accept(candidates, file_authors)
+        decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
             metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
