@@ -56,6 +56,16 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Added to an already linked Book's score when the file is another format of it (same
+# source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
+# title (0.55) it clears auto-accept; alone it does not (#39).
+SIBLING_FORMAT_BONUS = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS",
+    0.35,
+)
+# Title similarity above which two candidates may describe the same book.
+SAME_BOOK_TITLE_MIN_SCORE = 0.9
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -242,6 +252,11 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+# Evidence key holding hints from the source's configured folder layout (#35); written
+# by intake from ``core.source_layout``, read here when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -264,6 +279,10 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    title_hints, author_hints = _apply_path_layout_hints(
+        extracted_metadata, list(title_hints), list(author_hints)
+    )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -292,6 +311,45 @@ def build_identification_input(
         if isinstance(extracted_metadata.get("description"), str)
         else None,
     )
+
+
+def _apply_path_layout_hints(
+    extracted_metadata: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge folder-layout hints (evidence, not truth) into the title/author hints.
+
+    A layout title goes after an embedded title (usually the best signal) and before
+    the raw filename guesses. A layout author replaces the filename "A - B" split
+    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    """
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if not isinstance(layout, dict):
+        return title_hints, author_hints
+
+    metadata_title = extracted_metadata.get("title")
+    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
+    layout_title = layout.get("title")
+    if isinstance(layout_title, str) and layout_title.strip():
+        title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
+
+    raw_layout_authors = layout.get("authors")
+    layout_authors = [
+        author.strip()
+        for author in (raw_layout_authors if isinstance(raw_layout_authors, list) else [])
+        if isinstance(author, str) and author.strip()
+    ]
+    if layout_authors:
+        raw_embedded = extracted_metadata.get("authors")
+        embedded = [
+            author.strip()
+            for author in (raw_embedded if isinstance(raw_embedded, list) else [])
+            if isinstance(author, str) and author.strip()
+        ]
+        known = {normalize_text(author) for author in embedded}
+        author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+    return title_hints, author_hints
 
 
 class OpenLibraryMetadataProvider:
@@ -343,15 +401,16 @@ class OpenLibraryMetadataProvider:
         return payload
 
     def _resolve_author_names(self, payload: dict[str, Any]) -> list[str]:
-        """Resolve edition ``authors: [{key}]`` references to names (bounded, best effort)."""
-        raw_authors = payload.get("authors")
-        if not isinstance(raw_authors, list):
-            return []
+        """Resolve an edition's author references to names (bounded, best effort).
+
+        Many edition records carry no ``authors`` at all, only ``works: [{key}]``;
+        the authors are then taken from the (first) work record.
+        """
+        keys = _open_library_author_keys(payload.get("authors"))
+        if not keys:
+            keys = self._work_author_keys(payload.get("works"))
         names: list[str] = []
-        for entry in raw_authors[:MAX_AUTHOR_LOOKUPS]:
-            key = entry.get("key") if isinstance(entry, dict) else None
-            if not isinstance(key, str) or not re.fullmatch(r"/authors/OL\d+A", key):
-                continue
+        for key in keys[:MAX_AUTHOR_LOOKUPS]:
             try:
                 author_payload = self._get_json(f"https://openlibrary.org{key}.json")
             except (OSError, ValueError) as exc:
@@ -366,6 +425,28 @@ class OpenLibraryMetadataProvider:
             if isinstance(name, str) and name.strip():
                 names.append(name.strip())
         return names
+
+    def _work_author_keys(self, works: Any) -> list[str]:
+        """Author keys of the edition's first work record (``/works/OL...W``)."""
+        if not isinstance(works, list) or not works:
+            return []
+        entry = works[0]
+        key = entry.get("key") if isinstance(entry, dict) else None
+        if not isinstance(key, str) or not re.fullmatch(r"/works/OL\d+W", key):
+            return []
+        try:
+            work_payload = self._get_json(f"https://openlibrary.org{key}.json")
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "metadata_provider_request_failed",
+                provider_id=self.provider_id,
+                operation="work",
+                error_type=type(exc).__name__,
+            )
+            return []
+        if not isinstance(work_payload, dict):
+            return []
+        return _open_library_author_keys(work_payload.get("authors"))
 
     def _query_search(self, query: str) -> list[dict[str, Any]]:
         # Open Library's default search field set omits ``subject``; request it explicitly
@@ -404,6 +485,23 @@ class OpenLibraryMetadataProvider:
                     raise
                 time.sleep(_retry_after_seconds(exc))
         raise URLError("provider rate limited")  # pragma: no cover - loop always returns/raises
+
+
+def _open_library_author_keys(raw_authors: Any) -> list[str]:
+    """Author keys from ``[{"key": ...}]`` (editions) or ``[{"author": {"key": ...}}]`` (works)."""
+    if not isinstance(raw_authors, list):
+        return []
+    keys: list[str] = []
+    for entry in raw_authors:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        nested = entry.get("author")
+        if not isinstance(key, str) and isinstance(nested, dict):
+            key = nested.get("key")
+        if isinstance(key, str) and re.fullmatch(r"/authors/OL\d+A", key) and key not in keys:
+            keys.append(key)
+    return keys
 
 
 def _retry_after_seconds(error: HTTPError) -> float:
@@ -722,6 +820,93 @@ def author_similarity(left: list[str], right: list[str]) -> float:
     return _author_match_score(left, right)
 
 
+# Creator values that say nothing about who wrote the book: office-suite and PDF
+# tool defaults, account names, and "unknown" in a few languages. Compared after
+# normalize_text().
+_PLACEHOLDER_AUTHORS = frozenset(
+    {
+        "unknown",
+        "unknown author",
+        "unbekannt",
+        "unbekannter autor",
+        "inconnu",
+        "anonymous",
+        "anonym",
+        "administrator",
+        "admin",
+        "user",
+        "owner",
+        "author",
+        "n/a",
+        "none",
+        "various",
+        "various authors",
+        "multiple authors",
+        "microsoft office user",
+        "microsoft word",
+        "windows user",
+        "default",
+    }
+)
+
+
+def is_placeholder_author(name: str) -> bool:
+    """True for creator values such as "Microsoft Office User" that name nobody."""
+    return normalize_text(name).strip(" .,;:-_") in _PLACEHOLDER_AUTHORS
+
+
+def evidence_author_names(metadata: dict[str, Any]) -> list[str]:
+    """Author names the file's own embedded metadata gives, without placeholders.
+
+    This is evidence, not truth: it is only used to check a provider match and to
+    suggest authors to a reviewer, never written onto a Book automatically.
+    """
+    raw_authors = metadata.get("authors")
+    if not isinstance(raw_authors, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in raw_authors:
+        if not isinstance(value, str):
+            continue
+        name = " ".join(value.split()).strip(" ,;")
+        key = normalize_text(name)
+        if not key or is_placeholder_author(name) or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def _author_names_agree(left: str, right: str) -> bool:
+    """Same person per the scorer's name matching, or a bare surname on one side."""
+    if _author_name_similarity(normalize_text(left), normalize_text(right)) > 0:
+        return True
+    left_tokens = _author_name_tokens(normalize_text(left))
+    right_tokens = _author_name_tokens(normalize_text(right))
+    if not left_tokens or not right_tokens:
+        return False
+    # "Tolkien" vs "J. R. R. Tolkien": a surname-only credit is not a contradiction.
+    single_token = len(left_tokens) == 1 or len(right_tokens) == 1
+    return single_token and left_tokens[-1] == right_tokens[-1]
+
+
+def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) -> bool:
+    """True when both sides name authors and none of them is the same person.
+
+    Names are compared with the scorer's author matching (``_author_name_similarity``),
+    so "Banks, Iain" and "Iain M. Banks" agree while "Frank Herbert" and "Brian
+    Herbert" do not. Missing authors on either side are not a conflict.
+    """
+    candidates = [name for name in candidate_authors if normalize_text(name)]
+    evidence = [name for name in evidence_authors if normalize_text(name)]
+    if not candidates or not evidence:
+        return False
+    return not any(
+        _author_names_agree(candidate, other) for candidate in candidates for other in evidence
+    )
+
+
 def _apply_scoring(
     signals: IdentificationInput,
     candidate: IdentificationCandidate,
@@ -782,3 +967,30 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+def score_candidate(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> IdentificationCandidate:
+    """Score any candidate (e.g. an existing library Book) with the provider scorer."""
+    return _apply_scoring(signals, candidate)
+
+
+def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> bool:
+    """Whether two candidates describe the same book.
+
+    Shared ISBN, or near-equal titles with compatible authors (authors are only
+    compared when both sides list some).
+    """
+    left_isbns = {value for value in (left.isbn10, left.isbn13) if value}
+    right_isbns = {value for value in (right.isbn10, right.isbn13) if value}
+    expanded_left = {isbn for value in left_isbns for isbn in normalize_isbns(value)}
+    expanded_right = {isbn for value in right_isbns for isbn in normalize_isbns(value)}
+    if expanded_left & expanded_right:
+        return True
+    if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
+        return False
+    if left.authors and right.authors:
+        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+    return True

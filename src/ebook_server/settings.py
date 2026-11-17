@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     storage_min_free_bytes: int = 2 * 1024 * 1024 * 1024
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
+    ingest_batch_size: int = 100
+    ingest_max_per_hour: int = 0
+    # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
+    ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
@@ -78,6 +82,9 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
     metrics_bearer_token: SecretStr = SecretStr("")
     max_upload_bytes: int = 150 * 1024 * 1024
+    # Optional URL of the separate audiobook server (e.g. Audiobookshelf); audio
+    # uploads are rejected with a pointer to it. See docs/design/32-audiobooks.md.
+    audiobook_service_url: str = ""
     metadata_providers: list[str] = [
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
     ]
@@ -92,6 +99,7 @@ class Settings(BaseSettings):
     metadata_rate_limits: dict[str, float] = {"openlibrary": 1.0}
     metadata_rate_limit_default: float = 1.0
     metadata_rate_limit_max_wait_seconds: float = 60.0
+    identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
     ocr_service_url: str = "http://localhost:8020"
@@ -257,6 +265,9 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
+BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
+BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
+BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
@@ -287,9 +298,11 @@ BOOK_SCANNER_LDAP_CA_FILE = settings.ldap_ca_file
 BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
 BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
+BOOK_SCANNER_AUDIOBOOK_SERVICE_URL = settings.audiobook_service_url
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
 BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
+BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
