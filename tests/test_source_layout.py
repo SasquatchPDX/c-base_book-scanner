@@ -161,12 +161,26 @@ def test_layout_title_follows_embedded_title() -> None:
         source_path="/x/Neal Stephenson/Snow Crash (966)/Snow Crash - Neal Stephenson.mobi",
         original_filename="Snow Crash - Neal Stephenson.mobi",
         extracted_metadata={
+            "title": "Snow Crash: A Novel",
+            PATH_LAYOUT_EVIDENCE_KEY: {"authors": ["Neal Stephenson"], "title": "Snow Crash"},
+        },
+    )
+    assert signals.title_hints[:2] == ["Snow Crash: A Novel", "Snow Crash"]
+    assert signals.best_author() == "Neal Stephenson"
+
+
+def test_layout_title_leads_when_the_embedded_title_is_the_filename_stem() -> None:
+    # Extractors fall back to the filename stem as "title"; that is no embedded title.
+    signals = build_identification_input(
+        source_path="/x/Neal Stephenson/Snow Crash (966)/Snow Crash - Neal Stephenson.mobi",
+        original_filename="Snow Crash - Neal Stephenson.mobi",
+        extracted_metadata={
             "title": "Snow Crash - Neal Stephenson",
             PATH_LAYOUT_EVIDENCE_KEY: {"authors": ["Neal Stephenson"], "title": "Snow Crash"},
         },
     )
-    assert signals.title_hints[:2] == ["Snow Crash - Neal Stephenson", "Snow Crash"]
-    assert signals.best_author() == "Neal Stephenson"
+    assert signals.title_hints[0] == "Snow Crash"
+    assert signals.author_hints == ["Neal Stephenson"]
 
 
 def test_without_layout_signals_are_unchanged() -> None:
@@ -175,7 +189,9 @@ def test_without_layout_signals_are_unchanged() -> None:
         original_filename="Emma - Jane Austen.txt",
         extracted_metadata={},
     )
-    assert signals.author_hints == ["Emma", "Jane Austen"]
+    # "Emma - Jane Austen" is ambiguous for the filename parser (#15): both ends stay
+    # author alternatives, "Title - Author" first.
+    assert signals.author_hints == ["Jane Austen", "Emma"]
 
 
 @pytest.mark.django_db

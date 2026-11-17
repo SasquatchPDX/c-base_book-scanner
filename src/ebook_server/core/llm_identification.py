@@ -630,10 +630,14 @@ def process_llm_identification_job(job_id: str) -> None:
                 )
                 in saved_keys
             ]
+            file_metadata = import_job.evidence if isinstance(import_job.evidence, dict) else {}
             decision = intake.decide_auto_accept(
                 added,
-                identification.evidence_author_names(
-                    import_job.evidence if isinstance(import_job.evidence, dict) else {}
+                identification.evidence_author_names(file_metadata),
+                file_evidence=identification.build_identification_input(
+                    source_path=import_job.source_path,
+                    original_filename=import_job.original_filename,
+                    extracted_metadata=dict(file_metadata),
                 ),
             )
             outcome = (

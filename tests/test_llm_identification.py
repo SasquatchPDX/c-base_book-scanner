@@ -449,13 +449,27 @@ def test_http_client_rejects_declared_oversize_or_compressed_body_unread(
 
 
 def test_decide_auto_accept_blocks_llm_derived_candidates_even_at_score_one() -> None:
+    file_evidence = identification.IdentificationInput(
+        title_hints=["A Title"],
+        author_hints=["Jane Example"],
+        isbns=[],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
     llm_candidate = _candidate(score=1.0, raw={"_hint_source": "llm"})
-    decision = intake.decide_auto_accept([llm_candidate], ["Jane Example"])
+    decision = intake.decide_auto_accept(
+        [llm_candidate], ["Jane Example"], file_evidence=file_evidence
+    )
     assert decision.candidate is None
     assert decision.blocked_reason == intake.BLOCK_LLM_DERIVED
 
     normal = _candidate(score=1.0)
-    assert intake.decide_auto_accept([normal], ["Jane Example"]).candidate is normal
+    assert (
+        intake.decide_auto_accept([normal], ["Jane Example"], file_evidence=file_evidence).candidate
+        is normal
+    )
 
 
 def _import_job(*, source: SourceLocation | None = None) -> ImportJob:

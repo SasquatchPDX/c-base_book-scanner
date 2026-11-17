@@ -235,6 +235,8 @@ AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+# Bound for short OPF evidence values (publisher, date) copied into job evidence.
+MAX_EPUB_TEXT_FIELD = 255
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -288,6 +290,9 @@ BLOCK_AUTHOR_CONFLICT = "author_conflict"
 # guess is the weakest evidence the system has, so such candidates always need a person.
 BLOCK_LLM_DERIVED = "llm_derived"
 LLM_HINT_SOURCE_KEY = "_hint_source"
+# The provider record stands for another edition than the file: its ISBNs, language or
+# publisher contradict the file's (see identification.edition_conflicts).
+BLOCK_EDITION_CONFLICT = "edition_conflict"
 
 
 @dataclass(frozen=True)
@@ -315,6 +320,8 @@ def _block_details(
 def decide_auto_accept(
     candidates: list[identification.IdentificationCandidate],
     file_authors: list[str],
+    *,
+    file_evidence: identification.IdentificationInput,
 ) -> AutoAcceptDecision:
     """Pick the candidate to accept without review, or record why there is none.
 
@@ -322,7 +329,10 @@ def decide_auto_accept(
     candidate must not have been found through LLM-proposed search terms, it must name
     at least one real author, and its authors must not contradict the file's own
     embedded authors. A high score from an ISBN match alone is no evidence about
-    authorship.
+    authorship. Finally the candidate must be the file's edition:
+    ``file_evidence`` (the normalised file signals) is checked with
+    ``identification.edition_conflicts``, so a file ISBN must be one of the edition's
+    own ISBNs and the file's language/publisher must not contradict the edition's.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
@@ -347,6 +357,17 @@ def decide_auto_accept(
             candidate=None,
             blocked_reason=BLOCK_AUTHOR_CONFLICT,
             details=_block_details(top, file_authors),
+        )
+    conflicts = identification.edition_conflicts(top, file_evidence)
+    if conflicts:
+        return AutoAcceptDecision(
+            candidate=None,
+            blocked_reason=BLOCK_EDITION_CONFLICT,
+            details={
+                **_block_details(top, file_authors),
+                "edition_conflicts": conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            },
         )
     return AutoAcceptDecision(candidate=top)
 
@@ -1077,7 +1098,10 @@ def discover_source_jobs_for_location(
     With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
     would not fit, so a bulk import cannot queue more than the archive can hold.
     """
+    from . import multipart
+
     jobs: list[ImportJob] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     skipped: list[Path] = []
     audio_skipped = 0
     if limit is not None and limit <= 0:
@@ -1126,9 +1150,11 @@ def discover_source_jobs_for_location(
                 )
                 break
         try:
-            jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
+            job = create_source_import_job(candidate, source_location, uploader=uploader)
         except IntakeError:
             continue
+        multipart.assign_discovered_job(job, source_location, folder_groups=folder_groups)
+        jobs.append(job)
         if limit is not None and len(jobs) >= limit:
             break
     if skipped:
@@ -1199,7 +1225,10 @@ class SourcePreview:
 
 def preview_source_location(source_location: SourceLocation) -> SourcePreview:
     """Classify every candidate file in a source without creating jobs."""
+    from . import multipart
+
     rows: list[dict[str, Any]] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     for candidate in discover_source_paths(source_location):
         base: dict[str, Any] = {
             "source_location_id": str(source_location.id),
@@ -1232,6 +1261,16 @@ def preview_source_location(source_location: SourceLocation) -> SourcePreview:
             # Lets an admin check a folder layout before importing anything.
             hints = source_layout.hints_for_source_file(source_location, str(candidate))
             row["path_layout"] = hints.as_evidence() if hints is not None else None
+        if multipart.detection_enabled():
+            folder = candidate.parent
+            if folder not in folder_groups:
+                folder_groups[folder] = multipart.groups_for_folder(folder)
+            for detected in folder_groups[folder]:
+                part = next((p for p in detected.parts if p.filename == candidate.name), None)
+                if part is not None:
+                    row["multipart_group"] = detected.key
+                    row["part_label"] = part.label
+                    break
         rows.append(row)
     return SourcePreview(rows=rows)
 
@@ -1610,9 +1649,12 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         opf_root = ET.fromstring(opf_bytes)
         # Namespace-safe extraction; these fields are best-effort only.
         title = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}title")
-        author = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}creator")
+        authors = _epub_creator_authors(opf_root)
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        # Publisher and date are evidence for the publisher bonus and later review (#37).
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
         subjects = identification.normalize_subjects(
             [
                 "".join(element.itertext())
@@ -1627,16 +1669,35 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         )
         return {
             "title": title,
-            "authors": [author] if author else [],
+            "authors": authors,
             "language": language,
             "description": description,
             "subjects": subjects,
             "identifier": identifier,
+            "publisher": publisher[:MAX_EPUB_TEXT_FIELD] if publisher else None,
+            "date": raw_date[:MAX_EPUB_TEXT_FIELD] if raw_date else None,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },
             "container_type": "epub",
         }
+
+
+def _epub_creator_authors(opf_root: Any) -> list[str]:
+    """Every author-role dc:creator, in order: coauthors are all genuine evidence.
+
+    Creators with another ``opf:role`` (editor, translator, ...) are skipped; when no
+    creator is marked as an author, the first creator is kept as before.
+    """
+    creators = [
+        (element, " ".join("".join(element.itertext()).split()))
+        for element in opf_root.iterfind(".//{http://purl.org/dc/elements/1.1/}creator")
+    ]
+    creators = [(element, text) for element, text in creators if text]
+    authors = [text for element, text in creators if _opf_creator_is_author(element)]
+    if not authors and creators:
+        authors = [creators[0][1]]
+    return list(dict.fromkeys(authors))
 
 
 def _pick_epub_identifier(entries: list[tuple[Any, str]]) -> str | None:
@@ -1883,12 +1944,23 @@ def _create_or_reuse_file_variant(
     *,
     storage_identifier: str | None = None,
     source_type: str = "",
+    part_index: int | None = None,
+    part_label: str = "",
+    reuse_identical: bool = True,
+    converter_options: dict[str, Any] | None = None,
 ) -> FileVariant:
+    """The job's FileVariant on ``book``; by default any existing identical file is reused.
+
+    ``reuse_identical=False`` (multi-part parts, #60) always creates a new variant on
+    ``book`` from the job's own archived copy, so another Book's variant is never
+    returned for this Book.
+    """
     if not source_type:
         source_type = variant_source_type_for_job(job)
-    duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
-    if duplicate_variant is not None:
-        return duplicate_variant
+    if reuse_identical:
+        duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+        if duplicate_variant is not None:
+            return duplicate_variant
 
     storage = _default_storage()
     storage_id = storage_identifier or job.storage_identifier
@@ -1922,8 +1994,52 @@ def _create_or_reuse_file_variant(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        part_index=part_index,
+        part_label=_fit(FileVariant, "part_label", part_label),
+        converter_options=converter_options or {},
         **referenced_files.reference_fields_for_job(job),
     )
+
+
+def discard_redundant_archive_copy(job: ImportJob, *, keep: FileVariant) -> None:
+    """Delete ``job``'s own archive copy once ``keep`` (same bytes) stands in for it.
+
+    Only a copy this application wrote to the default archive is removed, never a file
+    referenced in place, never the file ``keep`` (or any other variant) points at, and
+    only after the surrounding transaction commits. The source itself is untouched.
+    """
+    identifier = job.storage_identifier
+    location = job.storage_location
+    if not identifier or location is None or location.read_only:
+        return
+    if location.pk != _default_storage_location().pk:
+        return
+    if keep.storage_location_id == location.pk and keep.storage_identifier == identifier:
+        return
+    if FileVariant.objects.filter(
+        storage_location_id=location.pk, storage_identifier=identifier
+    ).exists():
+        return
+    if keep.sha256 != job.sha256:
+        return
+
+    def _delete() -> None:
+        try:
+            _default_storage().delete(identifier)
+        except Exception as exc:  # an orphaned copy is harmless; never fail the decision
+            logger.warning(
+                "intake_redundant_archive_copy_not_deleted",
+                import_job_id=str(job.id),
+                error_type=type(exc).__name__,
+            )
+            return
+        logger.info(
+            "intake_redundant_archive_copy_deleted",
+            import_job_id=str(job.id),
+            kept_file_variant_id=keep.id,
+        )
+
+    transaction.on_commit(_delete)
 
 
 def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None) -> None:
@@ -2112,8 +2228,33 @@ def _resolve_import(
 ) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
-    variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
+    if review_task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+        from . import multipart
+
+        # Any identifying action on a multi-part review confirms the grouping: every
+        # archived part becomes an ordered part FileVariant of ``book``.
+        confirmed = multipart.confirm_parts(
+            lead_job=job,
+            review_task=review_task,
+            book=book,
+            inline_cover_fallback=inline_cover_fallback,
+        )
+        payload = dict(decision_payload if decision_payload is not None else {})
+        payload["multipart_confirmed"] = {
+            "import_group_id": str(job.import_group_id),
+            "file_variant_ids": [part.id for part in confirmed.variants],
+            # Detected parts the reviewer acknowledged confirming the book without.
+            "missing_parts": confirmed.absent,
+            # Acknowledged parts identical to another Book's file, included as parts of
+            # this Book (own variant, identical file recorded as provenance).
+            "duplicate_parts": confirmed.duplicates,
+        }
+        decision_payload = payload
+        job.refresh_from_db()
+        variant = job.file_variant or confirmed.variants[0]
+    else:
+        variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
+        schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -2509,33 +2650,7 @@ def _archive_for_review(
         _create_review_task(job=job, candidates=candidates)
         job.state = ImportJob.State.LOW_CONFIDENCE
         _save_job(job, update_fields=["state", "updated_at"])
-    job.state = ImportJob.State.ARCHIVING
-    _save_job(job, update_fields=["state", "updated_at"])
-    destination, verified = _archive_source(_default_storage(), job)
-    job.storage_identifier = destination
-    _save_job(
-        job,
-        update_fields=[
-            "storage_identifier",
-            "storage_location_id",
-            "state",
-            "updated_at",
-        ],
-    )
-    _finalize_source_cleanup(job, verified)
-    if not verified:
-        raise RuntimeError("archive verification failed")
-    job.state = ImportJob.State.LOW_CONFIDENCE
-    _save_job(
-        job,
-        update_fields=[
-            "state",
-            "storage_identifier",
-            "storage_location_id",
-            "updated_at",
-        ],
-        release=True,
-    )
+    _archive_awaiting_review(job)
     if not _groups_sibling_formats(job):
         return
     with _sibling_group_lock(job):
@@ -2726,6 +2841,58 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     """
     max_retries = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_RETRY_MAX", 0))
     return job.next_retry_at is not None and job.attempt_count <= max_retries
+
+
+def _archive_awaiting_review(job: ImportJob) -> None:
+    """Archive a job that waits for a reviewer, then leave it LOW_CONFIDENCE.
+
+    The source is only removed (MOVE sources) after the archive copy verified. The
+    final save releases this worker's lease.
+    """
+    job.state = ImportJob.State.ARCHIVING
+    _save_job(job, update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(_default_storage(), job)
+    job.storage_identifier = destination
+    _save_job(
+        job,
+        update_fields=[
+            "storage_identifier",
+            "storage_location_id",
+            "state",
+            "updated_at",
+        ],
+    )
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    _save_job(
+        job,
+        update_fields=[
+            "state",
+            "storage_identifier",
+            "storage_location_id",
+            "updated_at",
+        ],
+        release=True,
+    )
+
+
+def _settle_multipart_part(job: ImportJob) -> None:
+    """Exit hook of a grouped part's intake run; see ``multipart.settle_part``."""
+    from . import multipart
+
+    if job.import_group_id is None:
+        return
+    try:
+        multipart.settle_part(job)
+    except Exception as exc:  # the part itself is safely recorded; retried on next settle
+        logger.warning(
+            "multipart_settle_failed",
+            import_group_id=str(job.import_group_id),
+            import_job_id=str(job.id),
+            error_type=type(exc).__name__,
+        )
 
 
 # --- Exclusive ownership of an import job ---------------------------------------------
@@ -2927,6 +3094,10 @@ def recover_stale_import_job(job: ImportJob, reason: str) -> bool:
         lease_expires_at=None,
         updated_at=timezone.now(),
     )
+    if recovered:
+        # A recovered part of a multi-part work is now missing; let its group settle.
+        job.refresh_from_db()
+        _settle_multipart_part(job)
     return bool(recovered)
 
 
@@ -2966,10 +3137,16 @@ def process_import_job(job_id: str) -> None:
         logger.info("intake_cancelled", import_job_id=str(job.id))
     except ImportLeaseLostError:
         logger.warning("intake_lease_lost", import_job_id=str(job.id))
+    finally:
+        # Every exit of a claimed run (archived, duplicate, failed, source missing,
+        # exception, lost lease) settles a grouped part, so its group never waits forever.
+        _settle_multipart_part(job)
 
 
 def _process_claimed_import_job(job: ImportJob) -> None:
     """Run intake for a job this worker has claimed (``job.lease_owner`` is set)."""
+    from . import multipart
+
     source_path = Path(job.source_path)
     if not source_path.exists():
         job.last_error = "source file missing"
@@ -3002,6 +3179,17 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         )
 
         duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+        if duplicate_variant is not None and multipart.pending_group_for(job) is not None:
+            # A part of a pending multi-part work belongs to that work: it must not be
+            # resolved onto the other Book and silently drop out of the group (#60).
+            logger.info(
+                "multipart_part_identical_to_library_file",
+                import_job_id=str(job.id),
+                import_group_id=str(job.import_group_id),
+                file_variant_id=duplicate_variant.id,
+                book_id=duplicate_variant.book_id,
+            )
+            duplicate_variant = None
         if duplicate_variant is not None:
             job.book = duplicate_variant.book
             job.file_variant = duplicate_variant
@@ -3055,6 +3243,13 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 "updated_at",
             ],
         )
+        if multipart.pending_group_for(job) is not None:
+            # One part of a suspected multi-part work: archive it like any import
+            # awaiting review, but identify the work once for the whole group. A part
+            # identical to a file of another Book is archived too; the group review
+            # shows it as a duplicate part (see multipart.MEMBER_DUPLICATE).
+            _archive_awaiting_review(job)
+            return
 
         signals = identification.build_identification_input(
             source_path=job.source_path,
@@ -3065,7 +3260,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_job(job, update_fields=["state", "updated_at"])
         candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
-        decision = decide_auto_accept(candidates, file_authors)
+        decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
             metadata[AUTO_ACCEPT_BLOCKED_KEY] = decision.blocked_reason
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
