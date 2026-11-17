@@ -1024,6 +1024,40 @@ uv run pytest -q
 Monitor queue depth, failed `ProcessingJob` and `ImportJob` records, provider/OCR
 errors, storage capacity, and health endpoint status. Do not log document content.
 
+## Library search index
+
+`/library/books/` searches a denormalised row per book (`BookSearchDocument`
+plus `BookSearchFacet`, migration 0034, #28). On PostgreSQL it uses full-text
+search (`simple` configuration over accent- and case-folded text), `pg_trgm`
+substring and typo matching, and GIN/B-tree indexes. On SQLite, and on
+PostgreSQL until every book has a row, it falls back to plain `icontains`
+filters (slow on large libraries, but correct).
+
+Rows are rewritten automatically after every committed change to a book, its
+authors, genres, categories, identifiers, covers or file variants. Build them
+once after upgrading to migration 0034, and rebuild nightly as a safety net:
+
+```bash
+uv run python manage.py rebuild_search_index     # all books; safe to repeat
+uv run python manage.py verify_search_index      # exit 1 on missing/stale rows
+uv run python manage.py verify_search_index --fix
+```
+
+Queryset `.update()` and `bulk_*` writes send no model signals; code that changes
+indexed data that way calls `search.schedule_reindex` *after* the write. The
+verifier rebuilds a sample of rows in memory and compares every column, the
+facets and a SHA-256 digest of the weighted full-text input (so a changed
+description or publisher is caught), and on PostgreSQL also the stored
+`tsvector` itself; use `--sample` larger than the library to check every row.
+
+The migration creates the `pg_trgm` extension, which needs a role allowed to
+`CREATE EXTENSION` (pg_trgm is a trusted extension, so the database owner is
+enough on PostgreSQL 13+). Browse pages use signed `?cursor=` tokens; `?page=`
+still works for one release and answers with a `Deprecation: true` header.
+Global facet counts and the unfiltered total are cached for up to five minutes.
+Search logs record the backend, sort, result count and duration, never the
+query text.
+
 ## Metrics and logs
 
 Set a long random `BOOK_SCANNER_METRICS_BEARER_TOKEN` in production and configure
