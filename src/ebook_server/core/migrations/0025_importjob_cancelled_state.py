@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0017_sourcelocation_ingest_throttle"),
+        ("core", "0024_sourcelocation_ingest_throttle"),
     ]
 
     operations = [
