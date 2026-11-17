@@ -172,6 +172,19 @@ next search fails it and starts a new one. New terms submitted while a search is
 queued replace its terms; while one is running they are saved and the reviewer is
 asked to search again once it finishes (HTTP 409 for API clients).
 
+Searches are fenced so that an obsolete search can never publish. The import
+job / scan job records its current search job in `current_search_job_id`, moved
+under that row's lock whenever a new search replaces an older one (whose RQ
+entry, enqueued with the id `metadata-search-<job id>`, is also cancelled, best
+effort). A delivered queue entry only runs while its job is still QUEUED (or
+RUNNING with a dead worker) and current; a FAILED, finished or superseded job is
+ignored. When the providers return, the results become current only if, under
+the task, source and job row locks, the job is still current, still the attempt
+that started, and the review is still open (not resolved/cancelled, the import
+not complete, the scan not linked to a book). Otherwise the run is stored as a
+`discarded` ("Not applied") search whose candidates are history only: a review
+resolved while the providers ran keeps its decision and is never reopened.
+
 ### ISBN lookup from the review page (#59)
 
 "Look up by ISBN" (`POST /reviews/<id>/isbn-lookup/`, field `isbn`) queues the
@@ -180,13 +193,30 @@ fallback, and the task's saved title/author terms are left alone. The value must
 be one ISBN-10/13 with a valid check digit (spaces, hyphens and an `ISBN:` prefix
 are ignored). The run is recorded with `query.mode = "isbn"`.
 
-The typed ISBN is never trusted on its own (external verification is
-mandatory): a candidate counts as *ISBN verified* only when a provider returned a
-record carrying that ISBN in either form. If all verified records name the same
-title, the page offers "Accept ISBN match" for the best one. If they name
-different titles, the reviewer is asked to compare them. If none is verified, or
-providers failed, the task stays open with its earlier candidates. Nothing is
-accepted automatically; accepting still goes through the normal candidate flow.
+Reviewers usually judge an import from the actual ebook (the review page's
+reader, #6), so the ISBN they type is normally read from the book itself (its
+copyright page or metadata). It is still only a query (external verification is
+mandatory): a candidate counts as *ISBN verified* only when the provider's own
+record lists that ISBN, in either its 10- or 13-digit form (compared with
+isbnlib). Only identifiers in the stored raw provider payload count; keys
+starting with `_` are ours, so the `_queried_isbn` that Open Library's ISBN
+lookup echoes into the payload is never evidence, and normalization no longer
+copies it onto a record that does not list it.
+
+- **Exactly one distinct book verified** (one provider, or several naming the
+  same title): the review is resolved automatically by accepting the best such
+  record through the normal accept path (`ReviewTask.Decision.ACCEPT_CANDIDATE`,
+  `selected_candidate`, the record's metadata used fully), with
+  `decision_payload.resolution_source = "reviewer_isbn"` and `decision_payload.isbn`;
+  the reviewer who entered the ISBN is the task's reviewer. This happens only
+  while the lookup is still the source's current search and the review is still
+  unresolved (the same fencing as above), and only when the record names its
+  authors; an authorless record is offered for one-click "Accept ISBN match"
+  with an authors field instead (#42).
+- **Several distinct books carry the ISBN:** nothing is accepted; the page shows
+  the verified records for the reviewer to choose.
+- **Nothing verified, or providers failed:** the task stays open with its
+  earlier candidates.
 
 ## Subject / genre evidence
 

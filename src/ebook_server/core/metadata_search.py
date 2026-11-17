@@ -6,21 +6,31 @@ supersedes earlier candidates when it returns candidates itself, so a failed or
 empty repeat search never hides a good earlier result. Whether a search is still
 in progress is derived from its queued/running ``ProcessingJob`` (with a bounded
 staleness window), never from a status flag a killed worker could leave behind.
+
+Searches are fenced: the source (``ImportJob`` / ``ScanJob``) names its current
+search job in ``current_search_job_id``. A worker only starts a job that is still
+queued and current, and only publishes candidates if, under the source's row lock,
+its job is still current, still the attempt it started and the review is still
+open. Anything else is stored as a DISCARDED run whose candidates are history.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, TypeGuard
 
+import isbnlib
+import structlog
 from django.contrib.auth.models import AbstractBaseUser
 from django.db import models as django_models
+from django.db import transaction
 from django.db.models import Prefetch, QuerySet
 from django.utils import timezone
 
-from ebook_server.jobs import stale_after, tunable_setting
+from ebook_server.jobs import get_queue, is_stale_running, stale_after, tunable_setting
 
 from . import identification
 from .models import (
@@ -42,6 +52,11 @@ SEARCH_JOB_TYPES = (
 )
 ACTIVE_JOB_STATES = (ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING)
 MAX_ERROR_LENGTH = 500
+SUPERSEDED_REASON = "a newer search replaced this one"
+TAKEN_OVER_REASON = "a later attempt of this search took over"
+REVIEW_CLOSED_REASON = "the review was resolved while this search was running"
+
+logger = structlog.get_logger(__name__)
 
 
 class SearchInProgressError(RuntimeError):
@@ -154,27 +169,109 @@ def isbn_signals(isbn: str) -> identification.IdentificationInput:
     )
 
 
+def canonical_isbn13(value: Any) -> str | None:
+    """The ISBN-13 form of a valid ISBN-10/13 (isbnlib), so both forms compare equal."""
+    if not isinstance(value, str | int):
+        return None
+    compact = isbnlib.canonical(str(value))
+    if isbnlib.is_isbn10(compact):
+        return isbnlib.to_isbn13(compact) or None
+    if isbnlib.is_isbn13(compact):
+        return compact
+    return None
+
+
+# Identifier keys and lists as providers return them (Open Library ``isbn_10`` /
+# ``isbn_13`` / search ``isbn``; Google Books ``industryIdentifiers``; DNB and
+# Hardcover mapped to ``isbn_10`` / ``isbn_13`` from the record itself).
+_IDENTIFIER_TYPE_KEYS = ("type", "kind", "scheme")
+_IDENTIFIER_VALUE_KEYS = ("identifier", "value", "id")
+_MAX_RECORD_DEPTH = 4
+
+
+def record_isbns(raw: Any) -> set[str]:
+    """ISBN-13 forms of every ISBN the provider's own record lists.
+
+    Keys starting with ``_`` are ours, not the provider's (``_queried_isbn`` is the
+    lookup query echoed into the payload), so they are never evidence.
+    """
+    found: set[str] = set()
+
+    def walk(node: Any, depth: int) -> None:
+        if depth > _MAX_RECORD_DEPTH:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        type_value = next(
+            (node[key] for key in _IDENTIFIER_TYPE_KEYS if isinstance(node.get(key), str)), ""
+        )
+        if "isbn" in type_value.lower():
+            for key in _IDENTIFIER_VALUE_KEYS:
+                if (isbn := canonical_isbn13(node.get(key))) is not None:
+                    found.add(isbn)
+        for key, value in node.items():
+            if not isinstance(key, str) or key.startswith("_"):
+                continue
+            if "isbn" in key.lower():
+                for item in value if isinstance(value, list) else [value]:
+                    if (isbn := canonical_isbn13(item)) is not None:
+                        found.add(isbn)
+            elif isinstance(value, dict | list):
+                walk(value, depth + 1)
+
+    walk(raw, 0)
+    return found
+
+
+def record_carries_isbn(candidate: MetadataCandidate, isbn: str) -> bool:
+    """True when the provider record behind ``candidate`` itself lists ``isbn``.
+
+    Only the stored raw provider payload counts; the candidate's normalized
+    ``isbn10``/``isbn13`` may have been filled from the query and prove nothing.
+    """
+    wanted = canonical_isbn13(isbn)
+    return wanted is not None and wanted in record_isbns(candidate.raw_payload)
+
+
+def verified_isbn_candidates(
+    candidates: Iterable[MetadataCandidate],
+    isbn: str,
+) -> list[MetadataCandidate]:
+    """Candidates whose provider record carries ``isbn``, best first."""
+    verified = [candidate for candidate in candidates if record_carries_isbn(candidate, isbn)]
+    verified.sort(key=lambda candidate: (-candidate.score, candidate.id))
+    return verified
+
+
+def distinct_books(candidates: Iterable[MetadataCandidate]) -> set[str]:
+    """Distinct books among records for one ISBN (several providers may agree)."""
+    return {identification.normalize_text(candidate.title) for candidate in candidates}
+
+
 def isbn_lookup_result(
     search: MetadataSearch | None,
     current_ids: set[int],
 ) -> dict[str, Any] | None:
     """How the latest run answered an ISBN lookup, or ``None`` if it was no lookup.
 
-    A candidate is *verified* when the provider record carries the looked-up ISBN
-    (in either form); the typed value alone is never trusted. The lookup is
-    *unambiguous* when all verified current records name the same title, so
-    several providers agreeing on one book still count as a single match.
+    A candidate is *verified* when the provider's own record lists the looked-up
+    ISBN (either form, see :func:`record_carries_isbn`); neither the typed value
+    nor a query echoed into normalization is trusted. The lookup is *unambiguous*
+    when all verified current records name the same book, so several providers
+    agreeing on one book still count as a single match.
     """
     if search is None or not isinstance(search.query, dict) or search.query.get("mode") != "isbn":
         return None
-    isbns = {str(value) for value in search.query.get("isbns") or [] if value}
-    verified = [
-        candidate
-        for candidate in search.candidates.all()
-        if candidate.id in current_ids and ({candidate.isbn10, candidate.isbn13} & isbns)
-    ]
-    verified.sort(key=lambda candidate: (-candidate.score, candidate.id))
-    titles = {identification.normalize_text(candidate.title) for candidate in verified}
+    queried = str((search.query.get("isbns") or [""])[0] or "")
+    verified = verified_isbn_candidates(
+        [candidate for candidate in search.candidates.all() if candidate.id in current_ids],
+        queried,
+    )
+    titles = distinct_books(verified)
     return {
         "isbn": (search.query.get("isbns") or [""])[0],
         "state": search.state,
@@ -209,12 +306,23 @@ def record_search(
     requested_by_id: int | None = None,
     started_at: datetime | None = None,
     error: str = "",
+    discarded: str = "",
     mode: str = "text",
 ) -> MetadataSearch:
-    """Persist one finished run (FAILED when ``error`` is given)."""
+    """Persist one finished run.
+
+    FAILED when ``error`` is given; DISCARDED (results kept as history only) when
+    ``discarded`` gives the reason the run was not applied.
+    """
+    state = MetadataSearch.State.COMPLETE
+    if discarded:
+        state = MetadataSearch.State.DISCARDED
+        error = f"not applied: {discarded}" + (f"; {error}" if error else "")
+    elif error:
+        state = MetadataSearch.State.FAILED
     return MetadataSearch.objects.create(
         trigger=trigger,
-        state=MetadataSearch.State.FAILED if error else MetadataSearch.State.COMPLETE,
+        state=state,
         import_job=import_job,
         scan_job=scan_job,
         processing_job_id=processing_job_id,
@@ -233,15 +341,18 @@ def save_candidates(
     search: MetadataSearch,
     candidates: list[identification.IdentificationCandidate],
     match_threshold: float | None,
+    current: bool = True,
 ) -> None:
     """Make ``candidates`` the current ones, keeping earlier ones as history.
 
     Must run inside a transaction. With no candidates nothing is superseded: an
     empty or failed repeat search leaves the earlier candidates acceptable.
     ``match_threshold`` of ``None`` keeps every candidate in REVIEW state.
+    ``current=False`` stores them as already superseded history (a discarded run).
     """
     if not candidates:
         return
+    stored_at = timezone.now()
     source: dict[str, Any] = (
         {"import_job_id": search.import_job_id}
         if search.import_job_id is not None
@@ -253,9 +364,10 @@ def save_candidates(
         list(ImportJob.objects.select_for_update().filter(pk=search.import_job_id))
     else:
         list(ScanJob.objects.select_for_update().filter(pk=search.scan_job_id))
-    MetadataCandidate.objects.filter(**source, superseded_at__isnull=True).exclude(
-        search=search
-    ).update(superseded_at=timezone.now())
+    if current:
+        MetadataCandidate.objects.filter(**source, superseded_at__isnull=True).exclude(
+            search=search
+        ).update(superseded_at=stored_at)
     seen: set[tuple[str, str]] = set()
     for index, candidate in enumerate(candidates, start=1):
         # Records without a provider key must not collide with each other.
@@ -269,6 +381,7 @@ def save_candidates(
         MetadataCandidate.objects.create(
             **source,
             search=search,
+            superseded_at=None if current else stored_at,
             provider_id=candidate.provider_id,
             provider_ref=provider_ref,
             title=_fit("title", candidate.title),
@@ -396,12 +509,133 @@ def latest_search_job(task: ReviewTask) -> ProcessingJob | None:
 
 
 def abandon_stale_job(job: ProcessingJob) -> None:
-    """Mark a stale search job FAILED so a new search can replace it."""
+    """Mark a stale search job FAILED so a new search can replace it.
+
+    Its queue entry is cancelled (best effort) once this commits; should it still
+    be delivered, or its worker still be alive, the fencing in
+    :func:`start_refusal` / :func:`publication_refusal` keeps it from publishing.
+    """
     details = dict(job.details) if isinstance(job.details, dict) else {}
     details["error"] = "the search did not finish (worker stopped or queue entry lost)"
     job.state = ProcessingJob.JobState.FAILED
     job.finished_at = timezone.now()
     job.details = details
+    job.save(update_fields=["state", "finished_at", "details"])
+    transaction.on_commit(lambda: cancel_queue_entry(job))
+
+
+# ------------------------------------------------------------------------ fencing
+
+
+def rq_job_id(job: ProcessingJob) -> str:
+    """Deterministic queue-entry id, so a superseded entry can be cancelled."""
+    return f"metadata-search-{job.job_id}"
+
+
+def cancel_queue_entry(job: ProcessingJob) -> None:
+    """Best effort: drop a superseded job's queue entry. Fencing makes it safe if not."""
+    try:
+        queue = get_queue()
+        rq_queue = getattr(queue, "queue", None)
+        if rq_queue is None:
+            return
+        from rq.job import Job
+
+        Job.fetch(rq_job_id(job), connection=rq_queue.connection).cancel()
+    except Exception as exc:  # already gone, running, or Redis unavailable
+        logger.info(
+            "metadata_search_queue_entry_not_cancelled",
+            processing_job_id=str(job.job_id),
+            reason=type(exc).__name__,
+        )
+
+
+def make_current(source: ImportJob | ScanJob, job: ProcessingJob) -> None:
+    """Name ``job`` the source's current search (``source`` row must be locked)."""
+    if source.current_search_job_id != job.job_id:
+        source.current_search_job_id = job.job_id
+        source.save(update_fields=["current_search_job_id"])
+
+
+def attempt_of(job: ProcessingJob) -> int:
+    details = job.details if isinstance(job.details, dict) else {}
+    try:
+        return int(details.get("attempt_count", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def start_refusal(job: ProcessingJob, current_search_job_id: Any) -> str | None:
+    """Why a delivered queue entry must not run, or ``None`` when it may start.
+
+    Only a QUEUED job (or a RUNNING one whose worker died) that is still its
+    source's current search may run; a FAILED (abandoned/superseded) or finished
+    job never runs again, whatever the queue delivers.
+    """
+    if job.state == ProcessingJob.JobState.RUNNING:
+        if not is_stale_running(job):
+            return "already running"
+    elif job.state != ProcessingJob.JobState.QUEUED:
+        return f"job is {job.state}"
+    if current_search_job_id != job.job_id:
+        return SUPERSEDED_REASON
+    return None
+
+
+def refuse_superseded_job(job: ProcessingJob) -> None:
+    """Close a delivered job that a newer search replaced (``job`` row locked)."""
+    if job.state not in ACTIVE_JOB_STATES:
+        return
+    details = dict(job.details) if isinstance(job.details, dict) else {}
+    job.state = ProcessingJob.JobState.FAILED
+    job.finished_at = timezone.now()
+    job.details = {**details, "error": SUPERSEDED_REASON}
+    job.save(update_fields=["state", "finished_at", "details"])
+
+
+def publication_refusal(
+    *,
+    source: ImportJob | ScanJob,
+    job: ProcessingJob,
+    attempt: int,
+    review_closed: bool,
+) -> str:
+    """Why a finished run must not become current ("" when it may publish).
+
+    ``source`` and ``job`` must be rows locked and re-read inside the publishing
+    transaction, so the answer cannot change before that transaction commits.
+    """
+    if job.state != ProcessingJob.JobState.RUNNING or attempt_of(job) != attempt:
+        return TAKEN_OVER_REASON
+    if source.current_search_job_id != job.job_id:
+        return SUPERSEDED_REASON
+    if review_closed:
+        return REVIEW_CLOSED_REASON
+    return ""
+
+
+def owns_job(job: ProcessingJob, attempt: int) -> bool:
+    """True while ``job`` (a locked row) is still the attempt this worker started."""
+    return job.state == ProcessingJob.JobState.RUNNING and attempt_of(job) == attempt
+
+
+def finish_discarded_job(job: ProcessingJob, *, attempt: int, reason: str, search_id: Any) -> None:
+    """Close a run whose results were kept as history only (``job`` row locked).
+
+    A job taken over by another attempt or already closed is left alone.
+    """
+    if not owns_job(job, attempt):
+        return
+    details = dict(job.details) if isinstance(job.details, dict) else {}
+    job.state = ProcessingJob.JobState.SUCCESS
+    job.finished_at = timezone.now()
+    job.details = {
+        **details,
+        "search_id": str(search_id),
+        "published": False,
+        "discarded": reason,
+        "error": "",
+    }
     job.save(update_fields=["state", "finished_at", "details"])
 
 

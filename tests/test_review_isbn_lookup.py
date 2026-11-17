@@ -1,4 +1,9 @@
-"""Review page ISBN lookup: typed ISBN is a query, verified only by provider records (#59)."""
+"""Review page ISBN lookup (#59).
+
+The reviewer reads the ISBN from the actual ebook and types it. It is only a query:
+a candidate counts as verified when the provider's own record lists that ISBN. One
+distinct verified book is accepted automatically; several are shown for choice.
+"""
 
 from __future__ import annotations
 
@@ -8,16 +13,20 @@ from typing import Any
 import pytest
 from django.test import Client
 
-from ebook_server.core import metadata_search
+from ebook_server.core import metadata_search, review_identification
 from ebook_server.core.models import (
     Identifier,
+    ImportJob,
+    MetadataCandidate,
     MetadataSearch,
     ProcessingJob,
     ReviewTask,
+    ScanJob,
     get_or_create_profile,
 )
 from tests.test_review_search import (
     HTML,
+    _CallbackProvider,
     _FailingProvider,
     _import_review,
     _RecordingProvider,
@@ -29,8 +38,38 @@ DUNE_13 = "9780441172719"
 DUNE_10 = "0441172717"
 
 
-def _edition(title: str, *, isbn13: str = DUNE_13, key: str = "/books/OL1M") -> dict[str, Any]:
-    return {"key": key, "title": title, "author_name": ["Frank Herbert"], "isbn_13": [isbn13]}
+def _edition(
+    title: str,
+    *,
+    isbn13: str = DUNE_13,
+    key: str = "/books/OL1M",
+    authors: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "title": title,
+        "author_name": ["Frank Herbert"] if authors is None else authors,
+        "isbn_13": [isbn13],
+        "publishers": ["Ace"],
+    }
+
+
+def _candidate(raw: dict[str, Any]) -> MetadataCandidate:
+    return MetadataCandidate(title="x", authors=[], raw_payload=raw)
+
+
+def test_only_identifiers_in_the_provider_record_count_as_evidence() -> None:
+    # Open Library / Hardcover / DNB shapes, ISBN-10 vs ISBN-13 equivalence.
+    assert metadata_search.record_carries_isbn(_candidate({"isbn_13": [DUNE_13]}), DUNE_10)
+    assert metadata_search.record_carries_isbn(_candidate({"isbn_10": DUNE_10}), DUNE_13)
+    assert metadata_search.record_carries_isbn(_candidate({"isbn": ["0-441-17271-7"]}), DUNE_13)
+    # Google Books volumeInfo.industryIdentifiers.
+    google = {"volumeInfo": {"industryIdentifiers": [{"type": "ISBN_10", "identifier": DUNE_10}]}}
+    assert metadata_search.record_carries_isbn(_candidate(google), DUNE_13)
+    # The lookup query echoed into the payload is ours, not the provider's.
+    echoed = {"isbn_13": ["9780306406157"], "_queried_isbn": DUNE_13}
+    assert not metadata_search.record_carries_isbn(_candidate(echoed), DUNE_13)
+    assert not metadata_search.record_carries_isbn(_candidate({}), DUNE_13)
 
 
 def test_parse_isbn_accepts_formatted_values_and_rejects_bad_check_digits() -> None:
@@ -92,17 +131,29 @@ def test_isbn_lookup_queries_by_isbn_only_and_verifies_the_returned_record(
     assert lookup["unambiguous"] is True
     best_id = lookup["best_candidate_id"]
     assert lookup["verified_candidate_ids"] == [best_id]
-    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
-    assert 'data-isbn-lookup="match"' in page
-    assert "Accept ISBN match" in page
-    assert "ISBN verified" in page
+    assert lookup["auto_accepted"] is True
 
-    accept = client.post(f"/reviews/{task.id}/accept-candidate/", {"candidate_id": best_id})
-    assert accept.status_code == 200
+    # One verified book: accepted through the normal accept path, metadata used fully.
     task.refresh_from_db()
     assert task.state == ReviewTask.State.RESOLVED
-    assert task.resolved_book is not None
-    assert Identifier.objects.filter(book=task.resolved_book, value=DUNE_13).exists()
+    assert task.decision == ReviewTask.Decision.ACCEPT_CANDIDATE
+    assert str(task.selected_candidate_id) == best_id
+    assert task.reviewer is not None
+    assert task.reviewer.get_username() == "isbn-verified"
+    assert task.decision_payload["resolution_source"] == "reviewer_isbn"
+    assert task.decision_payload["isbn"] == DUNE_13
+    book = task.resolved_book
+    assert book is not None
+    assert book.title == "Dune"
+    assert book.publisher.lower() == "ace"  # provider metadata, normalized
+    assert [author.full_name for author in book.authors.all()] == ["Frank Herbert"]
+    assert Identifier.objects.filter(book=book, value=DUNE_13).exists()
+    import_job.refresh_from_db()
+    assert import_job.state == ImportJob.State.COMPLETE
+    assert import_job.book_id == book.id
+    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    assert "data-isbn-auto-accepted" in page
+    assert "Accept ISBN match" not in page
 
 
 @pytest.mark.django_db(transaction=True)
@@ -117,7 +168,9 @@ def test_isbn10_lookup_verifies_records_carrying_the_isbn13_form(
     assert client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_10}).status_code == 202
 
     assert provider.calls[0]["isbn"] == DUNE_10
-    assert client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]["unambiguous"] is True
+    lookup = client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]
+    assert lookup["unambiguous"] is True
+    assert lookup["auto_accepted"] is True
 
 
 @pytest.mark.django_db(transaction=True)
@@ -138,6 +191,55 @@ def test_record_without_the_typed_isbn_is_not_verified(
     page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
     assert 'data-isbn-lookup="none"' in page
     assert "Accept ISBN match" not in page
+    task.refresh_from_db()
+    assert task.state != ReviewTask.State.RESOLVED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_queried_isbn_echoed_into_a_different_record_is_not_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PDXDJN's probe: requested Dune, got "Different Book" carrying only another ISBN."""
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "isbn-echo")
+    record = {
+        "key": "/books/OL9M",
+        "title": "Different Book",
+        "author_name": ["Some Author"],
+        "isbn_13": ["9780306406157"],
+        "_queried_isbn": DUNE_13,  # what Open Library's ISBN lookup adds to the payload
+    }
+    _use_providers(monkeypatch, _RecordingProvider("openlibrary", [record]))
+
+    assert client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_13}).status_code == 202
+
+    candidate = import_job.metadata_candidates.get(superseded_at__isnull=True)
+    assert candidate.title == "Different Book"
+    assert candidate.isbn13 == "9780306406157"  # the echo is not copied onto it either
+    lookup = client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]
+    assert lookup["verified_candidate_ids"] == []
+    assert lookup["auto_accepted"] is False
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.OPEN
+    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    assert 'data-isbn-lookup="none"' in page
+
+
+@pytest.mark.django_db(transaction=True)
+def test_verified_record_without_authors_is_offered_not_auto_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, task, _import_job = _import_review(monkeypatch, tmp_path, "isbn-no-authors")
+    _use_providers(monkeypatch, _RecordingProvider("stub", [_edition("Dune", authors=[])]))
+
+    assert client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_13}).status_code == 202
+
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.OPEN
+    page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
+    assert "Accept ISBN match" in page
+    assert 'name="authors"' in page
 
 
 @pytest.mark.django_db(transaction=True)
@@ -158,6 +260,8 @@ def test_conflicting_isbn_records_are_ambiguous_and_agreeing_ones_are_not(
     page = client.get(f"/reviews/{task.id}/", headers=HTML).content.decode()
     assert 'data-isbn-lookup="ambiguous"' in page
     assert "Accept ISBN match" not in page
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.OPEN  # several books: the reviewer chooses
 
     _use_providers(
         monkeypatch,
@@ -168,6 +272,52 @@ def test_conflicting_isbn_records_are_ambiguous_and_agreeing_ones_are_not(
     lookup = client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]
     assert lookup["unambiguous"] is True
     assert len(lookup["verified_candidate_ids"]) == 2
+    assert lookup["auto_accepted"] is True  # two providers, one book
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_match_is_not_auto_accepted_into_a_review_resolved_meanwhile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, task, _import_job = _import_review(monkeypatch, tmp_path, "isbn-resolved")
+
+    def resolve_meanwhile() -> None:
+        assert client.post(f"/reviews/{task.id}/unidentified/").status_code == 200
+
+    _use_providers(monkeypatch, _CallbackProvider([_edition("Dune")], resolve_meanwhile))
+    assert client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_13}).status_code == 202
+
+    task.refresh_from_db()
+    assert task.decision == ReviewTask.Decision.MARK_UNIDENTIFIED
+    assert task.resolved_book is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_match_of_a_superseded_search_is_not_auto_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, task, import_job = _import_review(monkeypatch, tmp_path, "isbn-superseded")
+
+    def superseded_meanwhile() -> None:
+        # A newer search becomes current after this one has published.
+        ImportJob.objects.filter(pk=import_job.pk).update(current_search_job_id=None)
+
+    original_publish = review_identification._publish
+
+    def publish_then_supersede(**kwargs: Any) -> str:
+        reason = original_publish(**kwargs)
+        superseded_meanwhile()
+        return reason
+
+    monkeypatch.setattr(review_identification, "_publish", publish_then_supersede)
+    _use_providers(monkeypatch, _RecordingProvider("stub", [_edition("Dune")]))
+    assert client.post(f"/reviews/{task.id}/isbn-lookup/", {"isbn": DUNE_13}).status_code == 202
+
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.OPEN
+    assert client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]["auto_accepted"] is False
 
 
 @pytest.mark.django_db(transaction=True)
@@ -199,9 +349,16 @@ def test_isbn_lookup_works_for_scan_reviews(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert response.status_code == 202
     assert provider.calls == [{"title": None, "author": None, "isbn": DUNE_13}]
-    assert client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]["unambiguous"] is True
+    lookup = client.get(f"/reviews/{task.id}/").json()["isbn_lookup"]
+    assert lookup["unambiguous"] is True
+    assert lookup["auto_accepted"] is True
     task.refresh_from_db()
     assert task.inferred_title == "Provisional Title"
+    assert task.state == ReviewTask.State.RESOLVED
+    assert task.decision_payload["resolution_source"] == "reviewer_isbn"
+    scan_job = ScanJob.objects.get(pk=scan_job.pk)
+    assert scan_job.book is not None
+    assert scan_job.book.title == "Dune"
 
 
 @pytest.mark.django_db(transaction=True)

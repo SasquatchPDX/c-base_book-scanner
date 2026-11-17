@@ -24,7 +24,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.core.paginator import Paginator
 from django.db import connections, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q, QuerySet
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -59,6 +59,7 @@ from . import (
     intake,
     metadata_search,
     ocr,
+    review_accept,
     review_identification,
     scan_identification,
     scan_pipeline,
@@ -67,13 +68,12 @@ from . import (
 from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
-    Author,
     Book,
     CoverImage,
     FileVariant,
-    Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ProcessingJob,
     ReviewTask,
     ScanJob,
@@ -82,7 +82,6 @@ from .models import (
     ScanTailorStageState,
     ScanTodo,
     StorageLocation,
-    clean_publication_year,
 )
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -1077,7 +1076,10 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
     searches = metadata_search.searches_for_task(task)
     active_job = metadata_search.active_search_job(task)
     latest_job = metadata_search.latest_search_job(task)
-    latest_search = searches[0] if searches else None
+    # A discarded run (superseded, or finished after the review was resolved) is
+    # history only; the latest search shown is the latest one that was applied.
+    applied = [search for search in searches if search.state != MetadataSearch.State.DISCARDED]
+    latest_search = applied[0] if applied else None
     current_ids = set(_review_candidates(task).values_list("id", flat=True))
     # A failed job that recorded no run (dispatch failure, stale worker) must still
     # be visible; one that did record a run is shown through that run.
@@ -1097,7 +1099,7 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
     return {
         "searches": searches,
         "latest_search": latest_search,
-        "earlier_searches": searches[1:],
+        "earlier_searches": [search for search in searches if search is not latest_search],
         "active_search_job": active_job,
         "search_running": (
             active_job is not None and active_job.state == ProcessingJob.JobState.RUNNING
@@ -1142,57 +1144,8 @@ def _serialize_task(task: ReviewTask) -> dict[str, Any]:
     }
 
 
-def _resolve_review_source(
-    *,
-    task: ReviewTask,
-    book: Book,
-    reviewer: Any,
-    decision: str,
-    selected_candidate: MetadataCandidate | None = None,
-    decision_notes: str = "",
-    decision_payload: dict[str, Any] | None = None,
-) -> FileVariant | None:
-    import_job = task.import_job
-    if import_job is not None:
-        return intake.resolve_import_with_review_data(
-            job=import_job,
-            review_task=task,
-            book=book,
-            selected_candidate=selected_candidate,
-            reviewer=reviewer,
-            decision=decision,
-            decision_notes=decision_notes,
-            decision_payload=decision_payload,
-        )
-    if task.scan_job_id is None:
-        raise ValueError("review task has no source")
-    with transaction.atomic():
-        scan_job = ScanJob.objects.select_for_update().get(pk=task.scan_job_id)
-        scan_job.book = book
-        scan_job.save(update_fields=["book_id", "updated_at"])
-        task.state = ReviewTask.State.RESOLVED
-        task.decision = decision
-        task.decision_notes = decision_notes
-        task.decided_at = timezone.now()
-        if decision_payload is not None:
-            task.decision_payload = decision_payload
-        task.resolved_book = book
-        task.selected_candidate = selected_candidate
-        task.reviewer = reviewer
-        task.save(
-            update_fields=[
-                "state",
-                "decision",
-                "decision_notes",
-                "decision_payload",
-                "resolved_book_id",
-                "selected_candidate_id",
-                "reviewer_id",
-                "decided_at",
-                "updated_at",
-            ],
-        )
-    return None
+# Moved to review_accept so workers resolve reviews through the same path (#59).
+_resolve_review_source = review_accept.resolve_review_source
 
 
 def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
@@ -1368,8 +1321,8 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     if _wants_html(request):
         recent_books = (
             Book.objects.select_related("front_cover", "back_cover")
-            .prefetch_related("authors", "file_variants")
-            .order_by("-created_at")[:12]
+            .prefetch_related(*_book_list_prefetches())
+            .order_by("-created_at", "-id")[:12]
         )
         return render(
             request,
@@ -1388,6 +1341,43 @@ def library_home(request: HttpRequest) -> HttpResponseBase:
     return JsonResponse(
         {"status": "ok", "user": request.user.username, "role": profile.role},
     )
+
+
+# Attribute that `_book_list_prefetches` fills with the book's COMPLETE variants.
+_COMPLETE_VARIANTS_ATTR = "complete_file_variants"
+
+
+def _book_list_prefetches() -> list[str | Prefetch[Any]]:
+    """Prefetches that let `_serialize_book` render a list row without extra queries.
+
+    The COMPLETE variants are prefetched once for the whole page into
+    `_COMPLETE_VARIANTS_ATTR`, so `formats_available` is not a per-book query (#28).
+    """
+    return [
+        "authors",
+        "categories",
+        "genres",
+        Prefetch(
+            "file_variants",
+            queryset=FileVariant.objects.filter(
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            ).only("id", "book_id", "format", "processing_state"),
+            to_attr=_COMPLETE_VARIANTS_ATTR,
+        ),
+    ]
+
+
+def _complete_variants(book: Book) -> list[FileVariant]:
+    prefetched: list[FileVariant] | None = getattr(book, _COMPLETE_VARIANTS_ATTR, None)
+    if prefetched is not None:
+        return prefetched
+    # `.all()` reuses a plain `file_variants` prefetch when there is one; a
+    # `.filter()` here would bypass it and cost one query per book (#28).
+    return [
+        variant
+        for variant in book.file_variants.all()
+        if variant.processing_state == FileVariant.ProcessingState.COMPLETE
+    ]
 
 
 def _serialize_book(
@@ -1421,11 +1411,7 @@ def _serialize_book(
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
-        file_variants = list(
-            book.file_variants.filter(
-                processing_state=FileVariant.ProcessingState.COMPLETE,
-            ),
-        )
+        file_variants = _complete_variants(book)
         variants = [
             {
                 "id": file_variant.id,
@@ -1446,12 +1432,7 @@ def _serialize_book(
         )
     else:
         book_payload["formats_available"] = sorted(
-            {
-                variant.format
-                for variant in book.file_variants.filter(
-                    processing_state=FileVariant.ProcessingState.COMPLETE,
-                )
-            }
+            {variant.format for variant in _complete_variants(book)}
         )
     if include_conversion_options:
         book_payload["conversion_options"] = conversion.conversion_options_for_book(book)
@@ -1483,6 +1464,83 @@ def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
     return value
 
 
+_LIBRARY_SORTS: dict[str, tuple[str, str]] = {
+    "created_at": ("created_at", "id"),
+    "-created_at": ("-created_at", "-id"),
+    "title": ("title", "id"),
+    "-title": ("-title", "-id"),
+}
+
+
+def _book_ids_with_author(name: str) -> QuerySet[Any]:
+    return Book.authors.through.objects.filter(author__full_name__icontains=name).values("book_id")
+
+
+def _filtered_library_books(
+    *,
+    query: str = "",
+    title: str = "",
+    author: str = "",
+    category: str = "",
+    genre: str = "",
+    language: str = "",
+    book_format: str = "",
+    sort: str = "-created_at",
+) -> QuerySet[Book]:
+    """Build the browse/search queryset for `/library/books/`.
+
+    Filters over to-many relations are `pk IN (subquery)` conditions rather
+    than joins, so no row is duplicated and no `DISTINCT` is needed. The page
+    query and the paginator's `COUNT(*)` therefore stay narrow instead of
+    de-duplicating every column, `description` included (#28 phase 0). The
+    subqueries are uncorrelated, so PostgreSQL hashes each one once (and can
+    still scan books in parallel), which measured faster than correlated
+    `EXISTS` inside the `?q=` disjunction.
+
+    Each relation filter matches on its own, as the separate join per
+    `.filter()` call did before: `?q=` and `?author=` may match different
+    authors of the same book. The format filter keeps the format and the
+    COMPLETE state on one variant, as before.
+    """
+    books = Book.objects.select_related("front_cover", "back_cover").prefetch_related(
+        *_book_list_prefetches()
+    )
+    if query:
+        books = books.filter(
+            Q(title__icontains=query)
+            | Q(subtitle__icontains=query)
+            | Q(description__icontains=query)
+            | Q(pk__in=_book_ids_with_author(query)),
+        )
+    if title:
+        books = books.filter(title__icontains=title)
+    if author:
+        books = books.filter(pk__in=_book_ids_with_author(author))
+    if category:
+        books = books.filter(
+            pk__in=Book.categories.through.objects.filter(
+                category__name__icontains=category,
+            ).values("book_id"),
+        )
+    if genre:
+        books = books.filter(
+            pk__in=Book.genres.through.objects.filter(
+                genre__name__icontains=genre,
+            ).values("book_id"),
+        )
+    if language:
+        books = books.filter(language__iexact=language)
+    if book_format:
+        books = books.filter(
+            pk__in=FileVariant.objects.filter(
+                format__iexact=book_format,
+                processing_state=FileVariant.ProcessingState.COMPLETE,
+            ).values("book_id"),
+        )
+    # The id tiebreaker keeps offset pages stable when sort keys collide.
+    return books.order_by(*_LIBRARY_SORTS.get(sort, _LIBRARY_SORTS["-created_at"]))
+
+
 @require_GET
 @login_required
 def library_books(request: HttpRequest) -> HttpResponseBase:
@@ -1499,48 +1557,16 @@ def library_books(request: HttpRequest) -> HttpResponseBase:
     book_format = request.GET.get("format", "").strip()
     sort = request.GET.get("sort", "-created_at").strip()
 
-    books = (
-        Book.objects.all()
-        .select_related("front_cover", "back_cover")
-        .prefetch_related(
-            "authors",
-            "categories",
-            "genres",
-            "identifiers",
-            "file_variants",
-        )
+    books = _filtered_library_books(
+        query=query,
+        title=title,
+        author=author,
+        category=category,
+        genre=genre,
+        language=language,
+        book_format=book_format,
+        sort=sort,
     )
-
-    if query:
-        books = books.filter(
-            Q(title__icontains=query)
-            | Q(subtitle__icontains=query)
-            | Q(description__icontains=query)
-            | Q(authors__full_name__icontains=query),
-        )
-    if title:
-        books = books.filter(title__icontains=title)
-    if author:
-        books = books.filter(authors__full_name__icontains=author)
-    if category:
-        books = books.filter(categories__name__icontains=category)
-    if genre:
-        books = books.filter(genres__name__icontains=genre)
-    if language:
-        books = books.filter(language__iexact=language)
-    if book_format:
-        books = books.filter(
-            file_variants__format__iexact=book_format,
-            file_variants__processing_state=FileVariant.ProcessingState.COMPLETE,
-        )
-
-    sort_map = {
-        "created_at": "created_at",
-        "-created_at": "-created_at",
-        "title": "title",
-        "-title": "-title",
-    }
-    books = books.distinct().order_by(sort_map.get(sort, "-created_at"))
 
     page = _as_positive_int(request.GET.get("page"), 1)
     page_size = _as_positive_int(request.GET.get("page_size"), 25)
@@ -3425,7 +3451,10 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         return render(
             request,
             "core/upload.html",
-            {"max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES},
+            {
+                "max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES,
+                "audiobook_service_url": intake.audiobook_service_url(),
+            },
         )
 
     uploaded_file = request.FILES.get("file")
@@ -3439,6 +3468,18 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
         normalized_filename = intake.normalize_filename(original_name)
     except intake.ValidationError as exc:
         return HttpResponseBadRequest(str(exc))
+    if intake.is_audio_filename(original_name, uploaded_file.content_type):
+        # Audiobooks live on a separate service (docs/design/32-audiobooks.md); the
+        # file is rejected before it is staged, so no ImportJob is ever created.
+        logger.info(
+            "upload_audio_rejected",
+            drm_protected=intake.is_drm_audio_filename(original_name),
+        )
+        return HttpResponse(
+            intake.audio_upload_rejection_message(original_name),
+            status=415,
+            content_type="text/plain; charset=utf-8",
+        )
     try:
         detected_format, detected_mime = intake.detect_format(
             original_name,
@@ -3515,6 +3556,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
     tasks = ReviewTask.objects.select_related(
         "import_job",
         "import_job__uploader",
+        "import_job__source_location",
         "scan_job",
         "scan_job__operator",
     ).filter(state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED])
@@ -3522,7 +3564,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
         tasks = tasks.filter(
             Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
         )
-    tasks = tasks.order_by("-created_at")
+    task_list = list(tasks.order_by("-created_at"))
 
     payload = [
         {
@@ -3532,15 +3574,97 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
                 _serialize_candidate(candidate) for candidate in _review_candidates(task)
             ],
         }
-        for task in tasks
+        for task in task_list
     ]
+    groups = _group_sibling_review_tasks(task_list, payload)
     if _wants_html(request):
         return render(
             request,
             "core/review_queue.html",
-            {"tasks": list(tasks), "items": payload, "count": len(payload)},
+            {
+                "tasks": task_list,
+                "items": payload,
+                "groups": groups,
+                "count": len(payload),
+            },
         )
-    return JsonResponse({"items": payload, "count": len(payload)})
+    # The JSON list stays one item per task (non-breaking); items are only annotated
+    # with their sibling group so clients can collapse them like the HTML queue.
+    return JsonResponse({"items": payload, "count": len(payload), "group_count": len(groups)})
+
+
+# Formats most likely to carry real embedded metadata first: the primary entry of a
+# sibling group should be the most informative file to review (#49).
+REVIEW_FORMAT_PRIORITY = ("epub", "azw3", "mobi", "fb2", "pdf", "djvu", "html", "rtf", "txt")
+
+
+@dataclass
+class ReviewQueueGroup:
+    primary: ReviewTask
+    primary_item: dict[str, Any]
+    others: list[tuple[ReviewTask, dict[str, Any]]]
+
+    @property
+    def other_count(self) -> int:
+        return len(self.others)
+
+
+def _group_sibling_review_tasks(
+    tasks: list[ReviewTask],
+    items: list[dict[str, Any]],
+) -> list[ReviewQueueGroup]:
+    """Collapse open review tasks for formats of one book into one queue entry.
+
+    Uses the sibling key of ``intake._sibling_jobs`` (source, folder, case-folded name;
+    only for sources with ``group_sibling_formats``). The primary entry is the task with
+    the best candidate score, then the most metadata-rich format, then the oldest. Each
+    item in ``items`` gains ``sibling_group`` (``None`` when it stands alone).
+    """
+    keyed: dict[tuple[int, str, str], list[int]] = {}
+    order: list[tuple[int, str, str] | int] = []
+    for index, task in enumerate(tasks):
+        key = intake.sibling_group_key(task.import_job) if task.import_job else None
+        if key is None:
+            order.append(index)
+            continue
+        if key not in keyed:
+            keyed[key] = []
+            order.append(key)
+        keyed[key].append(index)
+
+    def rank(index: int) -> tuple[float, int, datetime]:
+        scores = [candidate["score"] for candidate in items[index]["candidates"]]
+        job = tasks[index].import_job
+        fmt = job.detected_format if job is not None else ""
+        priority = (
+            REVIEW_FORMAT_PRIORITY.index(fmt)
+            if fmt in REVIEW_FORMAT_PRIORITY
+            else len(REVIEW_FORMAT_PRIORITY)
+        )
+        return (-max(scores, default=0.0), priority, tasks[index].created_at)
+
+    groups: list[ReviewQueueGroup] = []
+    for entry in order:
+        members = sorted(keyed[entry], key=rank) if isinstance(entry, tuple) else [entry]
+        primary, *others = members
+        if len(members) > 1:
+            annotation = {
+                "primary_task_id": str(tasks[primary].id),
+                "task_ids": [str(tasks[index].id) for index in members],
+                "size": len(members),
+            }
+            for index in members:
+                items[index]["sibling_group"] = annotation
+        else:
+            items[primary]["sibling_group"] = None
+        groups.append(
+            ReviewQueueGroup(
+                primary=tasks[primary],
+                primary_item=items[primary],
+                others=[(tasks[index], items[index]) for index in others],
+            )
+        )
+    return groups
 
 
 @require_GET
@@ -3584,6 +3708,11 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
             "unambiguous": isbn_lookup["unambiguous"],
             "best_candidate_id": (
                 str(isbn_lookup["best"].id) if isbn_lookup["best"] is not None else None
+            ),
+            "auto_accepted": (
+                task.state == ReviewTask.State.RESOLVED
+                and isinstance(task.decision_payload, dict)
+                and task.decision_payload.get("resolution_source") == "reviewer_isbn"
             ),
         }
         if isbn_lookup is not None
@@ -3639,106 +3768,12 @@ def review_accept_candidate(
         )
 
     try:
-        candidate_isbn13 = candidate.isbn13 or None
-        if candidate_isbn13:
-            existing_identifier = (
-                Identifier.objects.filter(
-                    value=candidate_isbn13,
-                )
-                .select_related("book")
-                .first()
-            )
-            if existing_identifier is not None:
-                book = existing_identifier.book
-            else:
-                book = None
-        else:
-            book = None
-
-        if book is None:
-            candidate_isbn10 = candidate.isbn10 or None
-            if candidate_isbn10:
-                existing_identifier = (
-                    Identifier.objects.filter(
-                        value=candidate_isbn10,
-                    )
-                    .select_related("book")
-                    .first()
-                )
-                if existing_identifier is not None:
-                    book = existing_identifier.book
-
-        if book is None:
-            candidate_author_set = {
-                name.lower() for name in candidate.authors if isinstance(name, str)
-            }
-            for existing_book in Book.objects.filter(title__iexact=candidate.title):
-                known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
-                if candidate_author_set.intersection(known_authors):
-                    book = existing_book
-                    break
-
-        if book is None:
-            candidate_edition = getattr(candidate, "edition", "")
-            book = Book.objects.create(
-                title=candidate.title,
-                publisher=candidate.publisher or "",
-                language=candidate.language or "",
-                description=candidate.description or "",
-                edition=candidate_edition or "",
-            )
-            book.publication_year = clean_publication_year(candidate.publication_year)
-            for author_name in candidate.authors:
-                if not isinstance(author_name, str):
-                    continue
-                author, _ = Author.objects.get_or_create(full_name=author_name.strip())
-                if author_name.strip():
-                    book.authors.add(author)
-            if candidate.isbn10:
-                Identifier.objects.get_or_create(
-                    book=book,
-                    kind=Identifier.IdentifierType.ISBN10,
-                    value=candidate.isbn10,
-                    defaults={"normalized_value": candidate.isbn10},
-                )
-            if candidate.isbn13:
-                Identifier.objects.get_or_create(
-                    book=book,
-                    kind=Identifier.IdentifierType.ISBN13,
-                    value=candidate.isbn13,
-                    defaults={"normalized_value": candidate.isbn13},
-                )
-            book.save()
-
-        # A candidate without authors (the provider record names none) can be accepted
-        # with authors the reviewer confirmed, e.g. the file's suggested authors. They
-        # only fill a Book that has no authors yet; provider authors always win.
-        candidate_has_authors = any(
-            isinstance(name, str) and name.strip() for name in candidate.authors
-        )
-        reviewer_authors = (
-            [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
-        )
-        decision_payload: dict[str, Any] | None = None
-        if reviewer_authors and not book.authors.exists():
-            for author_name in reviewer_authors:
-                author, _ = Author.objects.get_or_create(
-                    full_name=intake._fit(Author, "full_name", author_name),
-                )
-                book.authors.add(author)
-            decision_payload = {
-                **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
-                "reviewer_authors": reviewer_authors,
-            }
-
-        variant = _resolve_review_source(
+        book, variant = review_accept.accept_candidate(
             task=task,
-            book=book,
-            selected_candidate=candidate,
+            candidate=candidate,
             reviewer=profile.user,
-            decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
+            reviewer_authors=_parse_author_list(payload.get("authors")),
             decision_notes=f"Accepted candidate {candidate.id}",
-            decision_payload=decision_payload,
         )
         return _review_action_response(
             request,

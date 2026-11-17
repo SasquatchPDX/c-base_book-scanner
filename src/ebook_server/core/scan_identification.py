@@ -6,13 +6,14 @@ from datetime import datetime
 from typing import Any
 
 import structlog
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
-from ebook_server.jobs import get_queue, is_stale_running
+from ebook_server.jobs import get_queue
 
-from . import identification, metadata_search
+from . import identification, metadata_search, review_accept
 from .models import MetadataSearch, ProcessingJob, ReviewTask, ScanJob
 
 logger = structlog.get_logger(__name__)
@@ -175,11 +176,23 @@ def request_scan_identification(
         )
         reused = metadata_search.reuse_or_replace_active_job(active, search_terms)
         if reused is not None:
+            metadata_search.make_current(locked, reused)
             return reused
+        open_task_id = (
+            ReviewTask.objects.filter(
+                scan_job=locked,
+                state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED],
+            )
+            .values_list("id", flat=True)
+            .first()
+        )
         processing_job = ProcessingJob.objects.create(
             job_type=ProcessingJob.JobType.SCAN_IDENTIFICATION,
             details={
                 "scan_job_id": str(locked.id),
+                # The review this search refreshes: resolving it while the search
+                # runs must keep its decision rather than open a new review.
+                "open_review_task_id": open_task_id,
                 "requested_by_user_id": requested_by_user_id,
                 "terms": search_terms,
                 "attempt_count": 0,
@@ -187,6 +200,7 @@ def request_scan_identification(
                 "error": "",
             },
         )
+        metadata_search.make_current(locked, processing_job)
 
     try:
         queue = get_queue()
@@ -197,6 +211,7 @@ def request_scan_identification(
                 process_scan_identification_job,
                 str(processing_job.job_id),
                 raise_on_error=True,
+                job_id=metadata_search.rq_job_id(processing_job),
             )
     except Exception as exc:
         processing_job.refresh_from_db()
@@ -213,7 +228,13 @@ def request_scan_identification(
 
 
 def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False) -> None:
-    """Resolve public metadata candidates and create a reusable review task."""
+    """Resolve public metadata candidates and create or refresh the scan's review.
+
+    Fenced like review searches (#104): only the scan's current search job starts,
+    and its results only become current if, under the scan-job lock, it is still
+    current and this attempt, the scan has no book yet and the review it refreshes
+    was not resolved meanwhile. Otherwise the run is kept as history only.
+    """
     with transaction.atomic():
         try:
             processing_job = ProcessingJob.objects.select_for_update().get(job_id=job_id)
@@ -221,17 +242,28 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             return
         if processing_job.job_type != ProcessingJob.JobType.SCAN_IDENTIFICATION:
             return
-        if processing_job.state == ProcessingJob.JobState.SUCCESS:
+        details = _details(processing_job)
+        current_search_job_id = (
+            ScanJob.objects.filter(pk=details.get("scan_job_id"))
+            .values_list("current_search_job_id", flat=True)
+            .first()
+        )
+        refusal = metadata_search.start_refusal(processing_job, current_search_job_id)
+        if refusal is not None:
+            if refusal == metadata_search.SUPERSEDED_REASON:
+                metadata_search.refuse_superseded_job(processing_job)
+            logger.info(
+                "scan_identification_not_started",
+                processing_job_id=str(processing_job.job_id),
+                reason=refusal,
+            )
             return
         if processing_job.state == ProcessingJob.JobState.RUNNING:
-            if not is_stale_running(processing_job):
-                return
             logger.warning(
                 "stale_running_job_reentered",
                 processing_job_id=str(processing_job.job_id),
             )
-        details = _details(processing_job)
-        attempt_count = int(details.get("attempt_count", 0)) + 1
+        attempt_count = metadata_search.attempt_of(processing_job) + 1
         details = {**details, "attempt_count": attempt_count, "error": ""}
         processing_job.state = ProcessingJob.JobState.RUNNING
         processing_job.started_at = timezone.now()
@@ -256,51 +288,83 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
         candidates, outcomes = identification.resolve_candidates_with_report(signals)
         with transaction.atomic():
+            # Same lock order as request_scan_identification and review resolution.
+            locked_scan = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
+            locked_job = ProcessingJob.objects.select_for_update().get(pk=processing_job.pk)
+            reason = metadata_search.publication_refusal(
+                source=locked_scan,
+                job=locked_job,
+                attempt=attempt_count,
+                review_closed=_review_closed(locked_scan, details),
+            )
             search = metadata_search.record_search(
                 trigger=MetadataSearch.Trigger.SCAN,
                 signals=signals,
                 outcomes=outcomes,
                 candidate_count=len(candidates),
-                scan_job=scan_job,
-                processing_job_id=processing_job.job_id,
+                scan_job=locked_scan,
+                processing_job_id=locked_job.job_id,
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
+                discarded=reason,
                 mode=mode,
             )
             metadata_search.save_candidates(
                 search=search,
                 candidates=candidates,
                 match_threshold=identification.AUTO_ACCEPT_SCORE,
+                current=not reason,
             )
-            task = _create_or_refresh_review(scan_job, candidates)
-            processing_job.state = ProcessingJob.JobState.SUCCESS
-            processing_job.finished_at = timezone.now()
-            processing_job.details = {
-                **details,
-                "candidate_count": len(candidates),
-                "review_task_id": task.id,
-                "search_id": str(search.id),
-                "error": "",
-            }
-            processing_job.save(update_fields=["state", "finished_at", "details"])
+            task_id: int | None = None
+            if reason:
+                metadata_search.finish_discarded_job(
+                    locked_job, attempt=attempt_count, reason=reason, search_id=search.id
+                )
+            else:
+                task = _create_or_refresh_review(locked_scan, candidates)
+                task_id = task.id
+                locked_job.state = ProcessingJob.JobState.SUCCESS
+                locked_job.finished_at = timezone.now()
+                locked_job.details = {
+                    **details,
+                    "candidate_count": len(candidates),
+                    "review_task_id": task.id,
+                    "search_id": str(search.id),
+                    "published": True,
+                    "error": "",
+                }
+                locked_job.save(update_fields=["state", "finished_at", "details"])
+        auto_accepted = None
+        if not reason and mode == "isbn" and task_id is not None:
+            auto_accepted = _auto_accept_isbn_match(
+                processing_job=processing_job,
+                scan_job=scan_job,
+                task_id=task_id,
+                isbn=str(details["terms"]["isbn"]),
+                requested_by_id=details.get("requested_by_user_id"),
+            )
         logger.info(
             "scan_identification_succeeded",
             processing_job_id=str(processing_job.job_id),
             scan_job_id=str(scan_job.id),
             candidate_count=len(candidates),
-            review_task_id=task.id,
+            review_task_id=task_id,
+            published=not reason,
+            discarded=reason,
+            auto_accepted_candidate_id=auto_accepted,
         )
     except Exception as exc:
         rq_job = get_current_job() if raise_on_error else None
         retry_pending = bool(
             rq_job is not None and rq_job.retries_left is not None and rq_job.retries_left > 0
         )
-        processing_job.state = (
-            ProcessingJob.JobState.QUEUED if retry_pending else ProcessingJob.JobState.FAILED
+        discarded = _record_job_failure(
+            processing_job=processing_job,
+            attempt_count=attempt_count,
+            details=details,
+            exc=exc,
+            retry_pending=retry_pending,
         )
-        processing_job.finished_at = None if retry_pending else timezone.now()
-        processing_job.details = {**details, "error": str(exc)}
-        processing_job.save(update_fields=["state", "finished_at", "details"])
         if signals is not None and scan_job is not None:
             _record_failed_search(
                 scan_job=scan_job,
@@ -310,6 +374,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
                 exc=exc,
+                discarded=discarded,
                 mode=mode,
             )
         logger.exception(
@@ -323,6 +388,95 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             raise
 
 
+def _auto_accept_isbn_match(
+    *,
+    processing_job: ProcessingJob,
+    scan_job: ScanJob,
+    task_id: int,
+    isbn: str,
+    requested_by_id: int | None,
+) -> int | None:
+    """Accept the one book whose provider record carries the reviewer's ISBN (#59).
+
+    Same rule and fencing as for import reviews: only while this job is still the
+    scan's current search, the scan has no book and its review is unresolved.
+    """
+    try:
+        with transaction.atomic():
+            locked_scan = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
+            task = ReviewTask.objects.select_for_update().get(pk=task_id)
+            if (
+                locked_scan.current_search_job_id != processing_job.job_id
+                or locked_scan.book_id is not None
+                or task.state not in {ReviewTask.State.OPEN, ReviewTask.State.CLAIMED}
+            ):
+                return None
+            candidate = review_accept.auto_acceptable_isbn_candidate(
+                metadata_search.current_candidates(task), isbn
+            )
+            if candidate is None:
+                return None
+            reviewer = (
+                get_user_model().objects.filter(pk=requested_by_id).first()
+                if requested_by_id is not None
+                else None
+            )
+            review_accept.accept_candidate(
+                task=task,
+                candidate=candidate,
+                reviewer=reviewer,
+                decision_notes=f"Accepted candidate {candidate.id}: ISBN {isbn} verified",
+                extra_payload={"resolution_source": "reviewer_isbn", "isbn": isbn},
+            )
+            return candidate.id
+    except Exception:  # the review stays open with the verified candidate shown
+        logger.exception(
+            "scan_isbn_auto_accept_failed",
+            processing_job_id=str(processing_job.job_id),
+            review_task_id=task_id,
+        )
+        return None
+
+
+def _review_closed(scan_job: ScanJob, details: dict[str, Any]) -> bool:
+    """True when the scan was identified, or the review this search refreshes was
+    resolved, while the providers were running (``scan_job`` row locked)."""
+    if scan_job.book_id is not None:
+        return True
+    task_id = details.get("open_review_task_id")
+    if task_id is None:
+        return False
+    state = ReviewTask.objects.filter(pk=task_id).values_list("state", flat=True).first()
+    return state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}
+
+
+def _record_job_failure(
+    *,
+    processing_job: ProcessingJob,
+    attempt_count: int,
+    details: dict[str, Any],
+    exc: Exception,
+    retry_pending: bool,
+) -> str:
+    """Fail (or requeue) this attempt if it still owns the job. Returns a discard reason."""
+    with transaction.atomic():
+        locked_scan = (
+            ScanJob.objects.select_for_update().filter(pk=details.get("scan_job_id")).first()
+        )
+        locked_job = ProcessingJob.objects.select_for_update().get(pk=processing_job.pk)
+        if not metadata_search.owns_job(locked_job, attempt_count):
+            return metadata_search.TAKEN_OVER_REASON
+        locked_job.state = (
+            ProcessingJob.JobState.QUEUED if retry_pending else ProcessingJob.JobState.FAILED
+        )
+        locked_job.finished_at = None if retry_pending else timezone.now()
+        locked_job.details = {**details, "error": str(exc)}
+        locked_job.save(update_fields=["state", "finished_at", "details"])
+        if locked_scan is None or locked_scan.current_search_job_id != locked_job.job_id:
+            return metadata_search.SUPERSEDED_REASON
+    return ""
+
+
 def _record_failed_search(
     *,
     scan_job: ScanJob,
@@ -332,7 +486,8 @@ def _record_failed_search(
     requested_by_id: int | None,
     started_at: datetime,
     exc: Exception,
-    mode: str,
+    discarded: str = "",
+    mode: str = "text",
 ) -> None:
     stage = "saving the results failed" if outcomes is not None else "the search failed"
     try:
@@ -345,6 +500,7 @@ def _record_failed_search(
             requested_by_id=requested_by_id,
             started_at=started_at,
             error=f"{stage}: {type(exc).__name__}",
+            discarded=discarded,
             mode=mode,
         )
     except Exception:  # never mask the original failure
