@@ -5,8 +5,10 @@ from typing import Any
 from unittest.mock import patch
 
 from ebook_server.core.identification import (
+    AUTO_ACCEPT_SCORE,
     IdentificationCandidate,
     IdentificationInput,
+    _title_match_score,
     build_identification_input,
     parse_filename_signals,
     resolve_candidates,
@@ -174,3 +176,41 @@ def test_conflicting_metadata_keeps_filename_signal() -> None:
 
     assert payload.title_hints[0] == "Wrong Title"
     assert payload.title_hints[1] == "The%20War%20of%20The%20Worlds"
+
+
+def test_title_match_score_does_not_give_full_marks_to_subset_titles() -> None:
+    # Regression for #8: token_set_ratio alone scored these 1.0.
+    assert _title_match_score("Foundation", "Foundation and Earth") < 0.9
+    assert _title_match_score("Dune", "Dune - House Harkonnen") < 0.75
+    assert _title_match_score("Gold", "Gold - 03 - Frustration") < 0.75
+
+
+def test_title_match_score_still_tolerates_case_punctuation_and_word_order() -> None:
+    assert _title_match_score("Snow Crash", "snow crash") == 1.0
+    assert _title_match_score("The Hobbit", "Hobbit, The") == 1.0
+    assert _title_match_score("Dune", "") == 0.0
+
+
+def test_subset_title_with_matching_author_stays_below_auto_accept() -> None:
+    signals = IdentificationInput(
+        title_hints=["Foundation"],
+        author_hints=["Isaac Asimov"],
+        isbns=[],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+    payloads = [
+        {"title": "Foundation and Earth", "author_name": ["Isaac Asimov"]},
+        {"title": "Foundation", "author_name": ["Isaac Asimov"]},
+    ]
+    with patch(
+        "ebook_server.core.identification._provider_instances",
+        lambda: [_stub_provider_from_candidates(payloads)()],
+    ):
+        candidates = resolve_candidates(signals)
+
+    assert [candidate.title for candidate in candidates] == ["Foundation", "Foundation and Earth"]
+    assert candidates[1].score < AUTO_ACCEPT_SCORE
+    assert candidates[0].score > candidates[1].score
