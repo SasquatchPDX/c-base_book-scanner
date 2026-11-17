@@ -318,10 +318,39 @@ def _header_strings(value: Any) -> list[str]:
     return [item.strip() for item in _as_str_list(value) if item.strip()]
 
 
+# "Last, First" in a filename part: one comma, a short name on each side, no digits,
+# and not a moved article ("Hobbit, The").
+_COMMA_FORM_AUTHOR = re.compile(r"^\s*([^,\d]{2,40}),\s*([^,\d]{1,40})\s*$")
+_MOVED_ARTICLES = frozenset({"the", "a", "an", "der", "die", "das", "le", "la", "les"})
+
+
+def comma_form_filename_authors(raw_filename: str) -> list[str]:
+    """Filename parts written as "Last, First" ("London, Jack - White Fang.txt").
+
+    That form is a deliberate author credit, so header hints read from the text may
+    add to it but never delete it.
+    """
+    stem = Path(raw_filename).stem.replace("_", " ")
+    authors: list[str] = []
+    for part in re.split(r"\s+-\s+", stem):
+        match = _COMMA_FORM_AUTHOR.match(part)
+        if match is None:
+            continue
+        last, first = match.group(1).strip(), match.group(2).strip()
+        if not last or not first or first.casefold() in _MOVED_ARTICLES:
+            continue
+        if len(last.split()) > 3 or len(first.split()) > 3:
+            continue
+        authors.append(part.strip())
+    return authors
+
+
 def _apply_text_header_hints(
     header: dict[str, Any],
     title_hints: list[str],
     author_hints: list[str],
+    *,
+    protected_authors: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Merge hints read from a plain-text book's first lines (see ``core.text_header``).
 
@@ -330,20 +359,38 @@ def _apply_text_header_hints(
     name-like lines are only appended after the other hints, so they never become the
     author sent to providers ahead of them. Hints from an admin-configured source such
     as a folder layout must likewise rank ahead of anything guessed from the text.
+
+    ``protected_authors`` (the filename's "Last, First" credits) are never removed:
+    not because the header title resembles them, and not by explicit header authors,
+    which are put in front of them instead.
     """
     title_hints = list(title_hints)
     author_hints = list(author_hints)
+    protected = [name for name in protected_authors or [] if name.strip()]
+    protected_keys = {normalize_text(name) for name in protected}
     header_title = header.get("title")
     if isinstance(header_title, str) and header_title.strip():
         header_title = header_title.strip()
         title_hints.insert(1 if title_hints else 0, header_title)
-        # A filename part the text names as the title is not an author.
+        # A filename part the text names as the title is not an author, unless the
+        # filename credits it in "Last, First" form.
         author_hints = [
-            hint for hint in author_hints if _title_match_score(hint, header_title) < 0.95
+            hint
+            for hint in author_hints
+            if normalize_text(hint) in protected_keys
+            or _title_match_score(hint, header_title) < 0.95
         ]
     explicit_authors = _header_strings(header.get("authors"))
     if explicit_authors:
-        return title_hints, explicit_authors
+        kept = [
+            name
+            for name in protected
+            if not any(
+                _author_name_similarity(normalize_text(name), normalize_text(explicit))
+                for explicit in explicit_authors
+            )
+        ]
+        return title_hints, explicit_authors + kept
     author_hints = [
         hint for hint in author_hints if normalize_text(hint) not in {"unknown", "anonymous"}
     ]
@@ -375,7 +422,12 @@ def build_identification_input(
     author_hints = filename_author_hints
     header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
     if isinstance(header, dict):
-        title_hints, author_hints = _apply_text_header_hints(header, title_hints, author_hints)
+        title_hints, author_hints = _apply_text_header_hints(
+            header,
+            title_hints,
+            author_hints,
+            protected_authors=comma_form_filename_authors(original_filename),
+        )
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:

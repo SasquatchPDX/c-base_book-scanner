@@ -12,8 +12,11 @@ Only the first non-empty lines are inspected. A line matching the file name is t
 as the title. Authors come in two strengths:
 
 * ``authors`` -- from explicit rules: a labelled ``Author:`` line, a Project Gutenberg
-  header, a ``by ...`` line and a copyright line. These may replace the guesses made
-  from splitting the file name.
+  header, a ``by ...`` line, a copyright line, and ``X by Y`` only when X is the
+  file-name title. These may replace the guesses made from splitting the file name,
+  but never a "Last, First" author credit there (see identification). Frontmatter
+  contributor lines ("Foreword by", "An Introduction by", "Edited by") and other
+  ``X by Y`` lines whose X is not the title are ignored.
 * ``likely_authors`` -- capitalised name-like lines right next to the title line, used
   only when no explicit rule fired. They are weak and may only be appended after
   other author hints, never put in front of them.
@@ -52,18 +55,25 @@ _COPYRIGHT_BY = re.compile(
 )
 _BY_ONLY = re.compile(r"^(?:by|von)\s*:?\s*(.*)$", re.IGNORECASE)
 _X_BY_Y = re.compile(r"^(.+?)\s+(?:by|von)\s*:?\s+(.+)$", re.IGNORECASE)
-# Roles that are not the author ("Edited by", "Typed by", "Cover designed by").
+# "#25 in our series by Charles Dickens": the old Project Gutenberg series line.
+_GUTENBERG_SERIES = re.compile(r"^#?\d+\s+in\s+our\s+series\s+by\s+(.+)$", re.IGNORECASE)
+# Roles that are not the author ("Edited by", "Typed by", "Cover designed by") and
+# frontmatter contributors ("Foreword by", "With an Introduction by", "Notes by").
 _NOT_AUTHOR_ROLE = re.compile(
-    r"\b(edit(?:ed|or|ors)|translat\w*|illustrat\w*|narrat\w*|read|typed|scanned|"
+    r"\b(edit(?:ed|or|ors|ion)|translat\w*|illustrat\w*|narrat\w*|read|typed|scanned|"
     r"proofread\w*|ocr|converted|formatted|prepared|produced|design\w*|cover|art\w*|"
-    r"photo\w*|typeset\w*|printed|published|herausgegeben|übersetzt)\b",
+    r"photo\w*|typeset\w*|printed|published|herausgegeben|übersetzt|"
+    r"forew\w*|introduc\w*|intro|preface\w*|afterword\w*|epilogue|prologue|notes?|"
+    r"annotat\w*|commentary|compil\w*|select\w*|abridg\w*|adapt\w*|"
+    r"vorwort|nachwort|einleitung|eingeleitet|ausgewählt)\b",
     re.IGNORECASE,
 )
 _INITIALS = re.compile(r"(?:[A-Z]\.){1,4}")
 _NAME_TOKEN = re.compile(r"^(?:[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]*\.?|[A-Z]\.)$")
 _NAME_PARTICLES = {"von", "van", "de", "der", "den", "da", "di", "du", "la", "le", "del", "zu", "y"}
 # Words that never occur in a person's name but do in header lines around it:
-# structure words, genre labels, publishers and places.
+# structure words, genre labels and publishers. Place names are not listed here: many
+# are real surnames (Jack London, Michael York); see _PLACE_WORDS instead.
 _NOT_NAME_WORDS = frozenset(
     """
     the of and a an in on to for with by from at der die das und ein eine
@@ -74,9 +84,18 @@ _NOT_NAME_WORDS = frozenset(
     tales stories story series roman novel novella collection anthology
     science fiction fantasy horror mystery thriller romance
     etext ebook project gutenberg once upon time unknown anonymous
-    new york london paris berlin boston toronto city
+    city
     cover designed design illustrated edited translated printed printing rights reserved
     first second third all
+    """.split()
+)
+# Imprint places ("New York", "London & New York"). A line made up only of these is a
+# location, not a person; a single place word inside a name is a surname ("Jack London").
+_PLACE_WORDS = frozenset(
+    """
+    new york london paris berlin boston toronto chicago philadelphia san francisco
+    los angeles sydney melbourne oxford cambridge munich münchen frankfurt hamburg
+    wien vienna zürich zurich leipzig stuttgart
     """.split()
 )
 _AUTHOR_TITLE_SEPARATOR = re.compile(r"\.\s+|\s{2,}|\s[-–—]\s")
@@ -110,6 +129,8 @@ def name_like(value: str) -> bool:
     tokens = value.split()
     if not 2 <= len(tokens) <= 5 or any(ch.isdigit() for ch in value):
         return False
+    if all(token.lower().strip(".,") in _PLACE_WORDS for token in tokens):
+        return False  # "New York", "London Paris": an imprint line, not a person
     for token in tokens:
         if _INITIALS.fullmatch(token):
             continue  # "A." or "H.P."
@@ -307,13 +328,26 @@ def parse_text_header(text: str, filename_stem: str) -> dict[str, Any] | None:
             if add_authors(authors, _names(remainder), number, "by line"):
                 explicit_author = True
                 continue
-        if (match := _X_BY_Y.match(line)) and not _NOT_AUTHOR_ROLE.search(match.group(1)):
+        if match := _GUTENBERG_SERIES.match(line):
+            explicit_author |= add_authors(
+                authors, _names(match.group(1)), number, "gutenberg series line"
+            )
+            continue
+        if match := _X_BY_Y.match(line):
+            left = match.group(1)
             found = _names(match.group(2))
-            if found:
-                left = match.group(1)
-                if _matches_title(left, variants):
+            title_match = _matches_title(left, variants)
+            # Strong evidence only when X is the title: the whole of it, or the title
+            # inside X without a contributor role ("Emma, with a Preface").
+            if title_match is not None and (title_match[1] or not _NOT_AUTHOR_ROLE.search(left)):
+                if found:
                     set_title(left, number, "title by author")
-                explicit_author |= add_authors(authors, found, number, "title by author")
+                    explicit_author |= add_authors(authors, found, number, "title by author")
+                    continue
+            elif found or _NOT_AUTHOR_ROLE.search(left):
+                # "Foreword by Virginia Woolf", "An Introduction by Thomas Pynchon", or
+                # any "X by Name" whose X is not the title: a contributor or unrelated
+                # text. Never author evidence, and never a title line either.
                 continue
         if _PATH_LIKE.search(line):
             continue

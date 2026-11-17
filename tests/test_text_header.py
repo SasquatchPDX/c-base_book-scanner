@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from django.test import override_settings
 
 from ebook_server.core import intake
 from ebook_server.core.identification import (
@@ -13,6 +14,7 @@ from ebook_server.core.identification import (
     IdentificationInput,
     build_identification_input,
 )
+from ebook_server.core.models import ImportJob, SourceLocation, StorageLocation
 from ebook_server.core.text_header import parse_text_header
 
 BODY = (
@@ -295,3 +297,152 @@ def test_text_intake_records_hints_but_not_book_text(tmp_path: Path) -> None:
     assert "copyright 1982" not in serialized
     assert "stormy" not in serialized
     assert metadata["title"] == "Crystal Singer - Unknown"  # filename title stays as it was
+
+
+# PR #89 review probes: frontmatter contributors and surnames that are also places.
+REVIEW_PROBES = [
+    (
+        "Austen, Jane - Emma.txt",
+        "Foreword by Virginia Woolf\nEmma\nJane Austen\n",
+        "Austen, Jane",
+        "Virginia Woolf",
+    ),
+    (
+        "Orwell, George - 1984.txt",
+        "1984\nAn Introduction by Thomas Pynchon\nGeorge Orwell\n",
+        "Orwell, George",
+        "Thomas Pynchon",
+    ),
+    (
+        "London, Jack - White Fang.txt",
+        "JACK LONDON\nWHITE FANG\n",
+        "London, Jack",
+        "White Fang",
+    ),
+]
+
+
+@pytest.mark.parametrize(("filename", "header", "first_author", "absent"), REVIEW_PROBES)
+def test_review_probes_keep_comma_form_filename_author(
+    filename: str, header: str, first_author: str, absent: str
+) -> None:
+    signals = _signals(filename, header + BODY)
+    assert signals.best_author() == first_author
+    assert absent not in signals.author_hints
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Foreword by Virginia Woolf",
+        "With an Introduction by Thomas Pynchon",
+        "Preface by Someone Else",
+        "Afterword by Some Critic",
+        "Notes by Jane Scholar",
+        "Selected and Edited by Max Editor",
+        "Translated by Constance Garnett",
+        "Illustrated by Arthur Rackham",
+        "Compiled by Anne Compiler",
+        "Cover by Frank Kelly Freas",
+    ],
+)
+def test_frontmatter_roles_are_not_authors(line: str) -> None:
+    result = parse_text_header(f"{line}\nEmma\n" + BODY, "Emma")
+    assert result is not None
+    assert result["authors"] == []
+    assert result["title"] == "Emma"
+
+
+def test_x_by_y_needs_the_title_to_be_strong() -> None:
+    result = parse_text_header("A Tale of Love by Someone Else\nEmma\n" + BODY, "Emma")
+    assert result is not None
+    assert result["authors"] == []
+    strong = parse_text_header("Emma by Jane Austen\n" + BODY, "Emma")
+    assert strong is not None
+    assert strong["authors"] == ["Jane Austen"]
+    # A title that itself contains a role word still counts when it is the whole X.
+    algorithms = parse_text_header(
+        "Introduction to Algorithms by Thomas Cormen\n" + BODY, "Introduction to Algorithms"
+    )
+    assert algorithms is not None
+    assert algorithms["authors"] == ["Thomas Cormen"]
+
+
+def test_place_words_reject_only_whole_place_lines() -> None:
+    result = parse_text_header("JACK LONDON\nWHITE FANG\n" + BODY, "London, Jack - White Fang")
+    assert result is not None
+    assert result["title"] == "White Fang"
+    assert result["likely_authors"] == ["Jack London"]
+    for place in ("New York", "London Paris", "San Francisco"):
+        found = parse_text_header(f"Manhattan Transfer\n{place}\n" + BODY, "Manhattan Transfer")
+        assert found is not None
+        assert found["title"] == "Manhattan Transfer"
+        assert found["authors"] == []
+        assert found["likely_authors"] == []
+
+
+def test_explicit_header_author_does_not_delete_comma_form_filename_author() -> None:
+    signals = _signals("London, Jack - White Fang.txt", "Author: Someone Else\n" + BODY)
+    assert signals.author_hints == ["Someone Else", "London, Jack"]
+    signals = _signals("London, Jack - White Fang.txt", "Author: Jack London\n" + BODY)
+    assert signals.author_hints == ["Jack London"]  # same person, not repeated
+
+
+class _RecordingProvider:
+    provider_id = "recording"
+
+    def __init__(self) -> None:
+        self.queries: list[tuple[str | None, str | None]] = []
+
+    def search(
+        self,
+        title: str | None = None,
+        *,
+        author: str | None = None,
+        isbn: str | None = None,
+        folder_hint: str | None = None,
+    ) -> list[dict[str, object]]:
+        del isbn, folder_hint
+        self.queries.append((title, author))
+        return []
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(("filename", "header", "first_author", "absent"), REVIEW_PROBES)
+def test_review_probes_end_to_end_through_source_intake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header: str,
+    first_author: str,
+    absent: str,
+) -> None:
+    provider = _RecordingProvider()
+    monkeypatch.setattr("ebook_server.core.identification._provider_instances", lambda: [provider])
+    root = tmp_path / "incoming"
+    root.mkdir()
+    (root / filename).write_text(header + BODY * 5, encoding="utf-8")
+    StorageLocation.objects.get_or_create(
+        identifier="default",
+        defaults={"backend": StorageLocation.BackendType.LOCAL, "base_path": "default"},
+    )
+    location = SourceLocation.objects.create(
+        name="header-probes",
+        root_path=str(root),
+        transfer_mode=SourceLocation.TransferMode.COPY,
+        recursive=True,
+        default_source_type=SourceLocation.SourceType.INCOMING_FOLDER,
+        is_active=True,
+    )
+    with override_settings(APP_DATA_DIR=tmp_path / "app-data"):
+        (job,) = intake.discover_source_jobs_for_location(location)
+        intake.process_import_job(str(job.id))
+    job = ImportJob.objects.get(pk=job.pk)
+
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    queried_authors = [author for _title, author in provider.queries if author]
+    assert queried_authors
+    assert queried_authors[0] == first_author
+    assert absent not in queried_authors
+    assert isinstance(job.evidence, dict)
+    assert absent not in job.evidence.get(TEXT_HEADER_EVIDENCE_KEY, {}).get("authors", [])
