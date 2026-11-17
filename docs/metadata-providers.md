@@ -44,6 +44,34 @@ title's words are a subset of the other's ("Foundation" vs "Foundation and Earth
 so the sort ratio is blended in to make unmatched words cost score. Only titles with
 the same words reach a full title score.
 
+### Author checks before auto-accept
+
+A score at or above the auto-accept threshold is necessary but not sufficient. An
+exact ISBN match alone reaches it, and an ISBN says nothing about who wrote the book,
+so intake (`intake.decide_auto_accept`) also checks the top candidate's authors:
+
+- **No provider authors** (`no_provider_authors`): the candidate names no authors,
+  or only placeholders such as "Unknown" or "Multiple Authors". The import goes to
+  review instead of creating, or attaching to, a Book whose authors nobody checked.
+  The file's embedded authors are never written onto the Book automatically, also
+  not when an existing Book matched by ISBN has no authors yet.
+- **Author conflict** (`author_conflict`): both sides name authors and none of the
+  candidate's authors is the same person as any of the file's embedded authors,
+  using the name matching above. A bare surname on one side ("Tolkien") agrees with
+  a full name that ends in it. Missing file authors are not a conflict.
+
+Either case sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
+`REVIEW` state (none is shown as a `MATCH`), and records in the import's evidence:
+`auto_accept_blocked` (the reason above), `auto_accept_block_details` (provider,
+score, candidate and file authors) and `suggested_authors` (the file's embedded
+authors without placeholder creators such as "Microsoft Office User", "Owner" or
+"Administrator"). The review page explains the reason and pre-fills the suggested
+authors. They are applied only when a reviewer accepts a candidate that has no
+authors of its own, and only to a Book without authors; provider authors always win.
+
+For Open Library ISBN lookups, an edition record without `authors` falls back to the
+authors of its first work record (`works[0]`), where Open Library usually keeps them.
+
 ## Provider options identified
 
 ### Open Library (primary)

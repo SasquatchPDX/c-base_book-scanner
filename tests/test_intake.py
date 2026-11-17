@@ -326,7 +326,7 @@ def test_pdf_upload_registers_file_variant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_stub_provider(monkeypatch, candidate_title="book", authors=["Unknown"])
+    _force_stub_provider(monkeypatch, candidate_title="book", authors=["Jane Doe"])
     _configure_storage(tmp_path)
     profile = get_or_create_profile("pdf-user")
     client = Client()
@@ -361,7 +361,7 @@ def test_pdf_upload_renders_first_page_cover_with_pdfium(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_data = tmp_path / "pdf-cover-app-data"
-    _force_stub_provider(monkeypatch, candidate_title="Rendered PDF")
+    _force_stub_provider(monkeypatch, candidate_title="Rendered PDF", authors=["Jane Doe"])
     profile = get_or_create_profile("pdf-cover-user")
     client = Client()
     client.force_login(profile.user)
@@ -397,7 +397,7 @@ def test_cbz_upload_uses_first_page_as_cover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_data = tmp_path / "cbz-cover-app-data"
-    _force_stub_provider(monkeypatch, candidate_title="Covered Comic")
+    _force_stub_provider(monkeypatch, candidate_title="Covered Comic", authors=["Jane Doe"])
     profile = get_or_create_profile("cbz-cover-user")
     client = Client()
     client.force_login(profile.user)
@@ -464,7 +464,7 @@ def test_duplicate_upload_reuses_existing_physical_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _force_stub_provider(monkeypatch, candidate_title="first", authors=["Unknown"])
+    _force_stub_provider(monkeypatch, candidate_title="first", authors=["Jane Doe"])
     _configure_storage(tmp_path)
     profile = get_or_create_profile("dup-user")
     client = Client()
@@ -713,7 +713,7 @@ def test_txt_upload_uses_normal_ingestion_and_external_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure_storage(tmp_path)
-    _force_stub_provider(monkeypatch, candidate_title="Plain Story")
+    _force_stub_provider(monkeypatch, candidate_title="Plain Story", authors=["Jane Doe"])
     profile = get_or_create_profile("txt-upload-user")
     client = Client()
     client.force_login(profile.user)
