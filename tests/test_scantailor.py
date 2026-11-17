@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import struct
+import zlib
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
 from typing import cast
@@ -12,7 +14,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFile
 
 from ebook_server.core import scantailor, views
 from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
@@ -1401,7 +1403,8 @@ def test_stage_outputs_are_named_for_the_png_they_contain() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_unreadable_input_fails_the_stage_with_message() -> None:
-    client, job = _create_scan_job("scan-user-unreadable")
+    # spread: no automatic Page Split output exists before the failing run
+    client, job = _create_scan_job("scan-user-unreadable", capture_layout="spread")
     good = _facing_page_bytes()
     _upload_scan_page(
         client,
@@ -1434,7 +1437,8 @@ def test_unreadable_input_fails_the_stage_with_message() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, job = _create_scan_job("scan-user-race")
+    # spread: no automatic Page Split output exists before the raced run
+    client, job = _create_scan_job("scan-user-race", capture_layout="spread")
     _upload_scan_page(
         client,
         str(job.id),
@@ -1658,8 +1662,9 @@ def test_oversized_image_is_an_image_load_error(
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
     with pytest.raises(scantailor.ImageLoadError):
         scantailor._load_image(source)
-    image, loaded = scantailor._as_image_if_available(source)
-    assert image is None and loaded is False
+    # The replacement dimension path observes the same limit without decoding.
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) is None
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1871,6 +1876,327 @@ def test_text_line_detection_rejects_too_few_lines() -> None:
     for x in range(100, 800, 60):
         draw.rectangle((x, 500, x + 40, 510), fill=30)
     assert scantailor._detect_text_line_quad(page) is None
+
+
+def _thumbnail_size(client: Client, page_id: str) -> tuple[tuple[int, int], str]:
+    response = client.get(f"/scan/pages/{page_id}/image/")
+    assert response.status_code == 200
+    assert response["Content-Type"] == "image/jpeg"
+    streaming = cast(StreamingHttpResponse, response)
+    body = b"".join(cast(Iterable[bytes], streaming.streaming_content))
+    with Image.open(io.BytesIO(body)) as thumb:
+        return thumb.size, response["ETag"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_page_thumbnail_follows_latest_completed_stage() -> None:
+    """#58: the overview thumbnail shows the latest completed stage, not the raw scan."""
+    client, job = _create_scan_job("scan-user-thumbnail-stage")
+    portrait = io.BytesIO()
+    _text_page(300, 400).save(portrait, format="PNG")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=portrait.getvalue(),
+        filename="portrait.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+
+    raw_size, raw_etag = _thumbnail_size(client, str(page.id))
+    assert raw_size == (300, 400)
+
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 90}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+
+    # Deskew rotated the page by 90 degrees: the thumbnail now shows landscape.
+    stage_size, stage_etag = _thumbnail_size(client, str(page.id))
+    assert stage_size == (400, 300)
+    assert stage_etag != raw_etag
+    revalidated = client.get(f"/scan/pages/{page.id}/image/", HTTP_IF_NONE_MATCH=stage_etag)
+    assert revalidated.status_code == 304
+    assert "max-age=0" in revalidated["Cache-Control"]
+
+    # A stale (invalidated) stage is never shown; fall back to the last good one.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.INVALIDATED,
+    )
+    fallback_size, fallback_etag = _thumbnail_size(client, str(page.id))
+    assert fallback_size == (300, 400)
+    assert fallback_etag not in {raw_etag, stage_etag}
+
+    # Downstream success after an upstream that is not complete does not count either.
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+        status=ScanTailorStageState.StageStatus.SUCCESS,
+    )
+    ScanTailorStageState.objects.filter(scan_page=page, stage="page_split").update(
+        status=ScanTailorStageState.StageStatus.QUEUED,
+    )
+    assert _thumbnail_size(client, str(page.id))[1] == raw_etag
+
+
+def test_passthrough_byte_copies_normalised_png(tmp_path: Path) -> None:
+    """#54: an unchanged normalised PNG is copied, not decoded and re-encoded."""
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(200, 200))
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+
+    assert scantailor._passthrough(source, output, preview) == {"algorithm": "copy"}
+
+    assert output.read_bytes() == source.read_bytes()
+    assert scantailor._compute_sha256(output) == scantailor._compute_sha256(source)
+    with Image.open(preview) as rendered:
+        assert rendered.format == "PNG"
+
+
+@pytest.mark.parametrize(
+    ("image", "save_kwargs"),
+    [
+        (Image.new("L", (40, 60), 200), {"format": "TIFF"}),
+        (Image.new("RGBA", (40, 60), (200, 200, 200, 128)), {"format": "PNG"}),
+        (Image.new("I;16", (40, 60), 40000), {"format": "PNG"}),
+    ],
+)
+def test_passthrough_still_normalises_other_inputs(
+    image: Image.Image,
+    save_kwargs: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    source = _save(image, tmp_path / "in.bin", **save_kwargs)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    assert output.read_bytes() != source.read_bytes()
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.mode in {"L", "RGB"}
+        assert written.size == (40, 60)
+
+
+def test_exif_rotated_input_is_normalised_and_sized_like_load_image(tmp_path: Path) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6  # rotate 90 CW on display
+    source = _save(Image.new("RGB", (80, 50), (250, 250, 250)), tmp_path / "in.jpg", exif=exif)
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+
+    loaded = scantailor._load_image(source)
+    assert loaded.size == (50, 80)
+    assert scantailor._oriented_size(source) == loaded.size
+    with Image.open(output) as written:
+        assert written.format == "PNG"
+        assert written.size == (50, 80)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (50, 80)
+    assert (recorded["output_width"], recorded["output_height"]) == (50, 80)
+
+
+def test_zero_angle_deskew_keeps_identical_pixels_by_copy(tmp_path: Path) -> None:
+    source = _save(_text_page(300, 400), tmp_path / "in.png", dpi=(300, 300))
+    output = tmp_path / "out.png"
+    preview = tmp_path / "preview.png"
+    result = scantailor._run_deskew(_state({"manual_angle": 0}), source, output, preview)
+
+    assert result["angle"] == 0
+    assert output.read_bytes() == source.read_bytes()
+    assert preview.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_noop_stage_still_persists_own_output_artifact_with_provenance() -> None:
+    client, job = _create_scan_job("scan-user-noop-stage")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_text_heavy_bytes(),
+        filename="noop.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    client.get(_stages_url(str(job.id), str(page.id)))
+    for stage, parameters in (
+        ("page_split", {"split_mode": "single"}),
+        ("deskew", {"manual_angle": 0}),
+    ):
+        response = client.post(
+            _stage_url(str(job.id), str(page.id), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code == 202
+
+    split = ScanTailorStageState.objects.get(scan_page=page, stage="page_split")
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
+    # The no-op stage has its own artifact (and preview) with full provenance ...
+    assert deskew.output_storage_identifier
+    assert deskew.output_storage_identifier != split.output_storage_identifier
+    assert deskew.preview_storage_identifier
+    assert deskew.input_stage_state_id == split.id
+    assert deskew.algorithm and deskew.algorithm_version
+    # ... byte-identical to its input, so the hashes match.
+    assert deskew.output_sha256 == split.output_sha256
+    assert deskew.output_size_bytes == split.output_size_bytes
+    assert deskew.parameters["output_width"] == deskew.parameters["input_width"]
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _raw_png(
+    width: int,
+    height: int,
+    bit_depth: int,
+    colour_type: int,
+    row: bytes,
+    *,
+    interlace: int = 0,
+    extra: Iterable[tuple[bytes, bytes]] = (),
+) -> bytes:
+    """Hand-built PNG (``row`` repeated for every scanline, filter type 0)."""
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, colour_type, 0, 0, interlace)
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + b"".join(_png_chunk(kind, data) for kind, data in extra)
+        + _png_chunk(b"pHYs", struct.pack(">IIB", 11811, 11811, 1))
+        + _png_chunk(b"IDAT", zlib.compress(raw))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _with_chunk_after_ihdr(png: bytes, chunk_type: bytes, data: bytes) -> bytes:
+    ihdr_end = 8 + 8 + 13 + 4
+    return png[:ihdr_end] + _png_chunk(chunk_type, data) + png[ihdr_end:]
+
+
+def _encoder_png(path: Path, mode: str = "L") -> Path:
+    colour: int | tuple[int, int, int] = 200 if mode == "L" else (200, 190, 180)
+    scantailor._save_png(Image.new(mode, (40, 60), colour), path, (300, 300))
+    return path
+
+
+@pytest.mark.parametrize("mode", ["L", "RGB"])
+def test_png_written_by_stage_encoder_is_passthrough_eligible(mode: str, tmp_path: Path) -> None:
+    source = _encoder_png(tmp_path / "in.png", mode)
+    layout = scantailor._read_png_layout(source)
+    assert layout is not None
+    assert layout.chunk_types <= scantailor._PNG_PASSTHROUGH_CHUNKS
+    assert scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() == source.read_bytes()
+
+
+def _not_normalised_cases() -> dict[str, tuple[bytes, tuple[int, int]]]:
+    encoded = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(encoded, format="PNG", dpi=(300, 300))
+    plain = encoded.getvalue()
+    palette = io.BytesIO()
+    Image.new("P", (40, 60), 3).save(palette, format="PNG", dpi=(300, 300))
+    no_phys = io.BytesIO()
+    Image.new("L", (40, 60), 200).save(no_phys, format="PNG")
+    exif = Image.Exif()
+    exif[0x0112] = 1
+    return {
+        # scanimage --format=png --depth 16: 48-bit RGB, which Pillow opens as "RGB"
+        "rgb16": (_raw_png(4, 3, 16, 2, b"\x80\x00\x40\x00\x20\x00" * 4), (4, 3)),
+        # 2/4-bit greyscale, which Pillow opens as "L"
+        "gray2": (_raw_png(8, 3, 2, 0, b"\x1b\xe4"), (8, 3)),
+        "gray4": (_raw_png(4, 3, 4, 0, b"\x0f\xf0"), (4, 3)),
+        "palette": (palette.getvalue(), (40, 60)),
+        # Adam7 data of a 1x1 image is a single pass-1 pixel
+        "interlaced": (_raw_png(1, 1, 8, 0, b"\x80", interlace=1), (1, 1)),
+        "gAMA": (_with_chunk_after_ihdr(plain, b"gAMA", struct.pack(">I", 45455)), (40, 60)),
+        "iCCP": (
+            _with_chunk_after_ihdr(plain, b"iCCP", b"fake\x00\x00" + zlib.compress(b"x" * 64)),
+            (40, 60),
+        ),
+        "sRGB": (_with_chunk_after_ihdr(plain, b"sRGB", b"\x00"), (40, 60)),
+        "eXIf": (_with_chunk_after_ihdr(plain, b"eXIf", exif.tobytes()), (40, 60)),
+        "tEXt": (_with_chunk_after_ihdr(plain, b"tEXt", b"Comment\x00hello"), (40, 60)),
+        "no-pHYs": (no_phys.getvalue(), (40, 60)),
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["rgb16", "gray2", "gray4", "palette", "interlaced", "gAMA", "iCCP", "sRGB", "eXIf", "tEXt"]
+    + ["no-pHYs"],
+)
+def test_non_normalised_png_is_reencoded_not_copied(case: str, tmp_path: Path) -> None:
+    """#54 review: bit depth/colour type/interlace/ancillary chunks come from IHDR, not mode."""
+    payload, size = _not_normalised_cases()[case]
+    source = tmp_path / "in.png"
+    source.write_bytes(payload)
+    assert not scantailor._is_normalised_png(source)
+
+    output = tmp_path / "out.png"
+    scantailor._passthrough(source, output, tmp_path / "preview.png")
+    assert output.read_bytes() != payload
+    layout = scantailor._read_png_layout(output)
+    assert layout is not None
+    assert (layout.bit_depth, layout.interlace) == (8, 0)
+    assert layout.colour_type in {0, 2}
+    assert (layout.width, layout.height) == size
+    assert scantailor._oriented_size(source) == size
+
+
+def _forbid_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _no_decode(self: object) -> None:
+        raise AssertionError("pixel data was decoded")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", _no_decode)
+    monkeypatch.setattr(Image.Image, "load", _no_decode)
+
+
+def test_png_passthrough_checks_and_sizes_do_not_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _encoder_png(tmp_path / "in.png", "RGB")
+    output = tmp_path / "out.png"
+    output.write_bytes(source.read_bytes())
+    _forbid_decode(monkeypatch)
+
+    assert scantailor._is_normalised_png(source)
+    assert scantailor._oriented_size(source) == (40, 60)
+    recorded = scantailor._record_image_dimensions(source, output, {})
+    assert (recorded["input_width"], recorded["input_height"]) == (40, 60)
+    assert (recorded["output_width"], recorded["output_height"]) == (40, 60)
+
+
+def test_png_exif_orientation_is_sized_from_chunk_without_decoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    plain = io.BytesIO()
+    Image.new("L", (80, 50), 200).save(plain, format="PNG", dpi=(300, 300))
+    source = tmp_path / "in.png"
+    source.write_bytes(_with_chunk_after_ihdr(plain.getvalue(), b"eXIf", exif.tobytes()))
+    expected = scantailor._load_image(source).size
+    assert expected == (50, 80)
+
+    _forbid_decode(monkeypatch)
+    assert scantailor._oriented_size(source) == expected
+    assert not scantailor._is_normalised_png(source)
 
 
 def _workspace_queries(client: Client, job_id: str) -> list[str]:

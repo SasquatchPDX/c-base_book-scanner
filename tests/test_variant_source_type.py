@@ -72,7 +72,9 @@ def test_matched_source_import_records_origin(
 ) -> None:
     del storage
     monkeypatch.setattr(
-        identification, "resolve_candidates", lambda _signals: [_strong_candidate("Book")]
+        identification,
+        "resolve_candidates_with_report",
+        lambda _signals: ([_strong_candidate("Book")], []),
     )
     job = _source_job(tmp_path, source_type)
 
@@ -89,7 +91,7 @@ def test_reviewed_source_import_records_origin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: None
 ) -> None:
     del storage
-    monkeypatch.setattr(identification, "resolve_candidates", lambda _signals: [])
+    monkeypatch.setattr(identification, "resolve_candidates_with_report", lambda _signals: ([], []))
     job = _source_job(tmp_path, SourceLocation.SourceType.NETWORK_SOURCE)
     intake.process_import_job(str(job.id))
     job.refresh_from_db()

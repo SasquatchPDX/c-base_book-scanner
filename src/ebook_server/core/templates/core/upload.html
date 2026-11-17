@@ -9,5 +9,6 @@
        type="file"
        name="file"
        accept=".epub,.pdf,application/epub+zip,application/pdf"
-       required><small>Maximum {{ max_upload_bytes|filesizeformat }}</small><button type="submit">Start import</button></form></div>
+       required><small>Maximum {{ max_upload_bytes|filesizeformat }}</small><button type="submit">Start import</button></form>
+    <p class="muted">Audiobooks are not managed here{% if audiobook_service_url %}; use the <a href="{{ audiobook_service_url }}" rel="noopener">audiobook service</a>{% endif %}.</p></div>
 {% endblock %}

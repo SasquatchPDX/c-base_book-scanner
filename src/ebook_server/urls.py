@@ -8,4 +8,5 @@ from django.urls import include, path
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("", include("ebook_server.core.urls")),
+    path("", include("ebook_server.core.review_reader_urls")),
 ]
