@@ -5,6 +5,7 @@ from email.message import Message
 from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 
 from ebook_server.core.identification import (
     IdentificationInput,
@@ -162,3 +163,30 @@ def test_rate_limit_honours_bounded_retry_after_and_generic_user_agent() -> None
 
     assert docs == [{"title": "Dune"}]
     assert slept == [5.0]
+
+
+def test_open_library_search_requests_and_captures_subjects() -> None:
+    doc = {
+        "key": "/works/OL893415W",
+        "title": "Dune",
+        "author_name": ["Frank Herbert"],
+        "subject": ["Science fiction", "Dune (Imaginary place)", "science fiction"],
+    }
+    seen: list[str] = []
+    with (
+        patch(
+            "ebook_server.core.identification.urlopen",
+            _fake_urlopen({"search.json": {"docs": [doc]}}, seen),
+        ),
+        patch(
+            "ebook_server.core.identification._provider_instances",
+            lambda: [OpenLibraryMetadataProvider()],
+        ),
+    ):
+        candidates = resolve_candidates(
+            _signals(title_hints=["Dune"], author_hints=["Frank Herbert"])
+        )
+
+    query = parse_qs(urlparse(seen[0]).query)
+    assert "subject" in query["fields"][0].split(",")
+    assert candidates[0].subjects == ["Science fiction", "Dune (Imaginary place)"]

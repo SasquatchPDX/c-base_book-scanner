@@ -35,6 +35,7 @@ from .identification import (
     _isbn10_to_isbn13,
     _normalize_identifier,
 )
+from .rate_limit import throttle_provider
 
 logger = structlog.get_logger(__name__)
 
@@ -140,14 +141,8 @@ def _parse_retry_after(headers: Message | None) -> float | None:
 
 
 def throttle_hook(provider_id: str) -> None:
-    """Client-side pacing hook, called before every outbound Hardcover request.
-
-    PR #63 (``fix/issue-10-provider-rate-limit``) adds
-    ``ebook_server.core.rate_limit.throttle_provider(provider_id)``. Once that is on
-    master, replace this body with a call to it. Hardcover's free plan allows 60
-    requests/minute with a burst of 10, so a 1 request/second limit fits.
-    """
-    del provider_id
+    """Pace every request through the shared per-provider limiter."""
+    throttle_provider(provider_id)
 
 
 class HardcoverMetadataProvider:

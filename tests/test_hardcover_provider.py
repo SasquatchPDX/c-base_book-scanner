@@ -24,6 +24,7 @@ from ebook_server.core.identification import (
     _provider_instances,
     resolve_candidates,
 )
+from tests.rate_limit_fixtures import FakeClock
 
 TOKEN = "hc-test-token-SECRET-1234567890"
 PROVIDER_REF = "ebook_server.core.hardcover_provider.HardcoverMetadataProvider"
@@ -120,6 +121,21 @@ EDITION = {
 def _provider() -> HardcoverMetadataProvider:
     with override_settings(BOOK_SCANNER_HARDCOVER_API_TOKEN=TOKEN):
         return HardcoverMetadataProvider()
+
+
+@override_settings(BOOK_SCANNER_METADATA_RATE_LIMITS={"hardcover": 1.0})
+def test_outbound_requests_use_shared_provider_pacing(rate_limit_clock: FakeClock) -> None:
+    recorder = _Recorder(
+        _json({"data": {"editions": [EDITION]}}),
+        _json({"data": {"editions": [EDITION]}}),
+    )
+    provider = _provider()
+    with patch(URLOPEN, recorder):
+        provider.lookup_isbn("9780593135204")
+        provider.lookup_isbn("9780593135204")
+
+    assert len(recorder.requests) == 2
+    assert rate_limit_clock.sleeps == [pytest.approx(1.0)]
 
 
 def test_without_token_provider_is_unavailable_and_skipped() -> None:

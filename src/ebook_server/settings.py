@@ -32,7 +32,8 @@ try:
 except PackageNotFoundError:  # pragma: no cover - running from a bare checkout
     _APP_VERSION = "0"
 DEFAULT_METADATA_USER_AGENT = (
-    f"ebook-server/{_APP_VERSION} (+https://github.com/; self-hosted hackerspace library)"
+    f"ebook-server/{_APP_VERSION} "
+    "(+https://github.com/SasquatchPDX/c-base_book-scanner; self-hosted hackerspace library)"
 )
 DEV_SECRET_KEY = "dev-only-secret-change-me-before-production-0123456789abcdef"
 
@@ -81,6 +82,12 @@ class Settings(BaseSettings):
     # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
     hardcover_api_token: SecretStr = SecretStr("")
     hardcover_timeout_seconds: float = 10.0
+    # Client-side request pacing per metadata provider_id (requests/second; <= 0 disables).
+    # Providers not listed use metadata_rate_limit_default. Shared across worker processes
+    # through Redis when redis_url is set, otherwise enforced per process.
+    metadata_rate_limits: dict[str, float] = {"openlibrary": 1.0}
+    metadata_rate_limit_default: float = 1.0
+    metadata_rate_limit_max_wait_seconds: float = 60.0
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
     ocr_service_url: str = "http://localhost:8020"
@@ -245,7 +252,13 @@ if settings.environment != "production" and STORAGE_REQUIRE_EXISTING_ROOT:
         pass
 BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = settings.source_min_age_seconds
 BOOK_SCANNER_INGEST_MAX_AUTO_ATTEMPTS = settings.ingest_max_auto_attempts
-BOOK_SCANNER_METADATA_USER_AGENT = settings.metadata_user_agent
+# An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
+BOOK_SCANNER_METADATA_USER_AGENT = (
+    settings.metadata_user_agent.strip() or DEFAULT_METADATA_USER_AGENT
+)
+BOOK_SCANNER_METADATA_RATE_LIMITS = settings.metadata_rate_limits
+BOOK_SCANNER_METADATA_RATE_LIMIT_DEFAULT = settings.metadata_rate_limit_default
+BOOK_SCANNER_METADATA_RATE_LIMIT_MAX_WAIT_SECONDS = settings.metadata_rate_limit_max_wait_seconds
 BOOK_SCANNER_QUEUE_URL = settings.redis_url
 BOOK_SCANNER_QUEUE_NAME = settings.queue_name
 BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS = settings.queue_job_timeout_seconds

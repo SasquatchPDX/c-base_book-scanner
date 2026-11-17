@@ -29,6 +29,21 @@ comparisons need normalization. `BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
 does not affect intake acceptance. Task D must give that setting a tested role or
 remove it; do not lower auto-accept merely to reduce the review queue.
 
+Author names are compared per name, not by exact string. Case, punctuation,
+spacing, and "Last, First" order are ignored, so "H P Lovecraft" equals
+"H. P. Lovecraft". A name variant counts as a partial match
+(`AUTHOR_VARIANT_MATCH_SCORE`, 0.9) when the surname is the same and the given
+names line up in order. Given names line up when they are equal, when one is the
+other's initial, or when they are close spellings, so a missing middle name or
+initial is allowed ("Iain M. Banks" vs "Iain Banks"). A shared surname alone is
+not a match ("Frank Herbert" vs "Brian Herbert").
+
+Title similarity is the mean of rapidfuzz `token_set_ratio` and `token_sort_ratio`
+over punctuation-normalized titles. `token_set_ratio` alone gives full marks when one
+title's words are a subset of the other's ("Foundation" vs "Foundation and Earth"),
+so the sort ratio is blended in to make unmatched words cost score. Only titles with
+the same words reach a full title score.
+
 ## Provider options identified
 
 ### Open Library (primary)
@@ -70,8 +85,8 @@ remove it; do not lower auto-accept merely to reduce the review queue.
     publisher or language, because those belong to a specific edition.
 - Limits (official docs): free plan 60 requests/minute, burst 10, 5,000/day; queries
   time out after 30 s (search after 2 s); responses carry `Retry-After` on 429. A title
-  search costs two requests. Client-side pacing hooks in via `throttle_hook()` in the
-  provider module (to be wired to the shared per-provider limiter from issue #10).
+  search costs two requests. Every outbound request uses the shared per-provider
+  limiter, including retries; the default rate is one request per second.
 - Failures: HTTP 401/403/408/429/5xx, GraphQL `errors`, non-JSON, unexpected shapes and
   responses over 1 MiB are provider failures (`metadata_provider_failed`), not "no
   results". A 429 is retried once only if `Retry-After` is at most 5 seconds.
@@ -98,3 +113,22 @@ For each hit store:
 - provenance timestamp
 
 Weak matches must route to review workflow instead of auto-linking.
+
+## Subject / genre evidence
+
+Subject tags are captured as evidence only; they do not affect candidate scoring and
+are not yet written to `Book.categories` / `Book.genres`.
+
+- Embedded: EPUB `dc:subject` and CBZ `ComicInfo.xml` `Genre` (comma-separated) land
+  in `ImportJob.evidence["subjects"]` (and therefore the review task's embedded
+  metadata).
+- Providers: `MetadataCandidate.subjects` holds tags from the provider record
+  (Open Library search `subject`, edition `subjects`, Google Books-style
+  `categories`). Open Library search requests `subject` explicitly via `fields`,
+  because the default search field set omits it.
+- Tags are trimmed, de-duplicated case-insensitively, limited to 25 per source and
+  128 characters each (`Category.name` / `Genre.name` length), and otherwise kept as
+  free text. Reviewers see candidate subjects on the review page.
+
+Mapping these tags onto `Category`/`Genre` (which taxonomy, normalization, and
+whether review gates it) is an open owner decision tracked in issue #50.
