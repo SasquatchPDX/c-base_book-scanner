@@ -1,0 +1,24 @@
+# Example unit for the Uvicorn ASGI web process. See deploy/systemd/README.md.
+# Adjust the user, checkout path, and listen address to the site; keep the
+# listener private (loopback or a private interface) behind the reverse proxy.
+[Unit]
+Description=Book Scanner web (Uvicorn ASGI)
+Wants=network-online.target
+After=network-online.target remote-fs.target postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=book-scanner
+Group=book-scanner
+# settings.py reads ".env" from the working directory, so this must be the
+# checkout root (the directory containing manage.py and .env).
+WorkingDirectory=/opt/book-scanner
+ExecStart=/opt/book-scanner/.venv/bin/uvicorn ebook_server.asgi:application --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

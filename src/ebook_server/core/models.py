@@ -817,6 +817,9 @@ class MetadataCandidate(models.Model):
     isbn13 = models.CharField(max_length=16, blank=True)
     score = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     raw_payload = models.JSONField(default=dict, blank=True)
+    # Provider-reported subject/genre/category tags: evidence only, not yet mapped to
+    # Book.categories / Book.genres (see #50 for the open taxonomy decision).
+    subjects = models.JSONField(default=list, blank=True)
     language = models.CharField(max_length=32, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
     description = models.TextField(blank=True)

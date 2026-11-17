@@ -143,6 +143,55 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
   return editable;
 }
 
+/** Outcome of re-requesting a preview image that failed to load. */
+export interface PreviewFailure {
+  /** HTTP status, or null when the request itself failed (network error). */
+  status: number | null;
+  /** Plain-text response body, if any. */
+  body: string;
+}
+
+export function previousStageName(stage: StageName): StageName | null {
+  const index = STAGE_ORDER.indexOf(stage);
+  return index > 0 ? (STAGE_ORDER[index - 1] ?? null) : null;
+}
+
+/**
+ * Explain why the editor preview for ``stage`` could not be shown, based on the
+ * actual response from the preview endpoint rather than the generic image
+ * ``error`` event (which carries no status or body).
+ */
+export function previewErrorMessage(stage: StageName, failure: PreviewFailure): string {
+  const { status } = failure;
+  const body = failure.body.trim().toLowerCase();
+  if (status === null) {
+    return "Could not load the preview because of a network error. Check your connection and try again.";
+  }
+  if (status === 404 && body === "input preview not ready") {
+    const previous = previousStageName(stage);
+    if (previous === null) {
+      return "The scanned page image is not available yet. Wait for the upload to finish processing, then reopen this page.";
+    }
+    return `The input preview is not ready. Run the ${STAGE_LABELS[previous]} stage first.`;
+  }
+  if (status === 404 && body === "preview not ready") {
+    return "The preview for this stage has not been generated yet. It will appear once the worker finishes.";
+  }
+  if (status === 404 && body === "preview artifact missing") {
+    return "The preview file is missing from storage. Save this stage again to regenerate it.";
+  }
+  if (status === 503) {
+    return "Scan storage is temporarily unavailable. Try again shortly.";
+  }
+  if (status === 401 || status === 403) {
+    return "You are not allowed to view this preview. Your session may have expired; sign in again.";
+  }
+  if (status >= 200 && status < 300) {
+    return "The preview was downloaded but could not be displayed as an image.";
+  }
+  return `Could not load the preview (HTTP ${status}).`;
+}
+
 /** Error text for a stage, shown only for genuine failures (not routine invalidation). */
 export function stageErrorText(state: Pick<StageState, "status" | "last_error">): string {
   return state.status === "failed" ? state.last_error || "Stage failed" : "";
@@ -332,10 +381,30 @@ class WorkspaceController {
     this.image.addEventListener("load", () => this.renderGeometry());
     window.addEventListener("resize", () => this.renderGeometry());
     this.image.addEventListener("error", () => {
-      this.setMessage("The input preview is not ready. Run the preceding stage first.", "error");
       this.clearGeometry();
+      void this.explainPreviewFailure(this.image.src, this.activeStage);
     });
     this.updateSelectionCount();
+  }
+
+  /**
+   * The ``<img>`` error event carries no status or body, so re-request the
+   * failed URL to find out why and show a message that matches the cause.
+   */
+  private async explainPreviewFailure(source: string, stage: StageName): Promise<void> {
+    if (!source) return;
+    this.setMessage("Loading the preview failed; checking why…", "error");
+    let failure: PreviewFailure;
+    try {
+      const response = await fetch(source, { credentials: "same-origin" });
+      const body = response.ok ? "" : await response.text();
+      failure = { status: response.status, body };
+    } catch {
+      failure = { status: null, body: "" };
+    }
+    // Ignore stale answers if the editor moved to another page/stage meanwhile.
+    if (this.image.src !== source || this.activeStage !== stage) return;
+    this.setMessage(previewErrorMessage(stage, failure), "error");
   }
 
   private activate(pageId: string, stage: StageName): void {

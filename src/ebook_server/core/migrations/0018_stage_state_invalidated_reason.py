@@ -25,7 +25,7 @@ def restore_invalidation_reasons(apps: Any, schema_editor: Any) -> None:
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0016_storage_identifier_lengths_and_source_stat"),
+        ("core", "0017_metadata_candidate_subjects"),
     ]
 
     operations = [
