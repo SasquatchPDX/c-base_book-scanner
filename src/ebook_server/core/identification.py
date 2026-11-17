@@ -377,6 +377,15 @@ def _provider_instances() -> list[MetadataProvider]:
             cls = getattr(module, symbol)
             provider = cls()
             providers.append(provider)
+        except ValueError as exc:
+            # A provider that cannot run as configured (e.g. a missing API key) is
+            # skipped with a warning instead of failing every lookup.
+            logger.warning(
+                "metadata_provider_unavailable",
+                provider_ref=provider_ref,
+                reason=str(exc),
+            )
+            continue
         except (ImportError, AttributeError, TypeError):
             continue
     return providers

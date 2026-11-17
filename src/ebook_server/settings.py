@@ -77,6 +77,10 @@ class Settings(BaseSettings):
         "ebook_server.core.identification.OpenLibraryMetadataProvider",
     ]
     metadata_user_agent: str = DEFAULT_METADATA_USER_AGENT
+    # Hardcover.app (opt-in): also add
+    # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
+    hardcover_api_token: SecretStr = SecretStr("")
+    hardcover_timeout_seconds: float = 10.0
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
     ocr_service_url: str = "http://localhost:8020"
@@ -264,6 +268,8 @@ BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
 BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
+BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
+BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
 BOOK_SCANNER_OCR_SERVICE_URL = settings.ocr_service_url
