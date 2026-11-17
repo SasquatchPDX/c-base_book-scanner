@@ -42,6 +42,7 @@ from django.http import (
 )
 from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
@@ -65,6 +66,7 @@ from . import (
     conversion,
     genres,
     intake,
+    intake_progress,
     llm,
     llm_identification,
     metadata_search,
@@ -74,6 +76,7 @@ from . import (
     review_batch,
     review_identification,
     scan_identification,
+    scan_logs,
     scan_pipeline,
     scantailor,
     search,
@@ -1258,6 +1261,11 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
     "author_conflict": (
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
+    ),
+    "stronger_title_evidence_disagrees": (
+        "The best match scored high enough to be accepted automatically, but its "
+        "title matches only a weaker hint (such as the filename) while the file's "
+        "stronger title evidence names another book."
     ),
     "llm_derived": (
         "The best match was found through search terms suggested by the local AI "
@@ -3350,7 +3358,9 @@ def scan_job_detail(
         )
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    return JsonResponse(_scan_job_payload(job))
+    payload = _scan_job_payload(job)
+    payload["logs"] = scan_logs.serialize_job_logs(job)
+    return JsonResponse(payload)
 
 
 @require_GET
@@ -3587,6 +3597,51 @@ def scan_page_request_rescan(
             "scan_job_id": str(page.scan_job_id),
         },
         status=201,
+    )
+
+
+@require_http_methods(["GET", "POST"])
+@scan_api_login_required
+def upload_scan_log(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """List a scan job's scanner logs (GET) or upload one (POST, processed by a worker).
+
+    POST only stages the bounded upload and queues a ``scan_log`` processing job
+    (202); hashing and storing happen on a worker. The log's ``state`` (``queued``,
+    ``stored``, ``duplicate``, ``failed``) is reported here and on the scan job.
+    """
+    if _coerce_uuid(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ScanJob.objects.get(pk=job_id)
+    except (ScanJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if request.method == "GET":
+        return JsonResponse({"job_id": str(job.id), "logs": scan_logs.serialize_job_logs(job)})
+    if job.state == ScanJob.State.CANCELLED:
+        return HttpResponseBadRequest("job cancelled")
+    uploaded_file = request.FILES.get("file")
+    if uploaded_file is None:
+        return HttpResponseBadRequest("missing_file")
+    try:
+        log = scan_logs.stage_scan_log(job, uploaded_file, profile.user_id)
+    except scan_logs.ScanLogError as exc:
+        return HttpResponseBadRequest(str(exc))
+    except scan_logs.ScanLogDispatchError:
+        logger.exception("scan log dispatch failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "queue unavailable", "retryable": True}, status=503)
+    except OSError:
+        logger.exception("scan log staging failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "storage unavailable", "retryable": True}, status=503)
+    return JsonResponse(
+        {
+            "job_id": str(job.id),
+            "log": scan_logs.serialize_scan_log(log),
+            "status_url": reverse("scan-job-upload-log", args=[job.id]),
+        },
+        status=202,
     )
 
 
@@ -4122,6 +4177,22 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
     if _wants_html(request):
         return redirect("imports-status", job_id=job.id)
     return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
+
+
+@require_GET
+@login_required
+def intake_progress_view(request: HttpRequest) -> HttpResponseBase:
+    """Admin page: how much is still left to import, per source, uploads and scanner.
+
+    Database aggregates only (``core.intake_progress``); nothing is scanned or hashed.
+    """
+    profile = _active_library_profile(request)
+    if profile is None or not profile.is_admin():
+        return HttpResponseForbidden()
+    progress = intake_progress.intake_progress()
+    if _wants_html(request):
+        return render(request, "core/intake_progress.html", {"progress": progress})
+    return JsonResponse(progress)
 
 
 @require_GET

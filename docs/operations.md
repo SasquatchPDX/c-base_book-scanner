@@ -142,7 +142,10 @@ Set `BOOK_SCANNER_ENVIRONMENT=production`. Startup then fails closed unless:
 - explicit allowed hosts are configured;
 - PostgreSQL and Redis URLs are supplied;
 - the authentication mode is `ldap` or `local` (`stub` is rejected);
-- HTTPS redirect, secure cookies, and HSTS are enabled.
+- HTTPS redirect, secure cookies, and HSTS are enabled;
+- if the scanner API is enabled (`BOOK_SCANNER_SCANNER_API_KEY_SHA256` is set),
+  `BOOK_SCANNER_PUBLIC_BASE_URL` is set to the server's `https://` base URL.
+  Without a scanner key neither setting is needed.
 
 When TLS terminates at a trusted reverse proxy, set
 `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true` and ensure that untrusted clients
@@ -165,11 +168,34 @@ rules this section implements:
   internal CA; sans verifies the chain and the host name and cannot skip that;
 - serif (or the site's NTP server) gives the LAN NTP, because sans refuses to
   start a job without a synchronised clock;
-- each scanner has its own API key, created with `manage.py scanner_device`.
+- there is exactly one scanner, and it has one API key, created with
+  `manage.py generate_scanner_key`. serif keeps only the key's SHA-256 in
+  `BOOK_SCANNER_SCANNER_API_KEY_SHA256`.
 
 All names and addresses below are placeholders: `serif.lan.example` is the
-VM's LAN host name, `192.0.2.0/24` stands for the LAN range(s), and
-`libreflip-01` is the scanner ID. Replace them with the site's values.
+VM's LAN host name and `192.0.2.0/24` stands for the LAN range(s). Replace
+them with the site's values.
+
+### The scanner API key
+
+The scanner authenticates to `/api/scanner/v1/` with `Authorization: Bearer
+<key>`, never with a member session. A browser session cannot use that
+namespace (it answers `401`), and the key authorises nothing outside it (it
+gets `403` on every other route). The API is off until a key hash is
+configured: with `BOOK_SCANNER_SCANNER_API_KEY_SHA256` empty (the default),
+every `/api/scanner/v1/` request answers `503`, and production does not
+require `BOOK_SCANNER_PUBLIC_BASE_URL`. With a key hash configured, production
+startup requires `BOOK_SCANNER_PUBLIC_BASE_URL` to be the server's `https://`
+base URL (it builds the portal links handed to the scanner).
+
+`BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` and `BOOK_SCANNER_SCANNER_MAX_OPF_BYTES`
+are the upload limits reported by `GET /api/scanner/v1/ping`. Every API request
+writes one log line (`scanner_api_request`: route, status, job ID); the key is
+never logged.
+
+Serve `/api/scanner/v1/` over HTTPS only. The plain-HTTP listener in
+`deploy/nginx/book-scanner.conf` already refuses `/api/scanner/` with `403`,
+because the key travels in every request header.
 
 ### nginx
 
@@ -304,18 +330,19 @@ timedatectl show -p NTPSynchronized --value   # must print "yes"
 
 ### Onboarding a scanner
 
-`manage.py scanner_device` is added by #125 (scanner device keys); the
-subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
-
-1. **Create the device key on the VM.** As the service user, from the checkout:
+1. **Generate the key on the VM.** As the service user, from the checkout:
 
    ```bash
-   uv run python manage.py scanner_device create libreflip-01 --name "libreflip scanner"
+   uv run python manage.py generate_scanner_key
    ```
 
-   The key is printed once; serif stores only its SHA-256 hash. If it is lost,
-   run `scanner_device rotate libreflip-01` (the old key stops working
-   immediately) and repeat step 2.
+   The command prints the key and the line
+   `BOOK_SCANNER_SCANNER_API_KEY_SHA256=<hex>`; it writes nothing anywhere.
+   Add that line to the server environment (`.env` or the systemd
+   `EnvironmentFile`), set `BOOK_SCANNER_PUBLIC_BASE_URL`, and restart the web
+   service. serif never stores the key itself. If it is lost or leaked, generate
+   a new one, replace the line, restart (the old key answers `401` from then
+   on), and repeat step 2.
 
 2. **Put the key and the CA on the Pi**, as the user that runs sans. Paste the
    key into a file that is created with mode 0600, so it never lands in shell
@@ -354,8 +381,7 @@ subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
      https://serif.lan.example/api/scanner/v1/ping
    ```
 
-   Expect `200` with `"api_version": 1`, `"scanner_id": "libreflip-01"`, a
-   `server_time` within a few seconds of `date -u`, and the `limits`. The idle
+   Expect `200` with `"api_version": 1`, a `server_time` within a few seconds of `date -u`, and the `limits`. The idle
    screen of sans should then show "All books uploaded" rather than "Upload
    not configured" or "serif rejects this scanner's key".
 
@@ -365,12 +391,12 @@ subcommands follow the contract's §7.2 (`create`, `rotate`, `revoke`, `list`).
 | curl exit 35 (handshake) | client cannot do TLS 1.3, or wrong port |
 | curl exit 60 (certificate) | wrong `ca_file`, or host name not in the certificate's subjectAltName |
 | `403` HTML page from nginx | the scanner's address is not in the `allow` lines |
-| `401` JSON error | key wrong, rotated or revoked; re-run step 1/2 |
-| `503` | `BOOK_SCANNER_SCANNER_API_ENABLED=false` |
+| `401` JSON error | key wrong or replaced; re-run step 1/2 |
+| `503` | `BOOK_SCANNER_SCANNER_API_KEY_SHA256` is empty (API disabled), or the web service was not restarted after setting it |
 | sans: "Clock not synchronised" | NTP on the Pi; check `timedatectl` |
 
-To take a scanner out of service, run `scanner_device revoke libreflip-01`;
-`scanner_device list` shows the registered devices.
+To take the scanner out of service, empty `BOOK_SCANNER_SCANNER_API_KEY_SHA256`
+and restart the web service; the API then answers `503`.
 
 ### Acceptance on the VM
 
@@ -535,11 +561,93 @@ identifier, and nothing reads metadata back from a path. Consequences:
 - **Correcting a book's title or author does not rename its folder.** The folder is
   assigned once (`Book.archive_folder`) and later files of that book keep joining
   it. Moving books into the folder their current metadata implies is an explicit,
-  admin-run reorganize.
+  admin-run reorganize (below).
 - **Files waiting for review** are archived under `_unsorted/<import job id>/` and
   moved into the book folder when identification or review settles the Book (a hard
   link on the same share, with the `_unsorted` name removed after the database
   commit; where hard links are unsupported the file stays under `_unsorted`).
+
+#### `metadata.opf` in each book folder (`BOOK_SCANNER_WRITE_BOOK_OPF`)
+
+Under a book-scoped layout (`author_title`, `calibre`, or a custom template with book
+fields) each book folder also gets a Calibre-compatible `metadata.opf` (OPF 2.0 Dublin
+Core, as Calibre writes it): title (with subtitle), authors with `opf:role="aut"` and
+`opf:file-as`, a stable `uuid` identifier plus ISBN/DOI/OCLC identifiers, language,
+publisher, date (the year alone when only the year is known), description, genres and
+categories as `dc:subject`, `calibre:title_sort`, and a `cover` guide reference when the
+cover image is in the same folder. Calibre, e-readers and file managers can read it.
+
+- **It is derived, never edited by hand.** The database is authoritative. Any change
+  to a book's metadata (title, subtitle, authors, identifiers, publisher, dates,
+  language, description, genres/categories, covers, a file joining/leaving the
+  folder, or deleting an attached author, genre or category) advances the book's
+  requested generation (`BookOpfState`, a separate table so an ordinary `Book.save()`
+  can never roll it back) and queues one background job after the database commit.
+  Further edits while that job is queued and not yet started do not queue more jobs,
+  so a review that changes ten fields writes the file once; an edit that commits once
+  the job has started queues a new one. The job records the generation it wrote only
+  if it is still the requested one, otherwise it writes again. A queued job lost with
+  its worker stops blocking new ones after the job timeout. A hand edit is overwritten
+  by the next regeneration.
+- **Atomic:** the job writes a hidden temporary file in the folder and renames it over
+  `metadata.opf`, so a reader never sees a half-written file. An unchanged file is not
+  rewritten.
+- **Never written on read-only, indexed-in-place locations.** Those folders belong to
+  their share. A book whose files are all referenced in place gets no OPF. A
+  `metadata.opf` the application did not generate is never overwritten.
+- **Marked as ours:** each file carries `<meta name="ebook-server:generated"
+  content="true"/>`. `core.book_opf.is_generated_book_opf()` recognizes it, so an
+  intake OPF-sidecar reader can skip it: a re-import of an archive folder must never
+  treat our own output as external evidence.
+- A reorganize writes the OPF into the new folder and removes the generated OPF left
+  alone in the old one; deleting a book removes it too.
+- `BOOK_SCANNER_WRITE_BOOK_OPF=false` turns it off. It has no effect under the `job`
+  layout (no book folders).
+
+After upgrading (or after restoring a share), queue a write for every existing book
+folder:
+
+```bash
+uv run python manage.py write_book_opfs --dry-run      # list the books, queue nothing
+uv run python manage.py write_book_opfs                # every book with an archive folder
+uv run python manage.py write_book_opfs --book 12      # one book (repeatable)
+```
+
+#### Reorganize: sorting the archive into the tree
+
+Files archived before the layout existed (`books/<import job id>/`), books whose title
+or author was corrected, and everything imported from a COPY/MOVE source can be moved
+into the folder each Book's *current* metadata implies. It is always two background
+jobs (`ProcessingJob`, type `archive_reorganize`), never work inside a web request:
+
+1. **Plan (dry run).** In the admin, select Books ("Plan moving selected books into
+   their archive folders") or COPY/MOVE sources ("Plan sorting books imported from
+   these sources into the archive tree"). The worker lists every file that would move
+   and where; the plan appears on the job's admin page. Nothing changes on storage.
+2. **Apply.** Select the finished plan under Processing jobs and run "Apply selected
+   archive reorganize plans". The plan is applied exactly as reviewed: each entry is
+   re-checked first (the record still points at the planned file with the planned
+   hash, still belongs to the planned Book, and that Book's current metadata still
+   implies the planned folder and file name). An entry that no longer matches, for
+   example because the title was edited after the dry run, is reported `stale` and
+   nothing is moved for it; the job's summary asks for a new dry run
+   (`requires_new_plan`). A valid entry is copied into the planned folder (never
+   over an existing file), verified by SHA-256, re-pointed in the database, and only
+   then is the old copy deleted; empty folders are pruned. A failed verification
+   keeps the original and fails the job. A plan applies once.
+
+From the shell (runs in the command's own process):
+
+```bash
+uv run python manage.py reorganize_archive --book 12 --book 13   # or --source 3, or --all
+uv run python manage.py reorganize_archive --apply <plan job id>
+uv run python manage.py reorganize_archive --run-queued          # admin-queued jobs, no worker
+```
+
+Files referenced in place (read-only locations) are never moved, and index-in-place
+sources cannot be selected: an indexed share stays exactly as it is. Plans are capped at
+5000 files; plan again after applying to continue. The `job` layout has no tree to sort
+into, so reorganize refuses to run under it.
 
 An existing collection does **not** have to be copied into `library-artifacts/`.
 Register it as an index-in-place source (see "Source transfer modes") and the
@@ -789,6 +897,12 @@ index-in-place sources hashed, plus review/complete/failed counts):
 uv run python manage.py ingest_sources --status
 uv run python manage.py ingest_sources --source-id 1 --status --json
 ```
+
+Admins see the same numbers in the web app at **Intake** (`/library/intake/`,
+JSON without `?view=html`): one row per source with a completion bar, plus web
+uploads and scan jobs still in progress. The page reads database counts only (no
+filesystem walk, no hashing) and refreshes every 30 seconds. Files a source has
+not been scanned for yet appear once `ingest_sources` has discovered them.
 
 ### Source transfer modes
 

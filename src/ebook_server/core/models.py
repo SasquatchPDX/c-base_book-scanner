@@ -499,6 +499,31 @@ class Book(models.Model):
         return self.title
 
 
+class BookOpfState(models.Model):
+    """Regeneration state of a book folder's generated ``metadata.opf`` (see core.book_opf).
+
+    Kept out of ``Book`` on purpose: an ordinary ``Book.save()`` writes every column of
+    a possibly stale instance, and must never roll this state back. Both counters only
+    move through queryset updates. The OPF is stale while ``requested_generation`` is
+    ahead of ``written_generation``.
+    """
+
+    book = models.OneToOneField(
+        Book, on_delete=models.CASCADE, primary_key=True, related_name="opf_state"
+    )
+    # Incremented (F() + 1) on every metadata change that affects the OPF.
+    requested_generation = models.PositiveBigIntegerField(default=0)
+    # The requested generation the worker last rendered and wrote, set only while that
+    # generation is still the requested one.
+    written_generation = models.PositiveBigIntegerField(default=0)
+    # Set when a job was queued and not yet started; the job clears it when it starts.
+    # Dedupes queued jobs per book; a claim older than the job timeout is ignored.
+    job_queued_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.book_id}: {self.written_generation}/{self.requested_generation}"
+
+
 class Identifier(models.Model):
     """Identifiers associated with a book (ISBN-10, ISBN-13, DOI, etc.)."""
 
@@ -924,6 +949,75 @@ class ScanJob(models.Model):
         return self.state not in {self.State.COMPLETE, self.State.CANCELLED}
 
 
+class ScanLog(models.Model):
+    """A scanner log file uploaded for a scan job (#7), stored as ``scan-upload-<sha8>.log``.
+
+    The upload request only stages the bytes and records the log as ``queued``; a
+    worker (``ProcessingJob`` of type ``scan_log``) validates, hashes and stores it.
+    Stored in the book's archive folder next to its files once the job is linked to a
+    Book; until then it waits in scan storage and is moved there on finalization.
+    """
+
+    class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        STORED = "stored", "Stored"
+        DUPLICATE = "duplicate", "Duplicate of a stored log"
+        FAILED = "failed", "Failed"
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="logs")
+    state = models.CharField(max_length=16, choices=State.choices, default=State.QUEUED)
+    # Staged upload in scan storage while queued; cleared once processed.
+    staging_identifier = models.CharField(max_length=512, blank=True, default="")
+    storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        related_name="scan_logs",
+        null=True,
+        blank=True,
+    )
+    storage_identifier = models.CharField(max_length=512, blank=True, default="")
+    original_filename = models.CharField(max_length=255)
+    size_bytes = models.PositiveBigIntegerField()
+    sha256 = models.CharField(max_length=64, blank=True, default="")
+    duplicate_of = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="duplicates",
+    )
+    processing_job = models.ForeignKey(
+        "ProcessingJob",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scan_logs",
+    )
+    error = models.CharField(max_length=500, blank=True, default="")
+    uploader = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scan_logs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            # The same log content is stored once per job; re-uploads become DUPLICATE.
+            models.UniqueConstraint(
+                fields=["scan_job", "sha256"],
+                condition=models.Q(state="stored"),
+                name="uniq_scan_log_content",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.scan_job_id}:{self.original_filename}"
+
+
 class ScanPage(models.Model):
     """One logical page within a scan job; multiple immutable versions are allowed."""
 
@@ -1185,6 +1279,8 @@ class ProcessingJob(models.Model):
         LLM_IDENTIFICATION = "llm_identification", "LLM identification assist"
         COMBINE_PARTS = "combine_parts", "Combine multi-part work"
         REFERENCE_CHECK = "reference_check", "Referenced file check"
+        SCAN_LOG = "scan_log", "Scanner log"
+        ARCHIVE_REORGANIZE = "archive_reorganize", "Archive reorganize"
 
     class JobState(models.TextChoices):
         QUEUED = "queued", "Queued"
