@@ -743,7 +743,7 @@ class ScanJob(models.Model):
 
 
 class ScanLog(models.Model):
-    """A scanner log (libreflip ``scan.log``) uploaded for a scan job (#7).
+    """A scanner log (libreflip ``scan.jsonl``) uploaded for a scan job (#7).
 
     The upload request only stages the bytes and records the log as ``queued``; a
     worker (``ProcessingJob`` of type ``scan_log``) validates, hashes and stores it.
