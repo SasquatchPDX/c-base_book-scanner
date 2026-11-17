@@ -110,6 +110,13 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    # Exact-title + strong-author rule for matches without ISBN confirmation
+    # (docs/metadata-providers.md).
+    identification_strong_match_enabled: bool = True
+    identification_strong_match_min_title: float = 1.0
+    identification_strong_match_min_author: float = 0.9
+    identification_strong_match_tie_margin: float = 0.05
+    identification_strong_match_year_tolerance: int = 2
     # Candidates within this score margin of the best one count as tied for auto-accept.
     identification_tie_margin: float = 0.02
     identification_work_isbn_bonus: float = 0.3
@@ -365,6 +372,17 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED = settings.identification_strong_match_enabled
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE = settings.identification_strong_match_min_title
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR = (
+    settings.identification_strong_match_min_author
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN = (
+    settings.identification_strong_match_tie_margin
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE = (
+    settings.identification_strong_match_year_tolerance
+)
 BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
 BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size

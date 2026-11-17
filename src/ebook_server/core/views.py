@@ -1254,6 +1254,11 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
     ),
+    "stronger_title_evidence_disagrees": (
+        "The best match scored high enough to be accepted automatically, but its "
+        "title matches only a weaker hint (such as the filename) while the file's "
+        "stronger title evidence names another book."
+    ),
     "llm_derived": (
         "The best match was found through search terms suggested by the local AI "
         "server. AI suggestions are unverified, so a person must confirm the match."
