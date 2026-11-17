@@ -33,6 +33,7 @@ from .models import (
     ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
+    ScanLog,
     ScanPage,
     ScanPageVersion,
     ScanTailorStageState,
@@ -225,6 +226,49 @@ def _queue_reference_check(
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
     list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
     list_filter = ("state",)
+
+
+@admin.register(ScanLog)
+class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
+    list_display = (
+        "scan_job",
+        "original_filename",
+        "state",
+        "size_bytes",
+        "storage_location",
+        "created_at",
+    )
+    list_filter = ("state",)
+    readonly_fields = (
+        "state",
+        "staging_identifier",
+        "storage_location",
+        "storage_identifier",
+        "sha256",
+        "size_bytes",
+        "duplicate_of",
+        "processing_job",
+        "error",
+    )
+    actions = ("retry_failed_logs",)
+
+    @admin.action(description="Retry selected failed logs (staged upload kept)")
+    def retry_failed_logs(self, request: HttpRequest, queryset: QuerySet[ScanLog]) -> None:
+        from .scan_logs import ScanLogDispatchError, retry_failed_scan_log
+
+        requeued = 0
+        try:
+            for log in queryset.filter(state=ScanLog.State.FAILED):
+                if retry_failed_scan_log(log):
+                    requeued += 1
+        except ScanLogDispatchError as exc:
+            self.message_user(request, f"Queue unavailable: {exc}", messages.ERROR)
+            return
+        self.message_user(
+            request,
+            f"Queued {requeued} log(s) again; failed logs without a staged upload were skipped.",
+            messages.SUCCESS if requeued else messages.WARNING,
+        )
 
 
 @admin.register(ScanPage)

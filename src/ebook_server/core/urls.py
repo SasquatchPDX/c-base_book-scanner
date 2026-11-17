@@ -70,6 +70,11 @@ urlpatterns = [
         name="scan-job-upload-page",
     ),
     path(
+        "scan/jobs/<uuid:job_id>/logs/",
+        views.upload_scan_log,
+        name="scan-job-upload-log",
+    ),
+    path(
         "scan/jobs/<uuid:job_id>/pause/",
         views.scan_job_pause,
         name="scan-job-pause",
