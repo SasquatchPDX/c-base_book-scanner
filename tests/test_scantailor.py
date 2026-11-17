@@ -1403,7 +1403,8 @@ def test_stage_outputs_are_named_for_the_png_they_contain() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_unreadable_input_fails_the_stage_with_message() -> None:
-    client, job = _create_scan_job("scan-user-unreadable")
+    # spread: no automatic Page Split output exists before the failing run
+    client, job = _create_scan_job("scan-user-unreadable", capture_layout="spread")
     good = _facing_page_bytes()
     _upload_scan_page(
         client,
@@ -1436,7 +1437,8 @@ def test_unreadable_input_fails_the_stage_with_message() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, job = _create_scan_job("scan-user-race")
+    # spread: no automatic Page Split output exists before the raced run
+    client, job = _create_scan_job("scan-user-race", capture_layout="spread")
     _upload_scan_page(
         client,
         str(job.id),

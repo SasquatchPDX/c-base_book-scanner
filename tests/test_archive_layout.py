@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -105,18 +107,120 @@ def test_safe_filename_keeps_extension_and_drops_odd_suffixes() -> None:
     assert safe_filename("PRN.pdf") == "_PRN.pdf"
 
 
-# --- storage generate_destination ----------------------------------------------------
+# --- storage destinations and exclusive publication ----------------------------------
 
 
-def test_unique_destination_never_reuses_an_existing_file(tmp_path: Path) -> None:
-    storage = LocalFilesystemStorage(str(tmp_path))
-    first = storage.generate_destination("A/B", "Title - Author.epub", unique=True)
+def test_publish_unique_never_reuses_an_existing_file(tmp_path: Path) -> None:
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
+    one, two = tmp_path / "one.epub", tmp_path / "two.epub"
+    one.write_bytes(b"one")
+    two.write_bytes(b"two")
+    first = storage.publish_unique(str(one), "A/B", "Title - Author.epub")
     assert first == "A/B/Title - Author.epub"
-    (tmp_path / "A" / "B").mkdir(parents=True)
-    (tmp_path / first).write_bytes(b"one")
-    second = storage.generate_destination("A/B", "Title - Author.epub", unique=True)
+    second = storage.publish_unique(str(two), "A/B", "Title - Author.epub")
     assert second != first
     assert second.startswith("A/B/Title - Author-") and second.endswith(".epub")
+    assert storage.resolve_location(first).read_bytes() == b"one"
+    assert storage.resolve_location(second).read_bytes() == b"two"
+    # The staging file is gone; only the two published names remain.
+    assert sorted(p.name for p in (tmp_path / "root" / "A" / "B").iterdir()) == sorted(
+        [Path(first).name, Path(second).name]
+    )
+
+
+def test_publish_unique_retries_when_a_competitor_takes_the_name_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's interleaving: both writers chose ``output.pdf`` before either wrote.
+
+    The competitor publishes between this writer's choice of name and its write; the
+    exclusive create notices, the write moves to a fresh name, and the competitor's
+    bytes are untouched.
+    """
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
+    mine = tmp_path / "mine.pdf"
+    mine.write_bytes(b"my output")
+    real_link = os.link
+    interleaved: list[str] = []
+
+    def competing_link(src: object, dst: object) -> None:
+        if not interleaved:
+            interleaved.append(str(dst))
+            Path(str(dst)).write_bytes(b"competitor output")
+        real_link(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("ebook_server.storage.os.link", competing_link)
+    published = storage.publish_unique(str(mine), "Book", "output.pdf")
+
+    assert published != "Book/output.pdf"
+    assert storage.resolve_location("Book/output.pdf").read_bytes() == b"competitor output"
+    assert storage.resolve_location(published).read_bytes() == b"my output"
+
+
+def test_publish_unique_without_hard_links_claims_the_name_exclusively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
+    source = tmp_path / "out.pdf"
+    source.write_bytes(b"fresh")
+    taken = storage.resolve_location("Book/output.pdf")
+    taken.parent.mkdir(parents=True)
+    taken.write_bytes(b"existing")
+
+    def no_links(src: object, dst: object) -> None:
+        raise OSError(1, "hard links not supported")
+
+    monkeypatch.setattr("ebook_server.storage.os.link", no_links)
+    published = storage.publish_unique(str(source), "Book", "output.pdf")
+
+    assert published != "Book/output.pdf"
+    assert taken.read_bytes() == b"existing"
+    assert storage.resolve_location(published).read_bytes() == b"fresh"
+    with pytest.raises(OSError):
+        storage.publish_unique(published, "Book", "linked.pdf", mode="link")
+
+
+def test_publish_unique_move_removes_the_source_only_after_publishing(tmp_path: Path) -> None:
+    storage = LocalFilesystemStorage(str(tmp_path))
+    (tmp_path / "_unsorted").mkdir()
+    (tmp_path / "_unsorted" / "x.txt").write_bytes(b"x")
+    published = storage.publish_unique("_unsorted/x.txt", "Book", "x.txt", mode="move")
+    assert published == "Book/x.txt"
+    assert not storage.exists("_unsorted/x.txt")
+    assert storage.resolve_location(published).read_bytes() == b"x"
+
+
+def test_competing_threads_each_publish_their_own_file(tmp_path: Path) -> None:
+    """Many writers race for the same name in one folder; none loses its bytes."""
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
+    writers = 12
+    barrier = threading.Barrier(writers)
+    results: dict[int, str] = {}
+    errors: list[BaseException] = []
+
+    def write(index: int) -> None:
+        source = tmp_path / f"src-{index}.pdf"
+        source.write_bytes(f"output of writer {index}".encode())
+        barrier.wait()
+        try:
+            results[index] = storage.publish_unique(str(source), "Jane Austen/Emma", "output.pdf")
+        except BaseException as exc:  # pragma: no cover - surfaced by the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert len(set(results.values())) == writers
+    for index, identifier in results.items():
+        assert storage.resolve_location(identifier).read_bytes() == (
+            f"output of writer {index}".encode()
+        )
+    folder = tmp_path / "root" / "Jane Austen" / "Emma"
+    assert len(list(folder.iterdir())) == writers  # no stray staging files
 
 
 @pytest.mark.parametrize("namespace", ["../escape", "/abs", "a/../../b", "a//b"])
@@ -127,8 +231,9 @@ def test_generate_destination_rejects_unsafe_namespaces(tmp_path: Path, namespac
 
 def test_read_only_backend_refuses_unique_destinations_and_pruning(tmp_path: Path) -> None:
     backend = ReadOnlyFilesystemStorage(str(tmp_path))
+    (tmp_path / "x.txt").write_bytes(b"x")
     with pytest.raises(ReadOnlyStorageError):
-        backend.generate_destination("a", "x.txt", unique=True)
+        backend.publish_unique("x.txt", "a", "x.txt")
     with pytest.raises(ReadOnlyStorageError):
         backend.prune_empty_parents("a/x.txt")
 
@@ -233,8 +338,8 @@ def test_matched_import_lands_in_author_title_folder(
 ) -> None:
     monkeypatch.setattr(
         identification,
-        "resolve_candidates",
-        lambda _signals: [_candidate("The Left Hand of Darkness", ["Ursula K. Le Guin"])],
+        "resolve_candidates_with_report",
+        lambda _signals: ([_candidate("The Left Hand of Darkness", ["Ursula K. Le Guin"])], []),
     )
     job = _source_job(tmp_path, "lhod.txt", "Genly Ai arrives on Gethen.")
     intake.process_import_job(str(job.id))
@@ -261,8 +366,8 @@ def test_second_format_of_same_book_joins_its_folder(
 ) -> None:
     monkeypatch.setattr(
         identification,
-        "resolve_candidates",
-        lambda _signals: [_candidate("Dune", ["Frank Herbert"])],
+        "resolve_candidates_with_report",
+        lambda _signals: ([_candidate("Dune", ["Frank Herbert"])], []),
     )
     first = _source_job(tmp_path, "dune.txt", "Arrakis, first edition.")
     second = _source_job(tmp_path, "dune-2.txt", "Arrakis, another text file.")
@@ -285,7 +390,7 @@ def test_second_format_of_same_book_joins_its_folder(
 def test_reviewed_import_waits_in_unsorted_then_moves_to_book_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive: LocalFilesystemStorage
 ) -> None:
-    monkeypatch.setattr(identification, "resolve_candidates", lambda _signals: [])
+    monkeypatch.setattr(identification, "resolve_candidates_with_report", lambda _signals: ([], []))
     job = _source_job(tmp_path, "mystery.txt", "An unidentified manuscript.")
     intake.process_import_job(str(job.id))
     job.refresh_from_db()
@@ -314,7 +419,9 @@ def test_job_layout_keeps_original_per_import_folders(  # type: ignore[no-untype
 ) -> None:
     settings.BOOK_SCANNER_ARCHIVE_LAYOUT = "job"
     monkeypatch.setattr(
-        identification, "resolve_candidates", lambda _signals: [_candidate("Emma", ["Austen"])]
+        identification,
+        "resolve_candidates_with_report",
+        lambda _signals: ([_candidate("Emma", ["Austen"])], []),
     )
     job = _source_job(tmp_path, "emma.txt", "Emma Woodhouse, handsome, clever, and rich.")
     intake.process_import_job(str(job.id))
@@ -326,19 +433,42 @@ def test_job_layout_keeps_original_per_import_folders(  # type: ignore[no-untype
 
 @pytest.mark.django_db
 def test_derived_files_go_into_the_book_folder(tmp_path: Path) -> None:
-    storage = LocalFilesystemStorage(str(tmp_path))
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
     book = _book("Emma", "Jane Austen")
-    cover = archive_layout.derived_destination(
-        storage, book, "cover.jpg", legacy_namespace=f"books/{book.pk}/covers"
+    produced = tmp_path / "produced"
+    produced.write_bytes(b"derived")
+    cover = archive_layout.publish_derived(
+        storage, book, str(produced), "cover.jpg", legacy_namespace=f"books/{book.pk}/covers"
     )
-    converted = archive_layout.derived_destination(
+    converted = archive_layout.publish_derived(
         storage,
         book,
+        str(produced),
         f"{archive_layout.book_file_stem(book)}.epub",
         legacy_namespace=f"books/{book.pk}/converted",
     )
     assert cover == "Jane Austen/Emma/cover.jpg"
     assert converted == "Jane Austen/Emma/Emma - Jane Austen.epub"
+    assert storage.resolve_location(converted).read_bytes() == b"derived"
+
+
+@pytest.mark.django_db
+def test_two_derived_outputs_with_the_same_name_keep_both_files(tmp_path: Path) -> None:
+    """Two conversions of one book to ``output.pdf``: the second never replaces the first."""
+    storage = LocalFilesystemStorage(str(tmp_path / "root"))
+    book = _book("Emma", "Jane Austen")
+    first_src, second_src = tmp_path / "a.pdf", tmp_path / "b.pdf"
+    first_src.write_bytes(b"first conversion")
+    second_src.write_bytes(b"second conversion")
+    first = archive_layout.publish_derived(
+        storage, book, str(first_src), "output.pdf", legacy_namespace="unused"
+    )
+    second = archive_layout.publish_derived(
+        storage, book, str(second_src), "output.pdf", legacy_namespace="unused"
+    )
+    assert first != second
+    assert storage.resolve_location(first).read_bytes() == b"first conversion"
+    assert storage.resolve_location(second).read_bytes() == b"second conversion"
 
 
 @pytest.mark.django_db
@@ -347,9 +477,12 @@ def test_derived_files_keep_legacy_namespace_under_job_layout(  # type: ignore[n
 ) -> None:
     settings.BOOK_SCANNER_ARCHIVE_LAYOUT = "job"
     book = _book("Emma", "Jane Austen")
-    destination = archive_layout.derived_destination(
-        LocalFilesystemStorage(str(tmp_path)),
+    produced = tmp_path / "produced.jpg"
+    produced.write_bytes(b"jpg")
+    destination = archive_layout.publish_derived(
+        LocalFilesystemStorage(str(tmp_path / "root")),
         book,
+        str(produced),
         "cover.jpg",
         legacy_namespace=f"books/{book.pk}/covers",
         legacy_filename="abc-front.jpg",
@@ -361,7 +494,7 @@ def test_derived_files_keep_legacy_namespace_under_job_layout(  # type: ignore[n
 def test_pending_move_survives_a_rolled_back_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive: LocalFilesystemStorage
 ) -> None:
-    monkeypatch.setattr(identification, "resolve_candidates", lambda _signals: [])
+    monkeypatch.setattr(identification, "resolve_candidates_with_report", lambda _signals: ([], []))
     job = _source_job(tmp_path, "draft.txt", "Pending text.")
     intake.process_import_job(str(job.id))
     job.refresh_from_db()

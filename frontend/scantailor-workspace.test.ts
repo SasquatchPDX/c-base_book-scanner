@@ -3,11 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   displayBoxToSource,
   editableParameters,
+  isAutoSkippedSplit,
   normalizeBox,
   previewErrorMessage,
   previousStageName,
   sourceBoxToDisplay,
+  SPLIT_MODES,
   stageErrorText,
+  stageStatusLabel,
   stageStatusMessage,
   STAGE_ORDER,
 } from "./scantailor-workspace";
@@ -144,5 +147,21 @@ describe("stage status presentation", () => {
       text: "Revision 1 · success",
       tone: "info",
     });
+  });
+});
+
+describe("single-page capture page split (#55)", () => {
+  it("labels an automatically skipped split and keeps other statuses", () => {
+    const skipped = { status: "success", revision: 2, last_error: "", auto_skipped: true };
+
+    expect(isAutoSkippedSplit(skipped)).toBe(true);
+    expect(stageStatusLabel(skipped)).toBe("skipped · single page");
+    expect(stageStatusMessage(skipped).text).toContain("skipped: single-page capture");
+    expect(stageStatusLabel({ status: "success", auto_skipped: false })).toBe("success");
+    expect(stageStatusLabel({ status: "queued" })).toBe("queued");
+  });
+
+  it("offers the no-split mode alongside the splitting modes", () => {
+    expect(SPLIT_MODES).toEqual(["none", "auto", "manual", "single"]);
   });
 });

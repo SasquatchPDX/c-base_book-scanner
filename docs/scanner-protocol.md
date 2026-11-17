@@ -82,7 +82,14 @@ book queues bibliographic identification instead (202, `requires_bibliographic_r
    `401 {"error": "authentication required"}` when the session is missing or expired
    (browsers still get the login redirect). On a 401, log in again (step 1) and retry.
 4. **Create a job:** `POST /scan/jobs/` (form or JSON: `provisional_title`, `scanner_id`,
-   `book_id`, `expected_page_count`...). The response (201) contains the job `id`.
+   `book_id`, `expected_page_count`, `capture_layout`...). The response (201) contains
+   the job `id`. `capture_layout` is `single_page` (every image is one page; the
+   default and what the project's scanner produces) or `spread` (an image may hold two
+   facing pages). If it is left out, scanner ids listed in
+   `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` get `spread` and every other scanner gets
+   `BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT`. Any other value is a 400. In a
+   `single_page` job, ScanTailor's Page Split completes automatically as "no split"
+   (see `docs/scantailor-web.md`).
 5. **Upload pages** one at a time with `POST /scan/jobs/{id}/pages/` as multipart, always
    sending `checksum_sha256` of the exact bytes. Retries are safe: re-sending the same
    `(sequence, side, checksum)` returns 200 without creating a version, so retry on network

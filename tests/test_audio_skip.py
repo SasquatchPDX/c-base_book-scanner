@@ -73,9 +73,13 @@ def test_preview_lists_audio_as_a_distinct_skipped_category(tmp_path: Path) -> N
     )
     payload = json.loads(stdout.getvalue())
 
-    by_path = {row["path"]: row for row in payload}
-    assert set(by_path) == {str(book), str(m4b), str(aax)}
+    by_path = {row["path"]: row for row in payload if "path" in row}
+    assert set(by_path) == {str(book), str(m4b), str(aax), str(docx)}
     assert "skipped" not in by_path[str(book)]
+    assert by_path[str(book)]["status"] == "importable"
+    # Unsupported formats are a separate skipped category (#23), not audio.
+    assert by_path[str(docx)]["skipped"] == "unsupported"
+    assert by_path[str(m4b)]["status"] == "skipped"
     assert by_path[str(m4b)]["skipped"] == "audio"
     assert by_path[str(m4b)]["reason"] == "audio (not managed here)"
     assert by_path[str(m4b)]["drm_protected"] is False
@@ -87,6 +91,11 @@ def test_preview_lists_audio_as_a_distinct_skipped_category(tmp_path: Path) -> N
     output = text.getvalue()
     assert f"skipped [audio (not managed here)] => {m4b}" in output
     assert "skipped_audio=2" in output
+    assert f"SKIPPED (unsupported format: .docx) => {docx}" in output
+    summary = next(row["summary"] for row in payload if "summary" in row)
+    assert summary["importable"] == 1
+    assert summary["skipped"] == 3
+    assert summary["skipped_audio"] == 2
     assert ImportJob.objects.count() == 0
 
 

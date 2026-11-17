@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar, Final
+from typing import Any, ClassVar, Final
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models.functions import Lower
@@ -67,7 +70,11 @@ class Author(models.Model):
 
 
 class Category(models.Model):
-    """Taxonomy bucket for browsing/search."""
+    """Library shelving bucket, curated by admins only.
+
+    Categories are *not* derived from subject tags; tag-derived classification goes to
+    ``Genre`` (#50, see docs/metadata-providers.md).
+    """
 
     name = models.CharField(max_length=128, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -79,14 +86,107 @@ class Category(models.Model):
         return self.name
 
 
+def genre_key(value: str) -> str:
+    """Comparison key for genre names and aliases.
+
+    Folds case, accents, ``&``/``and``, punctuation and whitespace, so "Sci-Fi", "SciFi"
+    and "sci fi" share one key. Only exact keys match; there is no fuzzy matching.
+    """
+    text = unicodedata.normalize("NFKD", value).casefold()
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    text = text.replace("&", " and ")
+    return re.sub(r"[\W_]+", "", text)
+
+
 class Genre(models.Model):
-    """Genre taxonomy bucket."""
+    """Literary genre (fiction or nonfiction) assigned from subject tags (#50).
+
+    Only admins create genres; tags that map to no genre or alias stay evidence.
+    """
 
     name = models.CharField(max_length=128, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        ordering: ClassVar[list[str]] = ["name"]
 
     def __str__(self) -> str:
         return self.name
+
+
+class GenreAlias(models.Model):
+    """Admin-editable alternative spelling of a genre ("SciFi" -> Science fiction)."""
+
+    genre = models.ForeignKey(Genre, on_delete=models.CASCADE, related_name="aliases")
+    alias = models.CharField(
+        max_length=255,
+        help_text=(
+            "Subject tag as providers or files write it. Case, accents, punctuation and "
+            "spacing are ignored when matching."
+        ),
+    )
+    key = models.CharField(max_length=255, unique=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    # Ownership marker for the 0023 starter-taxonomy migration: only rows it created are
+    # removed when it is reversed, and only while unused. Admin-created rows stay False.
+    seeded = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        ordering: ClassVar[list[str]] = ["alias"]
+        verbose_name_plural = "genre aliases"
+
+    def clean(self) -> None:
+        key = genre_key(self.alias)
+        if not key:
+            raise ValidationError({"alias": "Alias needs at least one letter or digit."})
+        if GenreAlias.objects.filter(key=key).exclude(pk=self.pk).exists():
+            raise ValidationError({"alias": "An equivalent alias already exists."})
+        for genre in Genre.objects.exclude(pk=self.genre_id).only("id", "name"):
+            if genre_key(genre.name) == key:
+                raise ValidationError({"alias": f"This is the name of the genre {genre.name}."})
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.key = genre_key(self.alias)
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.alias} -> {self.genre_id}"
+
+
+class BookGenre(models.Model):
+    """Book-to-genre link with provenance (#50).
+
+    Uses the original auto-created ``core_book_genres`` table. Automatic assignment never
+    removes or downgrades reviewer- or admin-set rows.
+    """
+
+    class Source(models.TextChoices):
+        PROVIDER = "provider", "Metadata provider subject"
+        EMBEDDED = "embedded", "Embedded file subject"
+        REVIEWER = "reviewer", "Reviewer"
+        ADMIN = "admin", "Admin"
+
+    book = models.ForeignKey("Book", on_delete=models.CASCADE)
+    genre = models.ForeignKey(Genre, on_delete=models.CASCADE)
+    # Rows added without explicit provenance (the admin inline, ``book.genres.add``)
+    # are treated as hand-curated.
+    source = models.CharField(max_length=16, choices=Source.choices, default=Source.ADMIN)
+    source_tag = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Subject tag that mapped to this genre, for automatic assignments.",
+    )
+    created_at = models.DateTimeField(default=now)
+
+    class Meta:
+        db_table = "core_book_genres"
+        unique_together = (("book", "genre"),)
+
+    def __str__(self) -> str:
+        return f"{self.book_id}:{self.genre_id} ({self.source})"
 
 
 class StorageLocation(models.Model):
@@ -186,6 +286,29 @@ class SourceLocation(models.Model):
         default=SourceType.NETWORK_SOURCE,
     )
     default_metadata = models.JSONField(default=dict, blank=True)
+    is_paused = models.BooleanField(
+        default=False,
+        help_text=(
+            "Paused sources queue no new imports, and queued imports that have not "
+            "started stay DISCOVERED until the source is resumed."
+        ),
+    )
+    ingest_batch_size = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum import jobs in flight for this source. Blank uses "
+            "BOOK_SCANNER_INGEST_BATCH_SIZE; 0 means unlimited."
+        ),
+    )
+    ingest_max_per_hour = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum new import jobs queued per rolling hour for this source. Blank "
+            "uses BOOK_SCANNER_INGEST_MAX_PER_HOUR; 0 means unlimited."
+        ),
+    )
 
     class AuthorNameOrder(models.TextChoices):
         AUTO = "auto", 'Auto ("Last, First" when a comma is present)'
@@ -319,10 +442,23 @@ class Book(models.Model):
         related_name="books",
         blank=True,
     )
-    genres: models.ManyToManyField[Genre, Genre] = models.ManyToManyField(
+    genres: models.ManyToManyField[Genre, BookGenre] = models.ManyToManyField(
         "Genre",
         related_name="books",
         blank=True,
+        through="BookGenre",
+    )
+    # Set on any reviewer or admin genre decision, including "no genres" (#50). Automatic
+    # assignment and the ``assign_genres`` backfill never touch a curated Book, whether
+    # or not it has genre links.
+    genres_curated_at = models.DateTimeField(null=True, blank=True, editable=False)
+    genres_curated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="+",
+        on_delete=models.SET_NULL,
     )
 
     front_cover = models.ForeignKey(
@@ -431,6 +567,10 @@ class FileVariant(models.Model):
     class VariantFormat(models.TextChoices):
         EPUB = "epub", "EPUB"
         MOBI = "mobi", "MOBI"
+        AZW = "azw", "AZW"
+        AZW3 = "azw3", "AZW3"
+        PRC = "prc", "PRC"
+        RTF = "rtf", "RTF"
         PDF = "pdf", "PDF"
         TXT = "txt", "TXT"
         HTML = "html", "HTML"
@@ -541,9 +681,20 @@ class ScanJob(models.Model):
         COMPLETE = "complete", "Complete"
         CANCELLED = "cancelled", "Cancelled"
 
+    class CaptureLayout(models.TextChoices):
+        """What one uploaded image contains; decides how Page Split treats it (#55)."""
+
+        SINGLE_PAGE = "single_page", "One page per image"
+        SPREAD = "spread", "Two facing pages per image"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     state = models.CharField(max_length=16, choices=State.choices, default=State.OPEN)
     scanner_id = models.CharField(max_length=64, blank=True)
+    capture_layout = models.CharField(
+        max_length=16,
+        choices=CaptureLayout.choices,
+        default=CaptureLayout.SINGLE_PAGE,
+    )
     operator = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -562,6 +713,11 @@ class ScanJob(models.Model):
     provisional_authors = models.JSONField(default=list, blank=True)
     expected_page_count = models.PositiveIntegerField(null=True, blank=True)
     notes = models.JSONField(default=dict, blank=True)
+    # Fencing token for provider searches: only the search job named here may
+    # publish candidates for this source. Moved under this row's lock whenever a
+    # new search supersedes an older one, so a stale queue entry or a late worker
+    # can never make its results current (#104).
+    current_search_job_id = models.UUIDField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -915,6 +1071,7 @@ class ImportJob(models.Model):
         ARCHIVING = "archiving", "Archiving"
         COMPLETE = "complete", "Complete"
         FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
 
     class SourceType(models.TextChoices):
         UPLOAD = "upload", "Upload"
@@ -971,11 +1128,21 @@ class ImportJob(models.Model):
     attempt_count = models.PositiveIntegerField(default=0)
     last_error = models.TextField(blank=True)
     evidence = models.JSONField(default=dict, blank=True)
+    # Fencing token for provider searches: only the search job named here may
+    # publish candidates for this source. Moved under this row's lock whenever a
+    # new search supersedes an older one, so a stale queue entry or a late worker
+    # can never make its results current (#104).
+    current_search_job_id = models.UUIDField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Exclusive ownership while a worker processes the job (HASHING through ARCHIVING).
+    # Set atomically when a delivery claims the job, renewed on every phase transition,
+    # and cleared when the job leaves the active phases. Empty means unowned.
+    lease_owner = models.CharField(max_length=64, blank=True, default="")
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -1003,8 +1170,107 @@ class ImportJob(models.Model):
         return f"{self.id}:{self.state}"
 
 
+class MetadataSearch(models.Model):
+    """One finished identification run against the configured metadata providers.
+
+    Records the terms that were searched, what every provider did (results, no
+    results, or an error and why) and, through ``candidates``, what it returned.
+    Runs are kept, so a failed or empty repeat search never hides earlier results.
+    A run is written only once it has finished; whether a search is in progress is
+    derived from its queued/running ``ProcessingJob``, never from this table.
+    """
+
+    class Trigger(models.TextChoices):
+        INTAKE = "intake", "Import"
+        REVIEW = "review", "Review search"
+        SCAN = "scan", "Scan identification"
+
+    class State(models.TextChoices):
+        COMPLETE = "complete", "Complete"
+        FAILED = "failed", "Failed"
+        # Finished, but its results were kept as history only: a newer search
+        # replaced it or the review was resolved while it ran. ``error`` says which.
+        DISCARDED = "discarded", "Not applied"
+
+    PROVIDER_STATUS_LABELS: ClassVar[dict[str, str]] = {
+        "results": "Results",
+        "no_results": "No results",
+        "error": "Error",
+    }
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    import_job = models.ForeignKey(
+        ImportJob,
+        on_delete=models.CASCADE,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    scan_job = models.ForeignKey(
+        ScanJob,
+        on_delete=models.CASCADE,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    trigger = models.CharField(max_length=16, choices=Trigger.choices)
+    state = models.CharField(max_length=16, choices=State.choices)
+    processing_job_id = models.UUIDField(null=True, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="metadata_searches",
+        null=True,
+        blank=True,
+    )
+    # The terms actually sent to the providers (title/author hints, ISBNs, ...).
+    query = models.JSONField(default=dict, blank=True)
+    # One ProviderOutcome.as_dict() per configured provider.
+    providers = models.JSONField(default=list, blank=True)
+    candidate_count = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(default=now)
+    finished_at = models.DateTimeField(default=now)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["import_job", "-finished_at"]),
+            models.Index(fields=["scan_job", "-finished_at"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(import_job__isnull=False, scan_job__isnull=True)
+                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                ),
+                name="search_has_exactly_one_source",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.trigger}:{self.id}:{self.state}"
+
+    @property
+    def provider_rows(self) -> list[dict[str, object]]:
+        """Provider outcomes with a display label for their status."""
+        return [
+            {**row, "status_label": self.PROVIDER_STATUS_LABELS.get(str(row.get("status")), "")}
+            for row in self.providers
+            if isinstance(row, dict)
+        ]
+
+    @property
+    def provider_errors(self) -> list[dict[str, object]]:
+        return [row for row in self.provider_rows if row.get("status") == "error"]
+
+
 class MetadataCandidate(models.Model):
-    """Candidate bibliographic matches returned during identification."""
+    """Candidate bibliographic matches returned during identification.
+
+    Candidates of earlier search runs are kept for history with ``superseded_at``
+    set; only current candidates (``superseded_at`` is NULL) can be accepted and
+    count towards metrics and review-queue payloads.
+    """
 
     class CandidateState(models.TextChoices):
         MATCH = "match", "Match"
@@ -1025,6 +1291,14 @@ class MetadataCandidate(models.Model):
         null=True,
         blank=True,
     )
+    search = models.ForeignKey(
+        MetadataSearch,
+        on_delete=models.SET_NULL,
+        related_name="candidates",
+        null=True,
+        blank=True,
+    )
+    superseded_at = models.DateTimeField(null=True, blank=True)
     provider_id = models.CharField(max_length=64)
     provider_ref = models.CharField(max_length=255, blank=True)
     title = models.CharField(max_length=512)
@@ -1033,8 +1307,8 @@ class MetadataCandidate(models.Model):
     isbn13 = models.CharField(max_length=16, blank=True)
     score = models.DecimalField(max_digits=5, decimal_places=2, default=0.0)
     raw_payload = models.JSONField(default=dict, blank=True)
-    # Provider-reported subject/genre/category tags: evidence only, not yet mapped to
-    # Book.categories / Book.genres (see #50 for the open taxonomy decision).
+    # Provider-reported subject/genre/category tags. Raw evidence; tags that map to a
+    # Genre (or GenreAlias) are attached to the Book on accept (#50).
     subjects = models.JSONField(default=list, blank=True)
     language = models.CharField(max_length=32, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
@@ -1062,15 +1336,17 @@ class MetadataCandidate(models.Model):
                 ),
                 name="candidate_has_exactly_one_source",
             ),
+            # Unique among current candidates only: superseded runs may hold the
+            # same provider record again.
             models.UniqueConstraint(
                 fields=["import_job", "provider_id", "provider_ref"],
-                condition=models.Q(import_job__isnull=False),
-                name="uniq_import_candidate_provider_ref",
+                condition=models.Q(import_job__isnull=False, superseded_at__isnull=True),
+                name="uniq_current_import_candidate_provider_ref",
             ),
             models.UniqueConstraint(
                 fields=["scan_job", "provider_id", "provider_ref"],
-                condition=models.Q(scan_job__isnull=False),
-                name="uniq_scan_candidate_provider_ref",
+                condition=models.Q(scan_job__isnull=False, superseded_at__isnull=True),
+                name="uniq_current_scan_candidate_provider_ref",
             ),
         ]
 
