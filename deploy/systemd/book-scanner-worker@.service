@@ -1,0 +1,35 @@
+# Example template unit for RQ workers. See deploy/systemd/README.md.
+# Start one or more instances: systemctl enable --now book-scanner-worker@1
+# The --url value must match BOOK_SCANNER_REDIS_URL and the queue name must
+# match BOOK_SCANNER_QUEUE_NAME (default "ebook-server").
+[Unit]
+Description=Book Scanner RQ worker %i
+Wants=network-online.target
+After=network-online.target remote-fs.target postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=book-scanner
+Group=book-scanner
+# settings.py reads ".env" from the working directory, so this must be the
+# checkout root (the directory containing manage.py and .env).
+WorkingDirectory=/opt/book-scanner
+# Required for headless Calibre PDF conversion.
+Environment=QT_QPA_PLATFORM=offscreen
+# --with-scheduler is mandatory on at least one worker (delayed retries); it is
+# safe on every instance because only one holds the scheduler lock at a time.
+ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --url redis://127.0.0.1:6379/0 ebook-server
+Restart=on-failure
+RestartSec=5
+# Give a running job a chance to finish on stop: SIGTERM goes only to the main
+# RQ process (warm shutdown); the forked work horse and converter children are
+# killed only when the timeout expires. Long conversions/OCR may still be
+# interrupted (see "Recovering from killed workers" in docs/operations.md).
+KillMode=mixed
+TimeoutStopSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
