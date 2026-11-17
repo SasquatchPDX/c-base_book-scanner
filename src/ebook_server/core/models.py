@@ -557,6 +557,43 @@ class ScanJob(models.Model):
         return self.state not in {self.State.COMPLETE, self.State.CANCELLED}
 
 
+class ScanLog(models.Model):
+    """A scanner log (libreflip ``scan.log``) uploaded for a scan job (#7).
+
+    Stored in the book's archive folder next to its files once the job is linked to a
+    Book; until then it waits in scan storage and is moved there on finalization.
+    """
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="logs")
+    storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        related_name="scan_logs",
+    )
+    storage_identifier = models.CharField(max_length=512)
+    original_filename = models.CharField(max_length=255)
+    size_bytes = models.PositiveBigIntegerField()
+    sha256 = models.CharField(max_length=64)
+    uploader = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scan_logs",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            # Uploads are idempotent: the same log content is recorded once per job.
+            models.UniqueConstraint(fields=["scan_job", "sha256"], name="uniq_scan_log_content"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.scan_job_id}:{self.original_filename}"
+
+
 class ScanPage(models.Model):
     """One logical page within a scan job; multiple immutable versions are allowed."""
 

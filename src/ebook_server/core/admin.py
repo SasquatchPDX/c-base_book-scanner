@@ -20,6 +20,7 @@ from .models import (
     ProcessingJob,
     ReviewTask,
     ScanJob,
+    ScanLog,
     ScanPage,
     ScanPageVersion,
     ScanTailorStageState,
@@ -114,6 +115,12 @@ class FileVariantAdmin(admin.ModelAdmin[FileVariant]):
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
     list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
     list_filter = ("state",)
+
+
+@admin.register(ScanLog)
+class ScanLogAdmin(admin.ModelAdmin[ScanLog]):
+    list_display = ("scan_job", "original_filename", "size_bytes", "storage_location", "created_at")
+    readonly_fields = ("storage_location", "storage_identifier", "sha256", "size_bytes")
 
 
 @admin.register(ScanPage)

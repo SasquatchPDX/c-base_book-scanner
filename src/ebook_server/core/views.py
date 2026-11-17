@@ -59,6 +59,7 @@ from . import (
     ocr,
     review_identification,
     scan_identification,
+    scan_logs,
     scan_pipeline,
     scantailor,
 )
@@ -2919,6 +2920,47 @@ def scan_page_request_rescan(
             "scan_job_id": str(page.scan_job_id),
         },
         status=201,
+    )
+
+
+@require_POST
+@scan_api_login_required
+def upload_scan_log(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """Accept a scanner log (libreflip ``scan.log``) for a scan job; idempotent by content."""
+    if _coerce_uuid(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ScanJob.objects.select_related("book").get(pk=job_id)
+    except (ScanJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.state == ScanJob.State.CANCELLED:
+        return HttpResponseBadRequest("job cancelled")
+    uploaded_file = request.FILES.get("file")
+    if uploaded_file is None:
+        return HttpResponseBadRequest("missing_file")
+    try:
+        log, created = scan_logs.store_scan_log(job, uploaded_file, profile.user_id)
+    except scan_logs.ScanLogError as exc:
+        return HttpResponseBadRequest(str(exc))
+    except OSError:
+        logger.exception("scan log storage failed", scan_job_id=str(job.id))
+        return JsonResponse({"error": "storage unavailable", "retryable": True}, status=503)
+    return JsonResponse(
+        {
+            "job_id": str(job.id),
+            "log": {
+                "id": log.pk,
+                "original_filename": log.original_filename,
+                "size_bytes": log.size_bytes,
+                "sha256": log.sha256,
+                "in_book_folder": log.storage_location.identifier != "scan",
+            },
+            "created": created,
+        },
+        status=201 if created else 200,
     )
 
 
