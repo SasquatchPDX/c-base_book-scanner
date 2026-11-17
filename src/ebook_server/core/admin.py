@@ -229,8 +229,19 @@ def _queue_reference_check(
 
 @admin.register(ScanJob)
 class ScanJobAdmin(admin.ModelAdmin[ScanJob]):
-    list_display = ("id", "state", "scanner_id", "operator", "book", "created_at", "finished_at")
-    list_filter = ("state",)
+    list_display = (
+        "id",
+        "state",
+        "scanner_id",
+        "source",
+        "operator",
+        "book",
+        "scan_started_at",
+        "created_at",
+        "finished_at",
+    )
+    list_filter = ("state", "source")
+    search_fields = ("id", "scanner_id")
 
 
 @admin.register(ScanLog)

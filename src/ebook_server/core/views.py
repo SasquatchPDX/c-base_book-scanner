@@ -108,6 +108,7 @@ from .models import (
     StorageLocation,
 )
 from .referenced_files import ReferencedFileError, ensure_reference_intact
+from .scan_job_ids import normalize_scan_job_id
 from .storage_registry import StorageConfigurationError, backend_for_location
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
@@ -554,7 +555,7 @@ def _scan_todos_for_query(request: HttpRequest) -> tuple[Any, str]:
     if states:
         queryset = queryset.filter(state__in=states)
     if raw_job_id := _coerce_str_or_none(request.GET.get("job_id")):
-        job_id = _coerce_uuid(raw_job_id)
+        job_id = normalize_scan_job_id(raw_job_id)
         if job_id is None:
             return None, "invalid job_id"
         queryset = queryset.filter(scan_job_id=job_id)
@@ -2904,7 +2905,7 @@ def scan_job_workspace(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     try:
@@ -2940,7 +2941,7 @@ async def scan_job_workspace_events(
     job_id: str,
 ) -> HttpResponseBase:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     initial_payload = await sync_to_async(
@@ -2996,7 +2997,7 @@ def scan_page_stages(
     page_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     try:
@@ -3024,7 +3025,7 @@ def scan_page_stage(
     page_id: str,
     stage: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     profile = _active_library_profile(request)
@@ -3101,7 +3102,7 @@ def scan_job_stage_batch(
     job_id: str,
     stage: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
     profile = _active_library_profile(request)
@@ -3202,7 +3203,7 @@ def scan_page_stage_preview(
     page_id: str,
     stage: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None or _coerce_uuid(page_id) is None:
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
         return HttpResponseBadRequest("invalid uuid")
     normalized_stage = _normalize_stage(stage)
     if normalized_stage is None:
@@ -3345,7 +3346,7 @@ def scan_job_detail(
     job_id: str,
 ) -> HttpResponseBase:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = (
@@ -3369,7 +3370,7 @@ def scan_job_todos(
     request: HttpRequest,
     job_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
     profile = _active_library_profile(request)
@@ -3405,7 +3406,7 @@ def scan_job_ocr_request(
     request: HttpRequest,
     job_id: str,
 ) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3443,7 +3444,7 @@ def scan_job_identification_request(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3651,7 +3652,7 @@ def upload_scan_page(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -3924,7 +3925,7 @@ def scan_job_pause(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)
@@ -3943,7 +3944,7 @@ def scan_job_resume(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)
@@ -3961,7 +3962,7 @@ def scan_job_finish(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
     if profile is None:
@@ -4085,7 +4086,7 @@ def scan_job_cancel(
     job_id: str,
 ) -> JsonResponse | HttpResponseNotFound | HttpResponseBadRequest | HttpResponseForbidden:
     del request
-    if _coerce_uuid(job_id) is None:
+    if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     try:
         job = ScanJob.objects.get(pk=job_id)

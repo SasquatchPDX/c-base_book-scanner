@@ -256,14 +256,13 @@ def test_every_request_logs_one_line_without_the_key(scanner_key: str) -> None:
     with structlog.testing.capture_logs() as logs:
         Client().get(PING, headers=_bearer(scanner_key))
         Client().get(PING, headers=_bearer("wrong-key"))
-        Client().get("/api/scanner/v1/jobs/20261117T143201Z", headers=_bearer(scanner_key))
+        Client().post("/api/scanner/v1/jobs/20261117T143201Z", headers=_bearer(scanner_key))
     lines = [entry for entry in logs if entry["event"] == "scanner_api_request"]
-    assert [(line["route"], line["status"]) for line in lines] == [
-        ("scanner-api-ping", 200),
-        ("scanner-api-ping", 401),
-        ("scanner-api-not-found", 404),
+    assert [(line["route"], line["status"], line["job_id"]) for line in lines] == [
+        ("scanner-api-ping", 200, None),
+        ("scanner-api-ping", 401, None),
+        ("scanner-api-job", 405, "20261117T143201Z"),
     ]
-    assert all("job_id" in line for line in lines)
     rendered = repr(logs)
     assert scanner_key not in rendered
     assert hash_key(scanner_key) not in rendered

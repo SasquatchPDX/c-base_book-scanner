@@ -14,6 +14,7 @@ Every request writes one log line (route, status, job ID); the key is never logg
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import wraps
@@ -21,10 +22,14 @@ from typing import Any, Final
 
 import structlog
 from django.conf import settings
+from django.db import IntegrityError, transaction
 from django.http import HttpRequest, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
+from .models import ScanJob
+from .scan_job_ids import is_device_job_id
 from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
 
 API_VERSION: Final = 1
@@ -163,6 +168,164 @@ def ping(request: HttpRequest) -> JsonResponse:
             "limits": limits(),
         }
     )
+
+
+# --- jobs (§6.3/§6.4) -------------------------------------------------------------------
+
+MAX_JOB_REQUEST_BYTES: Final = 16 * 1024
+
+
+def _invalid_job_id(job_id: str) -> JsonResponse:
+    return error_response(
+        400,
+        "invalid_job_id",
+        "The job ID must match YYYYMMDDTHHMMSSZ[-N].",
+        {"job_id": job_id[:80]},
+    )
+
+
+def portal_url(request: HttpRequest, job_id: str) -> str:
+    """Link to the job's portal page (``/j/<job_id>``, contract §9)."""
+    base = str(getattr(settings, "BOOK_SCANNER_PUBLIC_BASE_URL", "") or "")
+    if base:
+        return f"{base}j/{job_id}"
+    return request.build_absolute_uri(f"/j/{job_id}")
+
+
+def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
+    """Job status as in §6.4, limited to what exists so far.
+
+    Covers, ``metadata_opf`` and ``events`` are added by the tickets that store them.
+    """
+    pages = []
+    for page in job.pages.order_by("logical_sequence_number", "side"):
+        active = page.versions.filter(is_active=True).first()
+        if active is None:
+            continue
+        pages.append(
+            {
+                "sequence_number": page.logical_sequence_number,
+                "sha256": active.checksum_sha256,
+                "version": active.version,
+            }
+        )
+    return {
+        "job_id": job.pk,
+        "state": job.state,
+        "portal_url": portal_url(request, job.pk),
+        "scan_started_at": iso_utc(job.scan_started_at) if job.scan_started_at else None,
+        "capture_layout": job.capture_layout,
+        "pages": pages,
+        "open_rescans": job.todos.filter(state__in=["open", "claimed"], todo_type="rescan").count(),
+    }
+
+
+def _parse_registration(request: HttpRequest) -> tuple[dict[str, Any] | None, JsonResponse | None]:
+    if len(request.body) > MAX_JOB_REQUEST_BYTES:
+        return None, error_response(413, "payload_too_large", "The request body is too large.")
+    try:
+        payload = json.loads(request.body or b"null")
+    except (UnicodeDecodeError, ValueError):
+        return None, error_response(400, "invalid_json", "The body must be a JSON object.")
+    if not isinstance(payload, dict):
+        return None, error_response(400, "invalid_json", "The body must be a JSON object.")
+    started = _parse_timestamp(payload.get("scan_started_at"))
+    if started is None:
+        return None, error_response(
+            400,
+            "invalid_request",
+            "scan_started_at must be an ISO 8601 timestamp with a time zone.",
+            {"field": "scan_started_at"},
+        )
+    layout = payload.get("capture_layout", ScanJob.CaptureLayout.SINGLE_PAGE)
+    if layout not in ScanJob.CaptureLayout.values:
+        return None, error_response(
+            400,
+            "invalid_request",
+            "capture_layout must be one of: " + ", ".join(ScanJob.CaptureLayout.values),
+            {"field": "capture_layout"},
+        )
+    return {"scan_started_at": started, "capture_layout": layout}, None
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """An ISO 8601 timestamp with a time zone as aware UTC, or ``None`` if it is not one.
+
+    ``parse_datetime`` raises ``ValueError`` for well-formed strings that are not a
+    calendar date or time (``2026-02-30T00:00:00Z``, ``T25:00``), and converting an
+    extreme value to UTC can overflow. Both are a client error (``400``), not a ``500``.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        started = parse_datetime(value)
+        if started is None or started.tzinfo is None:
+            return None
+        return started.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _conflict(job_id: str) -> JsonResponse:
+    return error_response(
+        409,
+        "job_id_conflict",
+        "This job ID is already registered with other data.",
+        {"job_id": job_id},
+    )
+
+
+def scanner_job(job_id: str, *, lock: bool = False) -> ScanJob | None:
+    """The job if the scanner registered it (``source=scanner``), else ``None``.
+
+    Scanner job routes answer ``404`` for ``None``: a web-created job and an unknown ID
+    look the same, so job IDs cannot be probed (§6.1). Registration (``PUT``) is the
+    exception and answers ``409 job_id_conflict`` for an existing web job (§6.3).
+    """
+    jobs = ScanJob.objects.select_for_update() if lock else ScanJob.objects.all()
+    return jobs.filter(pk=job_id, source=ScanJob.Source.SCANNER).first()
+
+
+@scanner_api_view(["PUT"])
+def job(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Register a job (§6.3): 201 created, 200 identical repeat, 409 conflict.
+
+    Repeating the registration with the same ``scan_started_at`` (and
+    ``capture_layout``) gets ``200`` and changes nothing. Any other data for an existing
+    scanner job, or an existing web-created job with that ID, is
+    ``409 job_id_conflict``; nothing is overwritten.
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    registration, problem = _parse_registration(request)
+    if problem is not None:
+        return problem
+    assert registration is not None
+    for _attempt in range(2):
+        try:
+            with transaction.atomic():
+                current = ScanJob.objects.select_for_update().filter(pk=job_id).first()
+                if current is None:
+                    created = ScanJob.objects.create(
+                        id=job_id,
+                        state=ScanJob.State.OPEN,
+                        source=ScanJob.Source.SCANNER,
+                        operator=None,
+                        **registration,
+                    )
+                    return JsonResponse(job_status_payload(request, created), status=201)
+                same = (
+                    current.source == ScanJob.Source.SCANNER
+                    and current.scan_started_at == registration["scan_started_at"]
+                    and current.capture_layout == registration["capture_layout"]
+                )
+                if not same:
+                    return _conflict(job_id)
+                return JsonResponse(job_status_payload(request, current), status=200)
+        except IntegrityError:
+            # A concurrent first registration won the insert; re-read it.
+            continue
+    return _conflict(job_id)
 
 
 @scanner_api_view(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])

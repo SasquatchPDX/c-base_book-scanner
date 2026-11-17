@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from django.urls import path
+from django.urls import path, register_converter
 from django.views.generic import RedirectView
 
 from . import contributions_views, views
+from .scan_job_ids import ScanJobIdConverter
+
+# Scan job IDs are a canonical UUID (web jobs) or a scanner-assigned ID (#126).
+register_converter(ScanJobIdConverter, "scan_job_id")
 
 urlpatterns = [
     path("", RedirectView.as_view(pattern_name="library-home", permanent=False)),
@@ -40,79 +44,79 @@ urlpatterns = [
         name="library-book-delete",
     ),
     path("scan/jobs/", views.scan_jobs, name="scan-jobs"),
-    path("scan/jobs/<uuid:job_id>/", views.scan_job_detail, name="scan-job-detail"),
+    path("scan/jobs/<scan_job_id:job_id>/", views.scan_job_detail, name="scan-job-detail"),
     path(
-        "scan/jobs/<uuid:job_id>/workspace/",
+        "scan/jobs/<scan_job_id:job_id>/workspace/",
         views.scan_job_workspace,
         name="scan-job-workspace",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/workspace/events/",
+        "scan/jobs/<scan_job_id:job_id>/workspace/events/",
         views.scan_job_workspace_events,
         name="scan-job-workspace-events",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/pages/<uuid:page_id>/stages/",
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/",
         views.scan_page_stages,
         name="scan-job-page-stages",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/pages/<uuid:page_id>/stages/<str:stage>/",
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/",
         views.scan_page_stage,
         name="scan-job-page-stage",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/stages/<str:stage>/batch/",
+        "scan/jobs/<scan_job_id:job_id>/stages/<str:stage>/batch/",
         views.scan_job_stage_batch,
         name="scan-job-stage-batch",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/pages/<uuid:page_id>/stages/<str:stage>/preview/",
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/preview/",
         views.scan_page_stage_preview,
         name="scan-job-page-stage-preview",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/pages/",
+        "scan/jobs/<scan_job_id:job_id>/pages/",
         views.upload_scan_page,
         name="scan-job-upload-page",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/logs/",
+        "scan/jobs/<scan_job_id:job_id>/logs/",
         views.upload_scan_log,
         name="scan-job-upload-log",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/pause/",
+        "scan/jobs/<scan_job_id:job_id>/pause/",
         views.scan_job_pause,
         name="scan-job-pause",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/resume/",
+        "scan/jobs/<scan_job_id:job_id>/resume/",
         views.scan_job_resume,
         name="scan-job-resume",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/finish/",
+        "scan/jobs/<scan_job_id:job_id>/finish/",
         views.scan_job_finish,
         name="scan-job-finish",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/cancel/",
+        "scan/jobs/<scan_job_id:job_id>/cancel/",
         views.scan_job_cancel,
         name="scan-job-cancel",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/todos/",
+        "scan/jobs/<scan_job_id:job_id>/todos/",
         views.scan_job_todos,
         name="scan-job-todos",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/ocr/",
+        "scan/jobs/<scan_job_id:job_id>/ocr/",
         views.scan_job_ocr_request,
         name="scan-job-ocr",
     ),
     path(
-        "scan/jobs/<uuid:job_id>/identify/",
+        "scan/jobs/<scan_job_id:job_id>/identify/",
         views.scan_job_identification_request,
         name="scan-job-identify",
     ),
