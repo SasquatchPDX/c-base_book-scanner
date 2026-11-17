@@ -115,9 +115,33 @@ def ocr_job_timeout_seconds() -> int:
     )
 
 
+DEFAULT_LLM_JOB_TIMEOUT_SECONDS = 5 * 60
+
+
+def llm_job_timeout_seconds() -> int:
+    """RQ per-job timeout for LLM identification jobs (one request plus a provider pass)."""
+    return max(
+        60,
+        int(
+            float(
+                tunable_setting(
+                    "BOOK_SCANNER_LLM_JOB_TIMEOUT_SECONDS", DEFAULT_LLM_JOB_TIMEOUT_SECONDS
+                )
+            )
+        ),
+    )
+
+
+def llm_queue_name() -> str:
+    """RQ queue for LLM jobs, kept apart so a bulk import cannot starve OCR (#26)."""
+    return str(tunable_setting("BOOK_SCANNER_LLM_QUEUE_NAME", "llm"))
+
+
 def job_timeout_seconds(job_type: str) -> int:
     if job_type == "ocr":
         return ocr_job_timeout_seconds()
+    if job_type == "llm_identification":
+        return llm_job_timeout_seconds()
     return int(settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS)
 
 
@@ -167,13 +191,21 @@ def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
         StartedJobRegistry,
     )
 
+    # LLM identification jobs run on their own queue (#26); inspect it too.
+    rq_queues = [rq_queue]
+    llm_queue = getattr(get_queue(llm_queue_name()), "queue", None)
+    if llm_queue is not None and llm_queue.name != rq_queue.name:
+        rq_queues.append(llm_queue)
     try:
-        jobs = list(rq_queue.get_jobs())
-        for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
-            registry = registry_cls(queue=rq_queue)
-            jobs.extend(
-                rq_queue.fetch_job(registry_job_id(member)) for member in registry.get_job_ids()
-            )
+        jobs: list[Any] = []
+        for inspected in rq_queues:
+            jobs.extend(inspected.get_jobs())
+            for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
+                registry = registry_cls(queue=inspected)
+                jobs.extend(
+                    inspected.fetch_job(registry_job_id(member))
+                    for member in registry.get_job_ids()
+                )
         scheduler = scheduler_active(rq_queue)
     except Exception:
         return None, None
@@ -250,14 +282,15 @@ def queue_is_async() -> bool:
     return isinstance(get_queue(), ConfiguredQueue)
 
 
-def get_queue() -> QueueLike | None:
+def get_queue(name: str | None = None) -> QueueLike | None:
+    """The configured queue; ``name`` selects another RQ queue on the same Redis."""
     if not settings.BOOK_SCANNER_QUEUE_URL:
         return None
     if settings.BOOK_SCANNER_QUEUE_URL.startswith("inline://"):
         return InlineQueue()
     connection = Redis.from_url(settings.BOOK_SCANNER_QUEUE_URL)
     queue = Queue(
-        name=settings.BOOK_SCANNER_QUEUE_NAME,
+        name=name or settings.BOOK_SCANNER_QUEUE_NAME,
         connection=connection,
         default_timeout=settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS,
     )

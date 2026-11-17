@@ -20,7 +20,7 @@ from rq import get_current_job
 from ebook_server.jobs import get_queue, is_stale_running
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import archive_layout, conversion, intake, ocr, scan_logs
+from . import archive_layout, contributions, conversion, intake, ocr, scan_logs
 from .models import (
     FileVariant,
     ProcessingJob,
@@ -29,6 +29,7 @@ from .models import (
     ScanTailorStageState,
     StorageLocation,
 )
+from .search import schedule_reindex
 
 logger = structlog.get_logger(__name__)
 
@@ -118,9 +119,16 @@ def _invalidate_file_variants_and_descendants(variant_ids: set[int]) -> int:
         frontier = descendants - stale_ids
         stale_ids.update(descendants)
 
-    return FileVariant.objects.filter(id__in=stale_ids).update(
+    stale_variants = FileVariant.objects.filter(id__in=stale_ids)
+    book_ids = set(stale_variants.values_list("book_id", flat=True))
+    updated = stale_variants.update(
         processing_state=FileVariant.ProcessingState.FAILED,
     )
+    # `.update()` sends no signals, and the books' available formats just changed
+    # (#28). Schedule only after the write: outside a transaction `on_commit` runs
+    # the reindex immediately, and it must see the FAILED state, not COMPLETE.
+    schedule_reindex(book_ids)
+    return updated
 
 
 def invalidate_scan_job_library_artifacts(scan_job: ScanJob | str) -> int:
@@ -709,6 +717,8 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
             scan_job.state = ScanJob.State.COMPLETE
             scan_job.finished_at = finished_at
             scan_job.save(update_fields=["state", "finished_at", "updated_at"])
+        # Pending recognition for the members whose pages made the final set (#27).
+        contributions.record_scan_completion(scan_job)
         logger.info(
             "scan_finalization_succeeded",
             processing_job_id=str(processing_job.job_id),

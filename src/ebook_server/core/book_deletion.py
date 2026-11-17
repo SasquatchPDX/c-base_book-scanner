@@ -11,6 +11,7 @@ from django.db import transaction
 
 from ebook_server.storage import StorageBackend
 
+from . import contributions
 from .models import Book, StorageLocation
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -137,6 +138,8 @@ def delete_book_safely(
                         quarantine_identifier=quarantine_identifier,
                     ),
                 )
+            # Reviews that chose this book no longer stand (#27 points).
+            contributions.record_book_deleted(book_id)
             locked_book.delete()
     except Exception as exc:
         _restore_quarantined(quarantined)
