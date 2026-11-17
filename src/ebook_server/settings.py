@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     # "ebook_server.core.hardcover_provider.HardcoverMetadataProvider" to metadata_providers.
     hardcover_api_token: SecretStr = SecretStr("")
     hardcover_timeout_seconds: float = 10.0
+    # Google Books (opt-in): also add
+    # "ebook_server.core.metadata_providers.GoogleBooksMetadataProvider" to metadata_providers.
+    google_books_api_key: SecretStr = SecretStr("")
     # Client-side request pacing per metadata provider_id (requests/second; <= 0 disables).
     # Providers not listed use metadata_rate_limit_default. Shared across worker processes
     # through Redis when redis_url is set, otherwise enforced per process.
@@ -313,6 +316,7 @@ BOOK_SCANNER_AUDIOBOOK_SERVICE_URL = settings.audiobook_service_url
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
 BOOK_SCANNER_HARDCOVER_TIMEOUT_SECONDS = settings.hardcover_timeout_seconds
+BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_value()
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
