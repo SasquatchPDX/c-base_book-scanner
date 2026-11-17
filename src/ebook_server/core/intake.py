@@ -143,6 +143,18 @@ def normalize_filename(raw: str) -> str:
     return cap_filename(safe)
 
 
+def _sanitize_title_for_filename(title: str) -> str:
+    """Replace path separators in a bibliographic title before it becomes a filename.
+
+    A Book's title can legitimately contain "/" - e.g. an Open Library omnibus/anthology
+    edition titled "Franchise / The Fun They Had / The Last Question / ..." - which
+    normalize_filename's path-traversal guard rejects outright, since a raw "/" is
+    indistinguishable there from an actual path. This is a derived display title, not
+    untrusted path input, so the character just needs replacing, not rejecting.
+    """
+    return title.replace("/", "-").replace("\\", "-")
+
+
 def _fit(model: type[django_models.Model], field_name: str, value: str | None) -> str:
     """Truncate ``value`` to the model field's max_length (PostgreSQL rejects overflow)."""
     text = value or ""
@@ -1322,7 +1334,7 @@ def process_import_job(job_id: str) -> None:
         job.storage_identifier = destination
         job.storage_location = storage_location
         job.normalized_filename = normalize_filename(
-            f"{book.title}{Path(job.normalized_filename).suffix}",
+            f"{_sanitize_title_for_filename(book.title)}{Path(job.normalized_filename).suffix}",
         )
         variant = FileVariant.objects.create(
             book=book,
