@@ -595,6 +595,72 @@ web uploads, otherwise the source location's `default_source_type`
 (`incoming_folder` or `network_source`). An exact duplicate reuses the existing
 variant and keeps that variant's original origin.
 
+### Books split across per-chapter files (multi-part works)
+
+Some collections store one book as many files in one folder (`ch01.pdf` …
+`ch20.pdf`, `Appendix1.pdf`, `FM.pdf`, `Index.pdf`). Source discovery detects these
+from file names only: at least three files of one format in the same folder whose
+names share a prefix followed by a chapter/part/section/lesson token
+(`ch`, `chap`, `chapter`, `kapitel`, `part`, `pt`, `teil`, `sec`, `section`,
+`lesson`, `lektion`) and distinct numbers (digits, or roman numerals after a
+separator). Appendices (`AppA`, `Appendix 2`) and front/back matter (`FM`, `toc`,
+`preface`, `glossary`, `index`, …) join a detected group but never form one.
+Volume/book/band numbers are not part tokens (those are usually separate books),
+and the *folder* name is ignored: a single complete novel in a folder called
+`CHAPTER ONE` is not a split work. On the two real-world listings in
+`tests/fixtures/real_world_samples/` the detector flags exactly the two known split
+books and nothing in the 1,136-folder Calibre library.
+
+Each part is still hashed, validated and archived on its own (COPY keeps the source;
+MOVE removes it only after the archive copy verified). Instead of identifying every
+chapter separately, the parts wait in `low_confidence` and, once all of them have
+settled, one review task of type `multipart_work` is opened for the whole folder,
+searched by the folder name. `ingest_sources --preview --json` shows
+`multipart_group`/`part_label` for files that would be grouped.
+
+"All of them" is the membership detected from the folder listing (stored on the
+group with each file's source path), not only the jobs created so far: if a byte
+budget stopped discovery after some parts, the group waits until a later run
+imports the rest. A part whose import failed, whose source disappeared, or which was
+imported on its own is shown as *missing*; confirming the group then requires the
+reviewer to acknowledge the incomplete set first (**Confirm without the missing
+files**), and the decision records which files were left out. A file of an already
+confirmed or rejected group that turns up later is imported on its own.
+
+A part whose bytes are identical to a file already attached to *another* Book is not
+silently resolved onto that Book (which used to drop it from the group). It is
+archived for the group like every other part and shown on the review as a
+*duplicate* part, naming the other Book. Confirmation is blocked until the reviewer
+acknowledges it (the same acknowledgement as for missing parts). Confirming then
+makes it a part `FileVariant` of the group's Book, backed by the part's own
+verified archive copy, with `converter_options.multipart_identical_to` naming the
+identical variant and its Book. The other Book and its variant are not changed:
+the chapter belongs to this work, and Book != FileVariant. Two cases reuse the
+existing file instead of keeping a second copy, and delete the part's redundant
+archive copy (never a source and never a file referenced in place):
+
+- the group is linked to the Book that already holds those bytes, and
+- the grouping is rejected, so the part is an ordinary import and the normal
+  exact-duplicate rule applies.
+
+The check runs at every membership evaluation, so a file imported elsewhere while the
+review is open is also caught before confirmation.
+
+The reviewer can fix the proposed order and labels, then either
+
+- accept a candidate, enter metadata, or link an existing book: every part becomes
+  its own `FileVariant` of that one Book with `part_index`/`part_label` set (book
+  pages list them in order; parts are never offered as single-chapter conversions),
+  or
+- choose **Not one book**: the group is rejected and every file is identified as an
+  independent import in the background (auto-accepted only under the normal rules,
+  otherwise an ordinary review task). A part still being processed when the grouping
+  is rejected is identified on its own as soon as its job finishes.
+
+Originals are never merged, rewritten or deleted by either path. Completeness cannot
+be verified automatically; gaps in the numbering are shown on the review page.
+Disable detection with `BOOK_SCANNER_MULTIPART_DETECTION=false`.
+
 ### Metadata provider rate limits
 
 Every outbound metadata-provider request waits for a client-side slot before it is
@@ -650,7 +716,10 @@ code path as accepting a candidate on the detail page. A task is accepted only i
 
 Everything else stays open and is reported per task (`accepted`, `ambiguous`,
 `below_min_score`, `no_candidates`, `closed`, `forbidden`, `not_found`,
-`error`). A batch holds at most `BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
+`requires_individual_review`, `error`). Multi-part works require their individual
+review page to confirm membership, missing or duplicate parts, and reading order;
+batch acceptance always leaves those tasks unchanged. A batch holds at most
+`BOOK_SCANNER_REVIEW_BATCH_MAX_TASKS` (default
 100) tasks. Batch-resolved tasks record `batch_accept`, the scores and the
 thresholds used in `decision_payload`. The originals were already archived when
 the review task was created, so accepting only links records; no archive copy,
