@@ -301,8 +301,8 @@ One RQ worker processes jobs strictly one at a time. ScanTailor-Web queues one
 job per page and stage, so a stage batch over a realistic book (hundreds of
 pages) on a single worker takes as long as the sum of all pages (#54). Run
 several worker processes against the same Redis queue to process pages in
-parallel; this is standard RQ and needs no code change. With a systemd template
-unit, for example:
+parallel; this is standard RQ and needs no code change. With the
+`deploy/systemd/` template unit, for example:
 
 ```bash
 systemctl enable --now book-scanner-worker@2 book-scanner-worker@3 book-scanner-worker@4
