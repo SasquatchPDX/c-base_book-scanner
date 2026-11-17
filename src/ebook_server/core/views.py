@@ -54,6 +54,7 @@ from ebook_server.storage import (
 
 from . import (
     book_deletion,
+    contributions,
     conversion,
     intake,
     ocr,
@@ -73,6 +74,7 @@ from .models import (
     ImportJob,
     MetadataCandidate,
     ProcessingJob,
+    ReviewDecisionCorrection,
     ReviewTask,
     ScanJob,
     ScanPage,
@@ -1063,6 +1065,15 @@ def _review_owner_id(task: ReviewTask) -> int | None:
     if scan_job is not None:
         return scan_job.operator_id
     return None
+
+
+def _note_review_redecided(task: ReviewTask, profile: AppUserProfile) -> None:
+    """A resolved review decided again: the earlier decision no longer stands (#27)."""
+    contributions.record_review_reversal(
+        task,
+        source=ReviewDecisionCorrection.Source.RE_RESOLVED,
+        found_by=profile.user,
+    )
 
 
 def _review_candidates(task: ReviewTask) -> Any:
@@ -3828,6 +3839,7 @@ def review_accept_candidate(
                 "reviewer_authors": reviewer_authors,
             }
 
+        _note_review_redecided(task, profile)
         variant = _resolve_review_source(
             task=task,
             book=book,
@@ -3837,6 +3849,7 @@ def review_accept_candidate(
             decision_notes=f"Accepted candidate {candidate.id}",
             decision_payload=decision_payload,
         )
+        contributions.record_review_resolution(task)
         return _review_action_response(
             request,
             {
@@ -3866,6 +3879,7 @@ def review_mark_unidentified(
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
+    _note_review_redecided(task, profile)
     task.state = ReviewTask.State.RESOLVED
     task.decision = ReviewTask.Decision.MARK_UNIDENTIFIED
     task.reviewer = profile.user
@@ -3883,6 +3897,7 @@ def review_mark_unidentified(
             "updated_at",
         ],
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(request, {"task_id": str(task.id), "state": task.state})
 
 
@@ -4030,6 +4045,12 @@ def review_edit_search_terms(
             str(author).strip() for author in raw_inferred_authors if str(author).strip()
         ]
 
+    contributions.record_review_reversal(
+        task,
+        source=ReviewDecisionCorrection.Source.REOPENED,
+        found_by=profile.user,
+        note="search terms edited on a resolved review",
+    )
     task.state = ReviewTask.State.OPEN
     task.decision = ReviewTask.Decision.EDIT_SEARCH_TERMS
     task.reviewer = profile.user
@@ -4075,6 +4096,7 @@ def review_manual_entry(
         return HttpResponseBadRequest("title required")
     book = _build_manual_book_from_payload(payload)
 
+    _note_review_redecided(task, profile)
     variant = _resolve_review_source(
         task=task,
         book=book,
@@ -4082,6 +4104,7 @@ def review_manual_entry(
         decision=cast(str, ReviewTask.Decision.MANUAL_ENTRY),
         decision_payload=payload,
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(
         request,
         {
@@ -4122,6 +4145,7 @@ def review_merge_existing(
     except Book.DoesNotExist:
         return HttpResponseBadRequest("book not found")
 
+    _note_review_redecided(task, profile)
     _resolve_review_source(
         task=task,
         book=book,
@@ -4129,6 +4153,7 @@ def review_merge_existing(
         decision=cast(str, ReviewTask.Decision.MERGED_BOOK),
         decision_payload={"book_id": book_id},
     )
+    contributions.record_review_resolution(task)
     return _review_action_response(
         request,
         {"task_id": str(task.id), "book_id": str(book.id)},
