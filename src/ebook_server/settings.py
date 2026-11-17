@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     # "author_title" (Author/Title/, Calibre-style), "calibre" (Author/Title (id)/),
     # "job" (the original books/<import job id>/), or a custom template.
     archive_layout: str = "author_title"
+    # Write a Calibre-compatible metadata.opf into each book's archive folder (derived,
+    # regenerated in the background when metadata changes; see core.book_opf).
+    write_book_opf: bool = True
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     sidecar_covers_enabled: bool = True
@@ -264,6 +267,9 @@ BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 # Folder layout inside the archive. Changing it applies to newly archived files only;
 # existing files stay where they are until an admin runs a reorganize.
 BOOK_SCANNER_ARCHIVE_LAYOUT = settings.archive_layout
+# A derived, Calibre-compatible metadata.opf in each book folder (book-scoped layouts
+# only; never on read-only, indexed-in-place locations). See core.book_opf.
+BOOK_SCANNER_WRITE_BOOK_OPF = settings.write_book_opf
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes

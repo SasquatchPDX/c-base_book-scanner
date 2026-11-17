@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
 import shutil
+import tempfile
 import unicodedata
 import uuid
 from collections.abc import Iterator
@@ -257,6 +259,9 @@ class StorageBackend(Protocol):
         overwrites an existing one.
         """
 
+    def write_atomic(self, location: str, data: bytes) -> str:
+        """Create or replace a small artifact so readers never see a partial file."""
+
     def stat(self, location: str) -> tuple[int, int]:
         """Return ``(size_bytes, mtime_ns)`` for an artifact."""
 
@@ -333,6 +338,30 @@ class LocalFilesystemStorage:
         dest = self._prepare_destination(destination)
         os.link(src, dest)
         return destination
+
+    def write_atomic(self, location: str, data: bytes) -> str:
+        """Create or replace ``location`` with ``data`` atomically.
+
+        The bytes go to a hidden temporary file in the destination folder, are flushed
+        to disk, and the temporary file is then renamed over the destination
+        (``os.replace``, atomic on POSIX filesystems and on NFS/SMB within one folder).
+        A reader sees either the old file or the new one, never a partial write. Meant
+        for small derived files the application regenerates (``metadata.opf``).
+        """
+        dest = self._prepare_destination(location)
+        self.ensure_free_space(len(data))
+        fd, temp_name = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, dest)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+            raise
+        return location
 
     def delete(self, location: str) -> None:
         target = self.resolve_location(location)
@@ -436,6 +465,9 @@ class ReadOnlyFilesystemStorage(LocalFilesystemStorage):
 
     def link(self, source: str, destination: str) -> str:
         raise self._refuse("link")
+
+    def write_atomic(self, location: str, data: bytes) -> str:
+        raise self._refuse("write")
 
     def delete(self, location: str) -> None:
         raise self._refuse("delete")

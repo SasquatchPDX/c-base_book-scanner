@@ -9,3 +9,8 @@ class CoreConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "ebook_server.core"
     verbose_name = "Core"
+
+    def ready(self) -> None:
+        from .book_opf import connect_signals
+
+        connect_signals()

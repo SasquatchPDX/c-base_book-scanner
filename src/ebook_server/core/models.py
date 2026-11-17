@@ -299,6 +299,10 @@ class Book(models.Model):
     # later, so existing files stay where they are; only an explicit reorganize moves
     # them (see core.archive_layout). Empty until assigned and under the ``job`` layout.
     archive_folder = models.CharField(max_length=512, blank=True, default="")
+    # Set when canonical metadata changed and the book folder's generated metadata.opf
+    # is out of date; cleared by the background job that rewrites it. Coalesces bursts
+    # of edits into one job per book (see core.book_opf).
+    opf_dirty_at = models.DateTimeField(null=True, blank=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
