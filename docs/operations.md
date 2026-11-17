@@ -353,6 +353,14 @@ evidence under `format_sibling_of`. Decisions within one source are serialised w
 row lock on the source, so two formats finishing at the same time cannot create two
 Books.
 
+The review queue (`/reviews/`) shows siblings waiting in review as one entry. The
+primary task is the one with the best candidate score, then the format most likely
+to carry embedded metadata (EPUB, AZW3, MOBI, FB2, PDF, DjVu, HTML, RTF, TXT), then
+the oldest. The other formats are listed under it with their own candidate counts and
+links. The JSON response keeps one item per task, so existing clients are unaffected.
+Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
+and the response gains `group_count`.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
