@@ -134,6 +134,16 @@ urlpatterns = [
         name="library-book-ocr",
     ),
     path(
+        "library/books/<int:book_id>/combine-parts/",
+        views.library_book_combine_parts,
+        name="library-book-combine-parts",
+    ),
+    path(
+        "combine-jobs/<uuid:job_id>/",
+        views.combine_job_status,
+        name="combine-job-status",
+    ),
+    path(
         "conversions/<uuid:job_id>/",
         views.conversion_job_status,
         name="conversion-job-status",
