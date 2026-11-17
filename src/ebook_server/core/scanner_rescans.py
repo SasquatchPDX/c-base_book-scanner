@@ -471,7 +471,6 @@ def store_replacement(
                 page_number_verified=metadata.page_number_verified,
                 is_active=True,
             )
-            destination = None  # the version row now owns the published file
             page.recognized_page_number = metadata.recognized_page_number
             page.save(update_fields=["recognized_page_number", "updated_at"])
             locked_todo.complete()
@@ -502,7 +501,7 @@ def store_replacement(
                 version=version.version,
                 job_state=locked.state,
             )
-            return ReplacementResult(
+            result = ReplacementResult(
                 created=True,
                 todo_id=locked_todo.pk,
                 todo_state=locked_todo.state,
@@ -513,6 +512,8 @@ def store_replacement(
                 state=locked.state,
                 page_id=str(page.pk),
             )
+        destination = None  # committed: the version row now owns the published file
+        return result
     finally:
         if destination is not None:
             try:
