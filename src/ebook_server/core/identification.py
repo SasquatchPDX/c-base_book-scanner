@@ -70,6 +70,16 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Added to an already linked Book's score when the file is another format of it (same
+# source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
+# title (0.55) it clears auto-accept; alone it does not (#39).
+SIBLING_FORMAT_BONUS = getattr(
+    django_settings,
+    "BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS",
+    0.35,
+)
+# Title similarity above which two candidates may describe the same book.
+SAME_BOOK_TITLE_MIN_SCORE = 0.9
 # Author-name variants (same surname, compatible given names) count as a partial match.
 AUTHOR_VARIANT_MATCH_SCORE = 0.9
 # Minimum rapidfuzz ratio for two given-name tokens to count as spellings of one name.
@@ -296,6 +306,11 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+# Evidence key holding hints from the source's configured folder layout (#35); written
+# by intake from ``core.source_layout``, read here when building signals.
+PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+
+
 def build_identification_input(
     *,
     source_path: str,
@@ -318,6 +333,10 @@ def build_identification_input(
                 normalized_author = raw_author.strip()
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
+
+    title_hints, author_hints = _apply_path_layout_hints(
+        extracted_metadata, list(title_hints), list(author_hints)
+    )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
     author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
@@ -348,6 +367,45 @@ def build_identification_input(
         if isinstance(extracted_metadata.get("description"), str)
         else None,
     )
+
+
+def _apply_path_layout_hints(
+    extracted_metadata: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+) -> tuple[list[str], list[str]]:
+    """Merge folder-layout hints (evidence, not truth) into the title/author hints.
+
+    A layout title goes after an embedded title (usually the best signal) and before
+    the raw filename guesses. A layout author replaces the filename "A - B" split
+    guesses, which add *both* halves as authors, but never outranks embedded authors.
+    """
+    layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
+    if not isinstance(layout, dict):
+        return title_hints, author_hints
+
+    metadata_title = extracted_metadata.get("title")
+    has_embedded_title = isinstance(metadata_title, str) and bool(normalize_text(metadata_title))
+    layout_title = layout.get("title")
+    if isinstance(layout_title, str) and layout_title.strip():
+        title_hints.insert(1 if has_embedded_title else 0, layout_title.strip())
+
+    raw_layout_authors = layout.get("authors")
+    layout_authors = [
+        author.strip()
+        for author in (raw_layout_authors if isinstance(raw_layout_authors, list) else [])
+        if isinstance(author, str) and author.strip()
+    ]
+    if layout_authors:
+        raw_embedded = extracted_metadata.get("authors")
+        embedded = [
+            author.strip()
+            for author in (raw_embedded if isinstance(raw_embedded, list) else [])
+            if isinstance(author, str) and author.strip()
+        ]
+        known = {normalize_text(author) for author in embedded}
+        author_hints = embedded + [a for a in layout_authors if normalize_text(a) not in known]
+    return title_hints, author_hints
 
 
 class OpenLibraryMetadataProvider:
@@ -1063,3 +1121,30 @@ def best_candidate(
     if candidates[0].score < REVIEW_SCORE:
         return candidates[0]
     return candidates[0]
+
+
+def score_candidate(
+    signals: IdentificationInput,
+    candidate: IdentificationCandidate,
+) -> IdentificationCandidate:
+    """Score any candidate (e.g. an existing library Book) with the provider scorer."""
+    return _apply_scoring(signals, candidate)
+
+
+def same_book(left: IdentificationCandidate, right: IdentificationCandidate) -> bool:
+    """Whether two candidates describe the same book.
+
+    Shared ISBN, or near-equal titles with compatible authors (authors are only
+    compared when both sides list some).
+    """
+    left_isbns = {value for value in (left.isbn10, left.isbn13) if value}
+    right_isbns = {value for value in (right.isbn10, right.isbn13) if value}
+    expanded_left = {isbn for value in left_isbns for isbn in normalize_isbns(value)}
+    expanded_right = {isbn for value in right_isbns for isbn in normalize_isbns(value)}
+    if expanded_left & expanded_right:
+        return True
+    if _title_match_score(left.title, right.title) < SAME_BOOK_TITLE_MIN_SCORE:
+        return False
+    if left.authors and right.authors:
+        return _author_match_score(left.authors, right.authors) >= AUTHOR_VARIANT_MATCH_SCORE
+    return True

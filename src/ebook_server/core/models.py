@@ -152,11 +152,90 @@ class SourceLocation(models.Model):
         default=SourceType.NETWORK_SOURCE,
     )
     default_metadata = models.JSONField(default=dict, blank=True)
+    is_paused = models.BooleanField(
+        default=False,
+        help_text=(
+            "Paused sources queue no new imports, and queued imports that have not "
+            "started stay DISCOVERED until the source is resumed."
+        ),
+    )
+    ingest_batch_size = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum import jobs in flight for this source. Blank uses "
+            "BOOK_SCANNER_INGEST_BATCH_SIZE; 0 means unlimited."
+        ),
+    )
+    ingest_max_per_hour = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum new import jobs queued per rolling hour for this source. Blank "
+            "uses BOOK_SCANNER_INGEST_MAX_PER_HOUR; 0 means unlimited."
+        ),
+    )
+
+    class AuthorNameOrder(models.TextChoices):
+        AUTO = "auto", 'Auto ("Last, First" when a comma is present)'
+        FIRST_LAST = "first_last", "First Last (never reorder)"
+        LAST_FIRST = "last_first", "Last First (reorder even without a comma)"
+
+    # Folder layout: opt-in per source, because not every folder names an author (#35).
+    path_layouts = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Ordered list of path templates relative to the source root (file extension "
+            "stripped); the first match supplies author/title identification hints. "
+            "Placeholders: {author}, {authors}, {title}, {series}, {*}; '**' = any "
+            'folders. Examples: ["{author}/**"], ["{author}/{title} ({*})/{*}"], '
+            '["{title} - {author}"]. Leave empty when the collection has no consistent '
+            "structure."
+        ),
+    )
+    author_name_order = models.CharField(
+        max_length=16,
+        choices=AuthorNameOrder.choices,
+        default=AuthorNameOrder.AUTO,
+    )
+    layout_ignore_values = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            'Captured folder/file values that are not names, e.g. ["Unknown", "Misc"]. '
+            "Compared case-insensitively; an ignored value yields no hint."
+        ),
+    )
+    # Opt-in (#39): generic same-name pairs ("notes.txt"/"notes.pdf") are not one book
+    # in every collection.
+    group_sibling_formats = models.BooleanField(
+        default=False,
+        help_text=(
+            "Treat files in the same folder with the same name and different extensions "
+            "(e.g. 'Dune.epub', 'Dune.mobi') as formats of one book: once one is linked "
+            "to a book, the others are offered that book as a strong candidate. They are "
+            "still looked up externally, and conflicting evidence goes to review."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self) -> str:
         return self.name
+
+    def clean(self) -> None:
+        from django.core.exceptions import ValidationError
+
+        from .source_layout import validate_templates
+
+        errors = validate_templates(self.path_layouts)
+        if errors:
+            raise ValidationError({"path_layouts": errors})
+        if not isinstance(self.layout_ignore_values, list) or not all(
+            isinstance(value, str) for value in self.layout_ignore_values
+        ):
+            raise ValidationError({"layout_ignore_values": "Must be a JSON list of strings."})
 
 
 class Book(models.Model):
@@ -304,6 +383,10 @@ class FileVariant(models.Model):
     class VariantFormat(models.TextChoices):
         EPUB = "epub", "EPUB"
         MOBI = "mobi", "MOBI"
+        AZW = "azw", "AZW"
+        AZW3 = "azw3", "AZW3"
+        PRC = "prc", "PRC"
+        RTF = "rtf", "RTF"
         PDF = "pdf", "PDF"
         TXT = "txt", "TXT"
         HTML = "html", "HTML"
@@ -796,6 +879,11 @@ class ImportJob(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Exclusive ownership while a worker processes the job (HASHING through ARCHIVING).
+    # Set atomically when a delivery claims the job, renewed on every phase transition,
+    # and cleared when the job leaves the active phases. Empty means unowned.
+    lease_owner = models.CharField(max_length=64, blank=True, default="")
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]

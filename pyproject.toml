@@ -35,6 +35,7 @@ dependencies = [
   "pypdfium2>=4.30,<5",
   "uvicorn>=0.35,<1",
   "pycountry>=24.6,<27",
+  "nh3>=0.3.7,<0.4",
 ]
 
 [project.scripts]

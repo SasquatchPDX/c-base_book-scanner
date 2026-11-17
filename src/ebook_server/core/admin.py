@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.contrib import admin
+from django.db.models import QuerySet
 
 from .models import (
     AppUserProfile,
@@ -136,7 +139,60 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "recursive",
         "default_source_type",
         "is_active",
+        "is_paused",
+        "ingest_batch_size",
+        "ingest_max_per_hour",
     )
+    list_filter = ("is_active", "is_paused")
+    actions = ("pause_imports", "resume_imports")
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "name",
+                    "root_path",
+                    "transfer_mode",
+                    "recursive",
+                    "default_source_type",
+                    "is_active",
+                    "default_metadata",
+                ),
+            },
+        ),
+        (
+            "Folder layout (identification hints)",
+            {
+                "description": (
+                    "Describe how this collection is organised so folder and file names "
+                    "become author/title hints for the external lookup. Check the result "
+                    "with <code>manage.py ingest_sources --source-id N --preview</code>."
+                ),
+                "fields": ("path_layouts", "author_name_order", "layout_ignore_values"),
+            },
+        ),
+        (
+            "Formats of one book",
+            {"fields": ("group_sibling_formats",)},
+        ),
+        (
+            "Ingestion throttling",
+            {"fields": ("is_paused", "ingest_batch_size", "ingest_max_per_hour")},
+        ),
+    )
+
+    @admin.action(description="Pause imports from selected sources")
+    def pause_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=True)
+        self.message_user(request, f"Paused {updated} source(s).")
+
+    @admin.action(description="Resume imports from selected sources")
+    def resume_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=False)
+        self.message_user(
+            request,
+            f"Resumed {updated} source(s). Run ingest_sources to re-queue waiting imports.",
+        )
 
 
 @admin.register(ProcessingJob)
