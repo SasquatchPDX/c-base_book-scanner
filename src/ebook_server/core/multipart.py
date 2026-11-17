@@ -1070,6 +1070,7 @@ def confirm_parts(
     lead_job: ImportJob,
     review_task: ReviewTask,
     book: Book,
+    inline_cover_fallback: bool = True,
 ) -> ConfirmedParts:
     """Resolve every archived part of the task's group as an ordered part of ``book``.
 
@@ -1125,7 +1126,7 @@ def confirm_parts(
         group.decided_at = timezone.now()
         group.save(update_fields=["state", "book", "decided_at", "updated_at"])
     if first_part is not None:
-        intake._try_extract_front_cover(*first_part)
+        intake.schedule_front_cover_extraction(*first_part, inline_fallback=inline_cover_fallback)
     logger.info(
         "multipart_group_confirmed",
         import_group_id=str(group.id),
