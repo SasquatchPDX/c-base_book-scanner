@@ -52,6 +52,24 @@ test("a member completes digital intake, review, search, download, and conversio
 
     await member.getByRole("button", { name: "Accept" }).click();
 
+    // Search-first landing page (#28): shelf, facet link and author index, no JavaScript needed.
+    await member.goto("/library/?view=html");
+    await expect(member.getByRole("search")).toBeVisible();
+    const recentlyAdded = member.getByRole("region", { name: "Recently added" });
+    await expect(recentlyAdded.getByRole("link", { name: new RegExp(title) })).toBeVisible();
+    const facets = member.getByRole("navigation", { name: "Browse by facet" });
+    await facets.getByRole("link", { name: "EPUB", exact: true }).click();
+    await expect(member).toHaveURL(/[?&]format=epub(&|$)/);
+    await expect(member.getByRole("link", { name: title })).toBeVisible();
+    for (const image of await member.locator("img.cover-thumb").all()) {
+      await expect(image).toHaveAttribute("loading", "lazy");
+      await expect(image).toHaveAttribute("width", /\d+/);
+    }
+    await member.goto("/library/authors/?view=html&letter=A");
+    await member.getByRole("link", { name: "Ada Digital" }).click();
+    await expect(member).toHaveURL(/[?&]author_id=\d+/);
+    await expect(member.getByRole("link", { name: title })).toBeVisible();
+
     await member.goto(`/library/books/?view=html&q=${encodeURIComponent(title)}`);
     await member.getByRole("link", { name: title }).click();
     const variants = member.locator(".variant-list");

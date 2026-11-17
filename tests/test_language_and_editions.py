@@ -19,6 +19,7 @@ from ebook_server.core.identification import (
     EDITION_ISBN_UNCONFIRMED,
     EDITION_LANGUAGE_MISMATCH,
     EDITION_PUBLISHER_MISMATCH,
+    STRONG_MATCH_EVIDENCE_KEY,
     IdentificationInput,
     OpenLibraryMetadataProvider,
     _normalize_candidate,
@@ -504,6 +505,11 @@ def test_intake_routes_sparse_edition_probes_to_review(
     assert top is not None
     assert top.isbn13 == "9780441011582"
     assert float(top.score) == pytest.approx(0.85)
+    # The #9 exact-title + strong-author rule must not promote it either: the edition's
+    # missing field is uncertainty while the work lists the file's value.
+    rule = top.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert f"edition_{missing}_unknown" in rule["blocked_by"]
     assert not Book.objects.exists()
     assert not Identifier.objects.filter(normalized_value="9780441011582").exists()
 

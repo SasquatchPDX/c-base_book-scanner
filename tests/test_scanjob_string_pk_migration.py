@@ -1,4 +1,4 @@
-"""Migration ``core.0037_scanjob_string_pk``: UUID -> string ScanJob primary key (#126).
+"""Migration ``core.0041_scanjob_string_pk``: UUID -> string ScanJob primary key (#126).
 
 Runs on SQLite here and, re-collected by
 ``tests/integration/test_scanjob_string_pk_migration_postgres.py``, on PostgreSQL.
@@ -17,9 +17,9 @@ from django.db.migrations.exceptions import IrreversibleError
 from django.db.migrations.executor import MigrationExecutor
 from django.utils import timezone
 
-BEFORE = [("core", "0036_book_search_document")]
-AFTER = [("core", "0037_scanjob_string_pk")]
-MIGRATION = importlib.import_module("ebook_server.core.migrations.0037_scanjob_string_pk")
+BEFORE = [("core", "0040_cover_thumbnail")]
+AFTER = [("core", "0041_scanjob_string_pk")]
+MIGRATION = importlib.import_module("ebook_server.core.migrations.0041_scanjob_string_pk")
 
 # (model, FK field) pairs that reference ScanJob; the issue names the first three plus
 # the review/processing/search tables.
@@ -32,11 +32,14 @@ EXPECTED_REFERENCES = {
     "ReviewTask",
     "LLMSuggestion",
     "ContributionEvent",
+    "ScanLog",
 }
-# Foreign keys to ScanJob added by later migrations: created with the string key already,
-# so 0037 never has to convert them (it runs on the historical state, which lacks them).
-REFERENCES_ADDED_LATER = {
-    "ScanCover",  # 0039, #128
+# Foreign keys to ScanJob created by later migrations: they are string keys from the
+# start, so 0041 never converts them, but its discovery (run here on the current models)
+# lists them too.
+ADDED_AFTER_0041 = {
+    "ScanEvent",  # 0042_scan_events (#129)
+    "ScanCover",  # 0044_scanner_page_and_cover_upload (#128)
 }
 
 
@@ -52,7 +55,7 @@ def _migrate_to_latest() -> None:
 
 
 def _seed(apps: Any) -> dict[str, Any]:
-    """Create one of everything that references a scan job, in the 0036 (UUID) schema."""
+    """Create one of everything that references a scan job, in the 0040 (UUID) schema."""
     now = timezone.now()
     user = apps.get_model("auth", "User").objects.create(username="pk-migration-operator")
     book = apps.get_model("core", "Book").objects.create(title="Migrated Book")
@@ -90,6 +93,9 @@ def _seed(apps: Any) -> dict[str, Any]:
         scan_job=job, search=search, provider_id="openlibrary", title="Migrated Book"
     )
     apps.get_model("core", "ReviewTask").objects.create(scan_job=job, source_filename="scan")
+    apps.get_model("core", "ScanLog").objects.create(
+        scan_job=job, original_filename="scanner.log", size_bytes=10
+    )
     processing_model = apps.get_model("core", "ProcessingJob")
     # Non-canonical spellings (hex, uppercase) must come out canonical; nested too.
     non_canonical = processing_model.objects.create(
@@ -150,6 +156,7 @@ def _assert_references(apps: Any, job_id: Any, expected_pk: Any) -> None:
     assert job.review_tasks.count() == 1
     assert job.llm_suggestions.count() == 1
     assert job.contribution_events.count() == 1
+    assert job.logs.count() == 1
     page = apps.get_model("core", "ScanPage").objects.get(scan_job_id=job_id)
     assert page.scan_job.pk == expected_pk
     assert page.versions.get().storage_identifier.startswith("scan-jobs/")
@@ -159,7 +166,7 @@ def test_migration_discovers_every_scan_job_foreign_key() -> None:
     discovered = {table for table, _column in MIGRATION.scan_job_fk_columns(global_apps)}
     expected = {
         global_apps.get_model("core", name)._meta.db_table
-        for name in EXPECTED_REFERENCES | REFERENCES_ADDED_LATER
+        for name in EXPECTED_REFERENCES | ADDED_AFTER_0041
     }
     assert discovered == expected
     current_fks = {
@@ -168,7 +175,7 @@ def test_migration_discovers_every_scan_job_foreign_key() -> None:
         for field in model._meta.local_concrete_fields
         if field.many_to_one and field.related_model is global_apps.get_model("core", "ScanJob")
     }
-    assert current_fks == EXPECTED_REFERENCES | REFERENCES_ADDED_LATER
+    assert current_fks == EXPECTED_REFERENCES | ADDED_AFTER_0041
 
 
 @pytest.mark.django_db(transaction=True)

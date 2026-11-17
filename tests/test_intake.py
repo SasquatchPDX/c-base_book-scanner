@@ -7,6 +7,7 @@ from typing import Any, cast
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from django.conf import settings as django_settings
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models.signals import post_save
 from django.http import StreamingHttpResponse
@@ -42,6 +43,7 @@ def _build_epub(
     title: str = "Sample EPUB",
     *,
     cover_payload: bytes | None = None,
+    creator: str = "Jane Doe",
 ) -> None:
     with ZipFile(path, "w") as archive:
         archive.writestr(
@@ -70,7 +72,7 @@ def _build_epub(
                 '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
                 f'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
                 f"<dc:title>{title}</dc:title>"
-                f"<dc:creator>Jane Doe</dc:creator>"
+                f"<dc:creator>{creator}</dc:creator>"
                 f"{cover_metadata}"
                 "</metadata>"
                 f"{cover_manifest}"
@@ -100,6 +102,7 @@ def _force_stub_provider(
     auto_accept_threshold: float = 0.5,
     review_threshold: float = 0.3,
     isbn: str | None = None,
+    strong_match_enabled: bool = True,
 ) -> None:
     class StubProvider:
         provider_id = "stub"
@@ -127,6 +130,11 @@ def _force_stub_provider(
     )
     monkeypatch.setattr("ebook_server.core.intake.AUTO_ACCEPT_SCORE", auto_accept_threshold)
     monkeypatch.setattr("ebook_server.core.intake.REVIEW_SCORE", review_threshold)
+    monkeypatch.setattr(
+        django_settings,
+        "BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED",
+        strong_match_enabled,
+    )
 
 
 @pytest.mark.django_db(transaction=True)
@@ -177,12 +185,15 @@ def test_candidate_below_auto_accept_threshold_requires_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pins the plain threshold: with the exact-title + strong-author rule off, a 0.85
+    # title+author score stays below 0.86 and must go to review.
     _force_stub_provider(
         monkeypatch,
         candidate_title="Borderline Match",
         authors=["Jane Doe"],
         auto_accept_threshold=0.86,
         review_threshold=0.55,
+        strong_match_enabled=False,
     )
     _configure_storage(tmp_path)
     profile = get_or_create_profile("borderline-review-user")
@@ -221,6 +232,143 @@ def test_candidate_below_auto_accept_threshold_requires_review(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_exact_title_and_author_without_isbn_auto_accepts_with_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for #9: exact title + author, no ISBN/language/publisher, scored 0.85
+    # and could never reach the 0.86 auto-accept threshold.
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=["Jane Doe"],
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("strong-match-user")
+    client = Client()
+    client.force_login(profile.user)
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "strong.epub"
+    _build_epub(epub_path, "Borderline Match")
+    response = client.post(
+        "/imports/upload/",
+        {"file": SimpleUploadedFile(epub_path.name, epub_path.read_bytes())},
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    assert candidate.state == MetadataCandidate.CandidateState.MATCH
+    assert float(candidate.score) == pytest.approx(0.86)
+    evidence = candidate.raw_payload["_auto_accept_rule"]
+    assert evidence["rule"] == "exact_title_strong_author"
+    assert evidence["applied"] is True
+    assert evidence["base_score"] == pytest.approx(0.85)
+    assert job.state == ImportJob.State.COMPLETE
+    assert job.book_id is not None
+    assert not ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("upload_name", "creator", "provider_authors", "blocked_reason"),
+    [
+        # Placeholder authors on both sides agree, so the rule promotes the candidate,
+        # but the provider record names nobody real (#42 / #92 guard).
+        ("unknown.epub", "Unknown", ["Unknown"], intake.BLOCK_NO_PROVIDER_AUTHORS),
+    ],
+)
+def test_strong_match_promotion_still_goes_through_author_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    upload_name: str,
+    creator: str,
+    provider_authors: list[str],
+    blocked_reason: str,
+) -> None:
+    # The exact-title + strong-author rule (#9) only raises a score; intake's author
+    # checks still run on the promoted candidate and route it to review.
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=provider_authors,
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("strong-match-guard-user")
+    client = Client()
+    client.force_login(profile.user)
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "guarded.epub"
+    _build_epub(epub_path, "Borderline Match", creator=creator)
+    response = client.post(
+        "/imports/upload/",
+        {"file": SimpleUploadedFile(upload_name, epub_path.read_bytes())},
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    evidence = candidate.raw_payload["_auto_accept_rule"]
+    assert evidence["applied"] is True
+    assert float(candidate.score) == pytest.approx(0.86)
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == blocked_reason
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_strong_match_rule_does_not_promote_against_embedded_author(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The filename's author matches the provider, but the file's embedded author is
+    # someone else: the rule itself refuses to promote, so the candidate stays at its
+    # plain score and the import goes to review.
+    _force_stub_provider(
+        monkeypatch,
+        candidate_title="Borderline Match",
+        authors=["John Roe"],
+        auto_accept_threshold=0.86,
+        review_threshold=0.55,
+    )
+    _configure_storage(tmp_path)
+    profile = get_or_create_profile("strong-match-conflict-user")
+    client = Client()
+    client.force_login(profile.user)
+    storage = LocalFilesystemStorage(str(tmp_path / "storage" / "library-artifacts"))
+    monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
+
+    epub_path = tmp_path / "conflict.epub"
+    _build_epub(epub_path, "Borderline Match", creator="Jane Doe")
+    response = client.post(
+        "/imports/upload/",
+        {"file": SimpleUploadedFile("John Roe - Borderline Match.epub", epub_path.read_bytes())},
+    )
+
+    assert response.status_code == 201
+    job = ImportJob.objects.get(pk=response.json()["job_id"])
+    candidate = MetadataCandidate.objects.get(import_job=job)
+    evidence = candidate.raw_payload["_auto_accept_rule"]
+    assert evidence["applied"] is False
+    assert "author_evidence_conflict" in evidence["blocked_by"]
+    assert float(candidate.score) < 0.86
+    assert candidate.state == MetadataCandidate.CandidateState.REVIEW
+    assert job.state == ImportJob.State.LOW_CONFIDENCE
+    assert job.book_id is None
+    assert ReviewTask.objects.filter(import_job=job).exists()
+
+
+@pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("auto_accept_threshold", [0.8, 0.86])
 def test_import_status_exposes_each_processing_phase(
     tmp_path: Path,
@@ -232,6 +380,7 @@ def test_import_status_exposes_each_processing_phase(
         candidate_title="Observed Book",
         authors=["Jane Doe"],
         auto_accept_threshold=auto_accept_threshold,
+        strong_match_enabled=False,
     )
     profile = get_or_create_profile("status-observer")
     client = Client()

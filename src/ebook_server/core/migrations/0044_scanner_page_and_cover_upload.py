@@ -15,7 +15,7 @@ def mark_sidecar_covers(apps, schema_editor):
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0038_scanjob_raw_scan_lifecycle"),
+        ("core", "0043_scanjob_raw_scan_lifecycle"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
@@ -38,16 +38,7 @@ class Migration(migrations.Migration):
                 max_length=16,
             ),
         ),
-        migrations.AddField(
-            model_name="scanpage",
-            name="recognized_page_number",
-            field=models.CharField(blank=True, max_length=64, null=True),
-        ),
-        migrations.AddField(
-            model_name="scanpage",
-            name="status",
-            field=models.CharField(blank=True, max_length=32),
-        ),
+        # ScanPage.recognized_page_number and .status come from 0042_scan_events (#129).
         migrations.AddField(
             model_name="scanpageversion",
             name="source",

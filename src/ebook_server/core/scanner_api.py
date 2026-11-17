@@ -28,15 +28,15 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
-from . import scan_lifecycle, scan_manifest, scanner_uploads
+from . import scan_events, scan_lifecycle, scan_manifest, scanner_uploads
 from .models import ScanCover, ScanJob, ScanTodo
 from .scan_job_ids import is_device_job_id
 from .scanner_auth import bearer_token, is_scanner_key, scanner_api_enabled
 
 API_VERSION: Final = 1
 # §6.12: event batches are fixed by the contract rather than configured per deployment.
-MAX_EVENT_BATCH_BYTES: Final = 1024 * 1024
-MAX_EVENT_BATCH_LINES: Final = 1000
+MAX_EVENT_BATCH_BYTES: Final = scan_events.MAX_EVENT_BATCH_BYTES
+MAX_EVENT_BATCH_LINES: Final = scan_events.MAX_EVENT_BATCH_LINES
 
 logger = structlog.get_logger(__name__)
 
@@ -197,8 +197,8 @@ def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
     """Job status and received inventory (§6.4).
 
     The item sections come from :mod:`.scan_manifest`: ``pages``, ``covers`` (S4) and,
-    once its store registers a source, ``metadata_opf`` (S6). ``events``
-    carries the stored-event high-water mark (``0`` until S5 stores events).
+    once its store registers a source, ``metadata_opf`` (S6). ``events`` carries the
+    stored-event high-water mark (S5, registered at app start).
     """
     payload: dict[str, Any] = {
         "job_id": job.pk,
@@ -552,6 +552,107 @@ def cover(request: HttpRequest, job_id: str, position: str) -> JsonResponse:
         },
         status=201 if stored.created else 200,
     )
+
+
+# --- events (§6.7) ----------------------------------------------------------------------
+
+# The JSON body escapes the raw lines (every quote gains a backslash), so it may be
+# larger than the 1 MiB of line bytes the batch limit counts; a body beyond this is
+# refused before it is read.
+MAX_EVENT_REQUEST_BYTES: Final = 4 * MAX_EVENT_BATCH_BYTES
+
+
+def _too_large() -> JsonResponse:
+    return error_response(
+        413,
+        "payload_too_large",
+        f"An event batch may hold at most {MAX_EVENT_BATCH_LINES} lines and "
+        f"{MAX_EVENT_BATCH_BYTES} bytes.",
+        {
+            "max_event_batch_bytes": MAX_EVENT_BATCH_BYTES,
+            "max_event_batch_lines": MAX_EVENT_BATCH_LINES,
+        },
+    )
+
+
+def _read_limited_body(request: HttpRequest, limit: int) -> bytes | None:
+    """The request body, or None when it is (or claims to be) larger than ``limit``."""
+    try:
+        declared = int(request.META.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        declared = 0
+    if declared > limit:
+        return None
+    body = request.read(limit + 1)
+    if len(body) > limit:
+        return None
+    return body
+
+
+def _parse_event_batch(
+    request: HttpRequest,
+) -> tuple[tuple[int, list[str]] | None, JsonResponse | None]:
+    body = _read_limited_body(request, MAX_EVENT_REQUEST_BYTES)
+    if body is None:
+        return None, _too_large()
+    try:
+        payload = json.loads(body or b"null")
+    except (UnicodeDecodeError, ValueError):
+        return None, error_response(400, "invalid_json", "The body must be a JSON object.")
+    if not isinstance(payload, dict):
+        return None, error_response(400, "invalid_json", "The body must be a JSON object.")
+    first_line_no = payload.get("first_line_no")
+    if not isinstance(first_line_no, int) or isinstance(first_line_no, bool) or first_line_no < 1:
+        return None, error_response(
+            400,
+            "invalid_request",
+            "first_line_no must be an integer of at least 1.",
+            {"field": "first_line_no"},
+        )
+    lines = payload.get("lines")
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+        return None, error_response(
+            400,
+            "invalid_request",
+            "lines must be a list of strings.",
+            {"field": "lines"},
+        )
+    if len(lines) > MAX_EVENT_BATCH_LINES:
+        return None, _too_large()
+    total = 0
+    for line in lines:
+        total += len(line.encode("utf-8", errors="surrogatepass"))
+        if total > MAX_EVENT_BATCH_BYTES:
+            return None, _too_large()
+    return (first_line_no, lines), None
+
+
+@scanner_api_view(["POST"])
+def job_events(request: HttpRequest, job_id: str) -> JsonResponse:
+    """Append ``scan.jsonl`` lines (§6.7).
+
+    ``200 {"sans_last_line_no": N}`` when stored, or when every line was already stored
+    identically. ``409 event_gap`` (with ``details.expected_first_line_no``),
+    ``409 event_conflict``, ``409 job_state`` (cancelled), ``422 invalid_event``,
+    ``413 payload_too_large`` beyond 1000 lines or 1 MiB. A web-created or unknown job
+    is ``404`` (§6.1, :func:`scanner_job`).
+    """
+    if not is_device_job_id(job_id):
+        return _invalid_job_id(job_id)
+    batch, problem = _parse_event_batch(request)
+    if problem is not None:
+        return problem
+    assert batch is not None
+    first_line_no, lines = batch
+    if scanner_job(job_id) is None:
+        return error_response(404, "not_found", "No such job.", {"job_id": job_id})
+    try:
+        result = scan_events.append_sans_lines(job_id, first_line_no, lines)
+    except ScanJob.DoesNotExist:
+        return error_response(404, "not_found", "No such job.", {"job_id": job_id})
+    except scan_events.ScanEventError as exc:
+        return error_response(exc.status, exc.code, exc.message, exc.details)
+    return JsonResponse({"sans_last_line_no": result.sans_last_line_no}, status=200)
 
 
 @scanner_api_view(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
