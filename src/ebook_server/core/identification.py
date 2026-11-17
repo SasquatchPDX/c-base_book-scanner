@@ -20,6 +20,8 @@ from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import token_set_ratio, token_sort_ratio
 from rapidfuzz.utils import default_process
 
+from .rate_limit import throttle_provider
+
 logger = structlog.get_logger(__name__)
 
 MAX_AUTHOR_LOOKUPS = 5
@@ -43,7 +45,10 @@ OPEN_LIBRARY_SEARCH_FIELDS = ",".join(
         "subject",
     )
 )
-DEFAULT_USER_AGENT = "ebook-server (self-hosted hackerspace library)"
+DEFAULT_USER_AGENT = (
+    "ebook-server (+https://github.com/SasquatchPDX/c-base_book-scanner; "
+    "self-hosted hackerspace library)"
+)
 
 AUTO_ACCEPT_SCORE = getattr(
     django_settings,
@@ -381,6 +386,9 @@ class OpenLibraryMetadataProvider:
             getattr(django_settings, "BOOK_SCANNER_METADATA_USER_AGENT", "") or DEFAULT_USER_AGENT
         )
         for attempt in range(2):
+            # Proactive client-side pacing (shared across workers via Redis when configured);
+            # the 429 handling below is only the fallback when the server still objects.
+            throttle_provider(self.provider_id)
             request = Request(url, headers={"User-Agent": user_agent})
             try:
                 with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:

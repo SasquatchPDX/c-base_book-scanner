@@ -5,6 +5,18 @@ from collections.abc import Iterator
 import pytest
 from django.conf import settings as django_settings
 
+from ebook_server.core.rate_limit import LocalRateLimiter, set_rate_limiter
+from tests.rate_limit_fixtures import FakeClock
+
+
+@pytest.fixture(autouse=True)
+def rate_limit_clock() -> Iterator[FakeClock]:
+    """Metadata-provider pacing must never sleep for real in the unit test suite."""
+    clock = FakeClock()
+    set_rate_limiter(LocalRateLimiter(clock=clock, sleep=clock.sleep))
+    yield clock
+    set_rate_limiter(None)
+
 
 @pytest.fixture(autouse=True)
 def _relaxed_storage_root_and_source_age() -> Iterator[None]:
