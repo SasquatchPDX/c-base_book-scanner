@@ -1,0 +1,12 @@
+# Runs book-scanner-contributions.service once a day.
+# Enable with: systemctl enable --now book-scanner-contributions.timer
+[Unit]
+Description=Daily Book Scanner contribution settlement
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
