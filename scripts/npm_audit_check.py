@@ -15,10 +15,85 @@ import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWLIST_PATH = ROOT / ".npm-audit-allowlist.json"
 BLOCKING_SEVERITIES = {"high", "critical"}
+SEVERITIES = {"info", "low", "moderate", "high", "critical"}
+
+
+def validate_report(payload: Any, returncode: int) -> dict[str, Any]:
+    """Accept npm's completed v2 reports, never operational errors or partial JSON."""
+    if returncode not in (0, 1):
+        raise ValueError(f"npm audit exited with status {returncode}")
+    if not isinstance(payload, dict) or "error" in payload:
+        raise ValueError("npm audit returned an error or a non-report payload")
+    if payload.get("auditReportVersion") != 2:
+        raise ValueError("npm audit did not return a v2 audit report")
+    vulnerabilities = payload.get("vulnerabilities")
+    metadata = payload.get("metadata")
+    if not isinstance(vulnerabilities, dict) or not isinstance(metadata, dict):
+        raise ValueError("npm audit report is incomplete")
+    counts = metadata.get("vulnerabilities")
+    if not isinstance(counts, dict) or any(
+        type(counts.get(key)) is not int or counts[key] < 0 for key in SEVERITIES | {"total"}
+    ):
+        raise ValueError("npm audit report has invalid vulnerability counts")
+    actual = dict.fromkeys(SEVERITIES, 0)
+    for package, info in vulnerabilities.items():
+        if (
+            not isinstance(info, dict)
+            or not isinstance(info.get("severity"), str)
+            or info["severity"] not in SEVERITIES
+        ):
+            raise ValueError(f"npm audit report has an invalid package: {package}")
+        actual[info["severity"]] += 1
+        via = info.get("via")
+        if not isinstance(via, list) or not via:
+            raise ValueError(f"npm audit report has no advisory details: {package}")
+        for advisory in via:
+            if isinstance(advisory, str) and advisory in vulnerabilities:
+                continue
+            if (
+                isinstance(advisory, dict)
+                and isinstance(advisory.get("severity"), str)
+                and advisory.get("severity") in SEVERITIES
+                and isinstance(advisory.get("url"), str)
+                and advisory["url"]
+            ):
+                continue
+            raise ValueError(f"npm audit report has invalid advisory details: {package}")
+    # A transitive pointer must ultimately reach a real advisory, not just another
+    # pointer (or a cycle). Otherwise an incomplete report can hide a high finding.
+    covered = {
+        package
+        for package, info in vulnerabilities.items()
+        if any(
+            isinstance(via, dict) and via["severity"] in BLOCKING_SEVERITIES for via in info["via"]
+        )
+    }
+    while True:
+        expanded = covered | {
+            package
+            for package, info in vulnerabilities.items()
+            if any(isinstance(via, str) and via in covered for via in info["via"])
+        }
+        if expanded == covered:
+            break
+        covered = expanded
+    if any(
+        info["severity"] in BLOCKING_SEVERITIES and package not in covered
+        for package, info in vulnerabilities.items()
+    ):
+        raise ValueError("npm audit report is missing high/critical advisory details")
+    if any(counts[key] != actual[key] for key in SEVERITIES) or counts["total"] != len(
+        vulnerabilities
+    ):
+        raise ValueError("npm audit vulnerability counts do not match its package report")
+    if returncode == 1 and not vulnerabilities:
+        raise ValueError("npm audit failed without reporting vulnerabilities")
+    return payload
 
 
 def load_allowlist(path: Path = ALLOWLIST_PATH) -> dict[str, dict[str, str]]:
@@ -67,19 +142,18 @@ def evaluate(
 
 
 def main() -> int:
-    completed = subprocess.run(
-        ["npm", "audit", "--json"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        shell=sys.platform == "win32",
-    )
     try:
-        audit = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        print(completed.stdout, completed.stderr, sep="\n")
-        print("npm audit did not return JSON", file=sys.stderr)
+        completed = subprocess.run(
+            ["npm", "audit", "--json"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=sys.platform == "win32",
+        )
+        audit = validate_report(json.loads(completed.stdout), completed.returncode)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"npm audit could not complete: {exc}", file=sys.stderr)
         return 2
     allowlist = load_allowlist()
     problems = evaluate(audit, allowlist, date.today())
