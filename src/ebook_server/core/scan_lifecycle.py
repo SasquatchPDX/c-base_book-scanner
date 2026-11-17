@@ -42,7 +42,8 @@ RESCAN_STATES: Final = PROCESSING_STATES | {State.COMPLETE}
 # capture-complete (§6.9) and abort (§6.10) start from these.
 CAPTURE_COMPLETE_FROM: Final = frozenset({State.OPEN, State.CAPTURING})
 ABORT_FROM: Final = frozenset({State.OPEN, State.CAPTURING})
-# A repeated capture-complete on a job that already got past it answers 200 again.
+# A repeated capture-complete on a job that already got past it: 200 again for the
+# manifest that was verified, any other manifest is checked against what serif holds.
 CAPTURE_VERIFIED_STATES: Final = frozenset({State.CAPTURED, State.FINALIZING, State.COMPLETE})
 
 REFINISH_NOTE: Final = "re-finish needed"
@@ -56,14 +57,27 @@ class LifecycleError(Exception):
         self.state = state
 
 
-def mark_captured(job: ScanJob, *, finished_at: Any = None) -> ScanJob:
-    """``open``/``capturing`` -> ``captured`` on a row the caller has locked."""
+def mark_captured(job: ScanJob, *, finished_at: Any = None, manifest_sha256: str = "") -> ScanJob:
+    """``open``/``capturing`` -> ``captured`` on a row the caller has locked.
+
+    ``manifest_sha256`` is the digest of the verified manifest; a later identical
+    capture-complete is answered from it.
+    """
     if job.state not in CAPTURE_COMPLETE_FROM:
         raise LifecycleError(job.state, f"capture-complete is not allowed from '{job.state}'.")
     job.state = State.CAPTURED
     job.captured_at = timezone.now()
     job.capture_finished_at = finished_at
-    job.save(update_fields=["state", "captured_at", "capture_finished_at", "updated_at"])
+    job.capture_manifest_sha256 = manifest_sha256
+    job.save(
+        update_fields=[
+            "state",
+            "captured_at",
+            "capture_finished_at",
+            "capture_manifest_sha256",
+            "updated_at",
+        ]
+    )
     return job
 
 

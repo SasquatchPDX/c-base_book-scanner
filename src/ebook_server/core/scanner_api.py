@@ -379,9 +379,12 @@ def capture_complete(request: HttpRequest, job_id: str) -> JsonResponse:
     """Verify the scanner's full manifest and move the job to ``captured`` (§6.9).
 
     ``200`` when every listed item is held with exactly that active checksum and the
-    event high-water marks agree; repeating it (or calling it once the job got past
-    ``captured``) answers ``200`` again. ``409 incomplete`` lists ``missing`` and
-    ``mismatched`` item keys; ``409 job_state`` for a cancelled (or paused) job.
+    event high-water marks agree. Once the job got past ``captured``, repeating the
+    manifest that was verified answers ``200`` again; any other manifest is checked
+    against what serif holds now, like a first request (but the state is unchanged).
+    ``409 incomplete`` lists ``missing`` and ``mismatched`` item keys (a declared item
+    serif cannot store yet is ``missing``); ``409 job_state`` for a cancelled (or
+    paused) job.
     """
     if not is_device_job_id(job_id):
         return _invalid_job_id(job_id)
@@ -400,9 +403,8 @@ def capture_complete(request: HttpRequest, job_id: str) -> JsonResponse:
         current = scanner_job(job_id, lock=True)
         if current is None:
             return _not_found()
-        if current.state in scan_lifecycle.CAPTURE_VERIFIED_STATES:
-            return _capture_verified(request, current)
-        if current.state not in scan_lifecycle.CAPTURE_COMPLETE_FROM:
+        already_captured = current.state in scan_lifecycle.CAPTURE_VERIFIED_STATES
+        if not already_captured and current.state not in scan_lifecycle.CAPTURE_COMPLETE_FROM:
             return _job_state_error(
                 current, f"capture-complete is not allowed for a {current.state} job."
             )
@@ -410,6 +412,9 @@ def capture_complete(request: HttpRequest, job_id: str) -> JsonResponse:
             check = scan_manifest.check_manifest(current, payload)
         except scan_manifest.ManifestError as exc:
             return _invalid_request(exc.field, str(exc))
+        if already_captured and current.capture_manifest_sha256 == check.digest:
+            # An identical retry of the verified manifest (its response was lost).
+            return _capture_verified(request, current)
         if not check.verified:
             return error_response(
                 409,
@@ -421,9 +426,12 @@ def capture_complete(request: HttpRequest, job_id: str) -> JsonResponse:
                     "sans_last_line_no": check.sans_last_line_no,
                 },
             )
-        scan_lifecycle.mark_captured(
-            current, finished_at=finished_at.astimezone(UTC) if finished_at else None
-        )
+        if not already_captured:
+            scan_lifecycle.mark_captured(
+                current,
+                finished_at=finished_at.astimezone(UTC) if finished_at else None,
+                manifest_sha256=check.digest,
+            )
     return _capture_verified(request, current)
 
 
