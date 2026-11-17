@@ -111,3 +111,38 @@ def test_scanner_tls_front_end_is_tls13_only_and_fails_closed() -> None:
     root_location = re.search(r"location / \{([^}]*)\}", plain_server)
     assert root_location is not None
     assert "return" not in root_location.group(1)
+
+
+EVENT_STREAM_LOCATION = re.compile(r'location ~ "(?P<regex>[^"]*/workspace/events/\$)" \{')
+STREAM_JOB_IDS = (
+    "3f2b8c1e-9d4a-4b6f-a1c2-0e5d7f9a8b3c",  # web job (UUID)
+    "20261117T120000Z",  # scanner job
+    "20261117T120000Z-12",  # scanner job, same-second collision suffix
+)
+NOT_STREAM_JOB_IDS = (
+    "..",
+    "../..",
+    "../../etc",
+    "20261117T120000Z-0",
+    "20261117T120000Z-12345",
+    "20261117T120000Z/..",
+    "",
+)
+
+
+def test_event_stream_location_matches_web_and_scanner_job_ids() -> None:
+    """The unbuffered SSE location must cover every job ID form (#136, found in #137)."""
+    for name in ("book-scanner.conf", "integration.conf", "serif-lan-tls.conf"):
+        config = _nginx_directives(name)
+        assert "/scan/jobs/" in config, name
+        regexes = [m["regex"] for m in EVENT_STREAM_LOCATION.finditer(config)]
+        assert len(regexes) == 1, name
+        assert config.count("/workspace/events/") == 1, name
+        stream = re.compile(regexes[0])
+
+        for job_id in STREAM_JOB_IDS:
+            assert stream.search(f"/scan/jobs/{job_id}/workspace/events/"), (name, job_id)
+        for job_id in NOT_STREAM_JOB_IDS:
+            assert not stream.search(f"/scan/jobs/{job_id}/workspace/events/"), (name, job_id)
+        assert not stream.search("/scan/jobs/../workspace/events/"), name
+        assert not stream.search(f"/scan/jobs/{STREAM_JOB_IDS[1]}/workspace/events/x"), name
