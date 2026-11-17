@@ -71,6 +71,9 @@ AUTO_ACCEPT_SCORE = getattr(
     0.86,
 )
 REVIEW_SCORE = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_REVIEW", 0.55)
+# Evidence key for title/author hints read from the first lines of plain-text books
+# (see core.text_header); written by intake, read when building signals.
+TEXT_HEADER_EVIDENCE_KEY = "text_header"
 # Added to an already linked Book's score when the file is another format of it (same
 # source folder, same file name, ``SourceLocation.group_sibling_formats``). With an equal
 # title (0.55) it clears auto-accept; alone it does not (#39).
@@ -375,6 +378,92 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     )
 
 
+def _header_strings(value: Any) -> list[str]:
+    return [item.strip() for item in _as_str_list(value) if item.strip()]
+
+
+# "Last, First" in a filename part: one comma, a short name on each side, no digits,
+# and not a moved article ("Hobbit, The").
+_COMMA_FORM_AUTHOR = re.compile(r"^\s*([^,\d]{2,40}),\s*([^,\d]{1,40})\s*$")
+_MOVED_ARTICLES = frozenset({"the", "a", "an", "der", "die", "das", "le", "la", "les"})
+
+
+def comma_form_filename_authors(raw_filename: str) -> list[str]:
+    """Filename parts written as "Last, First" ("London, Jack - White Fang.txt").
+
+    That form is a deliberate author credit, so header hints read from the text may
+    add to it but never delete it.
+    """
+    stem = Path(raw_filename).stem.replace("_", " ")
+    authors: list[str] = []
+    for part in re.split(r"\s+-\s+", stem):
+        match = _COMMA_FORM_AUTHOR.match(part)
+        if match is None:
+            continue
+        last, first = match.group(1).strip(), match.group(2).strip()
+        if not last or not first or first.casefold() in _MOVED_ARTICLES:
+            continue
+        if len(last.split()) > 3 or len(first.split()) > 3:
+            continue
+        authors.append(part.strip())
+    return authors
+
+
+def _apply_text_header_hints(
+    header: dict[str, Any],
+    title_hints: list[str],
+    author_hints: list[str],
+    *,
+    protected_authors: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Merge hints read from a plain-text book's first lines (see ``core.text_header``).
+
+    Precedence for authors: explicit header rules (``Author:``, Gutenberg header,
+    ``by ...``, copyright line) replace the filename's "A - B" split guesses; heuristic
+    name-like lines are only appended after the other hints, so they never become the
+    author sent to providers ahead of them. Hints from an admin-configured source such
+    as a folder layout must likewise rank ahead of anything guessed from the text.
+
+    ``protected_authors`` (the filename's "Last, First" credits) are never removed:
+    not because the header title resembles them, and not by explicit header authors,
+    which are put in front of them instead.
+    """
+    title_hints = list(title_hints)
+    author_hints = list(author_hints)
+    protected = [name for name in protected_authors or [] if name.strip()]
+    protected_keys = {normalize_text(name) for name in protected}
+    header_title = header.get("title")
+    if isinstance(header_title, str) and header_title.strip():
+        header_title = header_title.strip()
+        title_hints.insert(1 if title_hints else 0, header_title)
+        # A filename part the text names as the title is not an author, unless the
+        # filename credits it in "Last, First" form.
+        author_hints = [
+            hint
+            for hint in author_hints
+            if normalize_text(hint) in protected_keys
+            or _title_match_score(hint, header_title) < 0.95
+        ]
+    explicit_authors = _header_strings(header.get("authors"))
+    if explicit_authors:
+        kept = [
+            name
+            for name in protected
+            if not any(
+                _author_name_similarity(normalize_text(name), normalize_text(explicit))
+                for explicit in explicit_authors
+            )
+        ]
+        return title_hints, explicit_authors + kept
+    author_hints = [
+        hint for hint in author_hints if normalize_text(hint) not in {"unknown", "anonymous"}
+    ]
+    for likely in _header_strings(header.get("likely_authors")):
+        if not any(_author_name_similarity(likely, known) for known in author_hints):
+            author_hints.append(likely)
+    return title_hints, author_hints
+
+
 # Evidence key holding hints from the source's configured folder layout (#35); written
 # by intake from ``core.source_layout``, read here when building signals.
 PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
@@ -395,6 +484,14 @@ def build_identification_input(
         title_hints = filename_title_hints
 
     author_hints = filename_author_hints
+    header = extracted_metadata.get(TEXT_HEADER_EVIDENCE_KEY)
+    if isinstance(header, dict):
+        title_hints, author_hints = _apply_text_header_hints(
+            header,
+            title_hints,
+            author_hints,
+            protected_authors=comma_form_filename_authors(original_filename),
+        )
     metadata_authors = extracted_metadata.get("authors")
     if isinstance(metadata_authors, list):
         for raw_author in metadata_authors:
@@ -1152,6 +1249,16 @@ def _author_match_score(left: list[str], right: list[str]) -> float:
         max(_author_name_similarity(name, other) for other in right_names) for name in left_names
     )
     return total / len(left_names)
+
+
+def title_similarity(left: str, right: str) -> float:
+    """Public form of the candidate title score, for comparing two metadata sources."""
+    return _title_match_score(left, right)
+
+
+def author_similarity(left: list[str], right: list[str]) -> float:
+    """Public form of the candidate author score (0.0 when no name corresponds)."""
+    return _author_match_score(left, right)
 
 
 # Creator values that say nothing about who wrote the book: office-suite and PDF
