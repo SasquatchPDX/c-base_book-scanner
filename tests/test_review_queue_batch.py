@@ -150,6 +150,26 @@ def test_queue_filters_by_source_state_confidence_and_candidates() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_queue_confidence_filters_ignore_superseded_search_results() -> None:
+    from django.utils import timezone
+
+    owner = get_or_create_profile("queue-search-history")
+    task = _make_task(owner.user, "history", [0.99, 0.60])
+    MetadataCandidate.objects.filter(import_job=task.import_job, score=Decimal("0.99")).update(
+        superseded_at=timezone.now(),
+    )
+    client = _client(owner)
+    assert client.get("/reviews/?min_score=0.9").json()["items"] == []
+    items = client.get("/reviews/?max_score=0.7").json()["items"]
+    assert [item["id"] for item in items] == [str(task.pk)]
+    MetadataCandidate.objects.filter(import_job=task.import_job).update(
+        superseded_at=timezone.now(),
+    )
+    items = client.get("/reviews/?has_candidates=no").json()["items"]
+    assert [item["id"] for item in items] == [str(task.pk)]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_queue_paginates_and_keeps_filters_in_page_links() -> None:
     owner = get_or_create_profile("paging-owner")
     for index in range(5):

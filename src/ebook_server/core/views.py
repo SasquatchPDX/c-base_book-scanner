@@ -3782,7 +3782,9 @@ def _review_queue_queryset(profile: AppUserProfile) -> Any:
     """Open/claimed review tasks visible to ``profile``, annotated with their top score."""
 
     def top_score(candidates: Any) -> Subquery:
-        return Subquery(candidates.order_by("-score").values("score")[:1])
+        return Subquery(
+            candidates.filter(superseded_at__isnull=True).order_by("-score").values("score")[:1]
+        )
 
     tasks = (
         ReviewTask.objects.select_related(
