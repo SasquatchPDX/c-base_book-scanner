@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.contrib import admin
+from django.db.models import QuerySet
 
 from .models import (
     AppUserProfile,
@@ -136,7 +139,12 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
         "recursive",
         "default_source_type",
         "is_active",
+        "is_paused",
+        "ingest_batch_size",
+        "ingest_max_per_hour",
     )
+    list_filter = ("is_active", "is_paused")
+    actions = ("pause_imports", "resume_imports")
     fieldsets = (
         (
             None,
@@ -167,7 +175,24 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
             "Formats of one book",
             {"fields": ("group_sibling_formats",)},
         ),
+        (
+            "Ingestion throttling",
+            {"fields": ("is_paused", "ingest_batch_size", "ingest_max_per_hour")},
+        ),
     )
+
+    @admin.action(description="Pause imports from selected sources")
+    def pause_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=True)
+        self.message_user(request, f"Paused {updated} source(s).")
+
+    @admin.action(description="Resume imports from selected sources")
+    def resume_imports(self, request: Any, queryset: QuerySet[SourceLocation]) -> None:
+        updated = queryset.update(is_paused=False)
+        self.message_user(
+            request,
+            f"Resumed {updated} source(s). Run ingest_sources to re-queue waiting imports.",
+        )
 
 
 @admin.register(ProcessingJob)

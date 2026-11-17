@@ -152,6 +152,29 @@ class SourceLocation(models.Model):
         default=SourceType.NETWORK_SOURCE,
     )
     default_metadata = models.JSONField(default=dict, blank=True)
+    is_paused = models.BooleanField(
+        default=False,
+        help_text=(
+            "Paused sources queue no new imports, and queued imports that have not "
+            "started stay DISCOVERED until the source is resumed."
+        ),
+    )
+    ingest_batch_size = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum import jobs in flight for this source. Blank uses "
+            "BOOK_SCANNER_INGEST_BATCH_SIZE; 0 means unlimited."
+        ),
+    )
+    ingest_max_per_hour = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Maximum new import jobs queued per rolling hour for this source. Blank "
+            "uses BOOK_SCANNER_INGEST_MAX_PER_HOUR; 0 means unlimited."
+        ),
+    )
 
     class AuthorNameOrder(models.TextChoices):
         AUTO = "auto", 'Auto ("Last, First" when a comma is present)'
@@ -856,6 +879,11 @@ class ImportJob(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     source_size = models.PositiveBigIntegerField(null=True, blank=True)
     source_mtime_ns = models.BigIntegerField(null=True, blank=True)
+    # Exclusive ownership while a worker processes the job (HASHING through ARCHIVING).
+    # Set atomically when a delivery claims the job, renewed on every phase transition,
+    # and cleared when the job leaves the active phases. Empty means unowned.
+    lease_owner = models.CharField(max_length=64, blank=True, default="")
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]

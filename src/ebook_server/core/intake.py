@@ -7,6 +7,7 @@ import mimetypes
 import re
 import shutil
 import time
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -653,6 +654,49 @@ PENDING_ARCHIVE_STATES = (
     ImportJob.State.ARCHIVING,
 )
 
+# States in which an import job still holds a slot of its source's batch: queued or
+# being processed by a worker. LOW_CONFIDENCE is excluded because those jobs are
+# already archived and only wait for a human reviewer.
+IN_FLIGHT_STATES = PENDING_ARCHIVE_STATES
+
+
+def _source_limit(value: int | None, setting_name: str) -> int | None:
+    """Per-source override, else the global setting; ``None`` means unlimited."""
+    limit = value if value is not None else int(getattr(django_settings, setting_name, 0) or 0)
+    return limit if limit > 0 else None
+
+
+def source_ingest_capacity(
+    source_location: SourceLocation,
+    *,
+    batch_size: int | None = None,
+) -> int | None:
+    """How many new import jobs may be queued for a source right now.
+
+    Bounded by the source's batch size (jobs in flight at once) and its hourly rate.
+    ``batch_size`` overrides the configured batch size (``ingest_sources --limit``;
+    0 means unlimited). Returns ``None`` when neither limit applies.
+    """
+    if source_location.is_paused:
+        return 0
+    limits: list[int] = []
+    batch = (
+        (batch_size or None)
+        if batch_size is not None
+        else _source_limit(source_location.ingest_batch_size, "BOOK_SCANNER_INGEST_BATCH_SIZE")
+    )
+    jobs = ImportJob.objects.filter(source_location=source_location)
+    if batch is not None:
+        in_flight = jobs.filter(state__in=IN_FLIGHT_STATES).count()
+        limits.append(max(batch - in_flight, 0))
+    per_hour = _source_limit(
+        source_location.ingest_max_per_hour, "BOOK_SCANNER_INGEST_MAX_PER_HOUR"
+    )
+    if per_hour is not None:
+        recent = jobs.filter(created_at__gte=timezone.now() - timedelta(hours=1)).count()
+        limits.append(max(per_hour - recent, 0))
+    return min(limits) if limits else None
+
 
 def archive_space_budget() -> ByteBudget | None:
     """Bytes that new imports may add to the archive before hitting the reserve.
@@ -677,10 +721,11 @@ def discover_source_jobs_for_location(
     source_location: SourceLocation,
     *,
     uploader: Any | None = None,
+    limit: int | None = None,
     byte_budget: ByteBudget | None = None,
     skipped_audio: list[int] | None = None,
 ) -> list[ImportJob]:
-    """Create DISCOVERED jobs for new files.
+    """Create DISCOVERED jobs for new files, stopping after ``limit`` jobs if given.
 
     Audio files are never turned into jobs. Pass ``skipped_audio`` to receive how
     many were seen (one count appended per call).
@@ -691,6 +736,10 @@ def discover_source_jobs_for_location(
     jobs: list[ImportJob] = []
     skipped: list[Path] = []
     audio_skipped = 0
+    if limit is not None and limit <= 0:
+        if skipped_audio is not None:
+            skipped_audio.append(0)
+        return jobs
     for candidate in discover_source_paths(source_location):
         if is_audio_filename(candidate.name):
             audio_skipped += 1
@@ -736,6 +785,8 @@ def discover_source_jobs_for_location(
             jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
         except IntakeError:
             continue
+        if limit is not None and len(jobs) >= limit:
+            break
     if skipped:
         # Unsupported files are never imported, but they must not vanish silently (#23).
         logger.warning(
@@ -1821,7 +1872,7 @@ def _record_sibling_evidence(job: ImportJob, assessment: SiblingAssessment) -> N
     evidence = dict(job.evidence) if isinstance(job.evidence, dict) else {}
     evidence[SIBLING_EVIDENCE_KEY] = assessment.as_evidence()
     job.evidence = evidence
-    job.save(update_fields=["evidence", "updated_at"])
+    _save_job(job, update_fields=["evidence", "updated_at"])
 
 
 def _top_saved_candidate(job: ImportJob) -> identification.IdentificationCandidate | None:
@@ -1964,15 +2015,18 @@ def _archive_for_review(
     candidates: list[identification.IdentificationCandidate],
 ) -> None:
     """Create the review task, archive the original, and leave the job LOW_CONFIDENCE."""
-    _create_review_task(job=job, candidates=candidates)
-    job.state = ImportJob.State.LOW_CONFIDENCE
-    job.save(update_fields=["state", "updated_at"])
+    with transaction.atomic():
+        # Rolled back with the task if this worker no longer owns the job.
+        _create_review_task(job=job, candidates=candidates)
+        job.state = ImportJob.State.LOW_CONFIDENCE
+        _save_job(job, update_fields=["state", "updated_at"])
     job.state = ImportJob.State.ARCHIVING
-    job.save(update_fields=["state", "updated_at"])
+    _save_job(job, update_fields=["state", "updated_at"])
     destination, verified = _archive_source(_default_storage(), job)
     job.storage_identifier = destination
     job.storage_location = _default_storage_location()
-    job.save(
+    _save_job(
+        job,
         update_fields=[
             "storage_identifier",
             "storage_location_id",
@@ -1984,13 +2038,15 @@ def _archive_for_review(
     if not verified:
         raise RuntimeError("archive verification failed")
     job.state = ImportJob.State.LOW_CONFIDENCE
-    job.save(
+    _save_job(
+        job,
         update_fields=[
             "state",
             "storage_identifier",
             "storage_location_id",
             "updated_at",
         ],
+        release=True,
     )
     if not _groups_sibling_formats(job):
         return
@@ -2011,7 +2067,23 @@ def _complete_with_book(
     destination: str,
     storage_location: StorageLocation,
 ) -> FileVariant:
-    """Link an archived, verified job to ``book`` as a new FileVariant."""
+    """Link an archived, verified job to ``book`` as a new FileVariant.
+
+    Atomic, so the FileVariant is rolled back if this worker lost the job meanwhile.
+    """
+    with transaction.atomic():
+        return _link_variant_and_complete(
+            job, book, destination=destination, storage_location=storage_location
+        )
+
+
+def _link_variant_and_complete(
+    job: ImportJob,
+    book: Book,
+    *,
+    destination: str,
+    storage_location: StorageLocation,
+) -> FileVariant:
     job.storage_identifier = destination
     job.storage_location = storage_location
     job.normalized_filename = normalize_filename(
@@ -2035,7 +2107,8 @@ def _complete_with_book(
     job.book = book
     job.file_variant = variant
     job.state = ImportJob.State.COMPLETE
-    job.save(
+    _save_job(
+        job,
         update_fields=[
             "state",
             "book_id",
@@ -2045,6 +2118,7 @@ def _complete_with_book(
             "normalized_filename",
             "updated_at",
         ],
+        release=True,
     )
     return variant
 
@@ -2157,25 +2231,199 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     return job.next_retry_at is not None and job.attempt_count <= max_retries
 
 
+# --- Exclusive ownership of an import job ---------------------------------------------
+#
+# More than one queue delivery may exist for one ImportJob: ``ingest_sources`` re-queues
+# DISCOVERED jobs it cannot see in RQ (the snapshot can be stale), RQ retries a job, an
+# operator re-queues it. Only one delivery may ever process it. A delivery therefore
+# claims the job with one conditional UPDATE that sets ``lease_owner`` to a fresh token,
+# and every later write of the job (each phase transition, the archive location, the
+# final state) is a conditional UPDATE ``WHERE lease_owner = <token>`` that also renews
+# the lease. A delivery that cannot claim the job returns without touching it, whatever
+# state it loaded (DISCOVERED, HASHING, ... ARCHIVING). A worker whose lease was taken
+# away (``recover_stale_jobs``) stops at its next write instead of overwriting the row.
+
+# A worker owns the job (holds its lease) while it is in one of these states.
+ACTIVE_IMPORT_STATES = (
+    ImportJob.State.HASHING,
+    ImportJob.State.METADATA_EXTRACTION,
+    ImportJob.State.SIGNAL_NORMALIZATION,
+    ImportJob.State.EXTERNAL_IDENTIFICATION,
+    ImportJob.State.MATCHED,
+    ImportJob.State.ARCHIVING,
+)
+
+
+class ImportLeaseLostError(Exception):
+    """This worker no longer owns the import job; it must stop without writing."""
+
+
+def import_lease_duration() -> timedelta:
+    """How long a claim stays valid without a phase transition renewing it.
+
+    Defaults to the RQ job timeout plus five minutes: RQ kills a work horse at its job
+    timeout, so once a lease has expired its worker is gone and the job is stale.
+    """
+    seconds = int(getattr(django_settings, "BOOK_SCANNER_INGEST_LEASE_SECONDS", 0) or 0)
+    if seconds <= 0:
+        timeout = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS", 1800))
+        seconds = max(timeout, 60) + 300
+    return timedelta(seconds=seconds)
+
+
+def claim_import_job(job: ImportJob) -> bool:
+    """Atomically take exclusive ownership of ``job`` and move it to HASHING.
+
+    Only an unowned job that is waiting to run can be claimed: DISCOVERED, or FAILED
+    with a queue retry due. One conditional UPDATE decides, so of any number of
+    concurrent deliveries exactly one wins. Jobs in an active phase are never claimed
+    by a delivery, even when their lease has expired; ``recover_stale_jobs`` handles
+    those explicitly. On success ``job`` carries the lease token used by later writes.
+    """
+    now = timezone.now()
+    token = uuid.uuid4().hex
+    expires = now + import_lease_duration()
+    max_retries = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_RETRY_MAX", 0))
+    waiting = django_models.Q(state=ImportJob.State.DISCOVERED) | django_models.Q(
+        state=ImportJob.State.FAILED,
+        next_retry_at__isnull=False,
+        attempt_count__lte=max_retries,
+    )
+    unowned = django_models.Q(lease_owner="") | django_models.Q(lease_expires_at__lt=now)
+    claimed = (
+        ImportJob.objects.filter(pk=job.pk)
+        .filter(waiting & unowned)
+        .update(
+            state=ImportJob.State.HASHING,
+            lease_owner=token,
+            lease_expires_at=expires,
+            updated_at=now,
+        )
+    )
+    if not claimed:
+        return False
+    job.state = ImportJob.State.HASHING
+    job.lease_owner = token
+    job.lease_expires_at = expires
+    job.updated_at = now
+    return True
+
+
+def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False) -> None:
+    """Persist ``update_fields`` of ``job``, only while this worker still owns it.
+
+    A job without a lease (review decisions, sibling bookkeeping) is saved normally. For
+    an owned job the row is fetched and locked by primary key (``SELECT ... FOR
+    UPDATE``, unconditionally, so the lock is held whatever the row contains), the
+    owner is compared in Python, and the save happens inside that same transaction. It
+    renews the lease, or with ``release`` clears it (the job leaves the active phases).
+    Raises ``ImportLeaseLostError`` when this worker's token is no longer the owner.
+    """
+    token = job.lease_owner
+    if not token:
+        job.save(update_fields=update_fields)
+        return
+    with transaction.atomic():
+        locked = ImportJob.objects.select_for_update().filter(pk=job.pk).first()
+        if locked is None or locked.lease_owner != token:
+            raise ImportLeaseLostError(str(job.pk))
+        if release:
+            job.lease_owner = ""
+            job.lease_expires_at = None
+        else:
+            job.lease_expires_at = timezone.now() + import_lease_duration()
+        job.save(update_fields=[*update_fields, "lease_owner", "lease_expires_at"])
+
+
+def stale_import_jobs(now: datetime | None = None) -> list[ImportJob]:
+    """Jobs in an active phase whose worker is gone: lease expired, or never leased.
+
+    Rows without a lease date predate leases (or were written by an older worker);
+    they count as stale once untouched for a lease duration.
+    """
+    now = now or timezone.now()
+    lease = import_lease_duration()
+    return list(
+        ImportJob.objects.filter(state__in=ACTIVE_IMPORT_STATES)
+        .filter(
+            django_models.Q(lease_expires_at__lt=now)
+            | django_models.Q(lease_expires_at__isnull=True, updated_at__lt=now - lease),
+        )
+        .order_by("updated_at"),
+    )
+
+
+def recover_stale_import_job(job: ImportJob, reason: str) -> bool:
+    """Mark a stale job FAILED and drop its lease; False if it changed meanwhile.
+
+    Conditional on the owner, state and expiry read by ``stale_import_jobs``, so a
+    worker that renewed its lease in the meantime is not touched. The worker that held
+    the lease, if it is somehow still running, stops at its next write. The job is not
+    retried automatically (its source may be half moved): ``ingest_sources
+    --retry-failed`` re-queues it once the operator has checked the source.
+    """
+    recovered = ImportJob.objects.filter(
+        pk=job.pk,
+        state=job.state,
+        lease_owner=job.lease_owner,
+        lease_expires_at=job.lease_expires_at,
+    ).update(
+        state=ImportJob.State.FAILED,
+        last_error=f"recovered by recover_stale_jobs: {reason}",
+        next_retry_at=None,
+        lease_owner="",
+        lease_expires_at=None,
+        updated_at=timezone.now(),
+    )
+    return bool(recovered)
+
+
 def process_import_job(job_id: str) -> None:
-    """Process one intake job from staging file to durable archive and optional matching."""
+    """Process one intake job from staging file to durable archive and optional matching.
+
+    Safe to deliver more than once: only the delivery that claims the job's lease does
+    any work, and it stops as soon as it loses the lease.
+    """
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
     if job.state == ImportJob.State.COMPLETE:
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
+    if (
+        job.state == ImportJob.State.DISCOVERED
+        and job.source_location is not None
+        and job.source_location.is_paused
+    ):
+        # Leave the job DISCOVERED; ingest_sources re-queues it after resume.
+        logger.info("intake_skipped_paused_source", import_job_id=str(job.id))
+        return
+    loaded_state = job.state
+    if not claim_import_job(job):
+        # Another delivery owns the job (or it is no longer waiting to run).
+        logger.info(
+            "intake_duplicate_delivery_skipped",
+            import_job_id=str(job.id),
+            loaded_state=loaded_state,
+        )
+        return
+    try:
+        _process_claimed_import_job(job)
+    except ImportLeaseLostError:
+        logger.warning("intake_lease_lost", import_job_id=str(job.id))
 
+
+def _process_claimed_import_job(job: ImportJob) -> None:
+    """Run intake for a job this worker has claimed (``job.lease_owner`` is set)."""
     source_path = Path(job.source_path)
     if not source_path.exists():
         job.last_error = "source file missing"
         job.state = ImportJob.State.FAILED
-        job.save(update_fields=["state", "last_error", "updated_at"])
+        _save_job(job, update_fields=["state", "last_error", "updated_at"], release=True)
         return
 
     try:
-        job.state = ImportJob.State.HASHING
-        job.save(update_fields=["state", "updated_at"])
-
+        # The claim was a bulk UPDATE; save once so HASHING is observable (post_save).
+        _save_job(job, update_fields=["state", "updated_at"])
         job.sha256 = compute_sha256(job.source_path)
         job.size_bytes = source_path.stat().st_size
         detected_format, mime_type = detect_format(job.original_filename, job.mime_type or None)
@@ -2185,7 +2433,8 @@ def process_import_job(job_id: str) -> None:
         if not job.normalized_filename:
             job.normalized_filename = normalize_filename(job.original_filename)
         job.state = ImportJob.State.METADATA_EXTRACTION
-        job.save(
+        _save_job(
+            job,
             update_fields=[
                 "state",
                 "sha256",
@@ -2203,7 +2452,8 @@ def process_import_job(job_id: str) -> None:
             job.storage_identifier = duplicate_variant.storage_identifier
             job.storage_location = duplicate_variant.storage_location
             job.state = ImportJob.State.COMPLETE
-            job.save(
+            _save_job(
+                job,
                 update_fields=[
                     "state",
                     "book_id",
@@ -2212,6 +2462,7 @@ def process_import_job(job_id: str) -> None:
                     "storage_location_id",
                     "updated_at",
                 ],
+                release=True,
             )
             _finalize_source_cleanup(
                 job,
@@ -2236,7 +2487,8 @@ def process_import_job(job_id: str) -> None:
                 metadata[identification.PATH_LAYOUT_EVIDENCE_KEY] = path_hints.as_evidence()
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
-        job.save(
+        _save_job(
+            job,
             update_fields=[
                 "evidence",
                 "state",
@@ -2250,7 +2502,7 @@ def process_import_job(job_id: str) -> None:
             extracted_metadata=metadata,
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         candidates = identification.resolve_candidates(signals)
         file_authors = identification.evidence_author_names(metadata)
         decision = decide_auto_accept(candidates, file_authors)
@@ -2259,7 +2511,7 @@ def process_import_job(job_id: str) -> None:
             metadata[AUTO_ACCEPT_BLOCK_DETAILS_KEY] = decision.details
             metadata[SUGGESTED_AUTHORS_KEY] = file_authors
             job.evidence = metadata
-            job.save(update_fields=["evidence", "updated_at"])
+            _save_job(job, update_fields=["evidence", "updated_at"])
             logger.info(
                 "intake_auto_accept_blocked",
                 import_job_id=str(job.id),
@@ -2302,17 +2554,20 @@ def process_import_job(job_id: str) -> None:
             return
 
         job.state = ImportJob.State.MATCHED
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         storage = _default_storage()
         storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
-        job.save(update_fields=["state", "updated_at"])
+        _save_job(job, update_fields=["state", "updated_at"])
         destination, verified = _archive_source(storage, job)
+        # Record where the archive copy went and confirm this worker still owns the
+        # job before a MOVE source is deleted.
+        _save_job(job, update_fields=["storage_identifier", "storage_location_id", "updated_at"])
         _finalize_source_cleanup(job, verified)
         if not verified:
             raise RuntimeError("archive verification failed")
 
-        with _sibling_group_lock(job):
+        with _sibling_group_lock(job), transaction.atomic():
             book: Book | None = assessment.book if assessment is not None else None
             if book is None and _groups_sibling_formats(job):
                 # A sibling may have been linked while this file was being archived.
@@ -2331,13 +2586,15 @@ def process_import_job(job_id: str) -> None:
                         job.storage_identifier = destination
                         job.storage_location = storage_location
                         job.state = ImportJob.State.LOW_CONFIDENCE
-                        job.save(
+                        _save_job(
+                            job,
                             update_fields=[
                                 "state",
                                 "storage_identifier",
                                 "storage_location_id",
                                 "updated_at",
                             ],
+                            release=True,
                         )
                         return
                     assessment = late_assessment
@@ -2362,12 +2619,16 @@ def process_import_job(job_id: str) -> None:
                     from_review=False,
                 )
             _propagate_book_to_siblings(job, book)
+    except ImportLeaseLostError:
+        raise
     except Exception as exc:  # pragma: no cover - failure path depends on input surface
         job.last_error = str(exc)
         job.state = ImportJob.State.FAILED
         job.attempt_count += 1
         job.next_retry_at = datetime.now(tz=UTC)
-        job.save(
+        # Raises ImportLeaseLostError (no retry) if another owner took over meanwhile.
+        _save_job(
+            job,
             update_fields=[
                 "state",
                 "last_error",
@@ -2375,6 +2636,7 @@ def process_import_job(job_id: str) -> None:
                 "next_retry_at",
                 "updated_at",
             ],
+            release=True,
         )
         logger.error(
             "intake_failed",
