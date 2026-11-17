@@ -12,8 +12,8 @@ is present on the worker.
 | PDF | EPUB | Calibre | `ebook-convert` + OCR-prep if scanned PDF | mixed (scanned PDFs degrade) | yes | optional if scanned | implemented; representative digital-PDF metadata/text quality verified in CI |
 | HTML | EPUB | Pandoc | Calibre | good for structured HTML | yes | no | implemented; Pandoc 3.9.0.2 semantic-content quality verified in CI |
 | TXT | EPUB | Pandoc | Calibre | fair (formatting limited) | yes | no | implemented; Pandoc 3.9.0.2 binary-verified in CI |
-| AZW / AZW3 / PRC | EPUB | Calibre `ebook-convert` | none | good for DRM-free files | yes | no | implemented; not yet binary-verified in CI |
-| RTF | EPUB | Calibre `ebook-convert` | Pandoc | fair | yes | no | implemented; not yet binary-verified in CI |
+| AZW / AZW3 / PRC | EPUB | Calibre `ebook-convert` | none | good for DRM-free files | yes | no | intake only (#23); conversion disabled until binary-verified in CI |
+| RTF | EPUB | Calibre `ebook-convert` | Pandoc | fair | yes | no | intake only (#23); conversion disabled until binary-verified in CI |
 | FB2 | EPUB | Calibre `ebook-convert` | none | good | yes | no | researched; not advertised |
 | DjVu -> EPUB/PDF | DjVuLibre text extraction then conversion | Calibre if supported in deployment | manual fallback | uncertain | yes | maybe | researched; not advertised |
 | CBZ/CBR extraction | Standard ZIP / RarFile and configured archive tool | libarchive/7zip | n/a | good if source clean | no | no | bounded intake implemented; conversion not advertised |
@@ -24,6 +24,11 @@ is present on the worker.
 
 - Pandoc 3.9.0.2 test archives are fetched from the upstream release and verified
   against the publisher's SHA-256 before execution on amd64 or arm64.
+- AZW, AZW3, PRC and RTF files are accepted, validated, previewed and downloadable
+  as uploaded, but no conversion route is advertised or accepted for them. Enabling
+  one requires real `ebook-convert` acceptance coverage (readable output, recorded
+  provenance, DRM-protected input failing cleanly) like the routes above, per
+  Sprint020's out-of-scope rule for unverified routes.
 - Calibre remains optional and runtime-detected. CI verifies EPUB-to-PDF/MOBI and
   representative reverse PDF/MOBI-to-EPUB routes against pinned Calibre 9.11.0,
   including canonical metadata and visible-text preservation.

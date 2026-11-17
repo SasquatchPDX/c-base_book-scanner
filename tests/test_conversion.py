@@ -456,20 +456,44 @@ def test_unknown_converter_capability_is_not_advertised(
 
 
 @pytest.mark.parametrize("source_format", ["azw", "azw3", "prc", "rtf"])
-def test_kindle_family_and_rtf_variants_convert_to_epub_via_calibre(
+def test_kindle_family_and_rtf_variants_have_no_unverified_conversion_routes(
     monkeypatch: pytest.MonkeyPatch,
     source_format: str,
 ) -> None:
+    """#23 accepts these formats for intake only: no route is binary-verified yet.
+
+    Even with Calibre (and Pandoc) available, nothing is advertised or plannable from
+    them, and a persisted route through them is rejected.
+    """
+
     class AvailableCalibre(conversion.CalibreConverter):
         def is_available(self) -> bool:
             return True
 
-    monkeypatch.setattr(conversion, "CONVERTER_REGISTRY", {"calibre": AvailableCalibre()})
+    class AvailablePandoc(conversion.PandocConverter):
+        def is_available(self) -> bool:
+            return True
 
-    plan = conversion.find_conversion_plan(source_format, "epub")
+    monkeypatch.setattr(
+        conversion,
+        "CONVERTER_REGISTRY",
+        {"calibre": AvailableCalibre(), "pandoc": AvailablePandoc()},
+    )
 
-    assert plan is not None
-    assert [step.converter for step in plan.steps] == ["calibre"]
+    assert conversion.list_conversion_targets(source_format) == {}
+    for target in ("epub", "pdf", "mobi", "txt"):
+        assert conversion.find_conversion_plan(source_format, target) is None
+    assert all(
+        source_format not in (capability.source_format, capability.target_format)
+        for capability in conversion.CAPABILITIES
+    )
+    with pytest.raises(conversion.ConversionError, match="unsupported step"):
+        conversion._validate_route(
+            source_format=source_format,
+            target_format="epub",
+            route=(conversion.ConversionStep(source_format, "epub", "calibre"),),
+        )
+    # Variants of these formats still carry a real MIME type for download.
     assert conversion.FORMAT_TO_MIME[source_format] != "application/octet-stream"
 
 

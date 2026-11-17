@@ -134,15 +134,14 @@ CONVERTER_REGISTRY: dict[str, Converter] = {
     "pandoc": PandocConverter(),
 }
 
+# Only routes with binary-verified acceptance evidence are advertised (Sprint020). AZW,
+# AZW3, PRC and RTF are intake formats (#23) but stay without conversion routes until
+# real ebook-convert acceptance coverage exists; see docs/conversion-matrix.md.
 CAPABILITIES: tuple[ConversionCapability, ...] = (
     ConversionCapability("epub", "pdf", "calibre"),
     ConversionCapability("pdf", "epub", "calibre"),
     ConversionCapability("epub", "mobi", "calibre"),
     ConversionCapability("mobi", "epub", "calibre"),
-    ConversionCapability("azw", "epub", "calibre"),
-    ConversionCapability("azw3", "epub", "calibre"),
-    ConversionCapability("prc", "epub", "calibre"),
-    ConversionCapability("rtf", "epub", "calibre"),
     ConversionCapability("epub", "txt", "calibre"),
     ConversionCapability("pdf", "txt", "calibre"),
     ConversionCapability("html", "epub", "pandoc"),
