@@ -162,8 +162,13 @@ see `docs/operations.md`).
   (`finished_at`, `sans_last_line_no`, `pages`, `covers`, `metadata_opf`):
   - `200 {"verified": true, "state": "captured", "portal_url"}`: every listed item is
     held with exactly that active checksum and the event high-water marks agree. The job
-    moves `open`/`capturing` -> `captured`. Repeating it, or calling it once the job is
-    `captured`, `finalizing` or `complete`, answers `200` again and changes nothing.
+    moves `open`/`capturing` -> `captured` and serif stores a digest of the verified
+    manifest (its items and `sans_last_line_no`; not `finished_at`).
+  - Once the job is `captured`, `finalizing` or `complete`, repeating the verified
+    manifest (items in any order) answers `200` again and changes nothing. Any other
+    manifest is checked against what serif holds now: `200` only if every listed item is
+    held and the high-water marks agree, else `409 incomplete`. Success is never answered
+    from the job state alone, because a `200` lets the scanner delete its local copy.
   - `409 incomplete`: `details.missing` and `details.mismatched` list item keys
     (`page:<n>`, `cover:<position>`, `metadata_opf`, `events`); `details.sans_last_line_no`
     is serif's high-water mark. The job stays where it was.
@@ -181,11 +186,13 @@ see `docs/operations.md`).
 what serif holds, its JSON status and how the request's field is parsed. Only pages exist
 so far. Until a feature is stored on serif it is "nothing expected":
 
-- a field with no registered source is left out of `GET jobs/{id}` and ignored in a
-  `capture-complete` request (covers until S4, `metadata_opf` until S6). `metadata_opf`
-  may be `null` either way;
+- a field with no registered source is left out of `GET jobs/{id}` (covers until S4,
+  `metadata_opf` until S6). In a `capture-complete` request it **fails closed**: an empty
+  value (`null` or `[]`) is accepted, but every declared item is reported `missing`
+  (`cover:front`, `cover:back`, `metadata_opf`), because serif cannot have stored it;
 - the event high-water mark is `0` until S5 stores `scan.jsonl` lines, and
-  `capture-complete` compares the request's `sans_last_line_no` with that `0`.
+  `capture-complete` compares the request's `sans_last_line_no` with that `0`, so any
+  later line is `mismatched` (`events`).
 
 S4 and S6 call `scan_manifest.register_manifest_source(...)`; S5 calls
 `scan_manifest.register_event_high_water_mark(...)`.

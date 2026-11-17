@@ -852,6 +852,9 @@ class ScanJob(models.Model):
     # Finish Book time from that request.
     captured_at = models.DateTimeField(null=True, blank=True)
     capture_finished_at = models.DateTimeField(null=True, blank=True)
+    # SHA-256 of the manifest capture-complete verified (items and event high-water
+    # mark): an identical retry answers 200 again, any other manifest is re-checked.
+    capture_manifest_sha256 = models.CharField(max_length=64, blank=True, default="")
     # A replacement page arrived after the job was complete (§5): the job is back in
     # `captured` and its existing library variants stay until the next finish.
     refinish_needed = models.BooleanField(default=False)
