@@ -56,6 +56,7 @@ from . import (
     book_deletion,
     conversion,
     intake,
+    intake_progress,
     ocr,
     review_identification,
     scan_identification,
@@ -3567,6 +3568,22 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
     if _wants_html(request):
         return redirect("imports-status", job_id=job.id)
     return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
+
+
+@require_GET
+@login_required
+def intake_progress_view(request: HttpRequest) -> HttpResponseBase:
+    """Admin page: how much is still left to import, per source, uploads and scanner.
+
+    Database aggregates only (``core.intake_progress``); nothing is scanned or hashed.
+    """
+    profile = _active_library_profile(request)
+    if profile is None or not profile.is_admin():
+        return HttpResponseForbidden()
+    progress = intake_progress.intake_progress()
+    if _wants_html(request):
+        return render(request, "core/intake_progress.html", {"progress": progress})
+    return JsonResponse(progress)
 
 
 @require_GET

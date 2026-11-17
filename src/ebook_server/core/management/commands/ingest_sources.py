@@ -7,10 +7,8 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand, CommandError
-from django.db.models import Count, Sum
-from django.db.models.functions import Coalesce
 
-from ebook_server.core import intake
+from ebook_server.core import intake, intake_progress
 from ebook_server.core.intake import IntakeError
 from ebook_server.core.models import ImportJob, SourceLocation
 from ebook_server.jobs import enqueue
@@ -205,18 +203,5 @@ class Command(BaseCommand):
 
     @staticmethod
     def _source_status(location: SourceLocation) -> dict[str, Any]:
-        jobs = ImportJob.objects.filter(source_location=location)
-        pending = jobs.filter(state__in=intake.PENDING_ARCHIVE_STATES).aggregate(
-            files=Count("id"),
-            total=Sum(Coalesce("source_size", "size_bytes")),
-        )
-        return {
-            "source_location_id": location.id,
-            "name": location.name,
-            "transfer_mode": location.transfer_mode,
-            "pending_files": pending["files"] or 0,
-            "pending_bytes": int(pending["total"] or 0),
-            "needs_review": jobs.filter(state=ImportJob.State.LOW_CONFIDENCE).count(),
-            "complete": jobs.filter(state=ImportJob.State.COMPLETE).count(),
-            "failed": jobs.filter(state=ImportJob.State.FAILED).count(),
-        }
+        # Shared with the admin intake-progress page.
+        return intake_progress.source_status(location)

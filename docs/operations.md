@@ -483,6 +483,12 @@ uv run python manage.py ingest_sources --status
 uv run python manage.py ingest_sources --source-id 1 --status --json
 ```
 
+Admins see the same numbers in the web app at **Intake** (`/library/intake/`,
+JSON without `?view=html`): one row per source with a completion bar, plus web
+uploads and scan jobs still in progress. The page reads database counts only (no
+filesystem walk, no hashing) and refreshes every 30 seconds. Files a source has
+not been scanned for yet appear once `ingest_sources` has discovered them.
+
 ### Source transfer modes
 
 Choose the mode per source in Django admin (`Source locations`). Existing sources

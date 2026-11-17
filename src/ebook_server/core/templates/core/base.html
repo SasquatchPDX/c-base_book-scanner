@@ -16,7 +16,7 @@
         <a href="{% url 'imports-upload' %}">Upload</a>
         <a href="{% url 'review-queue' %}?view=html">Reviews</a>
         <a href="{% url 'scan-jobs' %}?view=html">Scanning</a>
-        {% if request.user.is_staff %}<a href="/admin/">Admin</a>{% endif %}
+        {% if request.user.is_staff %}<a href="{% url 'intake-progress' %}?view=html">Intake</a><a href="/admin/">Admin</a>{% endif %}
       </nav>
     <span class="identity">{{ request.user.username }}</span>
     <form class="logout-form" method="post" action="{% url 'library-logout' %}">
