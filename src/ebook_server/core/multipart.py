@@ -825,7 +825,7 @@ def maybe_open_review(group: ImportGroup) -> ReviewTask | None:
             # task and its candidates to the new lead so actions apply consistently.
             task.import_job = lead
         intake._save_metadata_candidates(
-            lead, candidates, signals=signals, outcomes=outcomes, allow_match=False
+            lead, candidates, signals=signals, outcomes=outcomes, passed_over=candidates
         )
         folder_name = Path(locked.folder).name
         title = signals.best_title() or folder_name
@@ -1319,7 +1319,7 @@ def identify_split_part(job_id: str) -> None:
     )
     candidates, outcomes = identification.resolve_candidates_with_report(signals)
     file_authors = identification.evidence_author_names(metadata)
-    decision = intake.decide_auto_accept(candidates, file_authors)
+    decision = intake.decide_auto_accept(candidates, file_authors, file_evidence=signals)
     with transaction.atomic():
         job = ImportJob.objects.select_for_update().get(pk=job_id)
         if (
@@ -1334,12 +1334,16 @@ def identify_split_part(job_id: str) -> None:
             metadata[intake.SUGGESTED_AUTHORS_KEY] = file_authors
             job.evidence = metadata
             job.save(update_fields=["evidence", "updated_at"])
+        elif decision.tie_break is not None:
+            metadata[intake.AUTO_ACCEPT_TIE_BREAK_KEY] = decision.tie_break
+            job.evidence = metadata
+            job.save(update_fields=["evidence", "updated_at"])
         intake._save_metadata_candidates(
             job,
             candidates,
             signals=signals,
             outcomes=outcomes,
-            allow_match=decision.blocked_reason is None,
+            passed_over=decision.passed_over,
         )
         if decision.candidate is None:
             intake._create_review_task(job=job, candidates=candidates)

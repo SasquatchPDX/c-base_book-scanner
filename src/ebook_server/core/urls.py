@@ -134,6 +134,16 @@ urlpatterns = [
         name="library-book-ocr",
     ),
     path(
+        "library/books/<int:book_id>/combine-parts/",
+        views.library_book_combine_parts,
+        name="library-book-combine-parts",
+    ),
+    path(
+        "combine-jobs/<uuid:job_id>/",
+        views.combine_job_status,
+        name="combine-job-status",
+    ),
+    path(
         "conversions/<uuid:job_id>/",
         views.conversion_job_status,
         name="conversion-job-status",
@@ -188,6 +198,11 @@ urlpatterns = [
         "reviews/<int:task_id>/search-again/",
         views.review_search_again,
         name="review-search-again",
+    ),
+    path(
+        "reviews/<int:task_id>/isbn-lookup/",
+        views.review_isbn_lookup,
+        name="review-isbn-lookup",
     ),
     path(
         "reviews/<int:task_id>/edit-search-terms/",

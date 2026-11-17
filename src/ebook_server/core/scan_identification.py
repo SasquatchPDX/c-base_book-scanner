@@ -6,13 +6,14 @@ from datetime import datetime
 from typing import Any
 
 import structlog
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
 from ebook_server.jobs import get_queue
 
-from . import identification, metadata_search
+from . import identification, metadata_search, review_accept
 from .models import MetadataSearch, ProcessingJob, ReviewTask, ScanJob
 
 logger = structlog.get_logger(__name__)
@@ -157,7 +158,11 @@ def request_scan_identification(
     with transaction.atomic():
         locked = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
         search_terms = terms if terms is not None else _provisional_terms(locked)
-        if not search_terms.get("title") and not search_terms.get("authors"):
+        if (
+            not search_terms.get("title")
+            and not search_terms.get("authors")
+            and not metadata_search.is_isbn_terms(search_terms)
+        ):
             raise ScanIdentificationError("a provisional title or author is required")
         active = (
             ProcessingJob.objects.select_for_update()
@@ -267,6 +272,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         processing_job.save(update_fields=["state", "started_at", "finished_at", "details"])
 
     scan_job: ScanJob | None = None
+    mode = "text"
     signals: identification.IdentificationInput | None = None
     outcomes: list[identification.ProviderOutcome] | None = None
     search_started_at = timezone.now()
@@ -275,7 +281,11 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         if scan_job.book_id is not None:
             raise ScanIdentificationError("scan job is already linked to a book")
         terms = details.get("terms")
-        signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
+        if metadata_search.is_isbn_terms(terms):
+            mode = "isbn"
+            signals = metadata_search.isbn_signals(str(terms["isbn"]))
+        else:
+            signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
         candidates, outcomes = identification.resolve_candidates_with_report(signals)
         with transaction.atomic():
             # Same lock order as request_scan_identification and review resolution.
@@ -297,6 +307,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 requested_by_id=details.get("requested_by_user_id"),
                 started_at=search_started_at,
                 discarded=reason,
+                mode=mode,
             )
             metadata_search.save_candidates(
                 search=search,
@@ -323,6 +334,15 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                     "error": "",
                 }
                 locked_job.save(update_fields=["state", "finished_at", "details"])
+        auto_accepted = None
+        if not reason and mode == "isbn" and task_id is not None:
+            auto_accepted = _auto_accept_isbn_match(
+                processing_job=processing_job,
+                scan_job=scan_job,
+                task_id=task_id,
+                isbn=str(details["terms"]["isbn"]),
+                requested_by_id=details.get("requested_by_user_id"),
+            )
         logger.info(
             "scan_identification_succeeded",
             processing_job_id=str(processing_job.job_id),
@@ -331,6 +351,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             review_task_id=task_id,
             published=not reason,
             discarded=reason,
+            auto_accepted_candidate_id=auto_accepted,
         )
     except Exception as exc:
         rq_job = get_current_job() if raise_on_error else None
@@ -354,6 +375,7 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 started_at=search_started_at,
                 exc=exc,
                 discarded=discarded,
+                mode=mode,
             )
         logger.exception(
             "scan_identification_failed",
@@ -364,6 +386,57 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
         )
         if raise_on_error:
             raise
+
+
+def _auto_accept_isbn_match(
+    *,
+    processing_job: ProcessingJob,
+    scan_job: ScanJob,
+    task_id: int,
+    isbn: str,
+    requested_by_id: int | None,
+) -> int | None:
+    """Accept the one book whose provider record carries the reviewer's ISBN (#59).
+
+    Same rule and fencing as for import reviews: only while this job is still the
+    scan's current search, the scan has no book and its review is unresolved.
+    """
+    try:
+        with transaction.atomic():
+            locked_scan = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
+            task = ReviewTask.objects.select_for_update().get(pk=task_id)
+            if (
+                locked_scan.current_search_job_id != processing_job.job_id
+                or locked_scan.book_id is not None
+                or task.state not in {ReviewTask.State.OPEN, ReviewTask.State.CLAIMED}
+            ):
+                return None
+            candidate = review_accept.auto_acceptable_isbn_candidate(
+                metadata_search.current_candidates(task), isbn
+            )
+            if candidate is None:
+                return None
+            reviewer = (
+                get_user_model().objects.filter(pk=requested_by_id).first()
+                if requested_by_id is not None
+                else None
+            )
+            review_accept.accept_candidate(
+                task=task,
+                candidate=candidate,
+                reviewer=reviewer,
+                isbn=isbn,
+                decision_notes=f"Accepted candidate {candidate.id}: ISBN {isbn} verified",
+                extra_payload={"resolution_source": "reviewer_isbn", "isbn": isbn},
+            )
+            return candidate.id
+    except Exception:  # the review stays open with the verified candidate shown
+        logger.exception(
+            "scan_isbn_auto_accept_failed",
+            processing_job_id=str(processing_job.job_id),
+            review_task_id=task_id,
+        )
+        return None
 
 
 def _review_closed(scan_job: ScanJob, details: dict[str, Any]) -> bool:
@@ -415,6 +488,7 @@ def _record_failed_search(
     started_at: datetime,
     exc: Exception,
     discarded: str = "",
+    mode: str = "text",
 ) -> None:
     stage = "saving the results failed" if outcomes is not None else "the search failed"
     try:
@@ -428,6 +502,7 @@ def _record_failed_search(
             started_at=started_at,
             error=f"{stage}: {type(exc).__name__}",
             discarded=discarded,
+            mode=mode,
         )
     except Exception:  # never mask the original failure
         logger.exception(

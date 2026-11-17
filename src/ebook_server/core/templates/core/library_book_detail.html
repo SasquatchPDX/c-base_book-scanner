@@ -30,6 +30,11 @@
 {% empty %}<p>No downloadable variants are ready.</p>{% endfor %}
   </div>
   </section>
+  {% if combine_options %}<section><h2>Combine parts</h2><p class="muted">This book is stored as separate part files. A combined file is a new download built from the parts in the order shown above; the parts stay as they are.</p><div class="conversion-grid">
+    {% for option in combine_options %}{% if option.combined_variant_id %}<p>{{ option.format|upper }}: combined file available above.</p>{% else %}<form method="post" action="{% url 'library-book-combine-parts' book.id %}">{% csrf_token %}<input type="hidden" name="target_format" value="{{ option.format }}"><button type="submit">Combine {{ option.part_count }} {{ option.format|upper }} parts into one file</button></form>{% endif %}{% endfor %}
+    </div>
+    </section>
+  {% endif %}
   {% if conversion_options %}<section><h2>Convert</h2><div class="conversion-grid">
     {% for option in conversion_options %}<form method="post" action="{% url 'library-book-convert' book.id %}">{% csrf_token %}<input type="hidden"
        name="source_variant_id"

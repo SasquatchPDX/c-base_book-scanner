@@ -12,7 +12,7 @@ from django.contrib.auth.models import User
 from django.db import connection
 from django.test import Client
 
-from ebook_server.core import covers, intake, review_batch, views
+from ebook_server.core import covers, intake, review_accept, review_batch
 from ebook_server.core.models import (
     AppUserProfile,
     FileVariant,
@@ -488,7 +488,7 @@ def test_batch_accept_dispatches_no_cover_job_for_rolled_back_task(
     bad = _make_task(owner.user, "bad", [0.95])
     queue = _RecordingQueue()
     monkeypatch.setattr(intake, "get_queue", lambda: queue)
-    original = views._resolve_review_source
+    original = review_accept.resolve_review_source
 
     def failing_after_resolve(**kwargs: Any) -> FileVariant | None:
         variant = original(**kwargs)
@@ -496,7 +496,7 @@ def test_batch_accept_dispatches_no_cover_job_for_rolled_back_task(
             raise RuntimeError("simulated failure after the cover was scheduled")
         return variant
 
-    monkeypatch.setattr(views, "_resolve_review_source", failing_after_resolve)
+    monkeypatch.setattr(review_accept, "resolve_review_source", failing_after_resolve)
 
     response = _client(owner).post(
         "/reviews/batch-accept/",

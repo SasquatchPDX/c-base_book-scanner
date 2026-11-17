@@ -1045,3 +1045,23 @@ def test_batch_accept_leaves_multipart_for_individual_review(
     task.refresh_from_db()
     assert task.state == ReviewTask.State.OPEN
     assert ImportGroup.objects.get().state == ImportGroup.State.PENDING
+
+
+@pytest.mark.django_db(transaction=True)
+def test_group_review_keeps_high_scoring_candidates_for_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _library(tmp_path, monkeypatch)
+    _stub_provider(monkeypatch, title="Learning Widgets", authors=["Ada Example"])
+    monkeypatch.setattr(intake, "AUTO_ACCEPT_SCORE", 0.1)
+    root = tmp_path / "share"
+    _split_book_folder(root)
+    _ingest(_location(root, SourceLocation.TransferMode.COPY))
+
+    task = ReviewTask.objects.get(task_type=ReviewTask.TaskType.MULTIPART_WORK)
+    assert task.import_job is not None
+    candidate = task.import_job.metadata_candidates.get()
+    assert float(candidate.score) >= intake.AUTO_ACCEPT_SCORE
+    assert candidate.state == candidate.CandidateState.REVIEW
+    assert task.state == ReviewTask.State.OPEN
+    assert not Book.objects.exists()
