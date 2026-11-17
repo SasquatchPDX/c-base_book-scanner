@@ -185,23 +185,23 @@ def test_not_authors(stem: str, header: str, rejected: str) -> None:
 @pytest.mark.parametrize(
     ("filename", "header", "first_author", "absent"),
     [
-        ("Weber, David - On Basilisk Station.txt", "Baen Books\n", "Weber, David", "Baen Books"),
+        ("Weber, David - On Basilisk Station.txt", "Baen Books\n", "David Weber", "Baen Books"),
         (
             "Weber, David - On Basilisk Station.txt",
             "Baen Books\nOn Basilisk Station\nDavid Weber\n",
-            "Weber, David",
+            "David Weber",
             "Baen Books",
         ),
         (
             "Robinson, Kim Stanley - Red Mars.txt",
             "SCIENCE FICTION\nRed Mars\nKim Stanley Robinson\n",
-            "Robinson, Kim Stanley",
+            "Kim Stanley Robinson",
             "Science Fiction",
         ),
         (
             "Robinson, Kim Stanley - Red Mars.txt",
             "SCIENCE FICTION\nRed Mars\n",
-            "Robinson, Kim Stanley",
+            "Kim Stanley Robinson",
             "Red Mars",
         ),
     ],
@@ -262,24 +262,24 @@ def test_likely_authors_follow_filename_authors() -> None:
     signals = _signals("Count Zero - Unknown.txt", "COUNT ZERO\nWilliam Gibson\n" + BODY)
     # "Count Zero" is the title and "Unknown" a placeholder, so neither is an author.
     assert signals.author_hints == ["William Gibson"]
-    assert signals.title_hints[:2] == ["Count Zero - Unknown", "Count Zero"]
+    assert signals.title_hints[0] == "Count Zero"
 
     signals = _signals(
         "Weber, David - On Basilisk Station.txt", "On Basilisk Station\nDavid Weber\n" + BODY
     )
-    assert signals.author_hints == ["Weber, David"]  # same person, not repeated
+    assert signals.author_hints == ["David Weber"]  # same person, not repeated
 
     signals = _signals("Emma - Jane Austen.txt", "EMMA\nAnne Elliot\n" + BODY)
     assert signals.author_hints == ["Jane Austen", "Anne Elliot"]
 
 
-def test_without_header_signals_are_unchanged() -> None:
+def test_without_header_keeps_parsed_filename_author() -> None:
     signals = build_identification_input(
         source_path="/x/Emma - Jane Austen.txt",
         original_filename="Emma - Jane Austen.txt",
         extracted_metadata={"title": "Emma - Jane Austen"},
     )
-    assert signals.author_hints == ["Emma", "Jane Austen"]
+    assert signals.author_hints == ["Jane Austen", "Emma"]
 
 
 def test_text_intake_records_hints_but_not_book_text(tmp_path: Path) -> None:
@@ -304,19 +304,19 @@ REVIEW_PROBES = [
     (
         "Austen, Jane - Emma.txt",
         "Foreword by Virginia Woolf\nEmma\nJane Austen\n",
-        "Austen, Jane",
+        "Jane Austen",
         "Virginia Woolf",
     ),
     (
         "Orwell, George - 1984.txt",
         "1984\nAn Introduction by Thomas Pynchon\nGeorge Orwell\n",
-        "Orwell, George",
+        "George Orwell",
         "Thomas Pynchon",
     ),
     (
         "London, Jack - White Fang.txt",
         "JACK LONDON\nWHITE FANG\n",
-        "London, Jack",
+        "Jack London",
         "White Fang",
     ),
 ]

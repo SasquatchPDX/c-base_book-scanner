@@ -31,6 +31,11 @@ test("a member completes digital intake, review, search, download, and conversio
 
     await member.getByRole("link", { name: "Resolve metadata" }).click();
     await member.getByRole("link", { name: title }).click();
+    // Title, author and language match, but the file names another publisher than the
+    // provider's edition, so the import was held for review instead of auto-accepted.
+    await expect(member.locator('[data-block-reason="edition_conflict"]')).toContainText(
+      "describes another edition than the file",
+    );
     await expect(member.locator(".candidate-list")).toContainText("Ada Digital");
 
     // The reviewer can read the actual file in the collapsed-by-default reader panel.
