@@ -164,6 +164,10 @@ class SourceLocationAdmin(admin.ModelAdmin[SourceLocation]):
                 "fields": ("path_layouts", "author_name_order", "layout_ignore_values"),
             },
         ),
+        (
+            "Formats of one book",
+            {"fields": ("group_sibling_formats",)},
+        ),
     )
 
 
