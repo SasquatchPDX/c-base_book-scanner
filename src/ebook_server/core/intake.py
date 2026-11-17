@@ -300,6 +300,10 @@ SUGGESTED_AUTHORS_KEY = "suggested_authors"
 BLOCK_NO_PROVIDER_AUTHORS = "no_provider_authors"
 # The provider's authors and the file's embedded authors name different people.
 BLOCK_AUTHOR_CONFLICT = "author_conflict"
+# The candidate was found only through search terms a local LLM proposed (#26). An LLM
+# guess is the weakest evidence the system has, so such candidates always need a person.
+BLOCK_LLM_DERIVED = "llm_derived"
+LLM_HINT_SOURCE_KEY = "_hint_source"
 # Several different books tie for the best score and pass the author checks.
 BLOCK_AMBIGUOUS_TIE = "ambiguous_tie"
 # The provider record stands for another edition than the file: its ISBNs, language or
@@ -351,6 +355,8 @@ def _block_reason(
     conflicts found, which are reported even when an author check blocks first.
     """
     conflicts = identification.edition_conflicts(candidate, file_evidence)
+    if isinstance(candidate.raw, dict) and candidate.raw.get(LLM_HINT_SOURCE_KEY) == "llm":
+        return BLOCK_LLM_DERIVED, conflicts
     reason = _author_block_reason(candidate, file_authors)
     if reason is None and conflicts:
         reason = BLOCK_EDITION_CONFLICT
@@ -389,6 +395,7 @@ def decide_auto_accept(
     """Pick the candidate to accept without review, or record why there is none.
 
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
+    Candidates found through LLM-proposed search terms require human review.
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
     is no evidence about authorship. The candidate must also be the file's edition:
@@ -3437,6 +3444,12 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             needs_review = True
         if needs_review:
             _archive_for_review(job, candidates)
+            if assessment is None:
+                # Weak or no signal: the local LLM may propose better search terms (#26).
+                # Off by default; never blocks or fails the import.
+                from . import llm_identification
+
+                llm_identification.maybe_request_after_intake(job, candidates)
             return
 
         job.state = ImportJob.State.MATCHED

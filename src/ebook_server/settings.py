@@ -128,6 +128,22 @@ class Settings(BaseSettings):
     ocr_submit_timeout: float | None = None
     ocr_job_timeout_seconds: int | None = None
     converter_timeout_seconds: int | None = None
+    # Local LLM as an identification signal (#26). Off by default; see
+    # docs/metadata-providers.md.
+    # The service must be a loopback/private address or listed in llm_allowed_hosts.
+    llm_enabled: bool = False
+    llm_service_url: str = "http://127.0.0.1:11434"
+    llm_model: str = ""
+    llm_api_key: SecretStr = SecretStr("")
+    llm_allowed_hosts: list[str] = []
+    llm_request_timeout: float = 60.0
+    llm_max_tokens: int = 512
+    llm_text_sample_chars: int = 4000
+    llm_queue_name: str = "llm"
+    llm_job_timeout_seconds: int = 300
+    # Automatic (fallback) requests per source location and rolling 24 hours; 0 disables
+    # the automatic trigger. Reviewer requests are not counted against it.
+    llm_daily_cap: int = 200
     secure_ssl_redirect: bool = False
     secure_hsts_seconds: int = 0
     secure_hsts_include_subdomains: bool = True
@@ -138,6 +154,14 @@ class Settings(BaseSettings):
     csrf_trusted_origins: list[str] = []
     scantailor_event_stream_interval_seconds: float = 1.0
     scantailor_event_stream_max_events: int = 45
+    # Contribution recognition (#27, docs/contributions.md). Off by default; the
+    # leaderboard additionally needs its own flag and each member's opt-in.
+    contributions_enabled: bool = False
+    leaderboard_enabled: bool = False
+    contributions_hold_days: int = 14
+    contributions_daily_soft_cap: float = 50.0
+    contributions_retention_months: int = 24
+    contributions_season: Literal["month", "quarter"] = "month"
     # How scanners deliver pages (#55): ``single_page`` (one page per image, the
     # project's own scanner) or ``spread`` (one photo holds two facing pages).
     scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
@@ -248,6 +272,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "ebook_server.core.contributions_views.contribution_flags",
             ]
         },
     }
@@ -356,10 +381,27 @@ BOOK_SCANNER_OCR_POLL_INTERVAL_MAX_SECONDS = settings.ocr_poll_interval_max_seco
 BOOK_SCANNER_OCR_SUBMIT_TIMEOUT = settings.ocr_submit_timeout
 BOOK_SCANNER_OCR_JOB_TIMEOUT_SECONDS = settings.ocr_job_timeout_seconds
 BOOK_SCANNER_CONVERTER_TIMEOUT_SECONDS = settings.converter_timeout_seconds
+BOOK_SCANNER_LLM_ENABLED = settings.llm_enabled
+BOOK_SCANNER_LLM_SERVICE_URL = settings.llm_service_url
+BOOK_SCANNER_LLM_MODEL = settings.llm_model
+BOOK_SCANNER_LLM_API_KEY = settings.llm_api_key.get_secret_value()
+BOOK_SCANNER_LLM_ALLOWED_HOSTS = settings.llm_allowed_hosts
+BOOK_SCANNER_LLM_REQUEST_TIMEOUT = settings.llm_request_timeout
+BOOK_SCANNER_LLM_MAX_TOKENS = settings.llm_max_tokens
+BOOK_SCANNER_LLM_TEXT_SAMPLE_CHARS = settings.llm_text_sample_chars
+BOOK_SCANNER_LLM_QUEUE_NAME = settings.llm_queue_name
+BOOK_SCANNER_LLM_JOB_TIMEOUT_SECONDS = settings.llm_job_timeout_seconds
+BOOK_SCANNER_LLM_DAILY_CAP = settings.llm_daily_cap
 BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds
 SCANTAILOR_EVENT_STREAM_MAX_EVENTS = settings.scantailor_event_stream_max_events
+BOOK_SCANNER_CONTRIBUTIONS_ENABLED = settings.contributions_enabled
+BOOK_SCANNER_LEADERBOARD_ENABLED = settings.leaderboard_enabled
+BOOK_SCANNER_CONTRIBUTIONS_HOLD_DAYS = settings.contributions_hold_days
+BOOK_SCANNER_CONTRIBUTIONS_DAILY_SOFT_CAP = settings.contributions_daily_soft_cap
+BOOK_SCANNER_CONTRIBUTIONS_RETENTION_MONTHS = settings.contributions_retention_months
+BOOK_SCANNER_CONTRIBUTIONS_SEASON = settings.contributions_season
 BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
 BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 
