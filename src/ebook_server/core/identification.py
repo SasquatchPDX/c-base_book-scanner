@@ -6,6 +6,7 @@ import dataclasses
 import importlib
 import json
 import re
+import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,7 @@ from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
 from rapidfuzz.utils import default_process
 
 from .languages import normalize_language, normalize_languages
-from .rate_limit import throttle_provider
+from .rate_limit import RateLimitWaitExceeded, throttle_provider
 
 logger = structlog.get_logger(__name__)
 
@@ -135,6 +136,64 @@ class MetadataProvider(Protocol):
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return raw candidate dicts from external metadata source."""
+
+
+class ProviderRequestError(OSError):
+    """A metadata provider could not answer the request.
+
+    Distinct from "no results": the provider timed out, was unreachable, answered
+    with an HTTP error, rate limited us or returned a malformed response. ``reason``
+    is a short, safe description (never a URL, query string or credential), shown
+    to reviewers and recorded on the search run.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def describe_provider_error(exc: BaseException) -> str:
+    """Short, credential-free reason for a provider failure, for reviewers and logs."""
+    if isinstance(exc, ProviderRequestError):
+        return exc.reason
+    if isinstance(exc, RateLimitWaitExceeded):
+        return "rate limited (local request budget exhausted)"
+    if isinstance(exc, HTTPError):
+        if exc.code == 429:
+            return "rate limited (HTTP 429)"
+        return f"HTTP {exc.code}"
+    if isinstance(exc, URLError):
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return "timed out"
+        return "unreachable"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timed out"
+    if isinstance(exc, (UnicodeDecodeError, json.JSONDecodeError)):
+        return "malformed response"
+    if isinstance(exc, OSError) and type(exc).__name__.endswith("ProviderError"):
+        # Provider-specific errors (e.g. Hardcover's) promise credential-free messages.
+        return str(exc)[:200] or type(exc).__name__
+    return type(exc).__name__
+
+
+@dataclass(frozen=True)
+class ProviderOutcome:
+    """What one provider did during one search run."""
+
+    provider_id: str
+    status: str  # "results" | "no_results" | "error"
+    result_count: int
+    duration_seconds: float
+    error: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "status": self.status,
+            "result_count": self.result_count,
+            "duration_seconds": round(self.duration_seconds, 3),
+            "error": self.error,
+        }
 
 
 @dataclass(frozen=True)
@@ -427,8 +486,15 @@ class OpenLibraryMetadataProvider:
         isbn: str | None = None,
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
+        isbn_error: ProviderRequestError | None = None
         if isbn:
-            isbn_candidate = self._query_isbn(isbn)
+            try:
+                isbn_candidate = self._query_isbn(isbn)
+            except ProviderRequestError as exc:
+                # Still try the text search; the failure is reported only if that
+                # finds nothing either, so it is never mistaken for "no results".
+                isbn_error = exc
+                isbn_candidate = None
             if isbn_candidate:
                 return [isbn_candidate]
 
@@ -438,21 +504,24 @@ class OpenLibraryMetadataProvider:
         if not query_parts and folder_hint:
             query_parts = [folder_hint]
         if not query_parts:
+            if isbn_error is not None:
+                raise isbn_error
             return []
-        return self._query_search(" ".join(query_parts))
+        hits = self._query_search(" ".join(query_parts))
+        if not hits and isbn_error is not None:
+            raise isbn_error
+        return hits
 
     def _query_isbn(self, isbn: str) -> dict[str, Any] | None:
         url = f"https://openlibrary.org/isbn/{isbn}.json"
         try:
             payload = self._get_json(url)
+        except HTTPError as exc:
+            if exc.code == 404:  # unknown ISBN: a genuine miss, not a failure
+                return None
+            raise self._request_error("isbn", exc) from exc
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="isbn",
-                error_type=type(exc).__name__,
-            )
-            return None
+            raise self._request_error("isbn", exc) from exc
         if not isinstance(payload, dict):
             return None
         payload = dict(payload)
@@ -518,15 +587,22 @@ class OpenLibraryMetadataProvider:
         try:
             payload = self._get_json(url)
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "metadata_provider_request_failed",
-                provider_id=self.provider_id,
-                operation="search",
-                error_type=type(exc).__name__,
-            )
-            return []
-        docs = payload.get("docs", []) if isinstance(payload, dict) else []
-        return docs if isinstance(docs, list) else []
+            raise self._request_error("search", exc) from exc
+        docs = payload.get("docs", []) if isinstance(payload, dict) else None
+        if not isinstance(docs, list):
+            raise self._request_error("search", ProviderRequestError("malformed response"))
+        return [doc for doc in docs if isinstance(doc, dict)]
+
+    def _request_error(self, operation: str, exc: BaseException) -> ProviderRequestError:
+        reason = describe_provider_error(exc)
+        logger.warning(
+            "metadata_provider_request_failed",
+            provider_id=self.provider_id,
+            operation=operation,
+            error_type=type(exc).__name__,
+            reason=reason,
+        )
+        return ProviderRequestError(reason)
 
     def _get_json(self, url: str) -> Any:
         user_agent = str(
@@ -607,24 +683,60 @@ def _provider_instances() -> list[MetadataProvider]:
 
 
 def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandidate]:
+    candidates, _outcomes = resolve_candidates_with_report(signals)
+    return candidates
+
+
+def resolve_candidates_with_report(
+    signals: IdentificationInput,
+) -> tuple[list[IdentificationCandidate], list[ProviderOutcome]]:
+    """Ranked candidates plus what every configured provider did.
+
+    A failing provider never aborts the run: it is reported as ``error`` with a
+    short reason, so a reviewer can tell "the provider was down" from "no match".
+    """
     raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
+    outcomes: list[ProviderOutcome] = []
     for provider in _provider_instances():
         started_at = perf_counter()
         try:
             raw_list = _query_provider(provider, signals)
         except Exception as exc:  # provider boundary: one provider must not abort intake
-            logger.exception(
+            duration = perf_counter() - started_at
+            reason = describe_provider_error(exc)
+            # Network-level failures are expected; only unexpected ones need a traceback.
+            log = logger.warning if isinstance(exc, OSError) else logger.exception
+            log(
                 "metadata_provider_failed",
                 provider_id=provider.provider_id,
-                duration_seconds=perf_counter() - started_at,
+                duration_seconds=duration,
                 error_type=type(exc).__name__,
+                reason=reason,
+            )
+            outcomes.append(
+                ProviderOutcome(
+                    provider_id=provider.provider_id,
+                    status="error",
+                    result_count=0,
+                    duration_seconds=duration,
+                    error=reason,
+                )
             )
             continue
+        duration = perf_counter() - started_at
         logger.info(
             "metadata_provider_completed",
             provider_id=provider.provider_id,
             candidate_count=len(raw_list),
-            duration_seconds=perf_counter() - started_at,
+            duration_seconds=duration,
+        )
+        outcomes.append(
+            ProviderOutcome(
+                provider_id=provider.provider_id,
+                status="results" if raw_list else "no_results",
+                result_count=len(raw_list),
+                duration_seconds=duration,
+            )
         )
         for candidate in raw_list:
             raw_candidates.append((provider, candidate))
@@ -638,7 +750,7 @@ def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandi
     normalized.sort(
         key=lambda item: (item.score, not edition_conflicts(item, signals)), reverse=True
     )
-    return normalized
+    return normalized, outcomes
 
 
 def _query_provider(

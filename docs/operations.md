@@ -31,6 +31,13 @@ sets `X-Accel-Buffering: no`. Tune the one-second/45-iteration defaults with
 `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`; account for the resulting
 database polling load when sizing large concurrent scanning sessions.
 
+New scan jobs default to the `single_page` capture layout, which is what the
+project's scanner produces. In that layout, ScanTailor's Page Split completes
+automatically as a recorded "no split" passthrough. If a scanner photographs
+two-page spreads, list its id in `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` (a JSON
+list). To change the default for every scanner, set
+`BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT=spread`. See `docs/scantailor-web.md`.
+
 `deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
 add site TLS/static-file policy, and keep direct Uvicorn access private.
@@ -219,10 +226,30 @@ never be copied into a deployment.
 
 ## Storage
 
-Mount NFS/SMB storage on the application and worker hosts before processes start,
-then point `BOOK_SCANNER_STORAGE_ROOT` at that mount. The web and every worker
-must see the same paths. Do not place the production collection inside the source
-checkout or application VM root disk.
+### Deployment topology: one attached storage, the VM holds only state
+
+The application VM keeps only PostgreSQL, Redis, caches and short-lived temp
+files. Every book byte lives on **one attached storage**: a writable network share
+(NFS/SMB) mounted on the application and worker hosts before processes start.
+Point `BOOK_SCANNER_STORAGE_ROOT` at that mount. The web and every worker must see
+the same paths. Do not place the production collection inside the source checkout
+or on the application VM root disk.
+
+Layout under `BOOK_SCANNER_STORAGE_ROOT`:
+
+| Path | Contents |
+| --- | --- |
+| `library-artifacts/` | The archive (`default` storage location): originals from COPY/MOVE sources and web uploads, plus **every derived artifact** (conversions, covers, OCR output), including those derived from indexed-in-place files. |
+| `scan-artifacts/` | Scanner page captures and ScanTailor-Web stage outputs. |
+| `uploads/` | Web-upload staging before archiving. |
+
+The archive directory name is fixed (`BOOK_SCANNER_ARCHIVE_DIRNAME`) so the archive
+always sits behind the storage-root mount and sentinel checks below; it is not a
+separate setting that could point back at the VM disk.
+
+An existing collection does **not** have to be copied into `library-artifacts/`.
+Register it as an index-in-place source (see "Source transfer modes") and the
+library references each file where it already is, read-only.
 
 Verify database-to-storage references regularly and after mount incidents:
 
@@ -432,10 +459,136 @@ links. The JSON response keeps one item per task, so existing clients are unaffe
 Each item gains `sibling_group` (`primary_task_id`, `task_ids`, `size`, or `null`),
 and the response gains `group_count`.
 
+### Stopping (cancelling) a source import
+
+Do not stop a bulk import with `rq empty`: it leaves DISCOVERED rows behind, and
+RQ's abandoned-job handling can still re-run the job that was in progress when
+the worker stopped. Instead run:
+
+```bash
+uv run python manage.py cancel_source_import --source-id 1          # dry run
+uv run python manage.py cancel_source_import --source-id 1 --apply  # act
+```
+
+`--apply` pauses the source and marks its import jobs that have not started
+archiving `CANCELLED`. It then deletes their RQ jobs from the queue and from the
+started, scheduled, deferred and failed registries. A cancelled job never runs again,
+even if RQ redelivers it after a worker restart. A job that is running when it is
+cancelled stops at its next phase boundary without archiving, creating a review
+task, or creating a Book, and is not retried. Cancelling clears the job's lease
+and locks its row. Each phase save of the worker locks the same row before
+checking the state, so a cancellation never commits between that check and the
+save. Jobs already `ARCHIVING` are left
+to finish, because a MOVE source may already be in the archive; `LOW_CONFIDENCE`
+jobs waiting for review are untouched. To import the cancelled files later,
+resume the source and run `ingest_sources`; they are discovered again.
+
 Use the registered source's actual ID. A supported unattended schedule and
 application preview/run/retry pages remain Sprint019 task I. COPY retains its
 source even when review is needed. MOVE cleanup requires a verified archive; for
 duplicates, verification uses the existing variant's declared backend.
+
+Per-source progress (files and bytes still waiting to be copied, or for
+index-in-place sources hashed, plus review/complete/failed counts):
+
+```bash
+uv run python manage.py ingest_sources --status
+uv run python manage.py ingest_sources --source-id 1 --status --json
+```
+
+### Source transfer modes
+
+Choose the mode per source in Django admin (`Source locations`). Existing sources
+keep their mode; new sources default to COPY.
+
+| Mode | What intake does with the file | Source access needed |
+| --- | --- | --- |
+| `copy` | Copies it into `library-artifacts/`, keeps the source. | read |
+| `move` | Copies it into `library-artifacts/`, deletes the source only after the copy's SHA-256 is verified. | read + delete |
+| `index` (index in place) | Hashes and identifies it, then records a FileVariant that **references the file where it is**. Nothing is copied; nothing on the source is ever written, moved or deleted. | read |
+
+Use `index` for a collection that already lives on the attached storage, or on
+another long-lived read-only share (for example an existing Calibre library tree:
+its `Author/Title (id)/` folders are kept as they are). Use `copy` for a transient
+source that will go away. Identification still reads the file at its original
+path, so folder-layout hints (`path_layouts`, e.g. the Calibre template above) and
+sidecar `cover.jpg` files work for indexed sources exactly as for copied ones.
+Collections in any other layout are also indexed as they are; the application does
+not reorganize or move files on the share.
+
+Index in place details:
+
+- The source gets a **read-only storage location** (`StorageLocation.read_only`).
+  By default one named `source-<id>` is created from the source root on first
+  import. To index several sub-folders of one share under a single location,
+  create a read-only storage location for the share root first and select it as
+  the source's `index storage location`; the source root must lie inside it.
+- Each referenced variant stores that location plus the path relative to it, the
+  size, the mtime and the SHA-256. Database identifiers stay authoritative;
+  changing a source's `root_path` later does not break variants already indexed.
+- Downloads, conversions, cover extraction and OCR read through the storage
+  service from that location. Derived artifacts are written to
+  `library-artifacts/`, never onto the read-only share.
+- Exact-duplicate detection is by SHA-256 across archived and referenced
+  variants. A MOVE source whose only duplicate is a referenced file is **kept**:
+  the application does not control that copy.
+- Deleting a book removes only the database records of referenced files; the
+  files stay on their share.
+- Free-space budgeting ignores index sources: they add no archive bytes.
+
+#### Drift check for referenced files
+
+The application does not own referenced bytes, so check them regularly (systemd
+timer or cron, e.g. hourly; `--verify-hashes` off peak):
+
+```bash
+uv run python manage.py check_referenced_files
+uv run python manage.py check_referenced_files --verify-hashes --json
+uv run python manage.py check_referenced_files --location source-3
+```
+
+Files whose size or mtime changed are re-hashed: identical content stays served
+(the new mtime is recorded); different content is flagged `changed`, an absent
+file `missing` (`FileVariant.reference_state`). Every download, conversion and OCR
+request also compares size/mtime first and flags on mismatch. Flagged variants
+return HTTP 409 for downloads and are refused as conversion/OCR sources; they are
+never deleted. The command exits non-zero when it finds drift or an outage.
+
+**Mount readiness.** An unmounted share usually still leaves its mount point as an
+(empty) directory, so "the directory exists" proves nothing. Before checking any
+variant on a read-only location, the check requires:
+
+- the base directory to exist, and
+- the location's `sentinel_file` (set it in admin, `Storage locations`) to exist
+  under the base path, or, when no sentinel is configured, the base directory to be
+  non-empty.
+
+Configure a sentinel for every index share (e.g. create an empty
+`.ebook-index-sentinel` at the share root and enter that name): it also catches a
+mount point that has stray local files in it. A location that fails this check is
+an **outage**: nothing on it is flagged, its variants are reported as errors and
+listed as `UNAVAILABLE storage_location:<identifier>`, a
+`referenced_storage_unavailable` error is logged, and a queued check job ends
+`failed` (`ebook_server_processing_jobs{job_type="reference_check",state="failed"}`).
+A download or conversion that finds the file absent applies the same test, so it
+is refused (409) without flagging during an outage.
+
+**Re-checking from the admin.** The admin actions never check files in the web
+request (a check stats and may re-hash every file). "Queue re-check of selected
+referenced files" (`File variants`) and "Queue re-check of all referenced files on
+selected locations" (`Storage locations`) record a `reference_check`
+`ProcessingJob` scoped to the selection and hand it to the RQ worker; the message
+links the job, whose `details` hold the report (counts, affected variant ids)
+once it finishes. Without a configured queue the job stays `queued`; run
+`uv run python manage.py check_referenced_files --run-queued` to process it.
+
+Resolve flagged variants in Django admin (`File variants`, filter by reference
+state): restore the original file and queue a re-check, or delete the stale
+variant record and re-run `ingest_sources` so the new file is indexed as a new
+variant. A changed file at an already indexed path is not silently repointed;
+its import fails with a message pointing at the drift check until the old record
+is resolved. `ebook_server_referenced_file_variants{reference_state=...}` exports
+the counts for alerting.
 
 Imported variants record their origin in `FileVariant.source_type`: `upload` for
 web uploads, otherwise the source location's `default_source_type`

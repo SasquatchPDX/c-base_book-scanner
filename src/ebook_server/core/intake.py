@@ -12,7 +12,6 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -42,7 +41,7 @@ from ebook_server.storage import (
     min_free_bytes,
 )
 
-from . import identification, source_layout
+from . import genres, identification, metadata_search, referenced_files, source_layout
 from .models import (
     Author,
     Book,
@@ -50,12 +49,13 @@ from .models import (
     Identifier,
     ImportJob,
     MetadataCandidate,
+    MetadataSearch,
     ReviewTask,
     SourceLocation,
     StorageLocation,
     clean_publication_year,
 )
-from .storage_registry import backend_for_location
+from .storage_registry import archive_root, backend_for_location, default_archive_location
 
 logger = structlog.get_logger(__name__)
 
@@ -506,19 +506,11 @@ def _decode_text_sample(payload: bytes) -> tuple[str, str]:
 
 
 def _default_storage() -> LocalFilesystemStorage:
-    base = django_settings.APP_DATA_DIR
-    return LocalFilesystemStorage(str(base / "library-artifacts"))
+    return LocalFilesystemStorage(str(archive_root()))
 
 
 def _default_storage_location() -> StorageLocation:
-    location, _ = StorageLocation.objects.get_or_create(
-        identifier="default",
-        defaults={
-            "backend": StorageLocation.BackendType.LOCAL,
-            "base_path": "default",
-        },
-    )
-    return location
+    return default_archive_location()
 
 
 def _source_transfer_mode(job: ImportJob) -> str:
@@ -528,7 +520,10 @@ def _source_transfer_mode(job: ImportJob) -> str:
 
 
 def _archive_should_preserve_source(job: ImportJob) -> bool:
-    return _source_transfer_mode(job) == "copy"
+    return _source_transfer_mode(job) in {
+        SourceLocation.TransferMode.COPY,
+        SourceLocation.TransferMode.INDEX_IN_PLACE,
+    }
 
 
 def _verify_archive(storage: StorageBackend, location: str, expected_sha: str) -> bool:
@@ -732,9 +727,13 @@ def archive_space_budget() -> ByteBudget | None:
     free = _default_storage().free_bytes()
     if free is None:
         return None
-    pending = ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES).aggregate(
-        total=django_models.Sum(Coalesce("source_size", "size_bytes")),
-    )["total"]
+    pending = (
+        ImportJob.objects.filter(state__in=PENDING_ARCHIVE_STATES)
+        .exclude(source_location__transfer_mode=SourceLocation.TransferMode.INDEX_IN_PLACE)
+        .aggregate(
+            total=django_models.Sum(Coalesce("source_size", "size_bytes")),
+        )["total"]
+    )
     return ByteBudget(remaining=max(free - reserve - int(pending or 0), 0))
 
 
@@ -790,7 +789,7 @@ def discover_source_jobs_for_location(
         ).exists()
         if active_job_exists or _already_handled(source_location, candidate, normalized):
             continue
-        if byte_budget is not None:
+        if byte_budget is not None and not referenced_files.is_index_in_place(source_location):
             try:
                 size = candidate.stat().st_size
             except OSError:
@@ -1393,31 +1392,29 @@ def _save_metadata_candidates(
     job: ImportJob,
     candidates: list[identification.IdentificationCandidate],
     *,
+    signals: identification.IdentificationInput,
+    outcomes: list[identification.ProviderOutcome],
     allow_match: bool = True,
 ) -> None:
-    """Persist candidates; ``allow_match=False`` keeps all of them in REVIEW state."""
-    # Ensure idempotence if jobs are retried.
-    MetadataCandidate.objects.filter(import_job=job).delete()
-    for candidate in candidates:
-        state = MetadataCandidate.CandidateState.REVIEW
-        if allow_match and candidate.score >= AUTO_ACCEPT_SCORE:
-            state = MetadataCandidate.CandidateState.MATCH
-        MetadataCandidate.objects.create(
+    """Record the intake search run and its candidates.
+
+    ``allow_match=False`` keeps all candidates in REVIEW state.
+    """
+    with transaction.atomic():
+        # Ensure idempotence if jobs are retried: drop the earlier intake attempt.
+        metadata_search.discard_intake_runs(job)
+        search = metadata_search.record_search(
+            trigger=MetadataSearch.Trigger.INTAKE,
+            signals=signals,
+            outcomes=outcomes,
+            candidate_count=len(candidates),
             import_job=job,
-            provider_id=candidate.provider_id,
-            provider_ref=_fit(MetadataCandidate, "provider_ref", candidate.provider_ref),
-            title=_fit(MetadataCandidate, "title", candidate.title),
-            authors=candidate.authors,
-            isbn10=_fit(MetadataCandidate, "isbn10", candidate.isbn10),
-            isbn13=_fit(MetadataCandidate, "isbn13", candidate.isbn13),
-            score=Decimal(str(candidate.score)),
-            raw_payload=candidate.raw,
-            subjects=candidate.subjects,
-            language=_fit(MetadataCandidate, "language", candidate.language),
-            publisher=_fit(MetadataCandidate, "publisher", candidate.publisher),
-            description=candidate.description or "",
-            publication_year=candidate.publication_year,
-            state=state,
+            requested_by_id=job.uploader_id,
+        )
+        metadata_search.save_candidates(
+            search=search,
+            candidates=candidates,
+            match_threshold=AUTO_ACCEPT_SCORE if allow_match else None,
         )
 
 
@@ -1549,6 +1546,7 @@ def _create_or_reuse_file_variant(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        **referenced_files.reference_fields_for_job(job),
     )
 
 
@@ -2050,7 +2048,6 @@ def _archive_for_review(
     _save_job(job, update_fields=["state", "updated_at"])
     destination, verified = _archive_source(_default_storage(), job)
     job.storage_identifier = destination
-    job.storage_location = _default_storage_location()
     _save_job(
         job,
         update_fields=[
@@ -2128,6 +2125,7 @@ def _link_variant_and_complete(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        **referenced_files.reference_fields_for_job(job),
     )
     _try_extract_front_cover(variant, job)
     job.book = book
@@ -2222,6 +2220,14 @@ def _provision_book_from_metadata(
 
 
 def _archive_source(storage: LocalFilesystemStorage, job: ImportJob) -> tuple[str, bool]:
+    """Archive the source (COPY/MOVE) or reference it in place (INDEX_IN_PLACE).
+
+    Sets ``job.storage_location``/``storage_identifier``; callers must use those rather
+    than assuming the default archive location.
+    """
+    if referenced_files.is_index_in_place(job.source_location):
+        verified = referenced_files.index_source_file(job)
+        return job.storage_identifier, verified
     storage_location = _default_storage_location()
     destination = storage.generate_destination(f"books/{job.id}", job.normalized_filename)
     # Checked per file, so a bulk import already queued still stops before the disk fills.
@@ -2284,6 +2290,10 @@ class ImportLeaseLostError(Exception):
     """This worker no longer owns the import job; it must stop without writing."""
 
 
+class ImportCancelledError(ImportLeaseLostError):
+    """An operator cancelled the running import (``cancel_source_imports``)."""
+
+
 def import_lease_duration() -> timedelta:
     """How long a claim stays valid without a phase transition renewing it.
 
@@ -2340,10 +2350,13 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
 
     A job without a lease (review decisions, sibling bookkeeping) is saved normally. For
     an owned job the row is fetched and locked by primary key (``SELECT ... FOR
-    UPDATE``, unconditionally, so the lock is held whatever the row contains), the
-    owner is compared in Python, and the save happens inside that same transaction. It
-    renews the lease, or with ``release`` clears it (the job leaves the active phases).
-    Raises ``ImportLeaseLostError`` when this worker's token is no longer the owner.
+    UPDATE``, unconditionally, so the lock is held whatever the row contains), its
+    state and owner are inspected in Python, and the save happens inside that same
+    transaction. ``cancel_source_imports`` locks the same row, so a cancellation cannot
+    commit between the check and the save. The save renews the lease, or with
+    ``release`` clears it (the job leaves the active phases). Raises
+    ``ImportCancelledError`` when the job was cancelled and ``ImportLeaseLostError``
+    when this worker's token is no longer the owner; nothing is written then.
     """
     token = job.lease_owner
     if not token:
@@ -2351,6 +2364,8 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
         return
     with transaction.atomic():
         locked = ImportJob.objects.select_for_update().filter(pk=job.pk).first()
+        if locked is not None and locked.state == ImportJob.State.CANCELLED:
+            raise ImportCancelledError(f"import job {job.pk} was cancelled")
         if locked is None or locked.lease_owner != token:
             raise ImportLeaseLostError(str(job.pk))
         if release:
@@ -2359,6 +2374,52 @@ def _save_job(job: ImportJob, update_fields: list[str], *, release: bool = False
         else:
             job.lease_expires_at = timezone.now() + import_lease_duration()
         job.save(update_fields=[*update_fields, "lease_owner", "lease_expires_at"])
+
+
+# Cancellable: queued or running, but not yet ARCHIVING (its source may already be in
+# the archive). LOW_CONFIDENCE jobs are archived and waiting for review.
+CANCELLABLE_IMPORT_STATES = tuple(
+    state for state in IN_FLIGHT_STATES if state != ImportJob.State.ARCHIVING
+)
+
+
+def cancel_source_imports(source_location: SourceLocation) -> list[str]:
+    """Pause a source and cancel its import jobs that have not started archiving.
+
+    Returns the ids of the cancelled jobs. Jobs already ARCHIVING are allowed to
+    finish, because their source file may already have been moved into the archive.
+    LOW_CONFIDENCE jobs are archived and waiting for review, so they are untouched.
+    Cancelled files are rediscovered by ``ingest_sources`` once the source is resumed.
+
+    The jobs' rows are locked (``SELECT ... FOR UPDATE``) and their lease cleared in
+    the same transaction. A worker in the middle of an owned save holds the row lock,
+    so the cancellation waits for that save to commit and then re-reads the state: a
+    job that just reached ARCHIVING is no longer cancelled. A worker whose job was
+    cancelled stops at its next save (``ImportCancelledError``) without writing.
+    """
+    with transaction.atomic():
+        SourceLocation.objects.filter(pk=source_location.pk).update(is_paused=True)
+        source_location.is_paused = True
+        ids = [
+            str(pk)
+            for pk in ImportJob.objects.select_for_update()
+            .filter(source_location=source_location, state__in=CANCELLABLE_IMPORT_STATES)
+            .values_list("pk", flat=True)
+        ]
+        ImportJob.objects.filter(pk__in=ids, state__in=CANCELLABLE_IMPORT_STATES).update(
+            state=ImportJob.State.CANCELLED,
+            last_error="cancelled by operator",
+            next_retry_at=None,
+            lease_owner="",
+            lease_expires_at=None,
+            updated_at=timezone.now(),
+        )
+    logger.info(
+        "intake_source_cancelled",
+        source_location_id=source_location.pk,
+        cancelled=len(ids),
+    )
+    return ids
 
 
 def stale_import_jobs(now: datetime | None = None) -> list[ImportJob]:
@@ -2411,7 +2472,8 @@ def process_import_job(job_id: str) -> None:
     any work, and it stops as soon as it loses the lease.
     """
     job = ImportJob.objects.select_related("uploader", "source_location").get(pk=job_id)
-    if job.state == ImportJob.State.COMPLETE:
+    if job.state in (ImportJob.State.COMPLETE, ImportJob.State.CANCELLED):
+        # CANCELLED: RQ may redeliver an abandoned job after a worker restart.
         return
     if job.state == ImportJob.State.FAILED and not _failed_job_retry_due(job):
         return
@@ -2434,6 +2496,9 @@ def process_import_job(job_id: str) -> None:
         return
     try:
         _process_claimed_import_job(job)
+    except ImportCancelledError:
+        # Keep CANCELLED; failing would schedule an RQ retry of a cancelled job.
+        logger.info("intake_cancelled", import_job_id=str(job.id))
     except ImportLeaseLostError:
         logger.warning("intake_lease_lost", import_job_id=str(job.id))
 
@@ -2490,9 +2555,12 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 ],
                 release=True,
             )
+            # A duplicate that is only referenced in place lives on storage the
+            # application does not control, so it never authorizes deleting a MOVE source.
             _finalize_source_cleanup(
                 job,
-                _verify_archive(
+                not duplicate_variant.storage_location.read_only
+                and _verify_archive(
                     backend_for_location(duplicate_variant.storage_location),
                     duplicate_variant.storage_identifier,
                     job.sha256,
@@ -2529,7 +2597,7 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         )
         job.state = ImportJob.State.EXTERNAL_IDENTIFICATION
         _save_job(job, update_fields=["state", "updated_at"])
-        candidates = identification.resolve_candidates(signals)
+        candidates, provider_outcomes = identification.resolve_candidates_with_report(signals)
         file_authors = identification.evidence_author_names(metadata)
         decision = decide_auto_accept(candidates, file_authors, file_evidence=signals)
         if decision.blocked_reason is not None:
@@ -2548,6 +2616,8 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         _save_metadata_candidates(
             job,
             candidates,
+            signals=signals,
+            outcomes=provider_outcomes,
             allow_match=decision.blocked_reason is None,
         )
 
@@ -2582,10 +2652,10 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         job.state = ImportJob.State.MATCHED
         _save_job(job, update_fields=["state", "updated_at"])
         storage = _default_storage()
-        storage_location = _default_storage_location()
         job.state = ImportJob.State.ARCHIVING
         _save_job(job, update_fields=["state", "updated_at"])
         destination, verified = _archive_source(storage, job)
+        storage_location = job.storage_location or _default_storage_location()
         # Record where the archive copy went and confirm this worker still owns the
         # job before a MOVE source is deleted.
         _save_job(job, update_fields=["storage_identifier", "storage_location_id", "updated_at"])
@@ -2631,6 +2701,11 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                     candidate=top_candidate,
                     fallback_title=top_candidate.title,
                     extra_metadata=metadata,
+                )
+                genres.assign_automatic(
+                    book,
+                    provider_subjects=top_candidate.subjects,
+                    embedded_subjects=genres.embedded_subjects(metadata),
                 )
             _complete_with_book(
                 job, book, destination=destination, storage_location=storage_location

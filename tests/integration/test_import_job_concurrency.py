@@ -196,3 +196,114 @@ def test_owner_check_holds_the_row_lock_until_its_save_commits(
     source_job.state = ImportJob.State.SIGNAL_NORMALIZATION
     with pytest.raises(intake.ImportLeaseLostError):
         intake._save_job(source_job, ["state", "updated_at"])
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("next_phase", "expect_cancelled"),
+    [
+        (ImportJob.State.SIGNAL_NORMALIZATION, True),
+        (ImportJob.State.ARCHIVING, False),
+    ],
+)
+def test_cancellation_cannot_commit_between_owner_check_and_phase_save(
+    source_job: ImportJob,
+    monkeypatch: pytest.MonkeyPatch,
+    next_phase: str,
+    expect_cancelled: bool,
+) -> None:
+    """Review of #75: the worker's check-and-save must exclude a concurrent cancel.
+
+    The worker is paused inside its phase save, after the row lock and the state
+    check. ``cancel_source_imports`` on another connection must wait for that save to
+    commit, then decide on the committed state: a pre-archive phase is cancelled (and
+    the worker cannot write again), a job that reached ARCHIVING is left to finish.
+    Either way the worker never overwrites CANCELLED.
+    """
+    assert intake.claim_import_job(source_job) is True
+    location = source_job.source_location
+    assert location is not None
+    original_save = ImportJob.save
+    locked = threading.Event()
+    proceed = threading.Event()
+    cancel_done = threading.Event()
+    cancelled_ids: list[str] = []
+    errors: list[BaseException] = []
+    pausing = threading.local()
+
+    def _pausing_save(self: ImportJob, *args: Any, **kwargs: Any) -> None:
+        if getattr(pausing, "active", False):
+            locked.set()
+            assert proceed.wait(WAIT_SECONDS)
+        original_save(self, *args, **kwargs)
+
+    def _worker_phase_save() -> None:
+        pausing.active = True
+        source_job.state = next_phase
+        intake._save_job(source_job, ["state", "updated_at"])
+
+    def _cancel() -> None:
+        cancelled_ids.extend(intake.cancel_source_imports(location))
+        cancel_done.set()
+
+    monkeypatch.setattr(ImportJob, "save", _pausing_save)
+    worker = _in_thread(_worker_phase_save, errors)
+    assert locked.wait(WAIT_SECONDS)
+    canceller = _in_thread(_cancel, errors)
+    # The cancellation blocks on the row lock the worker holds for its check-and-save.
+    assert not cancel_done.wait(1.0)
+    proceed.set()
+    worker.join(WAIT_SECONDS)
+    canceller.join(WAIT_SECONDS)
+    monkeypatch.setattr(ImportJob, "save", original_save)
+
+    assert not errors
+    assert cancel_done.is_set()
+    job = ImportJob.objects.get(pk=source_job.pk)
+    if expect_cancelled:
+        assert cancelled_ids == [str(source_job.pk)]
+        assert job.state == ImportJob.State.CANCELLED
+        assert job.lease_owner == ""
+        # The worker's next phase save is refused; CANCELLED is never overwritten.
+        source_job.state = ImportJob.State.ARCHIVING
+        with pytest.raises(intake.ImportCancelledError):
+            intake._save_job(source_job, ["state", "updated_at"])
+        assert ImportJob.objects.get(pk=source_job.pk).state == ImportJob.State.CANCELLED
+    else:
+        assert cancelled_ids == []
+        assert job.state == ImportJob.State.ARCHIVING
+        assert job.lease_owner == source_job.lease_owner
+
+
+@pytest.mark.django_db(transaction=True)
+def test_cancel_while_worker_runs_intake_on_postgresql(
+    source_job: ImportJob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: cancel from another connection while the worker is hashing."""
+    real_sha256 = intake.compute_sha256
+    hashing_started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_sha256(path: str) -> str:
+        hashing_started.set()
+        assert release.wait(WAIT_SECONDS)
+        return real_sha256(path)
+
+    monkeypatch.setattr(intake, "compute_sha256", _blocking_sha256)
+    errors: list[BaseException] = []
+    worker = _in_thread(lambda: intake.process_import_job(str(source_job.id)), errors)
+    assert hashing_started.wait(WAIT_SECONDS)
+
+    location = source_job.source_location
+    assert location is not None
+    canceller = _in_thread(lambda: intake.cancel_source_imports(location), errors)
+    canceller.join(WAIT_SECONDS)
+    release.set()
+    worker.join(WAIT_SECONDS)
+
+    assert not errors  # the worker returned cleanly (no FAILED, no RQ retry)
+    job = ImportJob.objects.get(pk=source_job.pk)
+    assert job.state == ImportJob.State.CANCELLED
+    assert job.sha256 == ""
+    assert Path(job.source_path).exists()
+    assert not ReviewTask.objects.filter(import_job=job).exists()
