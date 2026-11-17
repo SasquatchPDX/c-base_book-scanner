@@ -1,0 +1,13 @@
+<div class="metadata-search" data-search-id="{{ search.id }}" data-search-state="{{ search.state }}">
+<p><span class="status status-{{ search.state }}">{{ search.get_state_display }}</span> {{ search.get_trigger_display }} · {{ search.finished_at|date:"Y-m-d H:i" }}{% if search.requested_by %} · {{ search.requested_by.get_username }}{% endif %}</p>
+<dl class="metadata">
+<div><dt>Title terms</dt><dd>{{ search.query.title_hints|join:" | "|default:"none" }}</dd></div>
+<div><dt>Author</dt><dd>{{ search.query.author|default:"none" }}</dd></div>
+{% if search.query.isbns %}<div><dt>ISBN</dt><dd class="mono">{{ search.query.isbns|join:", " }}</dd></div>{% endif %}
+<div><dt>Candidates</dt><dd>{{ search.candidate_count }}</dd></div>
+</dl>
+{% if search.error %}<p class="error">{{ search.error }}</p>{% endif %}
+{% if search.provider_rows %}<table class="provider-outcomes"><thead><tr><th scope="col">Provider</th><th scope="col">Outcome</th><th scope="col">Results</th><th scope="col">Time</th></tr></thead><tbody>
+{% for row in search.provider_rows %}<tr data-provider="{{ row.provider_id }}" data-provider-status="{{ row.status }}"><td>{{ row.provider_id }}</td><td>{% if row.status == "error" %}<span class="error">Error: {{ row.error }}</span>{% else %}{{ row.status_label }}{% endif %}</td><td>{{ row.result_count }}</td><td>{{ row.duration_seconds|floatformat:1 }} s</td></tr>
+{% endfor %}</tbody></table>{% elif search.state == "complete" %}<p class="muted">No metadata providers are configured.</p>{% endif %}
+</div>
