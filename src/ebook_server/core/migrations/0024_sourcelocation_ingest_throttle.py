@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0022_source_location_group_sibling_formats"),
+        ("core", "0023_file_variant_kindle_rtf_formats"),
     ]
 
     operations = [
