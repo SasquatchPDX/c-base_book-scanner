@@ -177,8 +177,9 @@ def test_ebook_meta_staging_name_title_is_not_embedded_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Calibre names an untitled book after the file it read: the upload staging path.
-    staged = _kindle_file(tmp_path, "upload-qe6hxjg9.tmp")
-    opf = KINDLE_OPF.replace(b"Mobi Book", b"upload-qe6hxjg9")
+    staged = _kindle_file(tmp_path, "upload-qe6h_xjg9.tmp")
+    # ... with "_" turned into a space.
+    opf = KINDLE_OPF.replace(b"Mobi Book", b"upload-qe6h xjg9")
     monkeypatch.setattr(conversion, "_run_conversion_command", FakeEbookMeta(opf))
 
     metadata = intake.extract_metadata(str(staged), "azw3", original_filename="Kindle Story.azw3")

@@ -114,6 +114,8 @@ pandoc \
   --to epub3 \
   --metadata title="Browser Digital Library" \
   --metadata author="Ada Digital" \
+  --metadata lang=en-US \
+  --metadata publisher="Ada Digital Self-Publishing" \
   --output "${book_scanner_browser_epub}"
 export BOOK_SCANNER_BROWSER_EPUB_FIXTURE="${book_scanner_browser_epub}"
 uv run python manage.py collectstatic --noinput --clear --verbosity 0

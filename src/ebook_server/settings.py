@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    multipart_detection: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
     queue_name: str = "ebook-server"
@@ -112,6 +113,9 @@ class Settings(BaseSettings):
     identification_strong_match_min_author: float = 0.9
     identification_strong_match_tie_margin: float = 0.05
     identification_strong_match_year_tolerance: int = 2
+    # Candidates within this score margin of the best one count as tied for auto-accept.
+    identification_tie_margin: float = 0.02
+    identification_work_isbn_bonus: float = 0.3
     review_queue_page_size: int = 50
     review_batch_min_score: float = 0.75
     review_batch_ambiguity_margin: float = 0.05
@@ -296,6 +300,7 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
 BOOK_SCANNER_METADATA_USER_AGENT = (
@@ -344,6 +349,8 @@ BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN = (
 BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE = (
     settings.identification_strong_match_year_tolerance
 )
+BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
+BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
 BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
 BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin

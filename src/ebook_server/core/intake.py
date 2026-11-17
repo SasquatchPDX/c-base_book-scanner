@@ -233,8 +233,11 @@ MAX_UPLOAD_BYTES = getattr(
 )
 AUTO_ACCEPT_SCORE = identification.AUTO_ACCEPT_SCORE
 REVIEW_SCORE = identification.REVIEW_SCORE
+AUTO_ACCEPT_TIE_MARGIN = identification.TIE_MARGIN
 MAX_EPUB_METADATA_MEMBER_BYTES = 2 * 1024 * 1024
 MAX_EPUB_METADATA_COMPRESSION_RATIO = 100
+# Bound for short OPF evidence values (publisher, date) copied into job evidence.
+MAX_EPUB_TEXT_FIELD = 255
 MAX_FORMAT_METADATA_BYTES = 2 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
@@ -287,6 +290,16 @@ BLOCK_AUTHOR_CONFLICT = "author_conflict"
 # Stronger title evidence (e.g. the embedded title) names another book than the
 # candidate, whose title matches only a weaker hint such as the filename.
 BLOCK_TITLE_EVIDENCE_CONFLICT = identification.TITLE_EVIDENCE_CONFLICT
+# Several different books tie for the best score and pass the author checks.
+BLOCK_AMBIGUOUS_TIE = "ambiguous_tie"
+# The provider record stands for another edition than the file: its ISBNs, language or
+# publisher contradict the file's (see identification.edition_conflicts).
+BLOCK_EDITION_CONFLICT = "edition_conflict"
+# ImportJob.evidence key recording that a tied candidate was accepted instead of the
+# first-ranked one, and why the others were passed over.
+AUTO_ACCEPT_TIE_BREAK_KEY = "auto_accept_tie_break"
+# Floating-point slack for the tie margin: 1.0 - 0.98 is 0.020000000000000018.
+_TIE_MARGIN_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
@@ -296,6 +309,54 @@ class AutoAcceptDecision:
     candidate: identification.IdentificationCandidate | None
     blocked_reason: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    # Set when the accepted candidate is not the first-ranked one (see decide_auto_accept).
+    tie_break: dict[str, Any] | None = None
+    # Candidates at or above the threshold that were not accepted.
+    passed_over: tuple[identification.IdentificationCandidate, ...] = ()
+
+
+def _author_block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+) -> str | None:
+    """Why the author checks forbid accepting ``candidate`` automatically, if they do."""
+    provider_authors = [
+        name for name in candidate.authors if not identification.is_placeholder_author(name)
+    ]
+    if not provider_authors:
+        return BLOCK_NO_PROVIDER_AUTHORS
+    if identification.authors_conflict(provider_authors, file_authors):
+        return BLOCK_AUTHOR_CONFLICT
+    return None
+
+
+def _block_reason(
+    candidate: identification.IdentificationCandidate,
+    file_authors: list[str],
+    file_evidence: identification.IdentificationInput,
+) -> tuple[str | None, list[str]]:
+    """Why ``candidate`` may not be accepted automatically (author, edition, then title).
+
+    Returns the block reason (``None`` when it may be accepted) and the edition
+    conflicts found, which are reported even when an author check blocks first.
+    """
+    conflicts = identification.edition_conflicts(candidate, file_evidence)
+    reason = _author_block_reason(candidate, file_authors)
+    if reason is None and conflicts:
+        reason = BLOCK_EDITION_CONFLICT
+    if reason is None and identification.title_evidence_conflict(file_evidence, candidate):
+        reason = BLOCK_TITLE_EVIDENCE_CONFLICT
+    return reason, conflicts
+
+
+def _candidate_summary(candidate: identification.IdentificationCandidate) -> dict[str, Any]:
+    return {
+        "provider_id": candidate.provider_id,
+        "provider_ref": candidate.provider_ref,
+        "title": candidate.title,
+        "authors": list(candidate.authors),
+        "score": float(candidate.score),
+    }
 
 
 def _block_details(
@@ -322,38 +383,88 @@ def decide_auto_accept(
     A score at or above ``AUTO_ACCEPT_SCORE`` is necessary but not sufficient: the
     candidate must also name at least one real author, and its authors must not
     contradict the file's own embedded authors. A high score from an ISBN match alone
-    is no evidence about authorship. Finally its title must not be contradicted by
-    stronger title evidence in ``file_evidence`` (the normalised file signals): a
-    candidate matching only the filename title while the embedded title names another
-    book is held for review, whether its score came from the #9 strong-match rule or
-    from ordinary bonuses such as language (``identification.title_evidence_conflict``).
+    is no evidence about authorship. The candidate must also be the file's edition:
+    ``file_evidence`` (the normalised file signals: ISBNs, language, publisher) is
+    checked with ``identification.edition_conflicts``, so a file ISBN must be one of the
+    edition's own ISBNs and the file's language/publisher must not contradict it.
+    Finally its title must not be contradicted by stronger title evidence in
+    ``file_evidence``: a candidate matching only the filename title while the embedded
+    title names another book is held for review, whether its score came from the #9
+    strong-match rule or from ordinary bonuses such as language
+    (``identification.title_evidence_conflict``).
+
+    Candidates within ``AUTO_ACCEPT_TIE_MARGIN`` of the best score count as tied (two
+    providers often both score an ISBN match at 1.0, and their order is only the
+    configured provider order). Among tied candidates the first one that passes the
+    author *and* edition checks is accepted, so a tied fallback whose identifiers
+    contradict the file's is never eligible. If tied candidates that pass describe
+    different books, the choice is ambiguous and goes to review.
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
         return AutoAcceptDecision(candidate=None)
-    provider_authors = [
-        name for name in top.authors if not identification.is_placeholder_author(name)
+    above_threshold = [c for c in candidates if c.score >= AUTO_ACCEPT_SCORE]
+    tied = [
+        candidate
+        for candidate in above_threshold
+        if top.score - candidate.score <= AUTO_ACCEPT_TIE_MARGIN + _TIE_MARGIN_EPSILON
     ]
-    if not provider_authors:
+    checks = [_block_reason(candidate, file_authors, file_evidence) for candidate in tied]
+    eligible = [
+        candidate for candidate, (reason, _) in zip(tied, checks, strict=True) if reason is None
+    ]
+    if not eligible:
+        top_reason, top_conflicts = checks[0]
+        details = _block_details(top, file_authors)
+        if top_conflicts:
+            details = {
+                **details,
+                "edition_conflicts": top_conflicts,
+                **identification.edition_evidence(top, file_evidence),
+            }
+        if top_reason == BLOCK_TITLE_EVIDENCE_CONFLICT:
+            details = {
+                **details,
+                **(identification.title_evidence_conflict(file_evidence, top) or {}),
+            }
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_NO_PROVIDER_AUTHORS,
-            details=_block_details(top, file_authors),
+            blocked_reason=top_reason,
+            details=details,
+            passed_over=tuple(above_threshold),
         )
-    if identification.authors_conflict(provider_authors, file_authors):
+    chosen = eligible[0]
+    if any(
+        not identification.candidates_describe_same_book(chosen, other) for other in eligible[1:]
+    ):
         return AutoAcceptDecision(
             candidate=None,
-            blocked_reason=BLOCK_AUTHOR_CONFLICT,
-            details=_block_details(top, file_authors),
+            blocked_reason=BLOCK_AMBIGUOUS_TIE,
+            details={
+                **_block_details(top, file_authors),
+                "tied_candidates": [_candidate_summary(candidate) for candidate in eligible],
+            },
+            passed_over=tuple(above_threshold),
         )
-    title_conflict = identification.title_evidence_conflict(file_evidence, top)
-    if title_conflict is not None:
-        return AutoAcceptDecision(
-            candidate=None,
-            blocked_reason=BLOCK_TITLE_EVIDENCE_CONFLICT,
-            details={**_block_details(top, file_authors), **title_conflict},
-        )
-    return AutoAcceptDecision(candidate=top)
+    tie_break: dict[str, Any] | None = None
+    if chosen is not top:
+        passed_over_summaries: list[dict[str, Any]] = []
+        for candidate, (reason, conflicts) in zip(tied, checks, strict=True):
+            if reason is None:
+                continue
+            summary = {**_candidate_summary(candidate), "reason": reason}
+            if conflicts:
+                summary["edition_conflicts"] = conflicts
+            passed_over_summaries.append(summary)
+        tie_break = {"chosen": _candidate_summary(chosen), "passed_over": passed_over_summaries}
+    eligible_ids = {id(candidate) for candidate in eligible}
+    return AutoAcceptDecision(
+        candidate=chosen,
+        tie_break=tie_break,
+        passed_over=tuple(
+            candidate for candidate in above_threshold if id(candidate) not in eligible_ids
+        ),
+    )
 
 
 def normalize_filename(raw: str) -> str:
@@ -1082,7 +1193,10 @@ def discover_source_jobs_for_location(
     With ``byte_budget``, stop (and mark the budget exhausted) at the first file that
     would not fit, so a bulk import cannot queue more than the archive can hold.
     """
+    from . import multipart
+
     jobs: list[ImportJob] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     skipped: list[Path] = []
     audio_skipped = 0
     if limit is not None and limit <= 0:
@@ -1131,9 +1245,11 @@ def discover_source_jobs_for_location(
                 )
                 break
         try:
-            jobs.append(create_source_import_job(candidate, source_location, uploader=uploader))
+            job = create_source_import_job(candidate, source_location, uploader=uploader)
         except IntakeError:
             continue
+        multipart.assign_discovered_job(job, source_location, folder_groups=folder_groups)
+        jobs.append(job)
         if limit is not None and len(jobs) >= limit:
             break
     if skipped:
@@ -1204,7 +1320,10 @@ class SourcePreview:
 
 def preview_source_location(source_location: SourceLocation) -> SourcePreview:
     """Classify every candidate file in a source without creating jobs."""
+    from . import multipart
+
     rows: list[dict[str, Any]] = []
+    folder_groups: dict[Path, list[multipart.DetectedGroup]] = {}
     for candidate in discover_source_paths(source_location):
         base: dict[str, Any] = {
             "source_location_id": str(source_location.id),
@@ -1237,6 +1356,16 @@ def preview_source_location(source_location: SourceLocation) -> SourcePreview:
             # Lets an admin check a folder layout before importing anything.
             hints = source_layout.hints_for_source_file(source_location, str(candidate))
             row["path_layout"] = hints.as_evidence() if hints is not None else None
+        if multipart.detection_enabled():
+            folder = candidate.parent
+            if folder not in folder_groups:
+                folder_groups[folder] = multipart.groups_for_folder(folder)
+            for detected in folder_groups[folder]:
+                part = next((p for p in detected.parts if p.filename == candidate.name), None)
+                if part is not None:
+                    row["multipart_group"] = detected.key
+                    row["part_label"] = part.label
+                    break
         rows.append(row)
     return SourcePreview(rows=rows)
 
@@ -1531,6 +1660,11 @@ def _run_ebook_meta_to_opf(file_path: str) -> bytes | None:
     return payload or None
 
 
+def _name_key(value: str) -> str:
+    """Letters and digits only, lower-cased: "upload-ab c123" equals "upload-ab_c123"."""
+    return re.sub(r"[\W_]+", "", value).casefold()
+
+
 def _extract_ebook_meta_metadata(
     file_path: str,
     detected_format: str,
@@ -1552,10 +1686,11 @@ def _extract_ebook_meta_metadata(
         logger.warning("ebook_meta_opf_unparseable", error_type=type(exc).__name__)
         return fallback
     title = fields["title"]
-    if isinstance(title, str) and title.strip() == Path(file_path).stem:
-        # Calibre reports the file's own name when the book has no title; that is the
-        # staging path (e.g. "upload-abc123"), not embedded evidence. Leave the title
-        # to the original-filename fallback instead of ranking it as embedded.
+    if isinstance(title, str) and _name_key(title) == _name_key(Path(file_path).stem):
+        # Calibre reports the file's own name when the book has no title (with "_"
+        # turned into spaces); that is the staging path (e.g. "upload-ab_c123"), not
+        # embedded evidence. Leave the title to the original-filename fallback instead
+        # of ranking it as embedded.
         title = None
     return {
         **fields,
@@ -1624,6 +1759,9 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
         authors = _epub_creator_authors(opf_root)
         language = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}language")
         description = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}description")
+        # Publisher and date are evidence for the publisher bonus and later review (#37).
+        publisher = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}publisher")
+        raw_date = _find_text_any(opf_root, ".//{http://purl.org/dc/elements/1.1/}date")
         subjects = identification.normalize_subjects(
             [
                 "".join(element.itertext())
@@ -1643,6 +1781,8 @@ def _extract_epub_metadata(file_path: str, *, original_filename: str) -> dict[st
             "description": description,
             "subjects": subjects,
             "identifier": identifier,
+            "publisher": publisher[:MAX_EPUB_TEXT_FIELD] if publisher else None,
+            "date": raw_date[:MAX_EPUB_TEXT_FIELD] if raw_date else None,
             "raw_metadata": {
                 "container_xml": container_doc.decode("utf-8", errors="ignore"),
             },
@@ -1798,11 +1938,11 @@ def _save_metadata_candidates(
     *,
     signals: identification.IdentificationInput,
     outcomes: list[identification.ProviderOutcome],
-    allow_match: bool = True,
+    passed_over: Iterable[identification.IdentificationCandidate] = (),
 ) -> None:
     """Record the intake search run and its candidates.
 
-    ``allow_match=False`` keeps all candidates in REVIEW state.
+    ``passed_over`` candidates stay in REVIEW state whatever their score.
     """
     with transaction.atomic():
         # Ensure idempotence if jobs are retried: drop the earlier intake attempt.
@@ -1818,7 +1958,8 @@ def _save_metadata_candidates(
         metadata_search.save_candidates(
             search=search,
             candidates=candidates,
-            match_threshold=AUTO_ACCEPT_SCORE if allow_match else None,
+            match_threshold=AUTO_ACCEPT_SCORE,
+            passed_over=passed_over,
         )
 
 
@@ -1911,12 +2052,23 @@ def _create_or_reuse_file_variant(
     *,
     storage_identifier: str | None = None,
     source_type: str = "",
+    part_index: int | None = None,
+    part_label: str = "",
+    reuse_identical: bool = True,
+    converter_options: dict[str, Any] | None = None,
 ) -> FileVariant:
+    """The job's FileVariant on ``book``; by default any existing identical file is reused.
+
+    ``reuse_identical=False`` (multi-part parts, #60) always creates a new variant on
+    ``book`` from the job's own archived copy, so another Book's variant is never
+    returned for this Book.
+    """
     if not source_type:
         source_type = variant_source_type_for_job(job)
-    duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
-    if duplicate_variant is not None:
-        return duplicate_variant
+    if reuse_identical:
+        duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+        if duplicate_variant is not None:
+            return duplicate_variant
 
     storage = _default_storage()
     storage_id = storage_identifier or job.storage_identifier
@@ -1950,8 +2102,52 @@ def _create_or_reuse_file_variant(
         uploader=job.uploader,
         imported_at=timezone.now(),
         processing_state=FileVariant.ProcessingState.COMPLETE,
+        part_index=part_index,
+        part_label=_fit(FileVariant, "part_label", part_label),
+        converter_options=converter_options or {},
         **referenced_files.reference_fields_for_job(job),
     )
+
+
+def discard_redundant_archive_copy(job: ImportJob, *, keep: FileVariant) -> None:
+    """Delete ``job``'s own archive copy once ``keep`` (same bytes) stands in for it.
+
+    Only a copy this application wrote to the default archive is removed, never a file
+    referenced in place, never the file ``keep`` (or any other variant) points at, and
+    only after the surrounding transaction commits. The source itself is untouched.
+    """
+    identifier = job.storage_identifier
+    location = job.storage_location
+    if not identifier or location is None or location.read_only:
+        return
+    if location.pk != _default_storage_location().pk:
+        return
+    if keep.storage_location_id == location.pk and keep.storage_identifier == identifier:
+        return
+    if FileVariant.objects.filter(
+        storage_location_id=location.pk, storage_identifier=identifier
+    ).exists():
+        return
+    if keep.sha256 != job.sha256:
+        return
+
+    def _delete() -> None:
+        try:
+            _default_storage().delete(identifier)
+        except Exception as exc:  # an orphaned copy is harmless; never fail the decision
+            logger.warning(
+                "intake_redundant_archive_copy_not_deleted",
+                import_job_id=str(job.id),
+                error_type=type(exc).__name__,
+            )
+            return
+        logger.info(
+            "intake_redundant_archive_copy_deleted",
+            import_job_id=str(job.id),
+            kept_file_variant_id=keep.id,
+        )
+
+    transaction.on_commit(_delete)
 
 
 def _try_extract_front_cover(variant: FileVariant, job: ImportJob | None = None) -> None:
@@ -2140,8 +2336,33 @@ def _resolve_import(
 ) -> FileVariant:
     if not decision:
         decision = cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE)
-    variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
-    schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
+    if review_task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+        from . import multipart
+
+        # Any identifying action on a multi-part review confirms the grouping: every
+        # archived part becomes an ordered part FileVariant of ``book``.
+        confirmed = multipart.confirm_parts(
+            lead_job=job,
+            review_task=review_task,
+            book=book,
+            inline_cover_fallback=inline_cover_fallback,
+        )
+        payload = dict(decision_payload if decision_payload is not None else {})
+        payload["multipart_confirmed"] = {
+            "import_group_id": str(job.import_group_id),
+            "file_variant_ids": [part.id for part in confirmed.variants],
+            # Detected parts the reviewer acknowledged confirming the book without.
+            "missing_parts": confirmed.absent,
+            # Acknowledged parts identical to another Book's file, included as parts of
+            # this Book (own variant, identical file recorded as provenance).
+            "duplicate_parts": confirmed.duplicates,
+        }
+        decision_payload = payload
+        job.refresh_from_db()
+        variant = job.file_variant or confirmed.variants[0]
+    else:
+        variant = _create_or_reuse_file_variant(job, book, source_type=source_type)
+        schedule_front_cover_extraction(variant, job, inline_fallback=inline_cover_fallback)
     review_task.state = ReviewTask.State.RESOLVED
     review_task.decision = decision
     review_task.decision_notes = decision_notes
@@ -2537,33 +2758,7 @@ def _archive_for_review(
         _create_review_task(job=job, candidates=candidates)
         job.state = ImportJob.State.LOW_CONFIDENCE
         _save_job(job, update_fields=["state", "updated_at"])
-    job.state = ImportJob.State.ARCHIVING
-    _save_job(job, update_fields=["state", "updated_at"])
-    destination, verified = _archive_source(_default_storage(), job)
-    job.storage_identifier = destination
-    _save_job(
-        job,
-        update_fields=[
-            "storage_identifier",
-            "storage_location_id",
-            "state",
-            "updated_at",
-        ],
-    )
-    _finalize_source_cleanup(job, verified)
-    if not verified:
-        raise RuntimeError("archive verification failed")
-    job.state = ImportJob.State.LOW_CONFIDENCE
-    _save_job(
-        job,
-        update_fields=[
-            "state",
-            "storage_identifier",
-            "storage_location_id",
-            "updated_at",
-        ],
-        release=True,
-    )
+    _archive_awaiting_review(job)
     if not _groups_sibling_formats(job):
         return
     with _sibling_group_lock(job):
@@ -2754,6 +2949,58 @@ def _failed_job_retry_due(job: ImportJob) -> bool:
     """
     max_retries = int(getattr(django_settings, "BOOK_SCANNER_QUEUE_RETRY_MAX", 0))
     return job.next_retry_at is not None and job.attempt_count <= max_retries
+
+
+def _archive_awaiting_review(job: ImportJob) -> None:
+    """Archive a job that waits for a reviewer, then leave it LOW_CONFIDENCE.
+
+    The source is only removed (MOVE sources) after the archive copy verified. The
+    final save releases this worker's lease.
+    """
+    job.state = ImportJob.State.ARCHIVING
+    _save_job(job, update_fields=["state", "updated_at"])
+    destination, verified = _archive_source(_default_storage(), job)
+    job.storage_identifier = destination
+    _save_job(
+        job,
+        update_fields=[
+            "storage_identifier",
+            "storage_location_id",
+            "state",
+            "updated_at",
+        ],
+    )
+    _finalize_source_cleanup(job, verified)
+    if not verified:
+        raise RuntimeError("archive verification failed")
+    job.state = ImportJob.State.LOW_CONFIDENCE
+    _save_job(
+        job,
+        update_fields=[
+            "state",
+            "storage_identifier",
+            "storage_location_id",
+            "updated_at",
+        ],
+        release=True,
+    )
+
+
+def _settle_multipart_part(job: ImportJob) -> None:
+    """Exit hook of a grouped part's intake run; see ``multipart.settle_part``."""
+    from . import multipart
+
+    if job.import_group_id is None:
+        return
+    try:
+        multipart.settle_part(job)
+    except Exception as exc:  # the part itself is safely recorded; retried on next settle
+        logger.warning(
+            "multipart_settle_failed",
+            import_group_id=str(job.import_group_id),
+            import_job_id=str(job.id),
+            error_type=type(exc).__name__,
+        )
 
 
 # --- Exclusive ownership of an import job ---------------------------------------------
@@ -2955,6 +3202,10 @@ def recover_stale_import_job(job: ImportJob, reason: str) -> bool:
         lease_expires_at=None,
         updated_at=timezone.now(),
     )
+    if recovered:
+        # A recovered part of a multi-part work is now missing; let its group settle.
+        job.refresh_from_db()
+        _settle_multipart_part(job)
     return bool(recovered)
 
 
@@ -2994,10 +3245,16 @@ def process_import_job(job_id: str) -> None:
         logger.info("intake_cancelled", import_job_id=str(job.id))
     except ImportLeaseLostError:
         logger.warning("intake_lease_lost", import_job_id=str(job.id))
+    finally:
+        # Every exit of a claimed run (archived, duplicate, failed, source missing,
+        # exception, lost lease) settles a grouped part, so its group never waits forever.
+        _settle_multipart_part(job)
 
 
 def _process_claimed_import_job(job: ImportJob) -> None:
     """Run intake for a job this worker has claimed (``job.lease_owner`` is set)."""
+    from . import multipart
+
     source_path = Path(job.source_path)
     if not source_path.exists():
         job.last_error = "source file missing"
@@ -3030,6 +3287,17 @@ def _process_claimed_import_job(job: ImportJob) -> None:
         )
 
         duplicate_variant = FileVariant.objects.filter(sha256=job.sha256).first()
+        if duplicate_variant is not None and multipart.pending_group_for(job) is not None:
+            # A part of a pending multi-part work belongs to that work: it must not be
+            # resolved onto the other Book and silently drop out of the group (#60).
+            logger.info(
+                "multipart_part_identical_to_library_file",
+                import_job_id=str(job.id),
+                import_group_id=str(job.import_group_id),
+                file_variant_id=duplicate_variant.id,
+                book_id=duplicate_variant.book_id,
+            )
+            duplicate_variant = None
         if duplicate_variant is not None:
             job.book = duplicate_variant.book
             job.file_variant = duplicate_variant
@@ -3083,6 +3351,13 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 "updated_at",
             ],
         )
+        if multipart.pending_group_for(job) is not None:
+            # One part of a suspected multi-part work: archive it like any import
+            # awaiting review, but identify the work once for the whole group. A part
+            # identical to a file of another Book is archived too; the group review
+            # shows it as a duplicate part (see multipart.MEMBER_DUPLICATE).
+            _archive_awaiting_review(job)
+            return
 
         signals = identification.build_identification_input(
             source_path=job.source_path,
@@ -3107,12 +3382,22 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 provider_id=decision.details.get("provider_id"),
                 score=decision.details.get("score"),
             )
+        elif decision.tie_break is not None:
+            metadata[AUTO_ACCEPT_TIE_BREAK_KEY] = decision.tie_break
+            job.evidence = metadata
+            _save_job(job, update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_tie_break",
+                import_job_id=str(job.id),
+                provider_id=decision.tie_break["chosen"]["provider_id"],
+                passed_over_count=len(decision.tie_break["passed_over"]),
+            )
         _save_metadata_candidates(
             job,
             candidates,
             signals=signals,
             outcomes=provider_outcomes,
-            allow_match=decision.blocked_reason is None,
+            passed_over=decision.passed_over,
         )
 
         sidecar_conflicts = sidecar_conflicts_in(metadata)
