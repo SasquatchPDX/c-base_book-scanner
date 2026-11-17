@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import struct
 import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -571,24 +573,134 @@ def _exif_orientation(image: Image.Image) -> int:
     return value if isinstance(value, int) else 1
 
 
-def _is_normalised_png(path: Path) -> bool:
-    """True when ``_load_image(path)`` would return the file's pixels unchanged.
-
-    That holds for an 8-bit L/RGB PNG without transparency or an EXIF rotation,
-    which is exactly what every stage writes. Such a file can be byte-copied as an
-    unchanged stage output instead of being decoded and re-encoded (#54). Only the
-    header is read.
-    """
+def _orientation_from_exif_bytes(data: bytes) -> int:
+    exif = Image.Exif()
     try:
-        with Image.open(path) as opened:
-            return (
-                opened.format == "PNG"
-                and opened.mode in {"L", "RGB"}
-                and "transparency" not in opened.info
-                and _exif_orientation(opened) == 1
-            )
-    except (OSError, UnidentifiedImageError, ValueError, SyntaxError):
+        exif.load(data)
+        value = exif.get(_ORIENTATION_TAG, 1)
+    except (OSError, ValueError, SyntaxError, struct.error):
+        return 1
+    return value if isinstance(value, int) else 1
+
+
+_PNG_SIGNATURE: Final[bytes] = b"\x89PNG\r\n\x1a\n"
+# Upper bounds for the chunk walk; real pages have a few hundred IDAT chunks at most.
+_PNG_MAX_CHUNKS: Final[int] = 100_000
+_PNG_MAX_EXIF_BYTES: Final[int] = 1 << 20
+# Exactly the chunks ``_save_png`` writes for an 8-bit L/RGB image (pHYs carries DPI).
+# Anything else (gAMA, cHRM, sRGB, iCCP, eXIf, sBIT, tRNS, text, ...) either changes
+# rendering/metadata or is dropped by a re-encode, so it disqualifies a byte copy.
+_PNG_PASSTHROUGH_CHUNKS: Final[frozenset[bytes]] = frozenset({b"IHDR", b"pHYs", b"IDAT", b"IEND"})
+
+
+@dataclass(frozen=True)
+class _PngLayout:
+    width: int
+    height: int
+    bit_depth: int
+    colour_type: int
+    interlace: int
+    chunk_types: frozenset[bytes]
+    phys: tuple[int, int, int] | None
+    exif: bytes | None
+
+
+def _read_png_layout(path: Path) -> _PngLayout | None:
+    """Walk the PNG chunk headers of ``path`` without decompressing any image data.
+
+    Only the IHDR, pHYs and eXIf payloads are read; every other chunk is skipped by
+    seeking. Returns None for anything that is not a structurally sane PNG.
+    """
+    ihdr: tuple[int, int, int, int, int] | None = None
+    phys: tuple[int, int, int] | None = None
+    exif: bytes | None = None
+    seen: set[bytes] = set()
+    try:
+        with path.open("rb") as handle:
+            if handle.read(len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+                return None
+            file_size = os.fstat(handle.fileno()).st_size
+            for _ in range(_PNG_MAX_CHUNKS):
+                head = handle.read(8)
+                if len(head) != 8:
+                    return None
+                length, chunk_type = struct.unpack(">I4s", head)
+                if handle.tell() + length + 4 > file_size:
+                    return None
+                if not seen and chunk_type != b"IHDR":
+                    return None
+                if chunk_type == b"IHDR":
+                    if seen or length != 13:
+                        return None
+                    width, height, bit_depth, colour_type, _, _, interlace = struct.unpack(
+                        ">IIBBBBB", handle.read(13)
+                    )
+                    ihdr = (width, height, bit_depth, colour_type, interlace)
+                    handle.seek(4, os.SEEK_CUR)
+                elif chunk_type == b"pHYs" and length == 9:
+                    phys = struct.unpack(">IIB", handle.read(9))
+                    handle.seek(4, os.SEEK_CUR)
+                elif chunk_type == b"eXIf" and length <= _PNG_MAX_EXIF_BYTES:
+                    exif = handle.read(length)
+                    handle.seek(4, os.SEEK_CUR)
+                else:
+                    handle.seek(length + 4, os.SEEK_CUR)
+                seen.add(chunk_type)
+                if chunk_type == b"IEND":
+                    break
+            else:
+                return None
+    except (OSError, struct.error):
+        return None
+    if ihdr is None or b"IDAT" not in seen or ihdr[0] == 0 or ihdr[1] == 0:
+        return None
+    width, height, bit_depth, colour_type, interlace = ihdr
+    return _PngLayout(
+        width=width,
+        height=height,
+        bit_depth=bit_depth,
+        colour_type=colour_type,
+        interlace=interlace,
+        chunk_types=frozenset(seen),
+        phys=phys,
+        exif=exif,
+    )
+
+
+def _phys_matches_encoder(phys: tuple[int, int, int] | None) -> bool:
+    """True when pHYs holds exactly what ``_save_png`` writes for the DPI it implies."""
+    if phys is None:
         return False
+    x_ppm, y_ppm, unit = phys
+    if unit != 1:
+        return False
+    dpi = _sanitize_dpi((x_ppm * 0.0254, y_ppm * 0.0254))
+    if dpi is None:
+        return False
+    return (int(dpi[0] / 0.0254 + 0.5), int(dpi[1] / 0.0254 + 0.5)) == (x_ppm, y_ppm)
+
+
+def _is_normalised_png(path: Path) -> bool:
+    """True when re-encoding ``path`` via ``_load_image``/``_save_png`` would change nothing.
+
+    That is a non-interlaced 8-bit greyscale or RGB PNG (IHDR bit depth 8, colour
+    type 0 or 2) whose only chunks are the ones ``_save_png`` itself writes (IHDR,
+    a pHYs with an in-range DPI, IDAT, IEND): exactly what every stage writes. Such
+    a file can be byte-copied as an unchanged stage output instead of being decoded
+    and re-encoded (#54). 16-bit, 1/2/4-bit, palette, alpha and interlaced files,
+    and files with colour-management, EXIF, transparency or text chunks, are not
+    eligible and take the normalising re-encode. Only chunk headers are read; no
+    image data is decompressed.
+    """
+    layout = _read_png_layout(path)
+    return (
+        layout is not None
+        and layout.bit_depth == 8
+        and layout.colour_type in {0, 2}
+        and layout.interlace == 0
+        and layout.chunk_types <= _PNG_PASSTHROUGH_CHUNKS
+        and _phys_matches_encoder(layout.phys)
+    )
 
 
 def _write_unchanged(
@@ -602,7 +714,8 @@ def _write_unchanged(
     When the input file already is a normalised PNG its bytes are copied verbatim,
     skipping the full-resolution PNG re-encode; the stage still gets its own output
     artifact (identical bytes, so identical SHA-256) and preview. Anything else
-    (raw TIFF/JPEG uploads, 16-bit, EXIF-rotated, alpha) is normalised as before.
+    (raw TIFF/JPEG uploads, 16-bit, palette, interlaced, alpha, EXIF/ICC/gamma
+    chunks, ...) is normalised by a re-encode as before.
     """
     if _is_normalised_png(source_path):
         shutil.copyfile(source_path, output_path)
@@ -639,7 +752,20 @@ def _record_image_dimensions(
 
 
 def _oriented_size(path: Path) -> tuple[int, int] | None:
-    """Size ``_load_image`` would report, read from the header without decoding pixels."""
+    """Size ``_load_image`` would report, honouring EXIF orientation, without decoding.
+
+    For a PNG the size comes from IHDR and the orientation from its eXIf chunk (if
+    any), so nothing is decompressed; Pillow's ``PngImageFile.getexif()`` would
+    fully decode the image when there is no eXIf chunk. A PNG with an iTXt chunk may
+    carry an XMP orientation, so it goes through Pillow, like every other format
+    (whose EXIF Pillow reads from the header).
+    """
+    layout = _read_png_layout(path)
+    if layout is not None and b"iTXt" not in layout.chunk_types:
+        orientation = _orientation_from_exif_bytes(layout.exif) if layout.exif else 1
+        if orientation in _TRANSPOSED_ORIENTATIONS:
+            return layout.height, layout.width
+        return layout.width, layout.height
     try:
         with Image.open(path) as opened:
             width, height = opened.size
