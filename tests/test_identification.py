@@ -552,20 +552,84 @@ def test_title_match_without_author_match_does_not_auto_accept() -> None:
     assert "author_not_strong" in _rule_evidence(candidates[0])["blocked_by"]
 
 
-def test_near_tied_candidates_do_not_auto_accept() -> None:
+def test_editions_of_the_same_work_do_not_tie_and_accept_the_work_only() -> None:
+    # DNB, Google Books and Open Library often return several records of one work at
+    # the same score. They are no rival books, but without a file ISBN the file's
+    # edition is unknown: the work is accepted without any one edition's details.
     candidates = _resolve(
         _signals(title="Poems", author="Emily Dickinson"),
         [
-            {"key": "/works/OL1W", "title": "Poems", "author_name": ["Emily Dickinson"]},
+            {
+                "key": "/works/OL1W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "isbn": ["9780141191744"],
+                "publisher": ["Penguin"],
+                "first_publish_year": 1890,
+            },
             {"key": "/works/OL2W", "title": "Poems", "author_name": ["Emily Dickinson"]},
+        ],
+    )
+
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["applied"] is True
+    assert evidence["blocked_by"] == []
+    assert evidence["same_work_editions"] == 1
+    assert evidence["edition_ambiguous"] is True
+    assert (top.isbn10, top.isbn13, top.publisher, top.publication_year) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert top.edition_isbns == ()
+
+
+def test_near_tied_rival_book_still_blocks() -> None:
+    # Same title and author but another language is another book, not another edition.
+    candidates = _resolve(
+        _signals(title="Poems", author="Emily Dickinson"),
+        [
+            {
+                "key": "/works/OL1W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "language": ["eng"],
+            },
+            {
+                "key": "/works/OL2W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "language": ["ger"],
+            },
         ],
     )
 
     assert all(candidate.score < AUTO_ACCEPT_SCORE for candidate in candidates)
     evidence = _rule_evidence(candidates[0])
-    assert evidence["applied"] is False
     assert evidence["blocked_by"] == ["near_tied_candidate"]
-    assert evidence["runner_up_score"] == pytest.approx(0.85)
+    assert evidence["same_work_editions"] == 0
+
+
+def test_single_edition_keeps_its_details() -> None:
+    candidates = _resolve(
+        _signals(title="The Hobbit", author="J.R.R. Tolkien"),
+        [
+            {
+                "title": "The Hobbit",
+                "author_name": ["J.R.R. Tolkien"],
+                "isbn": ["9780261102217"],
+                "first_publish_year": 1937,
+            }
+        ],
+    )
+
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    assert _rule_evidence(top)["edition_ambiguous"] is False
+    assert top.publication_year == 1937
 
 
 def test_clear_winner_over_weaker_candidate_auto_accepts() -> None:

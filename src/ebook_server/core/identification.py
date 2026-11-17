@@ -1964,6 +1964,44 @@ def candidates_describe_same_book(
     return not authors_conflict(left.authors, right.authors)
 
 
+def candidates_describe_same_work(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """True when two provider records are the same work, possibly different editions.
+
+    Same full title, both name authors and they agree, and their languages overlap when
+    both name some. Unlike ``candidates_describe_same_book`` different ISBNs do not tell
+    them apart: two editions of "Little Women" are one work.
+    """
+    if candidates_describe_same_book(left, right):
+        return True
+    left_languages = _candidate_languages(left)
+    right_languages = _candidate_languages(right)
+    if left_languages and right_languages and not left_languages & right_languages:
+        return False
+    if _title_match_score(left.title, right.title) < 1.0:
+        return False
+    if not left.authors or not right.authors:
+        return False
+    return not authors_conflict(left.authors, right.authors)
+
+
+def _without_edition_fields(candidate: IdentificationCandidate) -> IdentificationCandidate:
+    """``candidate`` as the work only: no ISBN, publisher or year of one chosen edition."""
+    return replace(
+        candidate,
+        isbn10=None,
+        isbn13=None,
+        publisher=None,
+        edition=None,
+        publication_year=None,
+        edition_isbns=(),
+        edition_publishers=(),
+        concrete_edition=False,
+    )
+
+
 # Reasons an otherwise acceptable candidate stands for another edition than the file.
 # The file's ISBN is not among the edition's ISBNs (it may be another edition's).
 EDITION_ISBN_MISMATCH = "edition_isbn_mismatch"
@@ -2361,14 +2399,24 @@ def _apply_strong_match_rule(
 
     assessment = _strong_match_assessment(signals, top, config)
     blocked_by = list(assessment["blocked_by"])
-    runner_up_score = candidates[1].score if len(candidates) > 1 else None
+    # Other editions of the same work (DNB, Google Books and Open Library often return
+    # several) are no competing books: they neither tie with nor rival the top one.
+    rivals = [other for other in candidates[1:] if not candidates_describe_same_work(top, other)]
+    same_work_editions = len(candidates) - 1 - len(rivals)
+    runner_up_score = rivals[0].score if rivals else None
     if runner_up_score is not None and top.score - runner_up_score <= config.tie_margin:
         blocked_by.append("near_tied_candidate")
     elif any(
-        not _strong_match_assessment(signals, other, config)["blocked_by"]
-        for other in candidates[1:]
+        not _strong_match_assessment(signals, other, config)["blocked_by"] for other in rivals
     ):
         blocked_by.append("multiple_qualifying_candidates")
+    # Without a file ISBN, other editions of the work at (nearly) the same score mean the
+    # file's edition is unknown: accept the work, not one arbitrary edition's details.
+    edition_ambiguous = not signals.isbns and any(
+        top.score - other.score <= config.tie_margin
+        for other in candidates[1:]
+        if candidates_describe_same_work(top, other)
+    )
 
     applied = not blocked_by
     evidence = {
@@ -2386,6 +2434,8 @@ def _apply_strong_match_rule(
         "title_source": assessment["title_source"],
         "strongest_title_source": assessment["strongest_title_source"],
         "missing_coauthors": assessment["missing_coauthors"],
+        "same_work_editions": same_work_editions,
+        "edition_ambiguous": edition_ambiguous,
     }
     if applied:
         logger.info(
@@ -2394,8 +2444,9 @@ def _apply_strong_match_rule(
             provider_id=top.provider_id,
             base_score=top.score,
         )
+    base = _without_edition_fields(top) if applied and edition_ambiguous else top
     promoted = replace(
-        top,
+        base,
         score=max(top.score, AUTO_ACCEPT_SCORE) if applied else top.score,
         raw={**top.raw, STRONG_MATCH_EVIDENCE_KEY: evidence},
     )
