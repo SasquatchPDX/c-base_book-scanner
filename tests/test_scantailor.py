@@ -1683,3 +1683,111 @@ def test_text_line_detection_rejects_too_few_lines() -> None:
     for x in range(100, 800, 60):
         draw.rectangle((x, 500, x + 40, 510), fill=30)
     assert scantailor._detect_text_line_quad(page) is None
+
+
+def _workspace_queries(client: Client, job_id: str) -> list[str]:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as captured:
+        response = client.get(f"/scan/jobs/{job_id}/workspace/")
+    assert response.status_code == 200
+    return [query["sql"] for query in captured.captured_queries]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_workspace_query_count_does_not_grow_with_page_count() -> None:
+    """Regression for #51: the workspace issued several queries per page *and* stage."""
+    client, job = _create_scan_job("scan-user-workspace-queries")
+    for sequence in (1, 2):
+        _upload_scan_page(
+            client,
+            str(job.id),
+            sequence=sequence,
+            side="single",
+            payload=f"page-{sequence}".encode(),
+            filename=f"p{sequence}.png",
+        )
+    _workspace_queries(client, str(job.id))  # first load creates the stage rows
+    small = _workspace_queries(client, str(job.id))
+
+    for sequence in range(3, 9):
+        _upload_scan_page(
+            client,
+            str(job.id),
+            sequence=sequence,
+            side="single",
+            payload=f"page-{sequence}".encode(),
+            filename=f"p{sequence}.png",
+        )
+    first_large = _workspace_queries(client, str(job.id))
+    large = _workspace_queries(client, str(job.id))
+
+    assert len(large) == len(small)
+    # Creating the missing rows costs a bounded number of extra queries, not O(pages).
+    assert len(first_large) <= len(small) + 2 * len(scantailor.stage_order()) + 2
+    # A steady-state load must not write anything.
+    assert not [sql for sql in large if sql.lstrip().upper().startswith(("UPDATE", "INSERT"))]
+    assert ScanTailorStageState.objects.filter(scan_job=job).count() == 8 * len(
+        scantailor.stage_order()
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_workspace_bulk_stage_creation_links_inputs_like_single_path() -> None:
+    client, job = _create_scan_job("scan-user-workspace-links")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"links",
+        filename="links.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    response = client.get(f"/scan/jobs/{job.id}/workspace/")
+    assert response.status_code == 200
+    stages = response.json()["pages"][0]["stages"]
+    assert [stage["stage"] for stage in stages] == list(scantailor.stage_order())
+
+    states = {state.stage: state for state in ScanTailorStageState.objects.filter(scan_page=page)}
+    active = page.active_version()
+    assert active is not None
+    assert states["page_split"].input_stage_state_id is None
+    assert states["page_split"].input_scan_page_version_id == active.id
+    assert states["page_split"].input_storage_identifier == active.storage_identifier
+    for stage in scantailor.stage_order()[1:]:
+        predecessor = scantailor.previous_stage(stage)
+        assert predecessor is not None
+        assert states[stage].input_stage_state_id == states[predecessor].id
+        assert states[stage].algorithm == scantailor.DEFAULT_STAGE_ALGORITHM[stage]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_get_or_create_stage_state_skips_noop_save() -> None:
+    client, job = _create_scan_job("scan-user-noop-save")
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=b"noop",
+        filename="noop.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    first = scantailor.get_or_create_stage_state(
+        scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+    )
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as captured:
+        again = scantailor.get_or_create_stage_state(
+            scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+        )
+    assert again.id == first.id
+    assert not [
+        query
+        for query in captured.captured_queries
+        if query["sql"].lstrip().upper().startswith("UPDATE")
+    ]
