@@ -29,6 +29,15 @@ comparisons need normalization. `BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
 does not affect intake acceptance. Task D must give that setting a tested role or
 remove it; do not lower auto-accept merely to reduce the review queue.
 
+Author names are compared per name, not by exact string. Case, punctuation,
+spacing, and "Last, First" order are ignored, so "H P Lovecraft" equals
+"H. P. Lovecraft". A name variant counts as a partial match
+(`AUTHOR_VARIANT_MATCH_SCORE`, 0.9) when the surname is the same and the given
+names line up in order. Given names line up when they are equal, when one is the
+other's initial, or when they are close spellings, so a missing middle name or
+initial is allowed ("Iain M. Banks" vs "Iain Banks"). A shared surname alone is
+not a match ("Frank Herbert" vs "Brian Herbert").
+
 ## Provider options identified
 
 ### Open Library (primary)
