@@ -59,11 +59,14 @@ from ebook_server.storage import (
 
 from . import (
     book_deletion,
+    combine,
     conversion,
     genres,
     intake,
     metadata_search,
+    multipart,
     ocr,
+    review_accept,
     review_batch,
     review_identification,
     scan_identification,
@@ -74,12 +77,10 @@ from . import (
 from .metrics import PersistentStateCollector
 from .models import (
     AppUserProfile,
-    Author,
     Book,
     CoverImage,
     FileVariant,
     Genre,
-    Identifier,
     ImportJob,
     MetadataCandidate,
     MetadataSearch,
@@ -92,7 +93,6 @@ from .models import (
     ScanTodo,
     SourceLocation,
     StorageLocation,
-    clean_publication_year,
 )
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
@@ -1158,6 +1158,7 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
             latest_search is not None
             and any(candidate.id in current_ids for candidate in latest_search.candidates.all())
         ),
+        "isbn_lookup": metadata_search.isbn_lookup_result(latest_search, current_ids),
     }
 
 
@@ -1185,61 +1186,8 @@ def _serialize_task(task: ReviewTask) -> dict[str, Any]:
     }
 
 
-def _resolve_review_source(
-    *,
-    task: ReviewTask,
-    book: Book,
-    reviewer: Any,
-    decision: str,
-    selected_candidate: MetadataCandidate | None = None,
-    decision_notes: str = "",
-    decision_payload: dict[str, Any] | None = None,
-    inline_cover_fallback: bool = True,
-) -> FileVariant | None:
-    import_job = task.import_job
-    if import_job is not None:
-        # Cover extraction is queued after commit, never done in this request when a
-        # queue is configured; ``inline_cover_fallback`` only matters without one.
-        return intake.resolve_import_with_review_data(
-            job=import_job,
-            review_task=task,
-            book=book,
-            selected_candidate=selected_candidate,
-            reviewer=reviewer,
-            decision=decision,
-            decision_notes=decision_notes,
-            decision_payload=decision_payload,
-            inline_cover_fallback=inline_cover_fallback,
-        )
-    if task.scan_job_id is None:
-        raise ValueError("review task has no source")
-    with transaction.atomic():
-        scan_job = ScanJob.objects.select_for_update().get(pk=task.scan_job_id)
-        scan_job.book = book
-        scan_job.save(update_fields=["book_id", "updated_at"])
-        task.state = ReviewTask.State.RESOLVED
-        task.decision = decision
-        task.decision_notes = decision_notes
-        task.decided_at = timezone.now()
-        if decision_payload is not None:
-            task.decision_payload = decision_payload
-        task.resolved_book = book
-        task.selected_candidate = selected_candidate
-        task.reviewer = reviewer
-        task.save(
-            update_fields=[
-                "state",
-                "decision",
-                "decision_notes",
-                "decision_payload",
-                "resolved_book_id",
-                "selected_candidate_id",
-                "reviewer_id",
-                "decided_at",
-                "updated_at",
-            ],
-        )
-    return None
+# Moved to review_accept so workers resolve reviews through the same path (#59).
+_resolve_review_source = review_accept.resolve_review_source
 
 
 def _serialize_candidate(candidate: MetadataCandidate) -> dict[str, Any]:
@@ -1292,6 +1240,15 @@ _AUTO_ACCEPT_BLOCK_MESSAGES = {
         "The best match scored high enough to be accepted automatically, but its "
         "authors differ from the authors in the file's own metadata."
     ),
+    "ambiguous_tie": (
+        "Several different books tied for the best score, so none was accepted "
+        "automatically. Pick the right one below."
+    ),
+    "edition_conflict": (
+        "The best match scored high enough to be accepted automatically, but it "
+        "describes another edition than the file: its ISBN, language or publisher "
+        "does not match the file's own metadata."
+    ),
 }
 
 
@@ -1339,33 +1296,7 @@ def _reviewer_genre_choice(request: HttpRequest, payload: dict[str, Any]) -> lis
     return [found[genre_id] for genre_id in ids]
 
 
-def _apply_review_genres(
-    *,
-    book: Book,
-    task: ReviewTask,
-    reviewer_genres: list[Genre] | None,
-    provider_subjects: list[Any] | None,
-    reviewer: Any = None,
-) -> dict[str, Any]:
-    """Attach genres on a review decision; returns decision-payload additions.
-
-    An explicit reviewer choice, even an empty one, marks the Book's genres curated.
-    """
-    embedded = genres.embedded_subjects(task.embedded_metadata)
-    if reviewer_genres is not None:
-        genres.assign_reviewer(
-            book,
-            reviewer_genres,
-            suggestion=genres.suggest(provider_subjects, embedded),
-            user=reviewer,
-        )
-        return {"reviewer_genres": [genre.name for genre in reviewer_genres]}
-    added = genres.assign_automatic(
-        book,
-        provider_subjects=provider_subjects,
-        embedded_subjects=embedded,
-    )
-    return {"automatic_genres": [genre.name for genre in added]} if added else {}
+_apply_review_genres = review_accept.apply_review_genres
 
 
 def _attach_genre_suggestions(task: ReviewTask, candidates: list[MetadataCandidate]) -> None:
@@ -1586,7 +1517,15 @@ def _serialize_book(
     if book.back_cover_id and book.back_cover is not None:
         book_payload["cover_back"] = _serialize_cover(book.back_cover)
     if include_variants:
-        file_variants = _complete_variants(book)
+        file_variants = sorted(
+            _complete_variants(book),
+            # Complete representations first, then the parts of a split work in order.
+            key=lambda variant: (
+                variant.part_index is not None,
+                variant.part_index or 0,
+                variant.id,
+            ),
+        )
         variants = [
             {
                 "id": file_variant.id,
@@ -1598,6 +1537,8 @@ def _serialize_book(
                 "imported_at": (
                     file_variant.imported_at.isoformat() if file_variant.imported_at else None
                 ),
+                "part_index": file_variant.part_index,
+                "part_label": file_variant.part_label,
             }
             for file_variant in file_variants
         ]
@@ -1821,6 +1762,7 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
         {"kind": identifier.kind, "value": identifier.value}
         for identifier in book.identifiers.all()
     ]
+    payload["combine_options"] = combine.combine_options_for_book(book)
     if _wants_html(request):
         return render(
             request,
@@ -1831,6 +1773,7 @@ def library_book_detail(request: HttpRequest, book_id: int) -> HttpResponseBase:
                 "variants": payload.get("variants", []),
                 "identifiers": payload["identifiers"],
                 "conversion_options": payload.get("conversion_options", []),
+                "combine_options": payload["combine_options"],
             },
         )
     return JsonResponse(payload)
@@ -2121,6 +2064,56 @@ def conversion_job_status(
             request,
             "core/processing_job.html",
             {"job": job, "payload": payload, "kind": "Conversion"},
+        )
+    return JsonResponse(payload)
+
+
+@require_POST
+@login_required
+def library_book_combine_parts(request: HttpRequest, book_id: int) -> HttpResponseBase:
+    """Queue a combined whole-book file built from a multi-part work's parts (#60)."""
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        book = Book.objects.get(pk=book_id)
+    except Book.DoesNotExist:
+        return HttpResponseNotFound()
+    payload = _request_payload(request)
+    raw_format = payload.get("target_format")
+    if not isinstance(raw_format, str) or not raw_format.strip():
+        return HttpResponseBadRequest("target_format required")
+    try:
+        job = combine.request_combined_variant(
+            book=book,
+            target_format=raw_format,
+            requested_by_user_id=profile.user_id,
+        )
+    except combine.CombineError as exc:
+        return HttpResponseBadRequest(str(exc))
+    if _wants_html(request):
+        return redirect("combine-job-status", job_id=job.job_id)
+    return JsonResponse(combine.combine_job_payload(job), status=202)
+
+
+@require_GET
+@login_required
+def combine_job_status(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    try:
+        job = ProcessingJob.objects.get(job_id=job_id)
+    except (ProcessingJob.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if job.job_type != ProcessingJob.JobType.COMBINE_PARTS:
+        return HttpResponseNotFound()
+    payload = combine.combine_job_payload(job)
+    if _wants_html(request):
+        return render(
+            request,
+            "core/processing_job.html",
+            {"job": job, "payload": payload, "kind": "Combine parts"},
         )
     return JsonResponse(payload)
 
@@ -4105,6 +4098,8 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    multipart_group = multipart.group_for_task(task)
+    payload["multipart"] = multipart_group
     search_context = _review_search_context(task)
     active_job = search_context["active_search_job"]
     payload["searches"] = [
@@ -4117,6 +4112,25 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         else None
     )
     payload["failed_search_error"] = search_context["failed_search_error"]
+    isbn_lookup = search_context["isbn_lookup"]
+    payload["isbn_lookup"] = (
+        {
+            "isbn": isbn_lookup["isbn"],
+            "state": isbn_lookup["state"],
+            "verified_candidate_ids": [str(pk) for pk in isbn_lookup["verified_candidate_ids"]],
+            "unambiguous": isbn_lookup["unambiguous"],
+            "best_candidate_id": (
+                str(isbn_lookup["best"].id) if isbn_lookup["best"] is not None else None
+            ),
+            "auto_accepted": (
+                task.state == ReviewTask.State.RESOLVED
+                and isinstance(task.decision_payload, dict)
+                and task.decision_payload.get("resolution_source") == "reviewer_isbn"
+            ),
+        }
+        if isbn_lookup is not None
+        else None
+    )
     if _wants_html(request):
         return render(
             request,
@@ -4125,6 +4139,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
+                "multipart": multipart_group,
                 "candidates": candidates,
                 "all_genres": list(Genre.objects.order_by("name")),
                 "books": Book.objects.order_by("title")[:250],
@@ -4134,77 +4149,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     return JsonResponse(payload)
 
 
-def _book_for_candidate(candidate: MetadataCandidate) -> Book:
-    """Find the canonical Book a provider candidate describes, creating it if new."""
-    candidate_isbn13 = candidate.isbn13 or None
-    if candidate_isbn13:
-        existing_identifier = (
-            Identifier.objects.filter(
-                value=candidate_isbn13,
-            )
-            .select_related("book")
-            .first()
-        )
-        if existing_identifier is not None:
-            book = existing_identifier.book
-        else:
-            book = None
-    else:
-        book = None
-
-    if book is None:
-        candidate_isbn10 = candidate.isbn10 or None
-        if candidate_isbn10:
-            existing_identifier = (
-                Identifier.objects.filter(
-                    value=candidate_isbn10,
-                )
-                .select_related("book")
-                .first()
-            )
-            if existing_identifier is not None:
-                book = existing_identifier.book
-
-    if book is None:
-        candidate_author_set = {name.lower() for name in candidate.authors if isinstance(name, str)}
-        for existing_book in Book.objects.filter(title__iexact=candidate.title):
-            known_authors = [author.full_name.lower() for author in existing_book.authors.all()]
-            if candidate_author_set.intersection(known_authors):
-                book = existing_book
-                break
-
-    if book is None:
-        candidate_edition = getattr(candidate, "edition", "")
-        book = Book.objects.create(
-            title=candidate.title,
-            publisher=candidate.publisher or "",
-            language=candidate.language or "",
-            description=candidate.description or "",
-            edition=candidate_edition or "",
-        )
-        book.publication_year = clean_publication_year(candidate.publication_year)
-        for author_name in candidate.authors:
-            if not isinstance(author_name, str):
-                continue
-            author, _ = Author.objects.get_or_create(full_name=author_name.strip())
-            if author_name.strip():
-                book.authors.add(author)
-        if candidate.isbn10:
-            Identifier.objects.get_or_create(
-                book=book,
-                kind=Identifier.IdentifierType.ISBN10,
-                value=candidate.isbn10,
-                defaults={"normalized_value": candidate.isbn10},
-            )
-        if candidate.isbn13:
-            Identifier.objects.get_or_create(
-                book=book,
-                kind=Identifier.IdentifierType.ISBN13,
-                value=candidate.isbn13,
-                defaults={"normalized_value": candidate.isbn13},
-            )
-        book.save()
-    return book
+_book_for_candidate = review_accept.book_for_candidate
 
 
 def _accept_review_candidate(
@@ -4227,41 +4172,16 @@ def _accept_review_candidate(
     ``inline_cover_fallback=False`` so it never extracts in the request, even without
     a configured queue.
     """
-    book = _book_for_candidate(candidate)
-    decision_additions: dict[str, Any] = {}
-    if reviewer_authors and not book.authors.exists():
-        for author_name in reviewer_authors:
-            author, _ = Author.objects.get_or_create(
-                full_name=intake._fit(Author, "full_name", author_name),
-            )
-            book.authors.add(author)
-        decision_additions["reviewer_authors"] = reviewer_authors
-    decision_additions.update(
-        _apply_review_genres(
-            book=book,
-            task=task,
-            reviewer_genres=reviewer_genres,
-            provider_subjects=candidate.subjects,
-            reviewer=reviewer,
-        )
-    )
-    if decision_additions:
-        decision_payload = {
-            **(task.decision_payload if isinstance(task.decision_payload, dict) else {}),
-            **(decision_payload or {}),
-            **decision_additions,
-        }
-    variant = _resolve_review_source(
+    return review_accept.accept_candidate(
         task=task,
-        book=book,
-        selected_candidate=candidate,
+        candidate=candidate,
         reviewer=reviewer,
-        decision=cast(str, ReviewTask.Decision.ACCEPT_CANDIDATE),
-        decision_notes=decision_notes or f"Accepted candidate {candidate.id}",
-        decision_payload=decision_payload,
+        reviewer_authors=reviewer_authors,
+        reviewer_genres=reviewer_genres,
+        decision_notes=decision_notes,
+        extra_payload=decision_payload,
         inline_cover_fallback=inline_cover_fallback,
     )
-    return book, variant
 
 
 @require_POST
@@ -4280,6 +4200,10 @@ def review_accept_candidate(
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
+
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
 
     payload = _request_payload(request)
     candidate_id = _coerce_int(payload.get("candidate_id"), minimum=1)
@@ -4302,21 +4226,13 @@ def review_accept_candidate(
         return HttpResponseBadRequest(str(exc))
 
     try:
-        # A candidate without authors (the provider record names none) can be accepted
-        # with authors the reviewer confirmed, e.g. the file's suggested authors. They
-        # only fill a Book that has no authors yet; provider authors always win.
-        candidate_has_authors = any(
-            isinstance(name, str) and name.strip() for name in candidate.authors
-        )
-        reviewer_authors = (
-            [] if candidate_has_authors else _parse_author_list(payload.get("authors"))
-        )
-        book, variant = _accept_review_candidate(
+        book, variant = review_accept.accept_candidate(
             task=task,
             candidate=candidate,
             reviewer=profile.user,
-            reviewer_authors=reviewer_authors,
+            reviewer_authors=_parse_author_list(payload.get("authors")),
             reviewer_genres=reviewer_genres,
+            decision_notes=f"Accepted candidate {candidate.id}",
         )
         return _review_action_response(
             request,
@@ -4369,6 +4285,12 @@ def _batch_accept_one(
             result["title"] = task.inferred_title or task.source_filename
             if task.state not in REVIEW_QUEUE_STATES:
                 return {**result, "outcome": "closed"}
+            if task.task_type == ReviewTask.TaskType.MULTIPART_WORK:
+                return {
+                    **result,
+                    "outcome": "requires_individual_review",
+                    "detail": "Confirm multipart membership and reading order on its review page.",
+                }
             candidates = list(_review_candidates(task))
             eligibility = review_batch.evaluate_top_candidates(
                 [candidate.score for candidate in candidates],
@@ -4524,17 +4446,13 @@ def _save_review_terms(task: ReviewTask, terms: dict[str, Any]) -> None:
         scan_job.save(update_fields=["provisional_title", "provisional_authors", "updated_at"])
 
 
-@require_POST
-@login_required
-def review_search_again(
+def _closed_or_forbidden_review(
     request: HttpRequest,
     task_id: str,
-) -> HttpResponseBase:
-    """Save the posted search terms (if any) and queue a provider search with them."""
+) -> tuple[AppUserProfile, ReviewTask] | HttpResponseBase:
     profile = _profile_for_request(request)
     if profile is None or profile.is_disabled:
         return HttpResponseBadRequest("forbidden")
-    payload = _request_payload(request)
     try:
         task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
@@ -4543,17 +4461,26 @@ def review_search_again(
         return HttpResponseForbidden()
     if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
         return HttpResponseBadRequest("review task is already closed")
+    return profile, task
 
-    posted_terms = metadata_search.terms_from_payload(payload)
-    if posted_terms is not None:
-        _save_review_terms(task, posted_terms)
-    terms = metadata_search.task_terms(task)
+
+def _queue_review_search(
+    request: HttpRequest,
+    *,
+    profile: AppUserProfile,
+    task: ReviewTask,
+    terms: dict[str, Any],
+    decision_payload: dict[str, Any],
+    notes: str,
+    busy_prefix: str,
+) -> HttpResponseBase:
+    """Claim the task and queue a provider search with ``terms`` (text or ISBN)."""
     task.state = ReviewTask.State.CLAIMED
     task.decision = ReviewTask.Decision.SEARCH_AGAIN
     task.reviewer = profile.user
-    task.decision_notes = str(payload.get("notes", ""))
+    task.decision_notes = notes
     task.decided_at = timezone.now()
-    task.decision_payload = {"search_again": True, "terms": terms}
+    task.decision_payload = decision_payload
     task.save(
         update_fields=[
             "state",
@@ -4589,7 +4516,7 @@ def review_search_again(
         task.state = ReviewTask.State.OPEN
         task.save(update_fields=["state", "updated_at"])
         if _wants_html(request):
-            messages.warning(request, f"Search terms saved, but {exc}.")
+            messages.warning(request, f"{busy_prefix} {exc}.")
             return redirect("review-detail", task_id=task.id)
         return JsonResponse({"task_id": str(task.id), "error": str(exc)}, status=409)
     except (
@@ -4613,6 +4540,67 @@ def review_search_again(
             "identification_job": job_payload,
         },
         status=202,
+    )
+
+
+@require_POST
+@login_required
+def review_search_again(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Save the posted search terms (if any) and queue a provider search with them."""
+    loaded = _closed_or_forbidden_review(request, task_id)
+    if isinstance(loaded, HttpResponseBase):
+        return loaded
+    profile, task = loaded
+    payload = _request_payload(request)
+    posted_terms = metadata_search.terms_from_payload(payload)
+    if posted_terms is not None:
+        _save_review_terms(task, posted_terms)
+    terms = metadata_search.task_terms(task)
+    return _queue_review_search(
+        request,
+        profile=profile,
+        task=task,
+        terms=terms,
+        decision_payload={"search_again": True, "terms": terms},
+        notes=str(payload.get("notes", "")),
+        busy_prefix="Search terms saved, but",
+    )
+
+
+@require_POST
+@login_required
+def review_isbn_lookup(
+    request: HttpRequest,
+    task_id: str,
+) -> HttpResponseBase:
+    """Queue a provider lookup by the ISBN the reviewer typed (#59).
+
+    The typed ISBN is only a query: a record counts as verified when a provider
+    returns it carrying that ISBN. The task's saved title/author terms are kept.
+    """
+    loaded = _closed_or_forbidden_review(request, task_id)
+    if isinstance(loaded, HttpResponseBase):
+        return loaded
+    profile, task = loaded
+    payload = _request_payload(request)
+    isbn = metadata_search.parse_isbn(payload.get("isbn"))
+    if isbn is None:
+        message = "enter one valid ISBN-10 or ISBN-13 (the check digit did not match)"
+        if _wants_html(request):
+            messages.error(request, f"ISBN lookup not started: {message}.")
+            return redirect("review-detail", task_id=task.id)
+        return HttpResponseBadRequest(message)
+    return _queue_review_search(
+        request,
+        profile=profile,
+        task=task,
+        terms=metadata_search.isbn_terms(isbn),
+        decision_payload={"isbn_lookup": isbn},
+        notes=str(payload.get("notes", "")),
+        busy_prefix="ISBN lookup not started:",
     )
 
 
@@ -4711,6 +4699,10 @@ def review_manual_entry(
     if not _can_manage_review_task(profile, task):
         return HttpResponseForbidden()
 
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
+
     payload = _request_payload(request)
     if not isinstance(payload.get("title"), str):
         return HttpResponseBadRequest("title required")
@@ -4774,6 +4766,9 @@ def review_merge_existing(
         book = Book.objects.get(pk=book_id)
     except Book.DoesNotExist:
         return HttpResponseBadRequest("book not found")
+    blocker = multipart.confirmation_blocker(task)
+    if blocker is not None:
+        return HttpResponseBadRequest(blocker)
 
     _resolve_review_source(
         task=task,
@@ -4785,6 +4780,126 @@ def review_merge_existing(
     return _review_action_response(
         request,
         {"task_id": str(task.id), "book_id": str(book.id)},
+    )
+
+
+def _multipart_review_task(
+    request: HttpRequest,
+    task_id: str,
+) -> tuple[ReviewTask | None, AppUserProfile | None, HttpResponseBase | None]:
+    profile = _profile_for_request(request)
+    if profile is None or profile.is_disabled:
+        return None, None, HttpResponseBadRequest("forbidden")
+    try:
+        task = ReviewTask.objects.select_related("import_job", "import_job__import_group").get(
+            pk=task_id
+        )
+    except (ReviewTask.DoesNotExist, ValueError):
+        return None, None, HttpResponseNotFound()
+    if not _can_manage_review_task(profile, task):
+        return None, None, HttpResponseForbidden()
+    if task.task_type != ReviewTask.TaskType.MULTIPART_WORK:
+        return None, None, HttpResponseBadRequest("not a multi-part review")
+    if task.state in {ReviewTask.State.RESOLVED, ReviewTask.State.CANCELLED}:
+        return None, None, HttpResponseBadRequest("review task is already closed")
+    return task, profile, None
+
+
+@require_POST
+@login_required
+def review_multipart_order(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Save the reviewer's part order/labels before confirming a multi-part work.
+
+    Form posts send ``part_index_<import_job_id>`` / ``part_label_<import_job_id>``;
+    JSON posts send ``{"parts": [{"import_job_id", "part_index", "part_label"}]}``.
+    """
+    task, _profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None:
+        return error or HttpResponseBadRequest("invalid request")
+    payload = _request_payload(request)
+    order: dict[str, tuple[int, str]] = {}
+    raw_parts = payload.get("parts")
+    if isinstance(raw_parts, list):
+        for entry in raw_parts:
+            if not isinstance(entry, dict):
+                return HttpResponseBadRequest("invalid parts")
+            index = _coerce_int(entry.get("part_index"), minimum=1)
+            if index is None:
+                return HttpResponseBadRequest("part_index must be a positive number")
+            order[str(entry.get("import_job_id"))] = (index, str(entry.get("part_label") or ""))
+    else:
+        for key, value in payload.items():
+            if not key.startswith("part_index_"):
+                continue
+            job_id = key.removeprefix("part_index_")
+            index = _coerce_int(value, minimum=1)
+            if index is None:
+                return HttpResponseBadRequest("part_index must be a positive number")
+            order[job_id] = (index, str(payload.get(f"part_label_{job_id}", "") or ""))
+    if not order:
+        return HttpResponseBadRequest("parts required")
+    try:
+        multipart.update_part_order(task, order)
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {"task_id": str(task.id), "multipart": multipart.group_for_task(task)},
+        task_id=task.id,
+    )
+
+
+@require_POST
+@login_required
+def review_multipart_acknowledge_incomplete(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Acknowledge the parts that block confirming a multi-part work.
+
+    Missing (failed/absent) parts are left out; parts identical to another Book's file
+    are included as parts of this work.
+    """
+    task, profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None or profile is None:
+        return error or HttpResponseBadRequest("invalid request")
+    try:
+        absent, duplicates = multipart.acknowledge_incomplete(
+            review_task=task, reviewer=profile.user
+        )
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {
+            "task_id": str(task.id),
+            "acknowledged_missing_parts": absent,
+            "acknowledged_duplicate_parts": duplicates,
+        },
+        task_id=task.id,
+    )
+
+
+@require_POST
+@login_required
+def review_multipart_reject(request: HttpRequest, task_id: str) -> HttpResponseBase:
+    """Not one work: close the group and identify every file as its own import."""
+    task, profile, error = _multipart_review_task(request, task_id)
+    if error is not None or task is None or profile is None:
+        return error or HttpResponseBadRequest("invalid request")
+    payload = _request_payload(request)
+    try:
+        split = multipart.reject_grouping(
+            review_task=task,
+            reviewer=profile.user,
+            notes=str(payload.get("notes", "")),
+        )
+    except multipart.MultipartError as exc:
+        return HttpResponseBadRequest(str(exc))
+    return _review_action_response(
+        request,
+        {
+            "task_id": str(task.id),
+            "state": ReviewTask.State.RESOLVED,
+            "split_import_job_ids": [str(job.id) for job in split],
+        },
     )
 
 

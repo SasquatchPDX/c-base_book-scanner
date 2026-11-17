@@ -16,10 +16,13 @@ open. Anything else is stored as a DISCARDED run whose candidates are history.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, TypeGuard
 
+import isbnlib
 import structlog
 from django.contrib.auth.models import AbstractBaseUser
 from django.db import models as django_models
@@ -106,13 +109,244 @@ def task_terms(task: ReviewTask) -> dict[str, Any]:
     }
 
 
-def query_payload(signals: identification.IdentificationInput) -> dict[str, Any]:
+def query_payload(
+    signals: identification.IdentificationInput,
+    *,
+    mode: str = "text",
+) -> dict[str, Any]:
     """The terms actually sent to providers, as shown to reviewers."""
     return {
+        "mode": mode,
         "title_hints": list(signals.title_hints[:3]),
         "author": signals.best_author(),
-        "isbns": list(signals.isbns[:1]),
+        # The first ISBN is the one queried; an ISBN lookup also lists its other form,
+        # which counts when verifying a returned record.
+        "isbns": list(signals.isbns[:2] if mode == "isbn" else signals.isbns[:1]),
     }
+
+
+# ------------------------------------------------------------------- ISBN lookup
+
+
+def parse_isbn(raw: Any) -> str | None:
+    """The single valid ISBN-10/13 a reviewer typed, normalized, or ``None``.
+
+    Spaces and hyphens are ignored; the check digit must be valid. Several ISBNs
+    in one field are rejected rather than guessed between.
+    """
+    if not isinstance(raw, str):
+        return None
+    compact = re.sub(r"[\s\-\u2010-\u2015]", "", raw)
+    compact = re.sub(r"^isbn(?:1[03])?:?", "", compact, flags=re.IGNORECASE)
+    if not compact or len(compact) > 13:
+        return None
+    values = identification.normalize_isbns(compact)
+    return values[0] if values else None
+
+
+def isbn_terms(isbn: str) -> dict[str, Any]:
+    return {"isbn": isbn}
+
+
+def is_isbn_terms(terms: Any) -> TypeGuard[dict[str, Any]]:
+    return isinstance(terms, dict) and isinstance(terms.get("isbn"), str) and bool(terms["isbn"])
+
+
+def isbn_signals(isbn: str) -> identification.IdentificationInput:
+    """Signals for a lookup by ISBN only: no title, author or folder fallback.
+
+    Both ISBN forms are listed so a record carrying either one scores as an ISBN
+    match; providers are queried with the first (the form the reviewer typed).
+    """
+    return identification.IdentificationInput(
+        title_hints=[],
+        author_hints=[],
+        isbns=identification.normalize_isbns(isbn) or [isbn],
+        folder_hints=[],
+        language=None,
+        publisher=None,
+        description=None,
+    )
+
+
+def canonical_isbn13(value: Any) -> str | None:
+    """The ISBN-13 form of a valid ISBN-10/13 (isbnlib), so both forms compare equal."""
+    if not isinstance(value, str | int):
+        return None
+    compact = isbnlib.canonical(str(value))
+    if isbnlib.is_isbn10(compact):
+        return isbnlib.to_isbn13(compact) or None
+    if isbnlib.is_isbn13(compact):
+        return compact
+    return None
+
+
+# Identifier keys and lists as providers return them (Open Library ``isbn_10`` /
+# ``isbn_13`` / search ``isbn``; Google Books ``industryIdentifiers``; DNB and
+# Hardcover mapped to ``isbn_10`` / ``isbn_13`` from the record itself).
+_IDENTIFIER_TYPE_KEYS = ("type", "kind", "scheme")
+_IDENTIFIER_VALUE_KEYS = ("identifier", "value", "id")
+_MAX_RECORD_DEPTH = 4
+
+
+def record_isbns(raw: Any) -> set[str]:
+    """ISBN-13 forms of every ISBN the provider's own record lists.
+
+    Keys starting with ``_`` are ours, not the provider's (``_queried_isbn`` is the
+    lookup query echoed into the payload), so they are never evidence.
+    """
+    found: set[str] = set()
+
+    def walk(node: Any, depth: int) -> None:
+        if depth > _MAX_RECORD_DEPTH:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        type_value = next(
+            (node[key] for key in _IDENTIFIER_TYPE_KEYS if isinstance(node.get(key), str)), ""
+        )
+        if "isbn" in type_value.lower():
+            for key in _IDENTIFIER_VALUE_KEYS:
+                if (isbn := canonical_isbn13(node.get(key))) is not None:
+                    found.add(isbn)
+        for key, value in node.items():
+            if not isinstance(key, str) or key.startswith("_"):
+                continue
+            if "isbn" in key.lower():
+                for item in value if isinstance(value, list) else [value]:
+                    if (isbn := canonical_isbn13(item)) is not None:
+                        found.add(isbn)
+            elif isinstance(value, dict | list):
+                walk(value, depth + 1)
+
+    walk(raw, 0)
+    return found
+
+
+def record_carries_isbn(candidate: MetadataCandidate, isbn: str) -> bool:
+    """True when the provider record behind ``candidate`` itself lists ``isbn``.
+
+    Only the stored raw provider payload counts; the candidate's normalized
+    ``isbn10``/``isbn13`` may have been filled from the query and prove nothing.
+    """
+    wanted = canonical_isbn13(isbn)
+    return wanted is not None and wanted in record_isbns(candidate.raw_payload)
+
+
+def verified_isbn_candidates(
+    candidates: Iterable[MetadataCandidate],
+    isbn: str,
+) -> list[MetadataCandidate]:
+    """Candidates whose provider record carries ``isbn``, best first."""
+    verified = [candidate for candidate in candidates if record_carries_isbn(candidate, isbn)]
+    verified.sort(key=lambda candidate: (-candidate.score, candidate.id))
+    return verified
+
+
+def isbn_forms(isbn: str) -> list[str]:
+    """``[isbn13, isbn10]`` for a valid ISBN-10/13 (the ISBN-10 only for 978-),
+    or ``[]``. The order is the lookup order for library identifiers."""
+    isbn13 = canonical_isbn13(isbn)
+    if isbn13 is None:
+        return []
+    isbn10 = isbnlib.to_isbn10(isbn13) if isbn13.startswith("978") else ""
+    return [isbn13, isbn10] if isbn10 else [isbn13]
+
+
+def _named_authors(candidate: MetadataCandidate) -> list[str]:
+    authors = candidate.authors if isinstance(candidate.authors, list) else []
+    return [name for name in authors if isinstance(name, str) and name.strip()]
+
+
+def same_book(left: MetadataCandidate, right: MetadataCandidate) -> bool:
+    """True when two provider records can describe the same book.
+
+    They are different books when their normalized titles differ, when both name
+    authors and none of them is the same person (``identification.authors_conflict``:
+    "Selected Poems" by Emily Dickinson vs by William Blake), or when both list
+    ISBNs and share none (different editions). Missing authors or ISBNs on one
+    side are no conflict.
+    """
+    if identification.normalize_text(left.title) != identification.normalize_text(right.title):
+        return False
+    if identification.authors_conflict(_named_authors(left), _named_authors(right)):
+        return False
+    left_isbns = record_isbns(left.raw_payload)
+    right_isbns = record_isbns(right.raw_payload)
+    return not (left_isbns and right_isbns and left_isbns.isdisjoint(right_isbns))
+
+
+def distinct_books(candidates: Iterable[MetadataCandidate]) -> list[list[MetadataCandidate]]:
+    """Group records into distinct books (several providers may agree on one).
+
+    A record joins a group only when it is :func:`same_book` as every member, so a
+    single group means every pair of records agrees on title, authors and ISBNs.
+    """
+    groups: list[list[MetadataCandidate]] = []
+    for candidate in candidates:
+        for group in groups:
+            if all(same_book(candidate, member) for member in group):
+                group.append(candidate)
+                break
+        else:
+            groups.append([candidate])
+    return groups
+
+
+def isbn_lookup_result(
+    search: MetadataSearch | None,
+    current_ids: set[int],
+) -> dict[str, Any] | None:
+    """How the latest run answered an ISBN lookup, or ``None`` if it was no lookup.
+
+    A candidate is *verified* when the provider's own record lists the looked-up
+    ISBN (either form, see :func:`record_carries_isbn`); neither the typed value
+    nor a query echoed into normalization is trusted. The lookup is *unambiguous*
+    when all verified current records describe the same book (title and authors,
+    :func:`distinct_books`), so several providers agreeing on one book still count
+    as a single match.
+    """
+    if search is None or not isinstance(search.query, dict) or search.query.get("mode") != "isbn":
+        return None
+    queried = str((search.query.get("isbns") or [""])[0] or "")
+    verified = verified_isbn_candidates(
+        [candidate for candidate in search.candidates.all() if candidate.id in current_ids],
+        queried,
+    )
+    books = distinct_books(verified)
+    return {
+        "isbn": (search.query.get("isbns") or [""])[0],
+        "state": search.state,
+        "provider_errors": len(search.provider_errors),
+        "verified": verified,
+        "verified_candidate_ids": [candidate.id for candidate in verified],
+        "distinct_books": len(books),
+        "unambiguous": len(books) == 1,
+        "best": verified[0] if len(books) == 1 else None,
+    }
+
+
+def bound_isbn(candidate: MetadataCandidate) -> str | None:
+    """The searched ISBN this candidate's own record carries, as ISBN-13, or ``None``.
+
+    A record can list several ISBNs (other editions, print and ebook). When the
+    search that found it asked for one of them (an intake search with the file's
+    ISBN, or a reviewer's ISBN lookup) and the provider record itself lists it,
+    that ISBN identifies the edition being accepted, not the record's first one.
+    """
+    search = candidate.search
+    query = search.query if search is not None and isinstance(search.query, dict) else {}
+    raw_queried = query.get("isbns")
+    queried: list[Any] = raw_queried if isinstance(raw_queried, list) else []
+    carried = record_isbns(candidate.raw_payload)
+    for value in queried:
+        if (isbn13 := canonical_isbn13(value)) is not None and isbn13 in carried:
+            return isbn13
+    return None
 
 
 # ----------------------------------------------------------------------- recording
@@ -139,6 +373,7 @@ def record_search(
     started_at: datetime | None = None,
     error: str = "",
     discarded: str = "",
+    mode: str = "text",
 ) -> MetadataSearch:
     """Persist one finished run.
 
@@ -158,7 +393,7 @@ def record_search(
         scan_job=scan_job,
         processing_job_id=processing_job_id,
         requested_by_id=requested_by_id,
-        query=query_payload(signals),
+        query=query_payload(signals, mode=mode),
         providers=[outcome.as_dict() for outcome in outcomes or []],
         candidate_count=candidate_count,
         error=error[:MAX_ERROR_LENGTH],
@@ -173,12 +408,15 @@ def save_candidates(
     candidates: list[identification.IdentificationCandidate],
     match_threshold: float | None,
     current: bool = True,
+    passed_over: Iterable[identification.IdentificationCandidate] = (),
 ) -> None:
     """Make ``candidates`` the current ones, keeping earlier ones as history.
 
     Must run inside a transaction. With no candidates nothing is superseded: an
     empty or failed repeat search leaves the earlier candidates acceptable.
-    ``match_threshold`` of ``None`` keeps every candidate in REVIEW state.
+    ``match_threshold`` of ``None`` keeps every candidate in REVIEW state, and
+    ``passed_over`` candidates (not accepted automatically) stay in REVIEW whatever
+    their score.
     ``current=False`` stores them as already superseded history (a discarded run).
     """
     if not candidates:
@@ -199,6 +437,7 @@ def save_candidates(
         MetadataCandidate.objects.filter(**source, superseded_at__isnull=True).exclude(
             search=search
         ).update(superseded_at=stored_at)
+    passed_over_ids = {id(candidate) for candidate in passed_over}
     seen: set[tuple[str, str]] = set()
     for index, candidate in enumerate(candidates, start=1):
         # Records without a provider key must not collide with each other.
@@ -207,7 +446,11 @@ def save_candidates(
             continue
         seen.add((candidate.provider_id, provider_ref))
         state = MetadataCandidate.CandidateState.REVIEW
-        if match_threshold is not None and candidate.score >= match_threshold:
+        if (
+            match_threshold is not None
+            and candidate.score >= match_threshold
+            and id(candidate) not in passed_over_ids
+        ):
             state = MetadataCandidate.CandidateState.MATCH
         MetadataCandidate.objects.create(
             **source,

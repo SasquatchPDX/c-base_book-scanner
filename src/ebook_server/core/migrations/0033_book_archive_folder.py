@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("core", "0030_metadata_search_runs"),
+        ("core", "0032_processingjob_combine_parts"),
     ]
 
     operations = [
