@@ -76,7 +76,7 @@ def test_upload_admission_precedes_staging_and_limits_survive_completion(tmp_pat
             BOOK_SCANNER_MEMBER_UPLOADS_PENDING=1,
             BOOK_SCANNER_MEMBER_UPLOAD_BYTES_PER_HOUR=7,
         ),
-        patch("ebook_server.core.views.enqueue"),
+        patch("ebook_server.core.intake_views.enqueue"),
     ):
         assert upload(first).status_code == 201
         staged = list((tmp_path / "uploads").iterdir())
