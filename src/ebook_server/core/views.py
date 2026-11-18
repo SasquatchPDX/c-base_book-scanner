@@ -4205,6 +4205,11 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
             "core/upload.html",
             {
                 "max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES,
+                "accepted_extensions": ",".join(sorted(intake.SUPPORTED_FORMATS)),
+                "supported_formats": ", ".join(
+                    extension.removeprefix(".").upper()
+                    for extension in sorted(intake.SUPPORTED_FORMATS)
+                ),
                 "audiobook_service_url": intake.audiobook_service_url(),
             },
         )

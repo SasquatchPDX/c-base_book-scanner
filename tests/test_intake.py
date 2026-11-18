@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
@@ -699,6 +700,35 @@ def test_book_title_with_slash_is_sanitized_before_naming_the_archive() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_upload_picker_and_help_follow_the_format_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A newly registered extension must appear without editing the template.
+    monkeypatch.setitem(
+        intake.SUPPORTED_FORMATS, ".newbook", intake.SupportedFormat("txt", "text/plain")
+    )
+    client = Client()
+    client.force_login(get_or_create_profile("upload-form-user").user)
+
+    response = client.get("/imports/upload/")
+
+    assert response.status_code == 200
+    html = response.content.decode()
+    accepted = re.search(r'accept="([^"]+)"', html)
+    assert accepted is not None
+    assert set(accepted[1].split(",")) == set(intake.SUPPORTED_FORMATS)
+    assert '<label for="book-file">Book file</label>' in html
+    assert 'aria-describedby="book-file-help"' in html
+    help_text = re.search(r'<small id="book-file-help">([^<]+)</small>', html)
+    assert help_text is not None
+    assert "Supported formats:" in help_text[1]
+    for extension in intake.SUPPORTED_FORMATS:
+        assert extension[1:].upper() in help_text[1]
+    assert "Maximum" in help_text[1]
+    assert "EPUB or PDF" not in html
+
+
+@pytest.mark.django_db(transaction=True)
 def test_unsupported_format_is_rejected() -> None:
     profile = get_or_create_profile("docx-user")
     client = Client()
@@ -715,6 +745,7 @@ def test_unsupported_format_is_rejected() -> None:
         },
     )
     assert response.status_code == 400
+    assert response.content.decode() == "unsupported file format: notes.docx"
     assert not ImportJob.objects.exists()
 
 
@@ -899,6 +930,7 @@ def test_txt_upload_uses_normal_ingestion_and_external_verification(
     assert job.state == ImportJob.State.COMPLETE
     assert job.file_variant is not None
     assert job.file_variant.format == FileVariant.VariantFormat.TXT
+    assert MetadataCandidate.objects.filter(import_job=job, provider_id="stub").exists()
 
 
 def test_plain_palmdoc_is_only_accepted_as_prc(tmp_path: Path) -> None:
