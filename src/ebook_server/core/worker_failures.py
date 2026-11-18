@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
 from django.db import close_old_connections, transaction
@@ -17,6 +18,8 @@ from django.utils import timezone
 from rq import get_current_job
 
 from .models import ProcessingJob, ReviewTask, ScanJob
+
+logger = structlog.get_logger(__name__)
 
 SUPPORTED = frozenset(
     {
@@ -70,7 +73,7 @@ def retry_pending(job: ProcessingJob, rq_job: Any = None) -> bool:
     )
 
 
-def _owner(job: ProcessingJob) -> tuple[int | None, str]:
+def _owner(job: ProcessingJob) -> tuple[int | None, str, str]:
     details = job.details if isinstance(job.details, dict) else {}
     requested = details.get("requested_by_user_id")
     owner = (
@@ -81,9 +84,10 @@ def _owner(job: ProcessingJob) -> tuple[int | None, str]:
     if job.file_variant_id is not None:
         source = job.file_variant
         assert source is not None
-        return owner or source.uploader_id, source.original_filename
-    scan = ScanJob.objects.filter(pk=details.get("scan_job_id")).first()
-    return owner or (scan.operator_id if scan else None), f"{job.get_job_type_display()} job"
+        return owner or source.uploader_id, source.original_filename, source.book.title
+    scan = ScanJob.objects.select_related("book").filter(pk=details.get("scan_job_id")).first()
+    title = (scan.book.title if scan.book else scan.provisional_title) if scan else ""
+    return owner or (scan.operator_id if scan else None), f"{job.get_job_type_display()} job", title
 
 
 def _snapshot(task: ReviewTask, action: str | None = None, user_id: int | None = None) -> None:
@@ -121,14 +125,12 @@ def sync_outcome(sender: Any, instance: ProcessingJob, **kwargs: Any) -> None:
         return
     if instance.recovery_task_id is None and instance.state != ProcessingJob.JobState.FAILED:
         return
-    if instance.state == ProcessingJob.JobState.FAILED and retry_pending(instance):
-        return
     with transaction.atomic():
         job = ProcessingJob.objects.select_for_update().get(pk=instance.pk)
         if job.recovery_task_id is None:
             if job.state != ProcessingJob.JobState.FAILED:
                 return
-            owner_id, filename = _owner(job)
+            owner_id, filename, title = _owner(job)
             task, _ = ReviewTask.objects.get_or_create(
                 processing_job=job,
                 defaults={
@@ -137,7 +139,11 @@ def sync_outcome(sender: Any, instance: ProcessingJob, **kwargs: Any) -> None:
                     "uploader_id": owner_id,
                     "source_filename": filename[:512],
                     "source_path_hint": f"processing-job:{job.job_id}",
-                    "inferred_title": job.get_job_type_display(),
+                    "inferred_title": (
+                        f"{job.get_job_type_display()} · {title}"
+                        if title
+                        else job.get_job_type_display()
+                    )[:255],
                 },
             )
             ProcessingJob.objects.filter(pk=job.pk).update(recovery_task=task)
@@ -295,6 +301,15 @@ def rq_failure_callback(
 ) -> None:
     """RQ also calls this after timeouts/worker exceptions outside the normal handler."""
     del connection, kind, traceback
+    try:
+        _record_rq_failure(rq_job, value, allow_retry=allow_retry)
+    except Exception as exc:
+        # The parent RQ worker must still register/retry a killed work horse when
+        # Django's database is unavailable. Operator stale-job recovery reconciles it.
+        logger.warning("worker_recovery_callback_failed", error_type=type(exc).__name__)
+
+
+def _record_rq_failure(rq_job: Any, value: Any, *, allow_retry: bool) -> None:
     args = getattr(rq_job, "args", ())
     if not args:
         return

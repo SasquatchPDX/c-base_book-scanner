@@ -1387,9 +1387,32 @@ waiting. With one worker, FIFO order hides this. With several, wait for a stage
 batch to finish before you start the next stage's batch, or re-run the affected
 pages afterwards.
 
+### Worker failure reviews
+
+An exhausted conversion, OCR or scan-finalization job creates one **Worker failure**
+review task. Use the review queue's **Task type** filter to find these tasks. The
+requesting member (or scan operator for automatic work) and administrators can open
+the task, inspect the failed job and error, then **Retry job** or **Acknowledge
+failure**. Jobs with automatic RQ retries remaining stay queued and create no task.
+
+Retry creates a fresh ProcessingJob with the same source and request settings, and
+records it on the same task. Old attempts remain available as history; they cannot
+change the latest task outcome. A successful retry resolves the task, and an exhausted
+retry reopens it with its new error. Acknowledgment resolves only the task and retains
+all originals and worker history. The displayed attempt ID fences recovery actions:
+resubmitting an old form cannot enqueue another attempt even if the first retry failed
+quickly. Members cannot recover someone else's work, and claimed tasks are respected.
+
+Run workers with `--worker-class ebook_server.recovery_worker.RecoveryWorker`, as in
+the systemd template. This is RQ's standard worker with its work-horse-killed handler
+installed: OOM/resource kills are reconciled with application state and respect the
+remaining retry count. Normal exception/timeout and operator-stop callbacks are also
+installed on these three job types. Deployments retaining plain `rq.Worker` still get
+normal failure callbacks, but need stale-job recovery after a hard work-horse kill.
+
 ### Recovering from killed workers
 
-A worker killed mid-job (OOM, `kill -9`, host restart) leaves its
+A whole worker host killed mid-job (for example a host restart) can leave its
 ProcessingJob RUNNING and, for finalization, the ScanJob FINALIZING. Jobs whose
 `started_at` is older than their timeout plus five minutes are treated as stale
 and are re-entered automatically if RQ redelivers them. To clean up manually:
@@ -1402,8 +1425,9 @@ uv run python manage.py recover_stale_jobs --apply  # act
 `--apply` marks stale RUNNING jobs, and QUEUED jobs with no matching RQ job
 (for example after a Redis flush), as FAILED with an explanatory error, and
 returns ScanJobs stuck in FINALIZING with no live finalization job to their
-prior state so Finish can be retried. It does not re-queue anything itself;
-re-request OCR/conversion/identification from the UI afterwards.
+prior state so Finish can be retried. It does not re-queue anything itself. Supported
+terminal worker jobs create the recovery task described above; other job types retain
+their existing operator recovery workflow.
 
 Conversion deliveries claim the job under a short row lock and persist a unique
 `details.conversion_attempt` token. A duplicate delivery of a live attempt exits;
@@ -1775,3 +1799,12 @@ log events (they carry the error class and model, never book content). Imports a
 unaffected: they stay in review without AI hints. Disable the assist with
 `BOOK_SCANNER_LLM_ENABLED=false` if the server will be down for long, and re-run
 `evaluate_llm_identification` after any model change.
+
+For terminal conversion, OCR and scan-finalization jobs that predate migration
+0048, run `python manage.py reconcile_worker_failures` to inspect a batch, then
+add `--apply` to create missing reviews. Each invocation examines at most 100
+jobs (`--limit 1..1000`); `--after-pk` accepts the printed continuation cursor.
+Repeating a batch does not reopen acknowledged tasks or create duplicate tasks,
+and does not rerun jobs or alter archives. Migration 0048 is explicitly
+irreversible because the prior schema cannot retain processing-job reviews;
+restore a pre-migration database snapshot if a schema rollback is required.
