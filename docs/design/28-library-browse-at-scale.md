@@ -18,6 +18,63 @@ current query shape does not scale (measured below).
 
 ## 2. Measurements on 150,000 synthetic books
 
+### Current implementation during concurrent intake (18 November 2026)
+
+The measured endpoint was the authenticated JSON view at `/library/books/` on
+commit `9595a575`. One Django client measured complete server-side requests,
+including authentication, database round trips and serialization. A second thread
+uploaded unique TXT books through normal intake, using a deterministic metadata
+provider and an inline worker. It waited 500 ms between completed uploads. The
+measured index lag runs from canonical Book creation to its search row timestamp.
+LDAP, network storage and queue wait time are outside this measurement.
+
+| Request | Baseline cold p95 | Baseline warm p95 | Intake cold p95 | Intake warm p95 |
+|---|---:|---:|---:|---:|
+| Ranked search for `garden` | 362.6 ms | 273.9 ms | 437.4 ms | 212.4 ms |
+| German EPUBs with genre, format and language counts | 791.1 ms | 610.9 ms | 829.3 ms | 535.6 ms |
+| Browse after the 100,000th creation-time cursor | 207.4 ms | 103.0 ms | 212.0 ms | 103.9 ms |
+
+Each cell uses the nearest-rank p95 over 20 interleaved samples. Cold samples
+clear Django's application cache before each request. PostgreSQL buffers and the
+OS page cache remain available. The warm phase follows the cold phase, and baseline
+precedes intake, so differences between phases include host load and cache history.
+The 35 concurrent uploads had p50/p95 of 606.2/920.3 ms and index lag of
+274.2/357.0 ms. Warm deep browsing met the 150 ms target in both phases.
+
+The filtered facets missed the target by the widest margin. To compute one
+format count the baseline plan visited 96,433 shared buffers, grouped 23,551
+matching books and processed 34,429 joined rows. That query took 297.5 ms on
+replay. For ranked search, 65,674 books matched the common term. PostgreSQL
+selected a parallel sequential scan and ranked the matches before returning 25.
+The next optimization to measure is computing the three facets over a shared
+filtered set. For search, compare rare and common terms before changing indexes.
+The benchmark records the slowest SELECT for each route and phase and replays
+it separately with `EXPLAIN (ANALYZE, BUFFERS)`. [Results and unforced plans](data/library-intake-benchmark-167.json)
+
+**Reproduction.** Use a fresh PostgreSQL 17.10 database named `bench167` and a
+scratch storage directory. The measured database ran under Docker Desktop/WSL2
+on an i9-12900H with a container allowance of three CPUs and 3 GiB RAM. PostgreSQL
+used 128 MiB shared buffers, 4 MiB work memory and default planner settings.
+The Django client ran on the Windows host with Python 3.13.9 and Django 5.2.17.
+Configure `BOOK_SCANNER_DATABASE_URL` for the scratch database, set
+`BOOK_SCANNER_STORAGE_ROOT` to the scratch directory, use the development
+environment, and leave the Redis URL unset. Run from the repository root with
+the locked development dependencies installed.
+
+```sh
+uv run python manage.py migrate
+uv run python manage.py seed_synthetic_library --books 150000 --seed 28
+psql "$BOOK_SCANNER_DATABASE_URL" -c 'ANALYZE'
+uv run python manage.py shell -c "import runpy; runpy.run_path('scripts/benchmark_library_intake.py')"
+```
+
+The seeder supplies 37,500 authors, multiple variants, languages, genres,
+categories, covers and resolved reviews. The workload writes additional books,
+so repeat it on a freshly seeded database. Its final JSON includes p50 and p95
+for each condition. The recorded run used local storage and the fixture provider.
+
+### Original design baseline
+
 **Setup.**
 
 - A scratch script (not committed) loaded data straight into a PostgreSQL 17.10
