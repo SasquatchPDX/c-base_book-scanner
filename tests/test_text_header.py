@@ -458,3 +458,50 @@ def test_text_header_keeps_filename_title_fallback_provenance(tmp_path: Path) ->
     assert metadata[intake.TITLE_SOURCE_KEY] == intake.TITLE_SOURCE_FILENAME
     assert metadata[TEXT_HEADER_EVIDENCE_KEY]["title"] == "Midworld"
     assert metadata[TEXT_HEADER_EVIDENCE_KEY]["authors"] == ["Alan Dean Foster"]
+
+
+@pytest.mark.parametrize(
+    ("stem", "header", "title", "likely"),
+    [
+        (
+            "Dune - House Harkonnen",
+            "Dune:   House Harkonnen\nBrian Herbert and Kevin J. Anderson\nOctober 2000\n",
+            "Dune: House Harkonnen",
+            ["Brian Herbert", "Kevin J. Anderson"],
+        ),
+        (
+            "Little Pear Girl",
+            "                       THE LlTTLE PEAR GIRL\n",
+            "The Little Pear Girl",
+            [],
+        ),
+        ("Narcissus", "NARClSSUS\n", "Narcissus", []),
+    ],
+)
+def test_scan_artefacts_and_whole_stem_titles(
+    stem: str, header: str, title: str, likely: list[str]
+) -> None:
+    result = parse_text_header(header + BODY * 3, stem)
+    assert result is not None
+    assert result["title"] == title
+    assert result["likely_authors"] == likely
+
+
+def test_letter_spaced_title_and_by_line() -> None:
+    header = (
+        "\t\t\tD O W N   I N   F L A M E S\n"
+        "\t\t    OUTLINE FOR AN UNWRITTEN EPIC NOVEL\n"
+        "\t\t\t      BY LARRY NIVEN\n"
+    )
+    result = parse_text_header(header + BODY * 3, "Down in Flames")
+    assert result is not None
+    assert result["title"] == "Down In Flames"
+    assert result["authors"] == ["Larry Niven"]
+
+
+def test_name_list_line_needs_every_part_to_be_a_name() -> None:
+    result = parse_text_header(
+        "Love and War\nMargaret Weis and the Dragon\n" + BODY, "Love and War"
+    )
+    assert result is not None
+    assert result["likely_authors"] == []
