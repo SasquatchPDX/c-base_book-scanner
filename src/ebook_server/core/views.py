@@ -2857,11 +2857,14 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
     if stage == "output":
         if str(parameters.get("zone_mode", "")).strip().lower() == "manual":
             return True
+        if str(parameters.get("zone_mode", "")).strip().lower() in {"auto", "off"}:
+            return False
         return any(
             key in parameters
             for key in {
                 "text_box",
                 "picture_box",
+                "zones",
                 "text_algorithm",
                 "picture_algorithm",
             }
