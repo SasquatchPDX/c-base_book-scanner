@@ -24,8 +24,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are:
 6. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
 
-The current dewarping stage corrects perspective on flat pages; it does not
-correct book-spine curvature. The four control points only define the correction
+The default dewarping model corrects perspective on flat pages; it does not
+correct book-spine curvature. An opt-in baseline curvature model is described below.
+The four perspective control points only define the correction
 (which quadrilateral becomes an upright rectangle); the output canvas holds the
 whole transformed input, so content outside the points and the Margins padding
 are kept (`opencv-v2`). A near-degenerate quad (a corner at or beyond the
@@ -40,7 +41,46 @@ robust fits through the outer line ends give the sides (a ragged side mirrors th
 aligned one). A page outline contour is the fallback. An already-upright page is
 passed through without resampling (`dewarp_correction="none_needed"`). When
 nothing is found, the result records `dewarp_mode="auto_fallback"` with a
-`dewarp_warning`. Curvature correction remains Sprint020 work.
+`dewarp_warning`.
+
+### Opt-in baseline curvature (`baseline-curvature-v1`)
+
+Perspective remains the default. Selecting **Dewarp model: curvature** opts one
+page into `baseline_curvature`; a batch applies it only when explicitly selected.
+This model straightens curved text lines with a vertical displacement field. It
+does not reconstruct a 3D page surface or correct horizontal foreshortening.
+Inspect the Result preview before finishing. Real photographed-book acceptance
+remains open; [the recorded measurements](measurements/curvature-acceptance.md)
+are synthetic.
+
+Automatic estimation tracks text bands in 25 vertical strips of an image reduced
+to at most 1200 pixels on its longest edge, robustly fits quadratic curves, and
+records nine source-coordinate control points per baseline in `curvature_curves`.
+Between baselines, the renderer interpolates vertical displacement using OpenCV
+`remap`. Output retains the input width and adds paper-colour padding above/below
+to retain the input, including content outside the baselines. Corrections below
+two pixels pass through without resampling.
+
+**Edit detected baselines** copies geometry into authored `dewarp_curves` and
+switches to manual mode. Select a baseline to drag its points or edit numeric y
+coordinates; add/remove baselines as needed. Only authored geometry travels back
+to the server. Manual geometry survives batch application with Preserve manual
+exceptions and produces identical output when replayed. Changing to perspective
+uses the existing quad editor and algorithm again.
+
+Manual input is bounded to 2–32 non-crossing baselines with 3–17 finite points
+each, ordered in x and inside the image. Baselines must stay at least two pixels
+apart. Displacement is limited to the smaller of 512 pixels and 15% of the input
+height. Unsafe geometry or unreliable estimation keeps the normalized input and
+records a visible `dewarp_warning` and `dewarp_applied="passthrough"`. Bypass keeps
+the existing normalized-PNG byte-copy policy. Every run clears stale derived
+geometry; selected model/version and actual applied transform are separate.
+
+Remap coordinate arrays are at most 512×512, with bounded source crops; there are
+no full-resolution float maps. Paper estimation and preview generation resize
+before making additional copies. Full source/output images still consume memory
+proportional to page size. Tests exercise actual decoding, remapping, PNG output
+and previews on 24-megapixel grayscale/RGB pages.
 
 ### Output zones (`opencv-zones-v2`)
 

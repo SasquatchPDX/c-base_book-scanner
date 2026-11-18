@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   displayBoxToSource,
   editableParameters,
+  curvatureCurvesForEditing,
   initializeScanTailorWorkspace,
   outputZonesForEditing,
   isAutoSkippedSplit,
@@ -48,6 +49,89 @@ describe("ScanTailor geometry coordinates", () => {
 });
 
 describe("editable stage parameters", () => {
+  it("copies curvature geometry only after explicit manual editing", () => {
+    const curves = [
+      [
+        [0, 20],
+        [50, 25],
+        [99, 20],
+      ],
+      [
+        [0, 80],
+        [50, 85],
+        [99, 80],
+      ],
+    ];
+    const parameters = {
+      dewarp_model: "curvature",
+      dewarp_mode: "auto",
+      curvature_curves: curves,
+      curvature_model_version: "derived",
+    };
+    const authored = curvatureCurvesForEditing(parameters);
+    authored[0]![1]![1] = 30;
+    expect(curves[0]![1]![1]).toBe(25);
+    expect(editableParameters("dewarping", parameters)).toEqual({
+      dewarp_model: "curvature",
+      dewarp_mode: "auto",
+    });
+    expect(
+      editableParameters("dewarping", { dewarp_mode: "manual", dewarp_curves: authored }),
+    ).toEqual({ dewarp_mode: "manual", dewarp_curves: authored });
+  });
+
+  it("edits and saves replayable baseline controls without sending detected provenance", async () => {
+    const state = {
+      id: 1,
+      stage: "dewarping",
+      stage_label: "Dewarping",
+      revision: 1,
+      status: "success",
+      algorithm: "baseline_curvature",
+      parameters: {
+        dewarp_model: "curvature",
+        dewarp_mode: "auto",
+        input_width: 100,
+        input_height: 200,
+        curvature_curves: [
+          [
+            [0, 40],
+            [50, 50],
+            [99, 40],
+          ],
+          [
+            [0, 140],
+            [50, 150],
+            [99, 140],
+          ],
+        ],
+      },
+    };
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="curvature-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="dewarping">Dewarping</button><button data-stage-open data-page-id="page" data-stage="dewarping" data-stage-url="/dewarp"></button></div>`;
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue({ ok: true, status: 202, json: async () => ({ stage: state }) });
+    vi.stubGlobal("fetch", fetcher);
+    const host = document.querySelector<HTMLElement>("#curvature-host")!;
+    initializeScanTailorWorkspace(host);
+    host.querySelector<HTMLButtonElement>('[data-stage-select="dewarping"]')!.click();
+    [...host.querySelectorAll("button")]
+      .find((b) => b.textContent === "Edit detected baselines")!
+      .click();
+    const input = [...host.querySelectorAll("label")]
+      .find((label) => label.textContent === "Baseline point 2 y")!
+      .querySelector("input")!;
+    input.value = "65";
+    input.dispatchEvent(new Event("change"));
+    host.querySelector<HTMLButtonElement>("[data-save-stage]")!.click();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+    const payload = JSON.parse(fetcher.mock.calls[0]![1].body);
+    expect(payload.parameters.dewarp_curves[0][1]).toEqual([50, 65]);
+    expect(payload.parameters.dewarp_mode).toBe("manual");
+    expect(payload.parameters).not.toHaveProperty("curvature_curves");
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
   it("turns detected geometry into independent editable lists, excluding provenance", () => {
     const parameters = {
       zone_mode: "auto",
@@ -70,9 +154,12 @@ describe("editable stage parameters", () => {
         picture_box: [1, 2, 30, 40],
       }),
     ).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
-    expect(outputZonesForEditing({
-      zone_mode: "manual", picture_box: { x1: 1, y1: 2, width: 29, height: 38 },
-    })).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
+    expect(
+      outputZonesForEditing({
+        zone_mode: "manual",
+        picture_box: { x1: 1, y1: 2, width: 29, height: 38 },
+      }),
+    ).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
   });
 
   it("edits, adds and removes multiple detected regions through real controls", async () => {
@@ -209,12 +296,9 @@ describe("preview error messages", () => {
   });
 
   it("names the actual predecessor when the input preview is missing", () => {
-    expect(
-      previewErrorMessage("dewarping", {
-        status: 404,
-        body: "input preview not ready",
-      }),
-    ).toBe("The input preview is not ready. Run the Margins stage first.");
+    expect(previewErrorMessage("dewarping", { status: 404, body: "input preview not ready" })).toBe(
+      "The input preview is not ready. Run the Margins stage first.",
+    );
     expect(previousStageName("page_split")).toBeNull();
     expect(previousStageName("deskew")).toBe("page_split");
   });
