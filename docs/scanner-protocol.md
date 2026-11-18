@@ -638,3 +638,8 @@ in them is rewritten.
 - **Reversal** works while every job ID is still a UUID. Once a scanner-assigned ID
   exists, reversing raises `IrreversibleError` instead of dropping or corrupting jobs.
 
+- **Rehearse it first.** `scripts/rehearse_migrations.sh` runs every pending migration
+  (0041 included) against a throwaway copy of the production database and reports
+  PASS/FAIL with the `migrate` time, so the downtime window is known before the real
+  upgrade. The source is only read by `pg_dump`. See "Rehearsing migrations" in
+  `docs/operations.md`.

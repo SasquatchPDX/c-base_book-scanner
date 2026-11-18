@@ -1,0 +1,213 @@
+"""Check that scan jobs survive a migration intact (used by scripts/rehearse_migrations.sh).
+
+Two modes:
+
+``--snapshot PATH``
+    Record every scan job ID (in canonical form) plus row counts of the scan tables and
+    of every foreign-key column that references ``core_scanjob``. Uses raw SQL only, so
+    it works on a database at any migration state, including the pre-0041 UUID schema.
+
+``--compare PATH``
+    Take the same snapshot of the (migrated) database and compare it with ``PATH``:
+    identical job ID sets, unchanged row and foreign-key counts, no dangling references,
+    and a sample of scan jobs that open through ``/scan/jobs/<id>/`` with the Django
+    test client. The sample request runs inside a transaction that is rolled back, so
+    the temporary user and session it needs never persist.
+
+The command exits non-zero (``CommandError``) on any mismatch.
+"""
+
+from __future__ import annotations
+
+import json
+import secrets
+from pathlib import Path
+from typing import Any
+
+from django.apps import apps as global_apps
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand, CommandError, CommandParser
+from django.db import connection, transaction
+from django.test import Client, override_settings
+from django.urls import reverse
+
+from ...scan_job_ids import normalize_scan_job_id
+
+SNAPSHOT_VERSION = 1
+SCAN_JOB_LABEL = "core.scanjob"
+# Row counts reported for these tables when they exist (logs/events arrived later).
+SCAN_TABLES = (
+    "core_scanjob",
+    "core_scanpage",
+    "core_scanpageversion",
+    "core_scantodo",
+    "core_scantailorstagestate",
+    "core_scanlog",
+    "core_scanevent",
+)
+
+
+def canonical_scan_job_id(value: object) -> str:
+    """Canonical text of a stored scan job ID (UUID objects, hex and uppercase included)."""
+    return normalize_scan_job_id(value) or str(value)
+
+
+def scan_job_reference_columns() -> list[tuple[str, str]]:
+    """``(table, column)`` of every concrete foreign key to ScanJob in the current models."""
+    columns = set()
+    for model in global_apps.get_models():
+        for field in model._meta.local_concrete_fields:
+            related = getattr(field, "related_model", None)
+            if field.many_to_one and related is not None:
+                if related._meta.label_lower == SCAN_JOB_LABEL:
+                    columns.add((model._meta.db_table, field.column))
+    return sorted(columns)
+
+
+def _count(sql: str) -> int:
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+def take_snapshot() -> dict[str, Any]:
+    quote = connection.ops.quote_name
+    existing = set(connection.introspection.table_names())
+    if "core_scanjob" not in existing:
+        raise CommandError("core_scanjob does not exist; is this a book-scanner database?")
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT {quote('id')} FROM {quote('core_scanjob')}")
+        ids = sorted(canonical_scan_job_id(row[0]) for row in cursor.fetchall())
+    tables = {
+        table: _count(f"SELECT count(*) FROM {quote(table)}")
+        for table in SCAN_TABLES
+        if table in existing
+    }
+    references = {}
+    dangling = {}
+    for table, column in scan_job_reference_columns():
+        if table not in existing:
+            continue
+        key = f"{table}.{column}"
+        references[key] = _count(
+            f"SELECT count(*) FROM {quote(table)} WHERE {quote(column)} IS NOT NULL"
+        )
+        dangling[key] = _count(
+            f"SELECT count(*) FROM {quote(table)} AS ref "
+            f"WHERE ref.{quote(column)} IS NOT NULL AND NOT EXISTS ("
+            f"SELECT 1 FROM {quote('core_scanjob')} AS job "
+            f"WHERE job.{quote('id')} = ref.{quote(column)})"
+        )
+    return {
+        "version": SNAPSHOT_VERSION,
+        "vendor": connection.vendor,
+        "scan_job_ids": ids,
+        "tables": tables,
+        "references": references,
+        "dangling": dangling,
+    }
+
+
+def compare_snapshots(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """Human-readable problems; empty when ``after`` preserves everything in ``before``."""
+    problems = []
+    before_ids = {canonical_scan_job_id(value) for value in before.get("scan_job_ids", [])}
+    after_ids = set(after["scan_job_ids"])
+    missing = sorted(before_ids - after_ids)
+    added = sorted(after_ids - before_ids)
+    if missing:
+        problems.append(f"{len(missing)} scan job ID(s) no longer resolve, e.g. {missing[:5]}")
+    if added:
+        problems.append(f"{len(added)} unexpected new scan job ID(s), e.g. {added[:5]}")
+    for group in ("tables", "references"):
+        for key, count in sorted(before.get(group, {}).items()):
+            now = after[group].get(key)
+            if now is None:
+                problems.append(f"{key}: present before ({count} rows), missing after")
+            elif now != count:
+                problems.append(f"{key}: {count} rows before, {now} after")
+    for key, count in sorted(after["dangling"].items()):
+        if count:
+            problems.append(f"{key}: {count} row(s) reference a scan job that does not exist")
+    return problems
+
+
+def check_sample_urls(job_ids: list[str], sample: int) -> tuple[int, list[str]]:
+    """GET ``/scan/jobs/<id>/`` for an evenly spread sample; returns (checked, problems)."""
+    if sample <= 0 or not job_ids:
+        return 0, []
+    step = max(1, len(job_ids) // sample)
+    chosen = job_ids[::step][:sample]
+    problems: list[str] = []
+    allowed_hosts = [*settings.ALLOWED_HOSTS, "testserver"]
+    with (
+        override_settings(ALLOWED_HOSTS=allowed_hosts, SECURE_SSL_REDIRECT=False),
+        transaction.atomic(),
+    ):
+        user = get_user_model().objects.create_user(
+            username=f"integrity-check-{secrets.token_hex(6)}"
+        )
+        client = Client()
+        client.force_login(user)
+        for job_id in chosen:
+            url = reverse("scan-job-detail", kwargs={"job_id": job_id})
+            response = client.get(url, HTTP_ACCEPT="application/json")
+            if response.status_code != 200:
+                problems.append(f"GET {url}: HTTP {response.status_code}")
+                continue
+            payload = response.json()
+            if payload.get("id") != job_id:
+                problems.append(f"GET {url}: returned id {payload.get('id')!r}")
+        transaction.set_rollback(True)
+    return len(chosen), problems
+
+
+class Command(BaseCommand):
+    help = "Snapshot scan job IDs and reference counts, or compare against a snapshot."
+
+    def add_arguments(self, parser: CommandParser) -> None:
+        mode = parser.add_mutually_exclusive_group(required=True)
+        mode.add_argument("--snapshot", type=Path, help="Write a snapshot JSON file.")
+        mode.add_argument("--compare", type=Path, help="Compare with a snapshot JSON file.")
+        parser.add_argument(
+            "--sample",
+            type=int,
+            default=20,
+            help="Scan jobs to open through the web view in --compare mode (default 20).",
+        )
+
+    def handle(self, *args: Any, **options: Any) -> None:
+        snapshot_path: Path | None = options["snapshot"]
+        if snapshot_path is not None:
+            snapshot = take_snapshot()
+            snapshot_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+            self.stdout.write(
+                f"snapshot: {len(snapshot['scan_job_ids'])} scan jobs; "
+                + ", ".join(f"{key}={value}" for key, value in snapshot["tables"].items())
+            )
+            return
+
+        compare_path: Path = options["compare"]
+        try:
+            before = json.loads(compare_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise CommandError(f"cannot read snapshot {compare_path}: {exc}") from exc
+        after = take_snapshot()
+        problems = compare_snapshots(before, after)
+        checked, url_problems = check_sample_urls(after["scan_job_ids"], options["sample"])
+        problems.extend(url_problems)
+        self.stdout.write(
+            f"scan job IDs: {len(before.get('scan_job_ids', []))} before, "
+            f"{len(after['scan_job_ids'])} after"
+        )
+        for group in ("tables", "references"):
+            for key, count in sorted(after[group].items()):
+                self.stdout.write(f"  {key}: {before.get(group, {}).get(key, '-')} -> {count}")
+        self.stdout.write(f"sample scan-job URLs checked: {checked}")
+        if problems:
+            for problem in problems:
+                self.stderr.write(f"FAIL: {problem}")
+            raise CommandError(f"{len(problems)} integrity problem(s)")
+        self.stdout.write("integrity: OK")

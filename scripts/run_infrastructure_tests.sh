@@ -99,7 +99,8 @@ export BOOK_SCANNER_OCR_POLL_INTERVAL_SECONDS="0.1"
 export QT_QPA_PLATFORM="offscreen"
 
 cd "${book_scanner_project_root}"
-# TLS 1.3-only, LAN-only scanner front end (deploy/nginx/serif-lan-tls.conf).
+# TLS 1.3-only, LAN-only scanner front end (deploy/nginx/serif-lan-tls.conf); it also
+# runs scripts/check_scanner_onboarding.sh against that nginx.
 "${book_scanner_project_root}/scripts/test_scanner_tls_proxy.sh"
 if ! command -v pandoc >/dev/null 2>&1; then
   "${book_scanner_project_root}/scripts/install_test_pandoc.sh" "${book_scanner_pandoc_root}"
@@ -124,6 +125,9 @@ uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120
 uv run python manage.py migrate --noinput
 uv run python manage.py check
+# tests/integration includes test_rehearse_migrations_postgres.py, which runs
+# scripts/rehearse_migrations.sh end to end against this PostgreSQL (pg_dump and friends
+# run from the pinned postgres image unless BOOK_SCANNER_REHEARSAL_PG_BINDIR is set).
 uv run pytest -q tests/integration --create-db
 
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS="0.2"

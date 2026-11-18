@@ -13,6 +13,11 @@
 # comes from the internal-CA procedure in docs/operations.md, and a small
 # Python HTTP server stands in for Uvicorn.
 #
+# The stand-in answers /api/scanner/v1/ping like the app: 200 with api_version,
+# server_time and limits for a throwaway Bearer key (checked by its SHA-256, as
+# BOOK_SCANNER_SCANNER_API_KEY_SHA256 does), 401 without it. The script ends by
+# running scripts/check_scanner_onboarding.sh against this harness.
+#
 # Asserts: TLS 1.3 works and verifies against the CA and the host name; a
 # TLS 1.2-only client cannot complete a handshake; a source outside the allowed
 # ranges gets 403, and so does everyone with the unedited file; /api/scanner/
@@ -137,11 +142,21 @@ if grep -q 'allow 127' "${work_dir}/ranges.conf" "${work_dir}/shipped.conf"; the
 fi
 
 # --- Upstream stand-in for Uvicorn ------------------------------------------
-# GET answers 200, PUT drains the body and answers 201 with its size.
+# GET answers 200 (ping: 200 with the key, 401 without), PUT drains the body and
+# answers 201 with its size.
+scanner_key_file="${work_dir}/serif-api-key"
+(umask 077 && openssl rand -hex 32 >"${scanner_key_file}")
+scanner_key_sha256="$(tr -d '[:space:]' <"${scanner_key_file}" | openssl dgst -sha256 -r | cut -d' ' -f1)"
 cat >"${work_dir}/upstream.py" <<'EOF'
+import hashlib
+import hmac
 import http.server
 import json
+import os
 import sys
+from datetime import datetime, timezone
+
+KEY_SHA256 = os.environ["SCANNER_KEY_SHA256"]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -154,6 +169,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/api/scanner/v1/ping":
+            header = self.headers.get("Authorization", "")
+            presented = header[7:] if header.startswith("Bearer ") else ""
+            digest = hashlib.sha256(presented.encode()).hexdigest()
+            if not presented or not hmac.compare_digest(digest, KEY_SHA256):
+                self._reply(401, {"error": "invalid scanner key"})
+                return
+            self._reply(
+                200,
+                {
+                    "api_version": 1,
+                    "server_time": datetime.now(timezone.utc).isoformat(),
+                    "limits": {"max_image_bytes": 67108864, "max_opf_bytes": 1048576},
+                    "stub": True,
+                },
+            )
+            return
         self._reply(200, {"api_version": 1, "stub": True, "path": self.path})
 
     def do_PUT(self):
@@ -173,7 +205,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 EOF
-python3 "${work_dir}/upstream.py" "${upstream_port}" >"${work_dir}/upstream.log" 2>&1 &
+SCANNER_KEY_SHA256="${scanner_key_sha256}" python3 "${work_dir}/upstream.py" "${upstream_port}" >"${work_dir}/upstream.log" 2>&1 &
 upstream_pid=$!
 
 # --- nginx -------------------------------------------------------------------
@@ -218,6 +250,7 @@ http_status() {
 body="$(curl --silent --show-error --fail --tlsv1.3 \
   --cacert "${tls_dir}/serif-ca.pem" \
   --resolve "${host_name}:${allowed_https}:127.0.0.1" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "${scanner_key_file}")") \
   "https://${host_name}:${allowed_https}/api/scanner/v1/ping")"
 [[ "${body}" == *'"stub": true'* ]] || fail "TLS 1.3 request did not reach the upstream: ${body}"
 pass "TLS 1.3 client from an allowed source reaches /api/scanner/v1/ping"
@@ -290,5 +323,71 @@ result="$(http_status "${legacy_http}" /library/)"
 result="$(http_status "${legacy_http}" /api/scanner/v1/ping)"
 [[ "${result}" == "403 "* ]] || fail "book-scanner.conf scanner API got '${result}', expected 403"
 pass "book-scanner.conf plain-HTTP listener refuses /api/scanner/"
+
+# --- scripts/check_scanner_onboarding.sh against this harness -----------------
+onboarding="${project_root}/scripts/check_scanner_onboarding.sh"
+onboarding_args=(
+  --url "https://${host_name}:${allowed_https}/"
+  --ca-file "${tls_dir}/serif-ca.pem"
+  --key-file "${scanner_key_file}"
+  --http-url "http://${host_name}:${allowed_http}/"
+  --resolve 127.0.0.1
+  --no-ntp-status
+)
+scanner_key="$(cat "${scanner_key_file}")"
+assert_key_not_printed() {
+  if grep -qF "${scanner_key}" "$1"; then
+    fail "check_scanner_onboarding.sh printed the API key"
+  fi
+}
+show_and_fail() {
+  # $1 = log file, rest = message
+  local log=$1
+  shift
+  cat "${log}" >&2
+  fail "$*"
+}
+
+"${onboarding}" "${onboarding_args[@]}" --dry-run >"${work_dir}/onboarding-dry.log" 2>&1 \
+  || show_and_fail "${work_dir}/onboarding-dry.log" "onboarding --dry-run failed"
+grep -q 'DRY RUN' "${work_dir}/onboarding-dry.log" || fail "onboarding --dry-run printed no plan"
+assert_key_not_printed "${work_dir}/onboarding-dry.log"
+pass "check_scanner_onboarding.sh --dry-run"
+
+"${onboarding}" "${onboarding_args[@]}" --pi >"${work_dir}/onboarding.log" 2>&1 \
+  || show_and_fail "${work_dir}/onboarding.log" "check_scanner_onboarding.sh failed"
+for check in key-file-mode tls13 tls12-refused ping ping-no-key plain-http clock-skew; do
+  grep -Eq "^PASS +${check} " "${work_dir}/onboarding.log" \
+    || show_and_fail "${work_dir}/onboarding.log" "onboarding check ${check} did not pass"
+done
+assert_key_not_printed "${work_dir}/onboarding.log"
+pass "check_scanner_onboarding.sh passes every check against the harness"
+
+# book-scanner.conf's plain-HTTP listener refuses the device API as well.
+"${onboarding}" "${onboarding_args[@]}" --http-url "http://${host_name}:${legacy_http}/" \
+  >"${work_dir}/onboarding-legacy.log" 2>&1 \
+  || show_and_fail "${work_dir}/onboarding-legacy.log" "onboarding failed on the 8080 listener"
+pass "check_scanner_onboarding.sh: the 8080 listener refuses /api/scanner/"
+
+# Negative cases: a wrong key fails ping, a group-readable key file fails --pi.
+wrong_key_file="${work_dir}/wrong-key"
+(umask 077 && echo "not-the-scanner-key" >"${wrong_key_file}")
+if "${onboarding}" "${onboarding_args[@]}" --key-file "${wrong_key_file}" \
+  >"${work_dir}/onboarding-wrong.log" 2>&1; then
+  fail "check_scanner_onboarding.sh passed with a wrong key"
+fi
+grep -Eq '^FAIL +ping ' "${work_dir}/onboarding-wrong.log" \
+  || show_and_fail "${work_dir}/onboarding-wrong.log" "a wrong key did not fail ping"
+if grep -q 'not-the-scanner-key' "${work_dir}/onboarding-wrong.log"; then
+  fail "check_scanner_onboarding.sh printed the wrong key"
+fi
+chmod 0644 "${scanner_key_file}"
+if "${onboarding}" "${onboarding_args[@]}" --pi >"${work_dir}/onboarding-mode.log" 2>&1; then
+  fail "check_scanner_onboarding.sh --pi accepted a 0644 key file"
+fi
+grep -Eq '^FAIL +key-file-mode ' "${work_dir}/onboarding-mode.log" \
+  || show_and_fail "${work_dir}/onboarding-mode.log" "a 0644 key file did not fail key-file-mode"
+assert_key_not_printed "${work_dir}/onboarding-mode.log"
+pass "check_scanner_onboarding.sh reports a wrong key and a readable key file"
 
 echo "scanner TLS proxy checks passed"
