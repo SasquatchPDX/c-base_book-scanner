@@ -35,6 +35,33 @@ def _stages_url(job_id: str, page_id: str) -> str:
     return f"/scan/jobs/{job_id}/pages/{page_id}/stages/"
 
 
+def test_margin_results_do_not_become_fixed_canvas_requests(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    with Image.new("RGB", (100, 100), "black") as image:
+        image.save(source)
+    output = tmp_path / "output.png"
+    preview = tmp_path / "preview.png"
+    first = scantailor._run_margins(
+        ScanTailorStageState(parameters={"margin": 20}), source, output, preview
+    )
+    assert first["resolved_canvas_width"] == first["resolved_canvas_height"] == 140
+    assert "canvas_width" not in first and "canvas_height" not in first
+    second = scantailor._run_margins(
+        ScanTailorStageState(parameters={**first, "margin": 0}), source, output, preview
+    )
+    with Image.open(output) as result, Image.open(source) as original:
+        assert result.size == (100, 100)
+        assert result.tobytes() == original.tobytes()
+    assert second["resolved_canvas_width"] == second["resolved_canvas_height"] == 100
+    fixed = scantailor._run_margins(
+        ScanTailorStageState(parameters={"margin": 0, "canvas_width": 200}),
+        source,
+        output,
+        preview,
+    )
+    assert fixed["canvas_width"] == fixed["resolved_canvas_width"] == 200
+
+
 def _facing_page_bytes(
     *,
     width: int = 420,
