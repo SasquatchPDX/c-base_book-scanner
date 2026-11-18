@@ -1,4 +1,6 @@
 import { expect, test, type BrowserContext, type Locator, type Page } from "@playwright/test";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 const SCAN_PAGE_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAGAAAACACAIAAAB7vvvtAAAA80lEQVR42u3YsQkEIRRFUZVpxsT+6zCxjUnMrUA0Ez7nxZvs4QuXyXP+yfYrCAABAgQIECBAgAwQIECAAAGKte/mR7W2qP9/jO6CPDFAD5d9k3ZBgADpIB3kiQHSQeaCAAHSQTrIEwOkg8wFAQKkg3SQJwZIB5kLAgRIB+kgTwyQDnJBBgiQDtJBnhggHeSCDBAgHaSDPDFAOsgFGSBAOkgHeWKAdJALAmSAdJAO8sQA6SAXBMgA6SAd5IkB0kEuCJAB0kE6yBMDpINcECBAFqCDjs3igjwxQDrIBQEyQIAAAQIECBAgAwQIECBAgAABAmSbLV6uSh6FE6P0AAAAAElFTkSuQmCC",
@@ -200,5 +202,127 @@ test("a member completes the physical-book pipeline through the browser", async 
     expect(await download.failure()).toBeNull();
   } finally {
     await context.close();
+  }
+});
+
+test("a scanner capture survives a lost acknowledgement and a member re-finishes its rescan", async ({ browser, playwright, baseURL }) => {
+  test.setTimeout(150_000);
+  const key = process.env.BOOK_SCANNER_BROWSER_DEVICE_KEY;
+  test.skip(!key, "requires the scanner key created by the infrastructure fixture");
+  const device = await playwright.request.newContext({ baseURL, extraHTTPHeaders: { Authorization: "Bearer " + key } });
+  const memberContext = await browser.newContext({ acceptDownloads: true });
+  const capture = await browser.newPage();
+  const date = new Date();
+  const started = date.toISOString();
+  const jobId = started.slice(0, 19).replace(/[:-]/g, "") + "Z-" + (date.getMilliseconds() + 1);
+  const job = "/api/scanner/v1/jobs/" + jobId;
+  const title = "Device acceptance " + jobId;
+  const digest = (data: Buffer) => createHash("sha256").update(data).digest("hex");
+  const opf = Buffer.from('<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>' +
+    title + '</dc:title><dc:creator>Ada Scanner</dc:creator><dc:language>en</dc:language></metadata></package>');
+  const raw = { sha256: digest(SCAN_PAGE_PNG), camera_role: "left", captured_at: started, recognized_page_number: "1" };
+  const asImage = (bytes: Buffer) => ({ name: "page.png", mimeType: "image/png", buffer: bytes });
+  const manifest = {
+    finished_at: started, sans_last_line_no: 1, pages: [{ sequence_number: 0, sha256: raw.sha256 }],
+    covers: [{ position: "front", sha256: raw.sha256 }], metadata_opf: { sha256: digest(opf) },
+  };
+  try {
+    expect((await device.put(job, { data: { scan_started_at: started, capture_layout: "single_page" } })).status()).toBe(201);
+    const premature = await device.post(job + "/capture-complete", { data: manifest });
+    expect(premature.status()).toBe(409);
+    expect((await premature.json()).verified).not.toBe(true);
+
+    // Drop the acknowledgement after the server has committed the page, then retry from the device.
+    await capture.goto("/accounts/login/");
+    let storedStatus = 0;
+    await capture.route("**" + job + "/pages/0", async route => {
+      const reply = await route.fetch();
+      storedStatus = reply.status();
+      await reply.dispose();
+      await route.abort("connectionreset");
+    });
+    const acknowledged = await capture.evaluate(async ({ url, metadata, bytes, token }) => {
+      const form = new FormData();
+      form.append("metadata", JSON.stringify(metadata));
+      form.append("image", new Blob([Uint8Array.from(bytes)], { type: "image/png" }), "page.png");
+      try {
+        await fetch(url, { method: "PUT", headers: { Authorization: "Bearer " + token }, body: form });
+        return true;
+      } catch { return false; }
+    }, { url: job + "/pages/0", metadata: raw, bytes: Array.from(SCAN_PAGE_PNG), token: key });
+    expect(acknowledged).toBe(false);
+    expect(storedStatus).toBe(201);
+    expect((await device.put(job + "/pages/0", { multipart: {
+      metadata: JSON.stringify(raw), image: asImage(SCAN_PAGE_PNG),
+    } })).status()).toBe(200);
+    expect((await device.put(job + "/covers/front", { multipart: {
+      metadata: JSON.stringify({ sha256: raw.sha256, captured_at: started }), image: asImage(SCAN_PAGE_PNG),
+    } })).status()).toBe(201);
+    expect((await device.put(job + "/metadata", { multipart: {
+      metadata: JSON.stringify(manifest.metadata_opf), opf: { name: "metadata.opf", mimeType: "application/oebps-package+xml", buffer: opf },
+    } })).status()).toBe(201);
+    const events = { first_line_no: 1, lines: [JSON.stringify({ type: "job", job_id: jobId })] };
+    expect((await (await device.post(job + "/events", { data: events })).json()).sans_last_line_no).toBe(1);
+    const complete = await device.post(job + "/capture-complete", { data: manifest });
+    expect(complete.status()).toBe(200);
+    const verified = await complete.json();
+    expect(verified).toMatchObject({ verified: true, state: "captured" });
+    expect((await (await device.post(job + "/capture-complete", { data: manifest })).json()).verified).toBe(true);
+
+    const member = await signIn(memberContext, "fry");
+    const detailsURL = "/scan/jobs/" + jobId + "/";
+    await member.goto("/scan/raw/");
+    await member.locator('a[href*="' + jobId + '/workspace/"]').click();
+    await expect(member.locator("[data-opf-title]")).toHaveText(title);
+    const first = (await (await member.request.get(detailsURL)).json()).pages[0];
+    expect(first.available_versions).toHaveLength(1);
+    expect(first.active_version.checksum_sha256).toBe(raw.sha256);
+    const finish = async () => {
+      await runAllScanTailorStages(member);
+      await member.getByRole("button", { name: "Queue finalization" }).click();
+      await expect(member.locator(".status-card .status")).toHaveText("Success", { timeout: 30_000 });
+    };
+    await finish();
+    await member.goto(verified.portal_url);
+    await member.getByPlaceholder("Why is a rescan needed?").fill("Retake the lower margin");
+    await member.getByRole("button", { name: "Request rescan" }).click();
+    const todos = (await (await device.get(job + "/rescans")).json()).todos;
+    expect(todos).toHaveLength(1);
+    expect(todos[0].sequence_number).toBe(0);
+    const csrf = (await memberContext.cookies()).find(cookie => cookie.name === "csrftoken");
+    expect(csrf).toBeDefined();
+    const claim = await member.request.post("/scan/todos/" + todos[0].todo_id + "/claim/", {
+      headers: { "X-CSRFToken": csrf!.value, Referer: member.url() },
+    });
+    expect((await claim.json()).state).toBe("claimed");
+    const replacement = { multipart: {
+      metadata: JSON.stringify({ ...raw, sha256: digest(RESCAN_PAGE_PNG), page_number_verified: true }),
+      image: asImage(RESCAN_PAGE_PNG),
+    } };
+    const replaceURL = job + "/rescans/" + todos[0].todo_id + "/replacement";
+    const replaced = await device.post(replaceURL, replacement);
+    expect(replaced.status()).toBe(201);
+    expect(await replaced.json()).toMatchObject({ todo_state: "completed", version: 2, previous_version: 1, state: "captured" });
+    expect((await device.post(replaceURL, replacement)).status()).toBe(200);
+    const next = (await (await member.request.get(detailsURL)).json()).pages[0];
+    expect(next.id).toBe(first.id);
+    expect(next.available_versions.map((v: { checksum_sha256: string }) => v.checksum_sha256)).toEqual([digest(RESCAN_PAGE_PNG), raw.sha256]);
+    expect(next.active_version.version).toBe(2);
+    await member.goto(verified.portal_url);
+    await expect(member.locator("[data-raw-scan]")).toContainText("re-finish needed");
+    await finish();
+    const finished = await (await member.request.get(detailsURL)).json();
+    expect(finished.state).toBe("complete");
+    await member.goto("/library/books/" + finished.book_id + "/");
+    const downloadable = member.locator(".variant-list > div").filter({ has: member.getByText("PDF", { exact: true }) });
+    const pending = member.waitForEvent("download");
+    await downloadable.getByRole("link", { name: "Download" }).click();
+    const download = await pending;
+    const path = await download.path();
+    expect((await readFile(path!)).subarray(0, 5).toString()).toBe("%PDF-");
+  } finally {
+    await capture.close();
+    await memberContext.close();
+    await device.dispose();
   }
 });

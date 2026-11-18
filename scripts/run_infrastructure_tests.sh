@@ -134,6 +134,10 @@ uv run python manage.py check
 # run from the pinned postgres image unless BOOK_SCANNER_REHEARSAL_PG_BINDIR is set).
 uv run pytest -q tests/integration --create-db
 
+# The simulated scanner and web app share a fresh device key for this run.
+export BOOK_SCANNER_BROWSER_DEVICE_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export BOOK_SCANNER_SCANNER_API_KEY_SHA256="$(uv run python -c 'import hashlib, os; print(hashlib.sha256(os.environ["BOOK_SCANNER_BROWSER_DEVICE_KEY"].encode()).hexdigest())')"
+export BOOK_SCANNER_PUBLIC_BASE_URL="http://127.0.0.1:${book_scanner_proxy_port}/"
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS="0.2"
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS="150"
 uv run uvicorn tests.browser_fixtures:ocr_app \
