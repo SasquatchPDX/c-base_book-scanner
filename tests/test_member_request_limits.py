@@ -25,7 +25,7 @@ from ebook_server.core.models import (
 def test_login_backoff_precedes_ldap_and_is_shared_between_clients() -> None:
     first, second = Client(), Client()
     now = timezone.now()
-    with patch("ebook_server.core.views.authenticate", return_value=None) as ldap:
+    with patch("ebook_server.core.member_views.authenticate", return_value=None) as ldap:
 
         def submit(client: Client, name: str, address: str = "192.0.2.10") -> HttpResponseBase:
             return client.post(
