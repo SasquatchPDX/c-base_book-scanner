@@ -162,9 +162,17 @@ padding, rather than silently resubmitting them as fixed dimensions.
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
-deletes existing `page_split` stage rows, relinks the remaining stages in the new
-order, and marks every stage that had been queued, run or failed as invalidated
-with a new revision, so existing jobs re-run once. Raw page versions are untouched.
+deletes existing `page_split` stage rows and relinks the remaining stages in the
+new order. On jobs that still accept processing (open, capturing, paused, raw
+scan) it marks every stage that had been queued, run or failed as invalidated
+with a new revision, so those jobs re-run once. Finalizing, complete and
+cancelled jobs keep their stage statuses, revisions and outputs: the lifecycle
+refuses stage re-runs in those states, and the outputs are the history behind
+the published book. When a replacement page reopens a complete job (raw scan,
+re-finish needed), that page is invalidated as usual and the re-finish reuses
+the other pages' recorded outputs. Raw page versions are untouched. The
+migration rehearsal's integrity check expects exactly the deleted `page_split`
+rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
 `capture_layout: single_page` and ignores it, and rejects `spread`.
 
