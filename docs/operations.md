@@ -1271,6 +1271,50 @@ libraries. Set `QT_QPA_PLATFORM=offscreen` in worker environments; the acceptanc
 runner enforces this, and CI installs `libegl1`, `libopengl0`, `libxcb-cursor0`,
 and `libxkbcommon-x11-0`.
 
+Converter subprocesses use the following positive limits (`.env.example` contains
+the byte-valued settings). They apply to Calibre/Pandoc conversion commands and
+their version probes; normal digital originals are copied into private scratch.
+
+| Setting (`BOOK_SCANNER_CONVERTER_...`) | Default | Application behavior |
+| --- | --- | --- |
+| `MAX_DIAGNOSTIC_BYTES` | 1 MiB | Abort when captured stdout plus stderr exceeds this total; keep only 64 KiB of stdout and the final 2000 stderr bytes in memory. No diagnostic spool file is created. Uncaptured stdout goes to the null device. |
+| `MAX_OUTPUT_BYTES` | 1 GiB | Reject each intermediate/final output before hashing or archive publication; on POSIX also impose this as a hard per-file write ceiling. |
+| `MAX_SCRATCH_BYTES` | 4 GiB | Limit the copied source and monitor the aggregate logical sizes of source, intermediates and auxiliary files, with a 10,000-entry ceiling. |
+| `ADDRESS_SPACE_BYTES` | unset | Optional positive POSIX per-process virtual-address limit; children inherit it. Validate each tool before enabling. Actual RAM is bounded by the deployment cgroup. |
+| `SCRATCH_ROOT` | system temporary directory | Optional existing local scratch mount; each conversion/probe gets its own temporary directory. |
+
+Commands run with a private working directory and `TMPDIR`, `TEMP`, `TMP`, and
+`CALIBRE_TEMP_DIR` pointing there. While the tool runs, the worker samples output
+and scratch sizes every 50 ms; fast writes can exceed the aggregate scratch budget
+between samples. Use a quota-backed local scratch filesystem for a strict volume
+boundary and point `SCRATCH_ROOT` there. A converter writing outside that tree is
+not contained by the scratch monitor: retain restricted worker credentials,
+filesystem permissions and container/mount isolation. These checks are resource
+controls, not a document-parser sandbox.
+
+The POSIX launcher sets hard file-size and CPU-time limits (and the optional
+address-space limit) before
+`exec`, rather than using a threaded-parent `preexec_fn`. CPU time is capped at
+the command's wall-clock timeout, rounded up to whole seconds; the existing
+wall-clock monitor terminates the whole process group as well. On other platforms
+the size/diagnostic checks and direct-child timeout still apply, but production
+descendant and OS resource isolation must be supplied by the deployment.
+
+The example systemd worker adds `MemoryHigh=4G`, `MemoryMax=6G`, `TasksMax=128`,
+and `CPUQuota=200%` for the entire worker cgroup, including descendant tools.
+Those limits cover every job assigned to that worker, not only conversions. Size
+them for the site's largest accepted jobs using a systemd override; changing the
+application's per-tool limit does not change the service's cgroup ceiling.
+Do not use a small virtual-address ceiling as a substitute for that RAM bound:
+[Calibre PDF conversion uses QtWebEngine](https://github.com/kovidgoyal/calibre/blob/master/src/calibre/ebooks/conversion/plugins/pdf_output.py),
+and [V8 reserves roughly 1 TiB of virtual
+address space](https://github.com/v8/v8/blob/main/docs/sandbox/architecture.md).
+Such a reservation is not equivalent to physical-memory consumption.
+Resource failures become failed conversion jobs, leave originals untouched and
+reclaim private scratch on normal exception exit. If the worker itself is killed
+by the OS/cgroup, use the killed-worker recovery procedure below and reconcile
+unreferenced temporary artifacts; Python cleanup cannot run after `SIGKILL`.
+
 ```bash
 uv run rq worker --with-scheduler --config ebook_server.rq_settings \
   --url redis://localhost:6379/0 ebook-server

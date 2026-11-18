@@ -6,12 +6,19 @@ import errno
 import os
 import shutil
 import signal
+import stat
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import uuid
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +40,16 @@ from .storage_registry import (
 )
 
 logger = structlog.get_logger(__name__)
+_CURRENT_SCRATCH: ContextVar[Path | None] = ContextVar("converter_scratch", default=None)
+
+
+@contextmanager
+def _conversion_scratch(root: Path) -> Iterator[None]:
+    token = _CURRENT_SCRATCH.set(root)
+    try:
+        yield
+    finally:
+        _CURRENT_SCRATCH.reset(token)
 
 
 class ConversionError(RuntimeError):
@@ -100,6 +117,7 @@ class CalibreConverter(Converter):
             [self.binary, "--version"],
             check=True,
             capture_output=True,
+            timeout=min(VERSION_PROBE_TIMEOUT_SECONDS, _converter_timeout_seconds()),
         )
         return _version_summary(output.stdout, fallback="calibre-unknown")
 
@@ -116,6 +134,8 @@ class CalibreConverter(Converter):
         _run_conversion_command(
             [self.binary, str(source_path), str(destination_path)],
             check=True,
+            scratch_dir=destination_path.parent,
+            output_path=destination_path,
         )
 
 
@@ -128,6 +148,7 @@ class PandocConverter(Converter):
             [self.binary, "--version"],
             check=True,
             capture_output=True,
+            timeout=min(VERSION_PROBE_TIMEOUT_SECONDS, _converter_timeout_seconds()),
         )
         return _version_summary(output.stdout, fallback="pandoc-unknown")
 
@@ -144,6 +165,8 @@ class PandocConverter(Converter):
         _run_conversion_command(
             [self.binary, str(source_path), "-o", str(destination_path)],
             check=True,
+            scratch_dir=destination_path.parent,
+            output_path=destination_path,
         )
 
 
@@ -543,13 +566,22 @@ def _execute_plan(
     if isinstance(request_options, dict):
         request_options_map = dict(request_options)
 
-    with tempfile.TemporaryDirectory(prefix="ebook-convert-") as workdir:
+    scratch_root = tunable_setting("BOOK_SCANNER_CONVERTER_SCRATCH_ROOT", "") or None
+    with (
+        tempfile.TemporaryDirectory(prefix="ebook-convert-", dir=scratch_root) as workdir,
+        _conversion_scratch(Path(workdir)),
+    ):
         source_suffix = Path(source_variant.original_filename).suffix or f".{source_variant.format}"
         source_path = Path(workdir) / f"source{source_suffix}"
         try:
             with storage.open(source_variant.storage_identifier) as source_stream:
                 with source_path.open("wb") as staged_source:
-                    shutil.copyfileobj(source_stream, staged_source, length=1 << 20)
+                    copied = 0
+                    while chunk := source_stream.read(1 << 20):
+                        copied += len(chunk)
+                        if copied > _resource_limit("MAX_SCRATCH_BYTES", 4 * 1024**3):
+                            raise ConversionError("converter scratch limit exceeded by source")
+                        staged_source.write(chunk)
         except FileNotFoundError as exc:
             raise ConversionError("source artifact missing") from exc
 
@@ -574,10 +606,11 @@ def _execute_plan(
             )
             if not destination.exists():
                 raise ConversionError(f"converter produced no output: {converter.name}")
+            _check_conversion_files(Path(workdir), destination)
             current_path = destination
 
-        output_sha = intake.compute_sha256(str(current_path))
         output_size = current_path.stat().st_size
+        output_sha = intake.compute_sha256(str(current_path))
         namespace = (
             f"books/{source_variant.book_id}/converted"
             if archive_layout.configured_layout().job_scoped
@@ -728,11 +761,62 @@ def _stderr_tail(raw: bytes | str | None) -> str:
     return data[-STDERR_TAIL_BYTES:].decode("utf-8", "replace").strip()
 
 
+def _resource_limit(suffix: str, default: int) -> int:
+    value = int(tunable_setting(f"BOOK_SCANNER_CONVERTER_{suffix}", default))
+    if value <= 0:
+        raise ConversionError(f"converter {suffix.lower()} must be positive")
+    return value
+
+
+def _check_conversion_files(root: Path, output: Path | None = None) -> None:
+    """Bound logical scratch bytes/entries without following tool-created symlinks."""
+    if output is not None and output.exists():
+        info = output.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ConversionError("converter output is not a regular file")
+        if info.st_size > _resource_limit("MAX_OUTPUT_BYTES", 1024**3):
+            raise ConversionError("converter output limit exceeded")
+    maximum = _resource_limit("MAX_SCRATCH_BYTES", 4 * 1024**3)
+    total = 0
+    entries = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            iterator = os.scandir(directory)
+        except FileNotFoundError:
+            continue
+        with iterator as items:
+            for item in items:
+                entries += 1
+                if entries > 10000:
+                    raise ConversionError("converter scratch file-count limit exceeded")
+                try:
+                    info = item.stat(follow_symlinks=False)
+                except FileNotFoundError:  # a tool removed a temporary file during sampling
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(Path(item.path))
+                elif stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                else:
+                    raise ConversionError("converter scratch contains a non-regular file")
+                if total > maximum:
+                    raise ConversionError("converter scratch limit exceeded")
+
+
 def _kill_process_group(process: subprocess.Popen[Any]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        if sys.platform == "win32":
+            # Windows deployment needs an external job-object/container boundary
+            # for descendant limits; production workers are the Linux systemd units.
+            if process.poll() is None:
+                process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
-        process.kill()
+        if process.poll() is None:
+            process.kill()
 
 
 def _run_conversion_command(
@@ -740,44 +824,141 @@ def _run_conversion_command(
     check: bool = False,
     capture_output: bool = False,
     timeout: float | None = None,
+    *,
+    scratch_dir: Path | None = None,
+    output_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a converter with a timeout, killing its whole process group on expiry.
+    """Bound diagnostics in RAM, monitor scratch, and reap the converter group.
 
-    stderr is always captured (bounded tail) so failures carry the converter's own
-    message; stdout is only kept when the caller asks for it.
+    A private cwd and TMPDIR keep normal converter scratch in the monitored tree.
+    POSIX exec limits bound each file and CPU (optionally address space) before
+    the tool starts; the sampled aggregate limit complements a filesystem quota.
     """
+    if scratch_dir is None:
+        scratch_dir = _CURRENT_SCRATCH.get()
+    if scratch_dir is None:
+        scratch_root = tunable_setting("BOOK_SCANNER_CONVERTER_SCRATCH_ROOT", "") or None
+        with tempfile.TemporaryDirectory(prefix="ebook-probe-", dir=scratch_root) as workdir:
+            return _run_conversion_command(
+                command,
+                check,
+                capture_output,
+                timeout,
+                scratch_dir=Path(workdir),
+                output_path=output_path,
+            )
+    scratch_dir = scratch_dir.resolve()
+    _check_conversion_files(scratch_dir, output_path)
     effective_timeout = timeout if timeout is not None else _converter_timeout_seconds()
-    with tempfile.TemporaryFile() as stderr_file:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
-            stderr=stderr_file,
-            text=True,
-            start_new_session=True,
-        )
+    diagnostic_limit = _resource_limit("MAX_DIAGNOSTIC_BYTES", 1024 * 1024)
+    address_limit = tunable_setting("BOOK_SCANNER_CONVERTER_ADDRESS_SPACE_BYTES", None)
+    memory_limit = 0 if address_limit is None else _resource_limit("ADDRESS_SPACE_BYTES", 0)
+    file_limit = min(
+        _resource_limit("MAX_OUTPUT_BYTES", 1024**3),
+        _resource_limit("MAX_SCRATCH_BYTES", 4 * 1024**3),
+    )
+    executable = command
+    if os.name == "posix":
+        executable = [
+            sys.executable,
+            "-I",
+            str(Path(__file__).parents[1] / "converter_limits.py"),
+            str(file_limit),
+            str(memory_limit),
+            str(max(1, ceil(effective_timeout))),
+            *command,
+        ]
+    environment = {
+        **os.environ,
+        "TMPDIR": str(scratch_dir),
+        "TEMP": str(scratch_dir),
+        "TMP": str(scratch_dir),
+        "CALIBRE_TEMP_DIR": str(scratch_dir),
+    }
+    process = subprocess.Popen(
+        executable,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        cwd=scratch_dir,
+        env=environment,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+    diagnostic_bytes = 0
+    exceeded = threading.Event()
+    capture_lock = threading.Lock()
+
+    def drain(stream: Any, *, is_stderr: bool) -> None:
+        nonlocal diagnostic_bytes
         try:
-            stdout, _ = process.communicate(timeout=effective_timeout)
-        except subprocess.TimeoutExpired as exc:
-            _kill_process_group(process)
-            process.communicate()
-            stderr_file.seek(max(0, stderr_file.seek(0, os.SEEK_END) - STDERR_TAIL_BYTES))
-            tail = _stderr_tail(stderr_file.read())
-            raise ConversionError(
-                f"{Path(command[0]).name} timed out after {int(effective_timeout)}s"
-                + (f": {tail}" if tail else ""),
-            ) from exc
-        except BaseException:
-            _kill_process_group(process)
-            process.wait()
-            raise
-        stderr_file.seek(max(0, stderr_file.seek(0, os.SEEK_END) - STDERR_TAIL_BYTES))
-        tail = _stderr_tail(stderr_file.read())
+            while chunk := stream.read(8192):
+                with capture_lock:
+                    diagnostic_bytes += len(chunk)
+                    if diagnostic_bytes > diagnostic_limit:
+                        exceeded.set()
+                    if is_stderr:
+                        stderr.extend(chunk)
+                        del stderr[:-STDERR_TAIL_BYTES]
+                    else:
+                        stdout.extend(chunk[: max(0, min(diagnostic_limit, 65536) - len(stdout))])
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(
+            target=drain, args=(process.stderr,), kwargs={"is_stderr": True}, daemon=True
+        )
+    ]
+    if process.stdout is not None:
+        readers.append(
+            threading.Thread(
+                target=drain, args=(process.stdout,), kwargs={"is_stderr": False}, daemon=True
+            )
+        )
+    deadline = time.monotonic() + effective_timeout
+    failure: str | None = None
+    try:
+        for reader in readers:
+            reader.start()
+        while True:
+            _check_conversion_files(scratch_dir, output_path)
+            if exceeded.is_set():
+                raise ConversionError("converter diagnostic limit exceeded")
+            if process.poll() is not None and all(not reader.is_alive() for reader in readers):
+                break
+            if time.monotonic() >= deadline:
+                raise ConversionError(
+                    f"{Path(command[0]).name} timed out after {effective_timeout:g}s"
+                )
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    except ConversionError as exc:
+        failure = str(exc)
+    finally:
+        # Also reap children left behind by a wrapper that exited before its tool.
+        _kill_process_group(process)
+        process.wait()
+        for reader in readers:
+            if reader.ident is not None:
+                reader.join(timeout=5)
+    _check_conversion_files(scratch_dir, output_path)
+    if exceeded.is_set() and failure is None:
+        failure = "converter diagnostic limit exceeded"
+    tail = _stderr_tail(bytes(stderr))
+    if failure is not None:
+        raise ConversionError(failure + (f": {tail}" if tail else ""))
     if check and process.returncode != 0:
         raise ConversionError(
             f"{Path(command[0]).name} exited with status {process.returncode}"
             + (f": {tail}" if tail else ""),
         )
-    return subprocess.CompletedProcess(command, process.returncode, stdout, tail)
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        bytes(stdout).decode("utf-8", "replace") if capture_output else None,
+        tail,
+    )
 
 
 def _version_summary(raw_output: object, *, fallback: str) -> str:
