@@ -29,9 +29,37 @@ class BrowserMetadataProvider:
         isbn: str | None = None,
         folder_hint: str | None = None,
     ) -> list[dict[str, Any]]:
-        del isbn, folder_hint
+        del folder_hint
         resolved_title = (title or "Browser Acceptance Book").strip()
         resolved_author = (author or "Acceptance Researcher").strip()
+        if isbn == "9780306406157":
+            return [
+                {
+                    "key": "/books/browser-verified",
+                    "title": "Verified Browser Edition",
+                    "author_name": ["Ada Digital"],
+                    "isbn_13": [isbn],
+                }
+            ]
+        if resolved_title == "Browser Local Manuscript":
+            return []
+        if resolved_title == "Browser Edition Twins":
+            return [
+                {
+                    "key": f"/books/browser-edition-{number}",
+                    "title": resolved_title,
+                    "author_name": ["Ada Digital"],
+                    "language": ["eng"],
+                    "publisher": [publisher],
+                    "isbn_13": [edition_isbn],
+                }
+                for number, (publisher, edition_isbn) in enumerate(
+                    [
+                        ("First Browser Press", "9780140327243"),
+                        ("Second Browser Press", "9780439554930"),
+                    ]
+                )
+            ]
         provider_ref = hashlib.sha256(resolved_title.encode()).hexdigest()[:16]
         # One concrete English edition from "Hackerspace Acceptance Press". The digital
         # scenario's EPUB (scripts/run_infrastructure_tests.sh) is English but names
