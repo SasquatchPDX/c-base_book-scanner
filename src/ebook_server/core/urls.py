@@ -5,7 +5,15 @@ from __future__ import annotations
 from django.urls import path, register_converter
 from django.views.generic import RedirectView
 
-from . import contributions_views, health_views, intake_views, library_views, member_views, views
+from . import (
+    contributions_views,
+    health_views,
+    intake_views,
+    library_views,
+    member_views,
+    views,
+    worker_failure_views,
+)
 from .scan_job_ids import ScanJobIdConverter
 
 # Scan job IDs are a canonical UUID (web jobs) or a scanner-assigned ID (#126).
@@ -198,6 +206,11 @@ urlpatterns = [
     path("reviews/", views.review_queue, name="review-queue"),
     path("reviews/batch-accept/", views.review_batch_accept, name="review-batch-accept"),
     path("reviews/<int:task_id>/", views.review_detail, name="review-detail"),
+    path(
+        "reviews/<int:task_id>/worker-recovery/",
+        worker_failure_views.recover,
+        name="review-worker-recovery",
+    ),
     path(
         "reviews/<int:task_id>/accept-candidate/",
         views.review_accept_candidate,

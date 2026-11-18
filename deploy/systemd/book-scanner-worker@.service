@@ -18,7 +18,7 @@ WorkingDirectory=/opt/book-scanner
 Environment=QT_QPA_PLATFORM=offscreen
 # --with-scheduler is mandatory on at least one worker (delayed retries); it is
 # safe on every instance because only one holds the scheduler lock at a time.
-ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --url redis://127.0.0.1:6379/0 ebook-server
+ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --worker-class ebook_server.recovery_worker.RecoveryWorker --url redis://127.0.0.1:6379/0 ebook-server
 Restart=on-failure
 RestartSec=5
 # Give a running job a chance to finish on stop: SIGTERM goes only to the main

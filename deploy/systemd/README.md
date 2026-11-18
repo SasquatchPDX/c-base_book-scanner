@@ -6,6 +6,9 @@ Example units for running the web and worker processes on a single host:
   on `127.0.0.1:8000`, behind the Nginx example in `deploy/nginx/`.
 - `book-scanner-worker@.service` is a template for RQ workers. Start one or more
   instances (`book-scanner-worker@1`, `book-scanner-worker@2`, ...).
+  It uses RQ's `RecoveryWorker` subclass to reconcile killed work horses with
+  application job state and the human recovery queue; retain its `--worker-class`
+  option when adapting the command.
 
 They assume:
 
