@@ -34,8 +34,14 @@ database polling load when sizing large concurrent scanning sessions.
 ScanTailor-Web expects one upright page per image; there is no Page Split stage
 (#195). `BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT` and
 `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` are ignored and can be removed from `.env`.
-Migration 0049 deletes old Page Split stage rows and marks every processed stage
-invalidated, so existing scan jobs need their stages re-run once after upgrading.
+Migration 0049 deletes old Page Split stage rows and relinks the remaining stages.
+On scan jobs that can still be processed (open, capturing, paused, raw scan) it
+marks every processed stage invalidated, so those jobs need their stages re-run
+once after upgrading. Finalizing, complete and cancelled jobs keep their stage
+results: they cannot be re-run in those states, and their outputs are what the
+published book was built from. A complete job is reprocessed only when a
+replacement page reopens it for a re-finish; the re-finish keeps the other
+pages' existing outputs.
 
 `deploy/nginx/book-scanner.conf` provides a validated Nginx upstream example with
 a dedicated unbuffered SSE location. Point its upstream at the Uvicorn service,
@@ -482,7 +488,9 @@ throwaway copy of the production database before the real upgrade:
 4. `manage.py migrate` on the copy, timed.
 5. Post-checks: `migrate --check`, `makemigrations --check`, and
    `check_scan_job_integrity --compare`: every pre-existing scan job ID still
-   resolves (compared in canonical form), the counts are unchanged, no row
+   resolves (compared in canonical form), the counts are unchanged apart from
+   rows a migration retires on purpose (the `page_split` stage states that 0049
+   deletes: exactly those may go, and the report says how many), no row
    references a missing job, and a sample of `/scan/jobs/<id>/` URLs answers
    `200` through the Django test client (inside a rolled-back transaction).
 6. A PASS/FAIL report with the time of each step, then `dropdb` of the copy
