@@ -74,6 +74,7 @@ from . import (
     metadata_search,
     multipart,
     ocr,
+    request_limits,
     review_accept,
     review_batch,
     review_identification,
@@ -134,8 +135,13 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
     if request.method == "POST":
         username = request.POST.get("username", "").strip()
         password = request.POST.get("password", "")
+        try:
+            ticket = request_limits.reserve_login(username, request.META.get("REMOTE_ADDR", ""))
+        except request_limits.RequestLimited as exc:
+            return _limited_response("login", exc)
         user = authenticate(request, username=username, password=password)
         if user is not None:
+            request_limits.release_successful_login(ticket)
             login(request, user)
             if next_url and url_has_allowed_host_and_scheme(
                 next_url,
@@ -151,6 +157,17 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
         {"next": next_url, "error": error},
         status=401 if error else 200,
     )
+
+
+def _limited_response(kind: str, error: request_limits.RequestLimited) -> HttpResponse:
+    request_limits.record_rejection(kind)
+    response = HttpResponse(
+        f"Too many requests. Try again in {error.retry_after} seconds.",
+        status=429,
+        content_type="text/plain; charset=utf-8",
+    )
+    response["Retry-After"] = str(error.retry_after)
+    return response
 
 
 @require_POST
@@ -4247,23 +4264,38 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
 
     staging_root = Path(django_settings.APP_DATA_DIR) / "uploads"
     try:
+        reservation = request_limits.reserve_upload(profile, uploaded_file.size or 0)
+    except request_limits.RequestLimited as exc:
+        return _limited_response("upload", exc)
+    source_path = ""
+    committed = False
+    try:
         source_path, size_bytes = intake.write_upload_to_staging(uploaded_file, staging_root)
-    except intake.ValidationError as exc:
+        with transaction.atomic():
+            request_limits.finish_reservation(reservation, size_bytes)
+            job = ImportJob.objects.create(
+                source_type=ImportJob.SourceType.UPLOAD,
+                state=ImportJob.State.DISCOVERED,
+                uploader=profile.user,
+                source_path=source_path,
+                original_filename=original_name,
+                normalized_filename=normalized_filename,
+                detected_format=detected_format,
+                mime_type=detected_mime,
+                size_bytes=size_bytes,
+            )
+        committed = True
+    except request_limits.RequestLimited as exc:
+        return _limited_response("upload", exc)
+    except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
     except OSError:
         return HttpResponse("storage unavailable", status=503)
-
-    job = ImportJob.objects.create(
-        source_type=ImportJob.SourceType.UPLOAD,
-        state=ImportJob.State.DISCOVERED,
-        uploader=profile.user,
-        source_path=source_path,
-        original_filename=original_name,
-        normalized_filename=normalized_filename,
-        detected_format=detected_format,
-        mime_type=detected_mime,
-        size_bytes=size_bytes,
-    )
+    finally:
+        if not committed:
+            reservation.delete()
+            if source_path:
+                _cleanup_staged_upload(source_path)
     try:
         enqueue(intake.process_import_job, str(job.id))
     except Exception as exc:  # pragma: no cover - transport/path specific

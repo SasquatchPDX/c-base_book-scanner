@@ -544,6 +544,26 @@ against a database seeded at the pre-0041 state.
 
 ## LDAP
 
+Sign-in admission uses PostgreSQL rows shared by web workers. The default burst
+allows six failed or in-flight binds per account and 40 per source address in
+a 15-minute window. Successful binds refund their reservations. When a budget
+fills, the endpoint returns HTTP 429 with `Retry-After`. Backoff starts at one
+second and doubles after each subsequent admitted failure, up to five minutes.
+The response is the same for unknown and existing accounts. Keys are stored as
+keyed digests. The application uses the web server's `REMOTE_ADDR`. Configure
+trusted proxy address handling at the web server if it otherwise sees all users
+as the same peer. The application ignores client-supplied forwarding headers.
+
+Digital uploads reserve capacity per member before writing to application
+staging. The defaults permit 10 pending uploads, 60 uploads per rolling hour,
+and 2 GiB per rolling hour. Completed or review-held imports release pending
+capacity. Their bytes and upload count still contribute to the hourly budgets.
+A worker crash during staging leaves a reservation that expires in 15 minutes.
+The normal per-file size limit and the reverse proxy's request-body limit still
+apply. Monitor the aggregate Prometheus counter `ebook_server_throttled_requests_total`
+by `kind` (`login` or `upload`). Operators can tune the five budgets in the
+environment. [Example settings](../.env.example)
+
 `ldap3` performs the credential bind. Configure one of:
 
 - `BOOK_SCANNER_LDAP_USER_DN_TEMPLATE`, for example

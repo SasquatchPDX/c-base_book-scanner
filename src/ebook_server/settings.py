@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import dj_database_url
 import django_stubs_ext
 import structlog
-from pydantic import SecretStr, model_validator
+from pydantic import PositiveInt, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
     metrics_bearer_token: SecretStr = SecretStr("")
     max_upload_bytes: int = 150 * 1024 * 1024
+    login_account_burst: PositiveInt = 6
+    login_address_burst: PositiveInt = 40
+    member_uploads_pending: PositiveInt = 10
+    member_uploads_per_hour: PositiveInt = 60
+    member_upload_bytes_per_hour: PositiveInt = 2 * 1024**3
     # Optional URL of the separate audiobook server (e.g. Audiobookshelf); audio
     # uploads are rejected with a pointer to it. See docs/design/32-audiobooks.md.
     audiobook_service_url: str = ""
@@ -433,6 +438,11 @@ BOOK_SCANNER_LDAP_CA_FILE = settings.ldap_ca_file
 BOOK_SCANNER_LDAP_TLS_REQUIRE_CERT = settings.ldap_tls_require_cert
 BOOK_SCANNER_LDAP_USERNAME_ATTRIBUTE = settings.ldap_username_attribute
 BOOK_SCANNER_MAX_UPLOAD_BYTES = settings.max_upload_bytes
+BOOK_SCANNER_LOGIN_ACCOUNT_BURST = settings.login_account_burst
+BOOK_SCANNER_LOGIN_ADDRESS_BURST = settings.login_address_burst
+BOOK_SCANNER_MEMBER_UPLOADS_PENDING = settings.member_uploads_pending
+BOOK_SCANNER_MEMBER_UPLOADS_PER_HOUR = settings.member_uploads_per_hour
+BOOK_SCANNER_MEMBER_UPLOAD_BYTES_PER_HOUR = settings.member_upload_bytes_per_hour
 BOOK_SCANNER_AUDIOBOOK_SERVICE_URL = settings.audiobook_service_url
 BOOK_SCANNER_METADATA_PROVIDERS = settings.metadata_providers
 BOOK_SCANNER_HARDCOVER_API_TOKEN = settings.hardcover_api_token.get_secret_value()
