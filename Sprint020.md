@@ -303,6 +303,12 @@ filesystem access, and every cover records where it came from.
 
 ### H — Scanner device identity
 
+> **Superseded (2026-11).** There is one scanner, and #125 (merged in #135) gives it a
+> single API key whose SHA-256 is `BOOK_SCANNER_SCANNER_API_KEY_SHA256`, created with
+> `manage.py generate_scanner_key`. There is no device registration or per-device
+> revocation; replacing the key means generating a new one and setting its hash. See "The scanner API key" in
+> `docs/operations.md` and `docs/scanner-protocol.md`.
+
 **Current.** Every scanner endpoint is `@login_required` with an ordinary session.
 `ScanJob.scanner_id` is a free-text field the client asserts about itself.
 

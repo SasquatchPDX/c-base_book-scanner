@@ -156,8 +156,10 @@ enabled after its long-lived operational consequences are understood.
 
 The libreflip scanner (`sans`, a Raspberry Pi) uploads to the device API
 `/api/scanner/v1/`. The contract is libreflip/serif
-`docs/sans-serif-interface.md` (currently
-[libreflip/serif#37](https://github.com/libreflip/serif/pull/37)); §3 sets the
+`docs/sans-serif-interface.md` (merged in
+[libreflip/serif#37](https://github.com/libreflip/serif/pull/37), pinned at
+[`d120d15`](https://github.com/libreflip/serif/blob/d120d156d30bc422bdb535e469c5711704c689cb/docs/sans-serif-interface.md));
+`docs/scanner-protocol.md` lists where this server differs from it. §3 sets the
 rules this section implements:
 
 - serif is reachable only inside the LAN; the VM has no public address or port

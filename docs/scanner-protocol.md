@@ -1,4 +1,68 @@
-# Sprint001 Scanner Protocol Draft (v1)
+# Scanner protocol
+
+The server has two scanner-facing APIs:
+
+1. **Device API v1 (`/api/scanner/v1/`)** for the one libreflip scanner (`sans`). Its
+   contract is libreflip/serif `docs/sans-serif-interface.md`, merged in
+   [libreflip/serif#37](https://github.com/libreflip/serif/pull/37) and pinned here at
+   [`d120d15`](https://github.com/libreflip/serif/blob/d120d156d30bc422bdb535e469c5711704c689cb/docs/sans-serif-interface.md)
+   ("§" below refers to it). The overview below lists what this server implements and
+   where it deliberately differs; the detail is in "Scan job IDs and the scanner API"
+   and the sections after it.
+2. **Session API (`/scan/...`)** for browsers, the portal and generic clients, from
+   "Core resources" to "Security" below. It keeps working for web-created jobs.
+
+## Device API v1 at a glance
+
+**Conventions (§6.1).** Every request sends `Authorization: Bearer <scanner key>`; sessions,
+cookies and CSRF play no part. Errors always use
+`{"error": {"code", "message", "details"}}`. Repeating an identical write answers `200` and
+changes nothing; a first write answers `201`. Requests that do not reach a view:
+
+| Status | Code | When |
+|---|---|---|
+| `503` | `scanner_api_disabled` | `BOOK_SCANNER_SCANNER_API_KEY_SHA256` is empty (the default). |
+| `401` | `authentication_required` / `invalid_api_key` | No Bearer key, or the wrong one (also for a member session). |
+| `405` | `method_not_allowed` | Wrong method; `details.allowed` and `Allow` list the right ones. |
+| `404` | `not_found` | A path outside the routes below, an unknown job, or a web-created job. |
+
+The scanner key gets `403` on every route outside `/api/scanner/v1/`.
+
+**Endpoints.**
+
+| Endpoint | § | Section below |
+|---|---|---|
+| `GET ping` (`api_version`, `server_time`, `limits`; no `scanner_id`, there is one scanner) | 6.2 | "The scanner API key" in `docs/operations.md` |
+| `PUT jobs/{job_id}`, `GET jobs/{job_id}` | 6.3, 6.4 | Scan job IDs and the scanner API |
+| `PUT jobs/{job_id}/pages/{sequence_number}` | 6.5 | Scan job IDs and the scanner API |
+| `PUT jobs/{job_id}/covers/{front\|back}` | 6.6 | Scan job IDs and the scanner API |
+| `POST jobs/{job_id}/events` | 6.7 | `scan.jsonl` event lines |
+| `PUT jobs/{job_id}/metadata` | 6.8 | Scanner `metadata.opf` |
+| `POST jobs/{job_id}/capture-complete` | 6.9 | Scan job IDs and the scanner API |
+| `POST jobs/{job_id}/abort` | 6.10 | Scan job IDs and the scanner API |
+| `GET rescans`, `GET jobs/{job_id}/rescans`, `GET jobs/{job_id}/pages/{n}/thumbnail`, `POST jobs/{job_id}/rescans/{todo_id}/replacement` | 6.11 | Rescans over the device API |
+
+**States (§5).** `open -> capturing -> captured -> finalizing -> complete`, plus
+`cancelled` from `open`/`capturing`, and `complete -> captured` ("re-finish needed") after
+a replacement page. See "Raw scans" below.
+
+**Contract decisions as implemented.**
+
+| Decision | On this server |
+|---|---|
+| D1 Job identity | Scanner jobs use the scanner's ID `YYYYMMDDTHHMMSSZ[-N]` as primary key; web-created jobs keep a server-generated UUID string. Both are opaque, immutable strings of at most 64 characters. |
+| D2 Uniqueness | Registering an existing ID with other data, or the ID of a web-created job, is `409 job_id_conflict`; nothing is overwritten. Every other route answers `404` for a web-created job, so IDs cannot be probed. |
+| D3 Metadata | The scanner OPF is the **primary** source: at finish it links to the one Book with its ISBN or creates a Book from it. An ambiguous ISBN or a likely duplicate goes to review. After that a background provider check (`scanner_opf_check`) still verifies it externally and routes contradictions to a `quality_review` task (owner decision, see "Owner decision" below). |
+| D4, D5 Upload timing, local retention | Scanner behaviour. This server's part: `capture-complete` answers `200 verified` only when every listed item is held with that checksum and the event high-water marks agree, never from the job state alone, because a `200` lets the scanner delete its copy. |
+| D6 Raw scans | `captured` jobs are raw scans: listed under **Raw scans** in the portal, never in library browse, search or download, until a human finishes them. |
+| D7 Rescans | Replacements add a page version and keep the old one; todos are `ScanTodo` rows keyed by `sequence_number`; `rescan_flag`/`rescan_replace` lines are appended to `scan.jsonl`. Allowed in `captured` and after `complete`. |
+| D9 Authentication | **Differs:** the contract's per-device key is one key for the one scanner (#125). The server stores only its SHA-256 in `BOOK_SCANNER_SCANNER_API_KEY_SHA256`; `manage.py generate_scanner_key` creates it. There is no device registry. |
+| D10 Transport | TLS 1.3 only, LAN only, through `deploy/nginx/serif-lan-tls.conf`; the plain-HTTP listener refuses `/api/scanner/`. See `deploy/nginx/README.md` and `docs/operations.md`. |
+| D11 Portal | `/j/<job_id>` requires the normal login and redirects to the job workspace. `portal_url` is built from `BOOK_SCANNER_PUBLIC_BASE_URL`. |
+
+Limits (§6.12) come from `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` (50 MiB) and
+`BOOK_SCANNER_SCANNER_MAX_OPF_BYTES` (1 MiB); event batches are capped at 1000 lines and
+1 MiB, and nginx allows 64 MiB bodies on `/api/scanner/`.
 
 ## Core resources
 
