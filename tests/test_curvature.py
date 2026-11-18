@@ -9,7 +9,7 @@ from typing import Any, cast
 import cv2
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ebook_server.core import curvature, scantailor
 from ebook_server.core.models import ScanPage, ScanTailorStageState
@@ -54,6 +54,13 @@ def test_bypass_and_failed_estimation_keep_pixels(tmp_path: Path) -> None:
             assert metadata["dewarp_warning"]
 
 
+def test_flat_text_page_needs_no_correction() -> None:
+    source = curled_page(0)
+    output, geometry = curvature.render(source, curvature.detect_curves(source))
+    assert geometry["dewarp_correction"] == "none_needed"
+    assert source.tobytes() == output.tobytes()
+
+
 def test_full_resolution_remap_scratch_is_tiled(monkeypatch: pytest.MonkeyPatch) -> None:
     source = Image.new("L", (4000, 6000), 255)
     curves = [[[0, y + 100], [2000, y], [3999, y + 100]] for y in (600, 2400, 4800)]
@@ -74,6 +81,59 @@ def test_full_resolution_remap_scratch_is_tiled(monkeypatch: pytest.MonkeyPatch)
         region[0] <= curvature.TILE_EDGE + 2 * curvature.MAX_DISPLACEMENT + 5
         for region, _mapping in sizes
     )
+
+
+def test_padding_keeps_all_four_input_corners() -> None:
+    source = Image.new("RGB", (1000, 1400), "white")
+    draw = ImageDraw.Draw(source)
+    colours = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 0, 255)]
+    for box, colour in zip(
+        ((0, 0, 12, 12), (987, 0, 999, 12), (0, 1387, 12, 1399), (987, 1387, 999, 1399)),
+        colours,
+        strict=True,
+    ):
+        draw.rectangle(box, fill=colour)
+    curves = [[[0, y + 100], [500, y], [999, y + 100]] for y in (200, 650, 1100)]
+    output, _metadata = curvature.render(source, curves, (255, 255, 255))
+    pixels = np.asarray(output)
+    assert all(bool((pixels == colour).all(axis=2).any()) for colour in colours)
+
+
+@pytest.mark.parametrize("mode", ["L", "RGB"])
+def test_full_resolution_stage_decodes_writes_and_bounds_preview(
+    tmp_path: Path,
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Image.new(mode, (4000, 6000), 255 if mode == "L" else (255, 255, 255))
+    draw = ImageDraw.Draw(source)
+    for y in range(100, 5900, 100):
+        draw.line((50, y, 3950, y), fill=0, width=2)
+    path = tmp_path / "full-resolution.png"
+    source.save(path)
+    del draw, source
+    before = path.read_bytes()
+    preview_sizes = []
+    original_preview = scantailor._save_preview
+
+    def record_preview(image: Image.Image, destination: Path) -> None:
+        preview_sizes.append(image.size)
+        original_preview(image, destination)
+
+    monkeypatch.setattr(scantailor, "_save_preview", record_preview)
+    curves = [[[0, y + 100], [2000, y], [3999, y + 100]] for y in (600, 2400, 4800)]
+    state = cast(
+        ScanTailorStageState,
+        SimpleNamespace(parameters={"dewarp_mode": "manual", "dewarp_curves": curves}),
+    )
+    metadata = scantailor._run_curvature_dewarp(
+        state, path, tmp_path / "out.png", tmp_path / "preview.png"
+    )
+    assert metadata["dewarp_applied"] == "curvature", metadata
+    with Image.open(tmp_path / "out.png") as output:
+        assert output.size == (4000, 6104)
+    assert preview_sizes and all(max(size) <= 960 for size in preview_sizes)
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -128,5 +188,6 @@ def test_opt_in_worker_provenance_manual_replay_and_switch_back() -> None:
     assert restored.algorithm == "projective_dewarp"
     assert restored.algorithm_version == "opencv-v3"
     assert restored.parameters["curvature_curves"] is None
+    assert restored.output_storage_location is not None
     storage = backend_for_location(restored.output_storage_location)
     assert storage.exists(restored.output_storage_identifier)

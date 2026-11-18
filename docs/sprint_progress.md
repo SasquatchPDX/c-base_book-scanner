@@ -44,8 +44,8 @@ Sprint-wide acceptance remains open.
 | 013 | Implemented | Server-rendered/API workspace, strict-TypeScript stage editor, persistent stage state, SSE updates, optimistic conflicts, worker lifecycle, and invalidation handling |
 | 014 | Implemented | Page split and deskew algorithms plus direct split-line/manual-angle controls, persisted dimensions/parameters, and regression tests |
 | 015 | Implemented | Content/margin stages plus draggable content geometry, alignment and batch controls, manual-exception preservation, and regression tests |
-| 016 | Partial | Projective correction, control points, and bypass/failure coverage exist; curvature correction and its fixture baseline remain outstanding |
-| 017 | Partial | Output modes and manual zones exist; `fox` is Niblack, `wolf` is approximate, and automatic segmentation is outstanding |
+| 016 | Partial | Perspective remains default; opt-in vertical baseline curvature has synthetic straightness/OCR and 24MP memory checks. Photographed-book/site acceptance remains open. |
+| 017 | Partial | Six output modes and multiple automatic/editable text/picture regions exist. Synthetic OCR/detail acceptance covers zoning; broader photographed-page quality and ScanTailor Advanced equivalence remain unproven. |
 | 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, downstream invalidation, and production-shaped Chromium acceptance for the synthetic physical-book flow |
 | 019 | In progress | A and F implemented; L covers backend-aware duplicate verification and streamed scan/OCR artifacts, including preservation of repeated OCR filenames; documentation reconciliation is partial. See the requirements audit for open work |
 | 020 | Partially implemented | Deferred algorithms, taxonomy/search, artifact retention, device identity, abuse controls, and other explicitly scoped development |

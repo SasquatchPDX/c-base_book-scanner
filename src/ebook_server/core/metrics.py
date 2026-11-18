@@ -10,7 +10,7 @@ from typing import Any
 from django.conf import settings
 from django.db.models import Count, Exists, Min, OuterRef
 from django.utils import timezone
-from prometheus_client.core import GaugeMetricFamily
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from redis import Redis
 from rq import Queue
 
@@ -25,6 +25,7 @@ from .models import (
     LLMSuggestion,
     MetadataCandidate,
     ProcessingJob,
+    RequestLimitCount,
     ReviewTask,
     ScanJob,
     ScanTailorStageState,
@@ -70,7 +71,16 @@ def _bucket_population(values: Iterable[float], bounds: Sequence[float]) -> list
 class PersistentStateCollector:
     """Collect bounded-cardinality metrics visible across web and worker processes."""
 
-    def collect(self) -> Iterator[GaugeMetricFamily]:
+    def collect(self) -> Iterator[GaugeMetricFamily | CounterMetricFamily]:
+        rejected = CounterMetricFamily(
+            "ebook_server_throttled_requests",
+            "Requests rejected by admission limits.",
+            labels=["kind"],
+        )
+        counts = dict(RequestLimitCount.objects.values_list("kind", "total"))
+        for kind in ("login", "upload"):
+            rejected.add_metric([kind], counts.get(kind, 0))
+        yield rejected
         collection = GaugeMetricFamily(
             "ebook_server_collection_objects",
             "Current canonical collection object counts.",

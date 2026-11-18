@@ -5,6 +5,7 @@ import {
   editableParameters,
   curvatureCurvesForEditing,
   initializeScanTailorWorkspace,
+  outputZonesForEditing,
   isAutoSkippedSplit,
   normalizeBox,
   previewErrorMessage,
@@ -131,6 +132,81 @@ describe("editable stage parameters", () => {
     vi.unstubAllGlobals();
     document.body.replaceChildren();
   });
+  it("turns detected geometry into independent editable lists, excluding provenance", () => {
+    const parameters = {
+      zone_mode: "auto",
+      resolved_zones: [
+        { kind: "picture", box: [1, 2, 30, 40], source: "auto" },
+        { kind: "text", box: [50, 2, 90, 40], source: "auto" },
+      ],
+    };
+    const zones = outputZonesForEditing(parameters);
+    zones[0]!.box[0] = 8;
+    expect(parameters.resolved_zones[0]!.box[0]).toBe(1);
+    expect(zones[0]).not.toHaveProperty("source");
+    expect(editableParameters("output", { ...parameters, zones: [] })).not.toHaveProperty(
+      "resolved_zones",
+    );
+    expect(editableParameters("output", { ...parameters, zones: [] })).not.toHaveProperty("zones");
+    expect(
+      outputZonesForEditing({
+        zone_mode: "manual",
+        picture_box: [1, 2, 30, 40],
+      }),
+    ).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
+    expect(
+      outputZonesForEditing({
+        zone_mode: "manual",
+        picture_box: { x1: 1, y1: 2, width: 29, height: 38 },
+      }),
+    ).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
+  });
+
+  it("edits, adds and removes multiple detected regions through real controls", async () => {
+    const state = {
+      id: 1,
+      stage: "output",
+      stage_label: "Output",
+      revision: 1,
+      status: "success",
+      algorithm: "binarization_otsu",
+      parameters: {
+        zone_mode: "auto",
+        resolved_zones: [
+          { kind: "picture", box: [1, 2, 30, 40] },
+          { kind: "text", box: [50, 2, 90, 40] },
+        ],
+      },
+    };
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
+      <div id="zones-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-stage-select="output">Output</button><button data-stage-open data-page-id="page" data-stage="output" data-stage-url="/output"></button></div>`;
+    const fetcher = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => ({ stage: state }),
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const host = document.querySelector<HTMLElement>("#zones-host")!;
+    initializeScanTailorWorkspace(host);
+    host.querySelector<HTMLButtonElement>('[data-stage-select="output"]')!.click();
+    const click = (label: string) =>
+      [...host.querySelectorAll("button")].find((b) => b.textContent === label)!.click();
+    click("Edit detected regions (2)");
+    click("Add picture region");
+    expect(host.textContent).toContain("Remove region 3");
+    click("Remove region 2");
+    host.querySelector<HTMLButtonElement>("[data-save-stage]")!.click();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+    const posted = JSON.parse(fetcher.mock.calls[0]![1].body);
+    expect(posted.parameters.zone_mode).toBe("manual");
+    expect(posted.parameters.zones.map((z: { kind: string }) => z.kind)).toEqual([
+      "picture",
+      "picture",
+    ]);
+    expect(posted.parameters).not.toHaveProperty("resolved_zones");
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
   it("does not resubmit a legacy computed margin canvas as a fixed request", () => {
     expect(
       editableParameters("margins", {
@@ -228,11 +304,17 @@ describe("preview error messages", () => {
   });
 
   it("distinguishes storage, artifact, network and other failures", () => {
-    expect(previewErrorMessage("deskew", { status: 503, body: "storage unavailable" })).toMatch(
-      /storage is temporarily unavailable/i,
-    );
     expect(
-      previewErrorMessage("deskew", { status: 404, body: "preview artifact missing" }),
+      previewErrorMessage("deskew", {
+        status: 503,
+        body: "storage unavailable",
+      }),
+    ).toMatch(/storage is temporarily unavailable/i);
+    expect(
+      previewErrorMessage("deskew", {
+        status: 404,
+        body: "preview artifact missing",
+      }),
     ).toMatch(/missing from storage/i);
     expect(previewErrorMessage("deskew", { status: 404, body: "preview not ready" })).toMatch(
       /not been generated yet/i,
@@ -266,10 +348,17 @@ describe("stage status presentation", () => {
   });
 
   it("shows the error only for failed stages", () => {
-    const failed = { status: "failed", revision: 2, last_error: "cannot read image" };
+    const failed = {
+      status: "failed",
+      revision: 2,
+      last_error: "cannot read image",
+    };
 
     expect(stageErrorText(failed)).toBe("cannot read image");
-    expect(stageStatusMessage(failed)).toEqual({ text: "cannot read image", tone: "error" });
+    expect(stageStatusMessage(failed)).toEqual({
+      text: "cannot read image",
+      tone: "error",
+    });
     expect(stageStatusMessage({ status: "success", revision: 1, last_error: "" })).toEqual({
       text: "Revision 1 · success",
       tone: "info",
@@ -279,7 +368,12 @@ describe("stage status presentation", () => {
 
 describe("single-page capture page split (#55)", () => {
   it("labels an automatically skipped split and keeps other statuses", () => {
-    const skipped = { status: "success", revision: 2, last_error: "", auto_skipped: true };
+    const skipped = {
+      status: "success",
+      revision: 2,
+      last_error: "",
+      auto_skipped: true,
+    };
 
     expect(isAutoSkippedSplit(skipped)).toBe(true);
     expect(stageStatusLabel(skipped)).toBe("skipped · single page");

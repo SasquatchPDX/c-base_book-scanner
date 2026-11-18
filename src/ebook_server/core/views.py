@@ -74,6 +74,7 @@ from . import (
     metadata_search,
     multipart,
     ocr,
+    request_limits,
     review_accept,
     review_batch,
     review_identification,
@@ -116,6 +117,7 @@ from .models import (
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .scan_job_ids import normalize_scan_job_id
 from .storage_registry import StorageConfigurationError, backend_for_location
+from .workspace_events import WorkspaceEventPoller
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
 SCANNING_NAMESPACE: Final[str] = "scan-jobs"
@@ -134,8 +136,13 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
     if request.method == "POST":
         username = request.POST.get("username", "").strip()
         password = request.POST.get("password", "")
+        try:
+            ticket = request_limits.reserve_login(username, request.META.get("REMOTE_ADDR", ""))
+        except request_limits.RequestLimited as exc:
+            return _limited_response("login", exc)
         user = authenticate(request, username=username, password=password)
         if user is not None:
+            request_limits.release_successful_login(ticket)
             login(request, user)
             if next_url and url_has_allowed_host_and_scheme(
                 next_url,
@@ -151,6 +158,17 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
         {"next": next_url, "error": error},
         status=401 if error else 200,
     )
+
+
+def _limited_response(kind: str, error: request_limits.RequestLimited) -> HttpResponse:
+    request_limits.record_rejection(kind)
+    response = HttpResponse(
+        f"Too many requests. Try again in {error.retry_after} seconds.",
+        status=429,
+        content_type="text/plain; charset=utf-8",
+    )
+    response["Retry-After"] = str(error.retry_after)
+    return response
 
 
 @require_POST
@@ -2775,31 +2793,26 @@ def _scan_workspace_page_payload(job: ScanJob, page: ScanPage) -> dict[str, Any]
 
 
 def _scan_workspace_event_payload(job_id: str) -> dict[str, Any] | None:
-    job = ScanJob.objects.filter(pk=job_id).only("id", "state", "updated_at").first()
-    if job is None:
-        return None
-    states = ScanTailorStageState.objects.filter(scan_job_id=job_id).order_by(
-        "scan_page__logical_sequence_number",
-        "scan_page__side",
-        "scan_page_id",
-        "stage",
+    return WorkspaceEventPoller(job_id, _serialize_stage_state).poll().payload
+
+
+def _bind_stage_inputs(state: ScanTailorStageState, page: ScanPage) -> bool:
+    previous = (
+        state.input_stage_state_id,
+        state.input_scan_page_version_id,
+        state.input_storage_identifier,
     )
-    return {
-        "job_id": str(job.id),
-        "state": job.state,
-        "updated_at": job.updated_at.isoformat(),
-        "stages": [_serialize_stage_state(state) for state in states],
-    }
-
-
-def _bind_stage_inputs(state: ScanTailorStageState, page: ScanPage) -> None:
     predecessor_name = scantailor.previous_stage(state.stage)
     if predecessor_name is None:
         active_version = page.active_version()
         state.input_stage_state = None
         state.input_scan_page_version = active_version
         state.input_storage_identifier = active_version.storage_identifier if active_version else ""
-        return
+        return previous != (
+            state.input_stage_state_id,
+            state.input_scan_page_version_id,
+            state.input_storage_identifier,
+        )
 
     predecessor = (
         ScanTailorStageState.objects.filter(scan_page=page, stage=predecessor_name)
@@ -2815,6 +2828,11 @@ def _bind_stage_inputs(state: ScanTailorStageState, page: ScanPage) -> None:
         state.input_storage_identifier = predecessor.output_storage_identifier
     else:
         state.input_storage_identifier = ""
+    return previous != (
+        state.input_stage_state_id,
+        state.input_scan_page_version_id,
+        state.input_storage_identifier,
+    )
 
 
 def _conflict_response(current: ScanTailorStageState, expected_revision: int) -> JsonResponse:
@@ -2857,11 +2875,14 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
     if stage == "output":
         if str(parameters.get("zone_mode", "")).strip().lower() == "manual":
             return True
+        if str(parameters.get("zone_mode", "")).strip().lower() in {"auto", "off"}:
+            return False
         return any(
             key in parameters
             for key in {
                 "text_box",
                 "picture_box",
+                "zones",
                 "text_algorithm",
                 "picture_algorithm",
             }
@@ -3021,11 +3042,12 @@ async def scan_job_workspace_events(
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
 
-    initial_payload = await sync_to_async(
-        _scan_workspace_event_payload,
+    poller = WorkspaceEventPoller(job_id, _serialize_stage_state)
+    initial_update = await sync_to_async(
+        poller.poll,
         thread_sensitive=True,
-    )(job_id)
-    if initial_payload is None:
+    )()
+    if not initial_update.exists:
         return HttpResponseNotFound()
 
     interval = max(
@@ -3040,18 +3062,22 @@ async def scan_job_workspace_events(
     async def event_stream() -> AsyncIterator[str]:
         previous: str | None = None
         for sequence in range(max_events):
-            payload = (
-                initial_payload
+            update = (
+                initial_update
                 if sequence == 0
                 else await sync_to_async(
-                    _scan_workspace_event_payload,
+                    poller.poll,
                     thread_sensitive=True,
-                )(job_id)
+                )()
             )
-            if payload is None:
+            if not update.exists:
                 yield "event: workspace-closed\ndata: {}\n\n"
                 return
-            encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            encoded = (
+                json.dumps(update.payload, separators=(",", ":"), sort_keys=True)
+                if update.payload is not None
+                else previous
+            )
             if encoded != previous:
                 yield f"event: workspace\ndata: {encoded}\n\n"
                 previous = encoded
@@ -3125,14 +3151,15 @@ def scan_page_stage(
     )
     if request.method == "GET":
         _ensure_workspace_stage_states(page.scan_job, page)
-        _bind_stage_inputs(state, page)
-        state.save(
-            update_fields=[
-                "input_stage_state",
-                "input_scan_page_version",
-                "input_storage_identifier",
-            ],
-        )
+        if _bind_stage_inputs(state, page):
+            state.save(
+                update_fields=[
+                    "input_stage_state",
+                    "input_scan_page_version",
+                    "input_storage_identifier",
+                    "updated_at",
+                ],
+            )
         return JsonResponse(_serialize_workspace_page(page))
 
     if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
@@ -4253,23 +4280,38 @@ def upload_file(request: HttpRequest) -> HttpResponseBase:
 
     staging_root = Path(django_settings.APP_DATA_DIR) / "uploads"
     try:
+        reservation = request_limits.reserve_upload(profile, uploaded_file.size or 0)
+    except request_limits.RequestLimited as exc:
+        return _limited_response("upload", exc)
+    source_path = ""
+    committed = False
+    try:
         source_path, size_bytes = intake.write_upload_to_staging(uploaded_file, staging_root)
-    except intake.ValidationError as exc:
+        with transaction.atomic():
+            request_limits.finish_reservation(reservation, size_bytes)
+            job = ImportJob.objects.create(
+                source_type=ImportJob.SourceType.UPLOAD,
+                state=ImportJob.State.DISCOVERED,
+                uploader=profile.user,
+                source_path=source_path,
+                original_filename=original_name,
+                normalized_filename=normalized_filename,
+                detected_format=detected_format,
+                mime_type=detected_mime,
+                size_bytes=size_bytes,
+            )
+        committed = True
+    except request_limits.RequestLimited as exc:
+        return _limited_response("upload", exc)
+    except ValueError as exc:
         return HttpResponseBadRequest(str(exc))
     except OSError:
         return HttpResponse("storage unavailable", status=503)
-
-    job = ImportJob.objects.create(
-        source_type=ImportJob.SourceType.UPLOAD,
-        state=ImportJob.State.DISCOVERED,
-        uploader=profile.user,
-        source_path=source_path,
-        original_filename=original_name,
-        normalized_filename=normalized_filename,
-        detected_format=detected_format,
-        mime_type=detected_mime,
-        size_bytes=size_bytes,
-    )
+    finally:
+        if not committed:
+            reservation.delete()
+            if source_path:
+                _cleanup_staged_upload(source_path)
     try:
         enqueue(intake.process_import_job, str(job.id))
     except Exception as exc:  # pragma: no cover - transport/path specific

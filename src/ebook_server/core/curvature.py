@@ -22,6 +22,15 @@ MAX_POINTS: Final = 17
 MAX_DISPLACEMENT: Final = 512
 
 
+def reduced_image(source: Image.Image, edge: int) -> Image.Image:
+    scale = min(1.0, edge / max(source.size))
+    return source.resize(
+        (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+        Image.Resampling.BICUBIC,
+        reducing_gap=2.0,
+    )
+
+
 def normalize_curves(value: Any, size: tuple[int, int]) -> list[list[list[float]]]:
     width, height = size
     if not isinstance(value, list) or not 2 <= len(value) <= MAX_CURVES:
@@ -63,9 +72,7 @@ def normalize_curves(value: Any, size: tuple[int, int]) -> list[list[list[float]
 
 def detect_curves(source: Image.Image) -> list[list[list[float]]]:
     scale = min(1.0, DETECTION_EDGE / max(source.size))
-    reduced = source.resize(
-        (max(1, round(source.width * scale)), max(1, round(source.height * scale)))
-    )
+    reduced = reduced_image(source, DETECTION_EDGE)
     gray = np.asarray(reduced.convert("L"))
     height, width = gray.shape
     _, ink = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -148,7 +155,8 @@ def render(source: Image.Image, value: Any, paper: Any = 255) -> tuple[Image.Ima
     anchors = np.median(samples, axis=1)
     maximum = float(np.max(np.abs(samples - anchors[:, None])))
     padding = int(ceil(maximum)) + 2
-    if maximum < 0.5:
+    # Subpixel glyph-band fitting noise must not resample an already flat page.
+    if maximum < 2.0:
         return source.copy(), {
             "curvature_padding": 0,
             "curvature_max_displacement": maximum,

@@ -76,6 +76,24 @@ class UserRole(models.TextChoices):
 DEFAULT_USER_ROLE: Final[str] = "normal"
 
 
+class LoginAttemptWindow(models.Model):
+    key = models.CharField(primary_key=True, max_length=64)
+    attempts = models.PositiveIntegerField(default=0)
+    expires_at = models.DateTimeField(db_index=True)
+    blocked_until = models.DateTimeField(null=True)
+
+
+class UploadReservation(models.Model):
+    member = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    size_bytes = models.PositiveBigIntegerField()
+    expires_at = models.DateTimeField(db_index=True)
+
+
+class RequestLimitCount(models.Model):
+    kind = models.CharField(primary_key=True, max_length=16)
+    total = models.PositiveBigIntegerField(default=0)
+
+
 class AppUserProfile(models.Model):
     """LDAP-backed identity metadata tracked locally."""
 

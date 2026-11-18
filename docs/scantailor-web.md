@@ -24,8 +24,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are:
 6. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
 
-The current dewarping stage corrects perspective on flat pages; it does not
-correct book-spine curvature. The four control points only define the correction
+The default dewarping model corrects perspective on flat pages; it does not
+correct book-spine curvature. An opt-in baseline curvature model is described below.
+The four perspective control points only define the correction
 (which quadrilateral becomes an upright rectangle); the output canvas holds the
 whole transformed input, so content outside the points and the Margins padding
 are kept (`opencv-v2`). A near-degenerate quad (a corner at or beyond the
@@ -40,12 +41,92 @@ robust fits through the outer line ends give the sides (a ragged side mirrors th
 aligned one). A page outline contour is the fallback. An already-upright page is
 passed through without resampling (`dewarp_correction="none_needed"`). When
 nothing is found, the result records `dewarp_mode="auto_fallback"` with a
-`dewarp_warning`. Text/picture separation is manual only:
-`zone_mode="auto"` currently applies one algorithm to the whole page. The output
-option named `fox` uses scikit-image's Niblack implementation, and `wolf` uses a
-local-contrast approximation. Correcting those advertised names and establishing
-curvature fixtures remain Sprint019 work; curvature correction and automatic
-segmentation are planned in Sprint020.
+`dewarp_warning`.
+
+### Opt-in baseline curvature (`baseline-curvature-v1`)
+
+Perspective remains the default. Selecting **Dewarp model: curvature** opts one
+page into `baseline_curvature`; a batch applies it only when explicitly selected.
+This model straightens curved text lines with a vertical displacement field. It
+does not reconstruct a 3D page surface or correct horizontal foreshortening.
+Inspect the Result preview before finishing. Real photographed-book acceptance
+remains open; [the recorded measurements](measurements/curvature-acceptance.md)
+are synthetic.
+
+Automatic estimation tracks text bands in 25 vertical strips of an image reduced
+to at most 1200 pixels on its longest edge, robustly fits quadratic curves, and
+records nine source-coordinate control points per baseline in `curvature_curves`.
+Between baselines, the renderer interpolates vertical displacement using OpenCV
+`remap`. Output retains the input width and adds paper-colour padding above/below
+to retain the input, including content outside the baselines. Corrections below
+two pixels pass through without resampling.
+
+**Edit detected baselines** copies geometry into authored `dewarp_curves` and
+switches to manual mode. Select a baseline to drag its points or edit numeric y
+coordinates; add/remove baselines as needed. Only authored geometry travels back
+to the server. Manual geometry survives batch application with Preserve manual
+exceptions and produces identical output when replayed. Changing to perspective
+uses the existing quad editor and algorithm again.
+
+Manual input is bounded to 2–32 non-crossing baselines with 3–17 finite points
+each, ordered in x and inside the image. Baselines must stay at least two pixels
+apart. Displacement is limited to the smaller of 512 pixels and 15% of the input
+height. Unsafe geometry or unreliable estimation keeps the normalized input and
+records a visible `dewarp_warning` and `dewarp_applied="passthrough"`. Bypass keeps
+the existing normalized-PNG byte-copy policy. Every run clears stale derived
+geometry; selected model/version and actual applied transform are separate.
+
+Remap coordinate arrays are at most 512×512, with bounded source crops; there are
+no full-resolution float maps. Paper estimation and preview generation resize
+before making additional copies. Full source/output images still consume memory
+proportional to page size. Tests exercise actual decoding, remapping, PNG output
+and previews on 24-megapixel grayscale/RGB pages.
+
+### Output zones (`opencv-zones-v2`)
+
+`zone_mode="auto"` detects multiple continuous-tone/halftone picture regions and
+groups the remaining glyphs into text blocks using OpenCV morphology and connected
+components. Detection runs on an image at most 1200 pixels on its longest edge,
+then maps rectangles back to source coordinates. The detector is a heuristic,
+not semantic recognition: inspect illustrated pages before finishing them.
+
+Text regions default to Sauvola; picture regions default to `copy`. Picture copy
+keeps the normalized source pixels, including RGB colours even if `keep_color`
+is false. It never converts a photograph to grayscale and then merely relabels
+the result RGB. `keep_color` protects picture and unclassified source pixels;
+only text regions are binarized, and the composed output stays RGB. It overrides
+the picture algorithm to `copy`, which is recorded in the result. Pictures win
+overlapping text regions. Outside regions, the selected output algorithm runs;
+`zone_mode="off"` deliberately uses that algorithm over the whole page.
+
+The worker records `resolved_zones` (`kind`, `box`, `source`) and the detector
+version. Choose **Edit detected regions** to make an explicit manual list. The
+editor supports adding, deleting, changing type, dragging/resizing, and numeric
+coordinates for up to 64 regions. Manual `zones` are recorded as human choices
+and survive batch application with **Preserve manual exceptions** enabled.
+Old `text_box` and `picture_box` parameters remain readable; a rerun records the
+equivalent list. Automatic runs redetect from the current input instead of
+reusing geometry after an upstream change. Derived detection metadata is never
+submitted as editable parameters.
+
+Layout detection allocates arrays only at reduced resolution. Thresholding uses
+768-pixel tiles with a local-window halo capped at 253 pixels; Otsu retains a
+global threshold. Full-size source/output Pillow images remain necessary, but
+there are no page-sized float or component-label arrays. Large local-statistic
+regions use tile-local contrast estimates. On a detection or processing error,
+the normalized source is copied and the result records `output_applied="copy_fallback"`
+and `output_warning`. `output_mode="copy"` bypasses zoning and thresholding.
+Successful execution alone does not establish output quality.
+
+CI runs a real Tesseract English acceptance case on a synthetic illustrated page:
+text character-error rate must be at most 5%, no worse than whole-page output by
+more than one percentage point, and picture pixel error must be below 15% of the
+whole-page result. The local Tesseract 5.5.2 run measured 0% CER for both paths,
+with picture detail retained. This is a repeatable layout regression, not proof
+of OCR quality on photographed books or the hackerspace AI server. The six output
+modes use OpenCV/NumPy statistics; Fox is a Niblack-style threshold with a noise
+floor and Wolf uses the Wolf–Jolion local-statistics formula, not a claim of
+bit-identical ScanTailor Advanced output.
 
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
@@ -173,6 +254,11 @@ parameters.
 
 - `GET /scan/jobs/<job_id>/workspace/` — HTML workspace or JSON page/stage state.
 - `GET /scan/jobs/<job_id>/workspace/events/` — authenticated SSE state stream.
+  The first event (including reconnects) contains all stages; later events contain
+  changed stages only. Unchanged ticks send periodic keep-alive comments without
+  reloading full stage models or serializing JSON. See the [300-page event polling
+  measurements](measurements/scantailor-workspace-events.md) for the PostgreSQL
+  fingerprint path, portable token fallback, and remaining database scan cost.
 - `GET /scan/jobs/<job_id>/pages/<page_id>/stages/` — ordered stage state.
 - `GET|POST /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/` — read/update one
   stage; POST accepts `expected_revision` and returns `409` on a conflict.
