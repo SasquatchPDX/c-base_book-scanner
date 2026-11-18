@@ -205,7 +205,8 @@
   </div>
   </div>
 
-  {% if pages and job.book_id and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}
+  {% if pages and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}
+    {% if job.book_id or opf_metadata.title and not opf_metadata.ignored %}
     <section class="finish-panel">
       <div><h2>Finish clean page set</h2><p>Every page needs a successful Output stage. Packaging and optional OCR run in workers.</p></div>
       <form method="post" action="{% url 'scan-job-finish' job.id %}">
@@ -214,5 +215,6 @@
         <button type="submit">Queue finalization</button>
       </form>
     </section>
+    {% endif %}
   {% endif %}
 {% endblock %}

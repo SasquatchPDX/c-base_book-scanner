@@ -25,7 +25,7 @@ from ebook_server.core.models import (
 def test_login_backoff_precedes_ldap_and_is_shared_between_clients() -> None:
     first, second = Client(), Client()
     now = timezone.now()
-    with patch("ebook_server.core.views.authenticate", return_value=None) as ldap:
+    with patch("ebook_server.core.member_views.authenticate", return_value=None) as ldap:
 
         def submit(client: Client, name: str, address: str = "192.0.2.10") -> HttpResponseBase:
             return client.post(
@@ -76,7 +76,7 @@ def test_upload_admission_precedes_staging_and_limits_survive_completion(tmp_pat
             BOOK_SCANNER_MEMBER_UPLOADS_PENDING=1,
             BOOK_SCANNER_MEMBER_UPLOAD_BYTES_PER_HOUR=7,
         ),
-        patch("ebook_server.core.views.enqueue"),
+        patch("ebook_server.core.intake_views.enqueue"),
     ):
         assert upload(first).status_code == 201
         staged = list((tmp_path / "uploads").iterdir())

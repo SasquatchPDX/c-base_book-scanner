@@ -5,7 +5,15 @@ from __future__ import annotations
 from django.urls import path, register_converter
 from django.views.generic import RedirectView
 
-from . import contributions_views, views, worker_failure_views
+from . import (
+    contributions_views,
+    health_views,
+    intake_views,
+    library_views,
+    member_views,
+    views,
+    worker_failure_views,
+)
 from .scan_job_ids import ScanJobIdConverter
 
 # Scan job IDs are a canonical UUID (web jobs) or a scanner-assigned ID (#126).
@@ -13,34 +21,38 @@ register_converter(ScanJobIdConverter, "scan_job_id")
 
 urlpatterns = [
     path("", RedirectView.as_view(pattern_name="library-home", permanent=False)),
-    path("accounts/login/", views.library_login, name="library-login"),
-    path("accounts/logout/", views.library_logout, name="library-logout"),
-    path("healthz/", views.health),
-    path("healthz/dependencies/", views.readiness),
-    path("metrics/", views.prometheus_metrics, name="prometheus-metrics"),
-    path("library/", views.library_home, name="library-home"),
-    path("library/intake/", views.intake_progress_view, name="intake-progress"),
-    path("library/books/", views.library_books, name="library-books"),
-    path("library/authors/", views.library_authors, name="library-authors"),
+    path("accounts/login/", member_views.library_login, name="library-login"),
+    path("accounts/logout/", member_views.library_logout, name="library-logout"),
+    path("healthz/", health_views.health),
+    path("healthz/dependencies/", health_views.readiness),
+    path("metrics/", health_views.prometheus_metrics, name="prometheus-metrics"),
+    path("library/", library_views.library_home, name="library-home"),
+    path("library/intake/", intake_views.intake_progress_view, name="intake-progress"),
+    path("library/books/", library_views.library_books, name="library-books"),
+    path("library/authors/", library_views.library_authors, name="library-authors"),
     path(
         "library/covers/<str:sha256>/<slug:size>.webp",
-        views.library_cover_thumbnail,
+        library_views.library_cover_thumbnail,
         name="library-cover-thumbnail",
     ),
-    path("library/books/<int:book_id>/", views.library_book_detail, name="library-book-detail"),
+    path(
+        "library/books/<int:book_id>/",
+        library_views.library_book_detail,
+        name="library-book-detail",
+    ),
     path(
         "library/books/<int:book_id>/download/",
-        views.library_book_download,
+        library_views.library_book_download,
         name="library-book-download",
     ),
     path(
         "library/books/<int:book_id>/covers/<str:position>/",
-        views.library_book_cover,
+        library_views.library_book_cover,
         name="library-book-cover",
     ),
     path(
         "library/books/<int:book_id>/delete/",
-        views.library_book_delete,
+        library_views.library_book_delete,
         name="library-book-delete",
     ),
     # The scanner's QR code (#127, contract §9); portal_url is built from this route.
@@ -145,32 +157,32 @@ urlpatterns = [
     path("scan/todos/<int:todo_id>/cancel/", views.scan_todo_cancel, name="scan-todo-cancel"),
     path(
         "library/books/<int:book_id>/convert/",
-        views.library_book_conversion_request,
+        library_views.library_book_conversion_request,
         name="library-book-convert",
     ),
     path(
         "library/books/<int:book_id>/ocr/",
-        views.library_book_ocr_request,
+        library_views.library_book_ocr_request,
         name="library-book-ocr",
     ),
     path(
         "library/books/<int:book_id>/combine-parts/",
-        views.library_book_combine_parts,
+        library_views.library_book_combine_parts,
         name="library-book-combine-parts",
     ),
     path(
         "combine-jobs/<uuid:job_id>/",
-        views.combine_job_status,
+        library_views.combine_job_status,
         name="combine-job-status",
     ),
     path(
         "conversions/<uuid:job_id>/",
-        views.conversion_job_status,
+        library_views.conversion_job_status,
         name="conversion-job-status",
     ),
     path(
         "ocr/<uuid:job_id>/",
-        views.ocr_job_status,
+        library_views.ocr_job_status,
         name="ocr-job-status",
     ),
     path(
@@ -188,9 +200,9 @@ urlpatterns = [
         views.scan_identification_job_status,
         name="scan-identification-job-status",
     ),
-    path("admin-only/", views.admin_only, name="admin-only"),
-    path("imports/upload/", views.upload_file, name="imports-upload"),
-    path("imports/<uuid:job_id>/", views.import_status, name="imports-status"),
+    path("admin-only/", member_views.admin_only, name="admin-only"),
+    path("imports/upload/", intake_views.upload_file, name="imports-upload"),
+    path("imports/<uuid:job_id>/", intake_views.import_status, name="imports-status"),
     path("reviews/", views.review_queue, name="review-queue"),
     path("reviews/batch-accept/", views.review_batch_accept, name="review-batch-accept"),
     path("reviews/<int:task_id>/", views.review_detail, name="review-detail"),

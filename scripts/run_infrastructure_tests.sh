@@ -134,6 +134,38 @@ uv run python manage.py check
 # run from the pinned postgres image unless BOOK_SCANNER_REHEARSAL_PG_BINDIR is set).
 uv run pytest -q tests/integration --create-db
 
+# The simulated scanner and web app share a fresh device key for this run.
+# Keep the normal HTTP listener's scanner denial. The extra TLS listener is
+# published only on loopback and uses a new certificate trusted by this test.
+tls_dir="${book_scanner_storage_root}/device-tls"
+mkdir -p "${tls_dir}"
+openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 1 \
+  -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 \
+  -keyout "${tls_dir}/device.key" -out "${tls_dir}/device.crt" 2>/dev/null
+cat >"${tls_dir}/device.conf" <<'NGINX'
+server {
+    listen 8443 ssl;
+    ssl_protocols TLSv1.3;
+    ssl_certificate /etc/nginx/device.crt;
+    ssl_certificate_key /etc/nginx/device.key;
+    client_max_body_size 64m;
+    location /api/scanner/ {
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://book_scanner_asgi;
+    }
+    location / { return 404; }
+}
+NGINX
+"${book_scanner_compose[@]}" cp "${tls_dir}/device.key" proxy:/etc/nginx/device.key
+"${book_scanner_compose[@]}" cp "${tls_dir}/device.crt" proxy:/etc/nginx/device.crt
+"${book_scanner_compose[@]}" cp "${tls_dir}/device.conf" proxy:/etc/nginx/conf.d/device.conf
+"${book_scanner_compose[@]}" exec -T proxy nginx -s reload
+export NODE_EXTRA_CA_CERTS="${tls_dir}/device.crt"
+export BOOK_SCANNER_BROWSER_DEVICE_URL="https://$("${book_scanner_compose[@]}" port proxy 8443)"
+export BOOK_SCANNER_BROWSER_DEVICE_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export BOOK_SCANNER_SCANNER_API_KEY_SHA256="$(uv run python -c 'import hashlib, os; print(hashlib.sha256(os.environ["BOOK_SCANNER_BROWSER_DEVICE_KEY"].encode()).hexdigest())')"
+export BOOK_SCANNER_PUBLIC_BASE_URL="http://127.0.0.1:${book_scanner_proxy_port}/"
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS="0.2"
 export BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS="150"
 uv run uvicorn tests.browser_fixtures:ocr_app \

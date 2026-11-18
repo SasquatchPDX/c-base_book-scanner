@@ -1,0 +1,3470 @@
+{
+  "baseline": {
+    "cases": [
+      {
+        "canonical_books": 1,
+        "case": "isbn-exact-edition",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "isbn10-equivalent",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-other-edition",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-unconfirmed",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-author-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-language-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "isbn-tied-matching-edition",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-clean-embedded",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-text-header",
+        "linked_formats": [
+          "txt"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-fuzzy-threshold",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-near-title-wrong-work",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-placeholder-author",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-wrong-author",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "same-title-different-work-tie",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "work-only-two-editions",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "work-only-translations",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "edition-publisher-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "edition-language-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "publisher-tool-noise",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "coauthors-complete",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "coauthors-reordered",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "coauthors-contradictory",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "sidecar-agrees",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "sidecar-contradicts",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "sidecar-only-misleading",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "local-no-provider-record",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "local-path-only",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "all-providers-outage",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "one-provider-outage",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 2
+      },
+      {
+        "canonical_books": 1,
+        "case": "sibling-formats-opt-in",
+        "linked_formats": [
+          "epub",
+          "txt"
+        ],
+        "provider_calls": 2
+      },
+      {
+        "canonical_books": 1,
+        "case": "sibling-conflicting-header",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 2
+      }
+    ],
+    "groups": {
+      "ambiguity": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 1,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "authors": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 3,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 3,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "coauthors": {
+        "auto": 2,
+        "correct_auto": 2,
+        "failed": 0,
+        "local_suggestions": 1,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 0.333333,
+        "rows": 3,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "editions": {
+        "auto": 6,
+        "correct_auto": 6,
+        "failed": 0,
+        "local_suggestions": 5,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 5,
+        "review_policy_violations": 0,
+        "review_rate": 0.454545,
+        "rows": 11,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "isbn": {
+        "auto": 4,
+        "correct_auto": 4,
+        "failed": 0,
+        "local_suggestions": 3,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 4,
+        "review_policy_violations": 0,
+        "review_rate": 0.5,
+        "rows": 8,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "local-consensus": {
+        "auto": 1,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 2,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 3,
+        "review_policy_violations": 0,
+        "review_rate": 0.75,
+        "rows": 4,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "no-isbn": {
+        "auto": 10,
+        "correct_auto": 10,
+        "failed": 0,
+        "local_suggestions": 3,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 8,
+        "review_policy_violations": 0,
+        "review_rate": 0.444444,
+        "rows": 18,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "provider-empty": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 1,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 2,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "provider-failure": {
+        "auto": 1,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 1,
+        "provider_failure_rows": 2,
+        "provider_failures": 2,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 0.5,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "required-review": {
+        "auto": 2,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 8,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 16,
+        "review_policy_violations": 1,
+        "review_rate": 0.888889,
+        "rows": 18,
+        "wrong_auto": 1,
+        "wrong_edition_auto": 1,
+        "wrong_work_auto": 1
+      },
+      "sibling-formats": {
+        "auto": 3,
+        "correct_auto": 3,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 0.25,
+        "rows": 4,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "sidecars": {
+        "auto": 2,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 1,
+        "review_rate": 0.333333,
+        "rows": 3,
+        "wrong_auto": 1,
+        "wrong_edition_auto": 1,
+        "wrong_work_auto": 1
+      },
+      "threshold-boundary": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 2,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "work-only": {
+        "auto": 2,
+        "correct_auto": 2,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 0,
+        "review_policy_violations": 0,
+        "review_rate": 0.0,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      }
+    },
+    "rows": [
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-exact-edition",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn10-equivalent",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "isbn-other-edition",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "isbn-unconfirmed",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "author_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-author-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-language-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          },
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "isbn-tied-matching-edition",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "no-isbn-clean-embedded",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.86
+          }
+        ],
+        "case": "no-isbn-text-header",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "no-isbn",
+          "local-consensus"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.83
+          }
+        ],
+        "case": "no-isbn-fuzzy-threshold",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Ivo Merrin/capture.epub",
+        "groups": [
+          "no-isbn",
+          "threshold-boundary"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "return-en",
+          "require_review": false,
+          "work": "return",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.83
+          }
+        ],
+        "case": "no-isbn-near-title-wrong-work",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Ivo Merrin/capture.epub",
+        "groups": [
+          "no-isbn",
+          "threshold-boundary",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "returns-en",
+          "require_review": true,
+          "work": "returns",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.65
+          }
+        ],
+        "case": "no-isbn-placeholder-author",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.65
+          }
+        ],
+        "case": "no-isbn-wrong-author",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "window-a-en",
+            "score": 0.6
+          },
+          {
+            "ref": "window-b-en",
+            "score": 0.6
+          }
+        ],
+        "case": "same-title-different-work-tie",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "unattributed/Night Window.epub",
+        "groups": [
+          "no-isbn",
+          "ambiguity",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "window-a-en",
+          "require_review": true,
+          "work": "window-a",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.9
+          },
+          {
+            "ref": "orchard-second",
+            "score": 0.9
+          }
+        ],
+        "case": "work-only-two-editions",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "work-only"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
+        "truth": {
+          "edition": null,
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": "en"
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.86
+          },
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "work-only-translations",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "work-only"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
+        "truth": {
+          "edition": null,
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": ""
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-second",
+            "score": 0.9
+          }
+        ],
+        "case": "edition-publisher-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "edition-language-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.9
+          }
+        ],
+        "case": "publisher-tool-noise",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.95
+          }
+        ],
+        "case": "coauthors-complete",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Emil Voss",
+            "Nora Vale"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "signal press",
+          "title": "Signal Garden",
+          "year": 2014
+        },
+        "truth": {
+          "edition": "garden-en",
+          "require_review": false,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.95
+          }
+        ],
+        "case": "coauthors-reordered",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Emil Voss",
+            "Nora Vale"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "signal press",
+          "title": "Signal Garden",
+          "year": 2014
+        },
+        "truth": {
+          "edition": "garden-en",
+          "require_review": false,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.8
+          }
+        ],
+        "case": "coauthors-contradictory",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "garden-en",
+          "require_review": true,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sidecar-agrees",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sidecars",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          },
+          {
+            "ref": "return-en",
+            "score": 0.38
+          }
+        ],
+        "case": "sidecar-contradicts",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sidecars",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sidecar-only-misleading",
+        "correct_auto": false,
+        "correct_edition": false,
+        "correct_work": false,
+        "error": "",
+        "file": "unknown/capture.epub",
+        "groups": [
+          "sidecars",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": true,
+        "selected": {
+          "authors": [
+            "Ivo Merrin"
+          ],
+          "identifiers": [
+            "9780141439600"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Long Return",
+          "year": 2005
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": true
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "local-no-provider-record",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "local-consensus",
+          "provider-empty",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "local-path-only",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "local-consensus",
+          "provider-empty",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "all-providers-outage",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "provider-failure",
+          "local-consensus",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 1,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "one-provider-outage",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "provider-failure",
+          "isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 1,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sibling-formats-opt-in",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sibling-formats",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.86
+          }
+        ],
+        "case": "sibling-formats-opt-in",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "sibling-formats",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "sibling-conflicting-header",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sibling-formats",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.55
+          }
+        ],
+        "case": "sibling-conflicting-header",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "sibling-formats",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "window-b-en",
+          "require_review": true,
+          "work": "window-b",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      }
+    ],
+    "threshold": 0.86,
+    "totals": {
+      "auto": 16,
+      "correct_auto": 15,
+      "failed": 0,
+      "local_suggestions": 8,
+      "provider_failure_rows": 2,
+      "provider_failures": 2,
+      "review": 17,
+      "review_policy_violations": 1,
+      "review_rate": 0.515152,
+      "rows": 33,
+      "wrong_auto": 1,
+      "wrong_edition_auto": 1,
+      "wrong_work_auto": 1
+    }
+  },
+  "changed_rows": [
+    {
+      "after": "auto",
+      "after_correct_auto": true,
+      "before": "review",
+      "before_correct_auto": false,
+      "case": "no-isbn-fuzzy-threshold",
+      "file": "Ivo Merrin/capture.epub"
+    },
+    {
+      "after": "auto",
+      "after_correct_auto": false,
+      "before": "review",
+      "before_correct_auto": false,
+      "case": "no-isbn-near-title-wrong-work",
+      "file": "Ivo Merrin/capture.epub"
+    },
+    {
+      "after": "auto",
+      "after_correct_auto": false,
+      "before": "review",
+      "before_correct_auto": false,
+      "case": "coauthors-contradictory",
+      "file": "Nora Vale/Signal Garden.epub"
+    }
+  ],
+  "corpus_sha256": "89a711862b05f2837772c2089ee6066b5f57a166b351f1c4649dda43ac9f2871",
+  "dependency_lock_sha256": "0e32b38930e7a2d31adc7d7214f4d8d2a3fcb49e81ecfbc54f25f5bb234b2919",
+  "rule_sha256": {
+    "identification.py": "6415fdfd7cafa809247f932eb2fe88884d1fda0d6a746015c0790bdfc0fc69b3",
+    "intake.py": "9e9aa797f742c6863e98ee52a4f835f93bc1f27b674f51da05198801e990503f",
+    "intake_evaluation.py": "90f8a4c5c92ea52e43bed35585645a4fc1ea11fb81c6d511c89c4a0650cda4a8",
+    "local_identity.py": "7d490e822e576cf99119743865d84f77de154b1f7b372d5c9be42f06302d78e5"
+  },
+  "schema_version": 1,
+  "scope": "synthetic offline provider snapshots; not field accuracy or provider uptime",
+  "trial": {
+    "cases": [
+      {
+        "canonical_books": 1,
+        "case": "isbn-exact-edition",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "isbn10-equivalent",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-other-edition",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-unconfirmed",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-author-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "isbn-language-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "isbn-tied-matching-edition",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-clean-embedded",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-text-header",
+        "linked_formats": [
+          "txt"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-fuzzy-threshold",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "no-isbn-near-title-wrong-work",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-placeholder-author",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "no-isbn-wrong-author",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "same-title-different-work-tie",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "work-only-two-editions",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "work-only-translations",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "edition-publisher-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "edition-language-conflict",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "publisher-tool-noise",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "coauthors-complete",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "coauthors-reordered",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "coauthors-contradictory",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "sidecar-agrees",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "sidecar-contradicts",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "sidecar-only-misleading",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "local-no-provider-record",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "local-path-only",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 0,
+        "case": "all-providers-outage",
+        "linked_formats": [],
+        "provider_calls": 1
+      },
+      {
+        "canonical_books": 1,
+        "case": "one-provider-outage",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 2
+      },
+      {
+        "canonical_books": 1,
+        "case": "sibling-formats-opt-in",
+        "linked_formats": [
+          "epub",
+          "txt"
+        ],
+        "provider_calls": 2
+      },
+      {
+        "canonical_books": 1,
+        "case": "sibling-conflicting-header",
+        "linked_formats": [
+          "epub"
+        ],
+        "provider_calls": 2
+      }
+    ],
+    "groups": {
+      "ambiguity": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 1,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "authors": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 3,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 3,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "coauthors": {
+        "auto": 3,
+        "correct_auto": 2,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 0,
+        "review_policy_violations": 1,
+        "review_rate": 0.0,
+        "rows": 3,
+        "wrong_auto": 1,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 1
+      },
+      "editions": {
+        "auto": 6,
+        "correct_auto": 6,
+        "failed": 0,
+        "local_suggestions": 5,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 5,
+        "review_policy_violations": 0,
+        "review_rate": 0.454545,
+        "rows": 11,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "isbn": {
+        "auto": 4,
+        "correct_auto": 4,
+        "failed": 0,
+        "local_suggestions": 3,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 4,
+        "review_policy_violations": 0,
+        "review_rate": 0.5,
+        "rows": 8,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "local-consensus": {
+        "auto": 1,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 2,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 3,
+        "review_policy_violations": 0,
+        "review_rate": 0.75,
+        "rows": 4,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "no-isbn": {
+        "auto": 13,
+        "correct_auto": 11,
+        "failed": 0,
+        "local_suggestions": 2,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 5,
+        "review_policy_violations": 2,
+        "review_rate": 0.277778,
+        "rows": 18,
+        "wrong_auto": 2,
+        "wrong_edition_auto": 1,
+        "wrong_work_auto": 2
+      },
+      "provider-empty": {
+        "auto": 0,
+        "correct_auto": 0,
+        "failed": 0,
+        "local_suggestions": 1,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 2,
+        "review_policy_violations": 0,
+        "review_rate": 1.0,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "provider-failure": {
+        "auto": 1,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 1,
+        "provider_failure_rows": 2,
+        "provider_failures": 2,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 0.5,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "required-review": {
+        "auto": 4,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 7,
+        "provider_failure_rows": 1,
+        "provider_failures": 1,
+        "review": 14,
+        "review_policy_violations": 3,
+        "review_rate": 0.777778,
+        "rows": 18,
+        "wrong_auto": 3,
+        "wrong_edition_auto": 2,
+        "wrong_work_auto": 3
+      },
+      "sibling-formats": {
+        "auto": 3,
+        "correct_auto": 3,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 0,
+        "review_rate": 0.25,
+        "rows": 4,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      },
+      "sidecars": {
+        "auto": 2,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 1,
+        "review_policy_violations": 1,
+        "review_rate": 0.333333,
+        "rows": 3,
+        "wrong_auto": 1,
+        "wrong_edition_auto": 1,
+        "wrong_work_auto": 1
+      },
+      "threshold-boundary": {
+        "auto": 2,
+        "correct_auto": 1,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 0,
+        "review_policy_violations": 1,
+        "review_rate": 0.0,
+        "rows": 2,
+        "wrong_auto": 1,
+        "wrong_edition_auto": 1,
+        "wrong_work_auto": 1
+      },
+      "work-only": {
+        "auto": 2,
+        "correct_auto": 2,
+        "failed": 0,
+        "local_suggestions": 0,
+        "provider_failure_rows": 0,
+        "provider_failures": 0,
+        "review": 0,
+        "review_policy_violations": 0,
+        "review_rate": 0.0,
+        "rows": 2,
+        "wrong_auto": 0,
+        "wrong_edition_auto": 0,
+        "wrong_work_auto": 0
+      }
+    },
+    "rows": [
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-exact-edition",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn10-equivalent",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "isbn-other-edition",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "isbn-unconfirmed",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "author_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-author-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "isbn-language-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          },
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "isbn-tied-matching-edition",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "no-isbn-clean-embedded",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.85
+          }
+        ],
+        "case": "no-isbn-text-header",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "no-isbn",
+          "local-consensus"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.83
+          }
+        ],
+        "case": "no-isbn-fuzzy-threshold",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Ivo Merrin/capture.epub",
+        "groups": [
+          "no-isbn",
+          "threshold-boundary"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Ivo Merrin"
+          ],
+          "identifiers": [
+            "9780141439600"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Long Return",
+          "year": 2005
+        },
+        "truth": {
+          "edition": "return-en",
+          "require_review": false,
+          "work": "return",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.83
+          }
+        ],
+        "case": "no-isbn-near-title-wrong-work",
+        "correct_auto": false,
+        "correct_edition": false,
+        "correct_work": false,
+        "error": "",
+        "file": "Ivo Merrin/capture.epub",
+        "groups": [
+          "no-isbn",
+          "threshold-boundary",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": true,
+        "selected": {
+          "authors": [
+            "Ivo Merrin"
+          ],
+          "identifiers": [
+            "9780141439600"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Long Return",
+          "year": 2005
+        },
+        "truth": {
+          "edition": "returns-en",
+          "require_review": true,
+          "work": "returns",
+          "work_only_language": null
+        },
+        "wrong_auto": true
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.65
+          }
+        ],
+        "case": "no-isbn-placeholder-author",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.65
+          }
+        ],
+        "case": "no-isbn-wrong-author",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "authors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "window-a-en",
+            "score": 0.6
+          },
+          {
+            "ref": "window-b-en",
+            "score": 0.6
+          }
+        ],
+        "case": "same-title-different-work-tie",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "unattributed/Night Window.epub",
+        "groups": [
+          "no-isbn",
+          "ambiguity",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "window-a-en",
+          "require_review": true,
+          "work": "window-a",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.9
+          },
+          {
+            "ref": "orchard-second",
+            "score": 0.9
+          }
+        ],
+        "case": "work-only-two-editions",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "work-only"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
+        "truth": {
+          "edition": null,
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": "en"
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.85
+          },
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "work-only-translations",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "work-only"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
+        "truth": {
+          "edition": null,
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": ""
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-second",
+            "score": 0.9
+          }
+        ],
+        "case": "edition-publisher-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": "edition_conflict",
+        "candidates": [
+          {
+            "ref": "orchard-fr",
+            "score": 0.85
+          }
+        ],
+        "case": "edition-language-conflict",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.9
+          }
+        ],
+        "case": "publisher-tool-noise",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "no-isbn",
+          "editions"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.95
+          }
+        ],
+        "case": "coauthors-complete",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Emil Voss",
+            "Nora Vale"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "signal press",
+          "title": "Signal Garden",
+          "year": 2014
+        },
+        "truth": {
+          "edition": "garden-en",
+          "require_review": false,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.95
+          }
+        ],
+        "case": "coauthors-reordered",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Emil Voss",
+            "Nora Vale"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "signal press",
+          "title": "Signal Garden",
+          "year": 2014
+        },
+        "truth": {
+          "edition": "garden-en",
+          "require_review": false,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "garden-en",
+            "score": 0.8
+          }
+        ],
+        "case": "coauthors-contradictory",
+        "correct_auto": false,
+        "correct_edition": true,
+        "correct_work": false,
+        "error": "",
+        "file": "Nora Vale/Signal Garden.epub",
+        "groups": [
+          "no-isbn",
+          "coauthors",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": true,
+        "selected": {
+          "authors": [
+            "Nora Vale",
+            "Theo Vale"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "signal press",
+          "title": "Signal Garden",
+          "year": 2014
+        },
+        "truth": {
+          "edition": "garden-en",
+          "require_review": true,
+          "work": "garden",
+          "work_only_language": null
+        },
+        "wrong_auto": true
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sidecar-agrees",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sidecars",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          },
+          {
+            "ref": "return-en",
+            "score": 0.38
+          }
+        ],
+        "case": "sidecar-contradicts",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sidecars",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "return-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sidecar-only-misleading",
+        "correct_auto": false,
+        "correct_edition": false,
+        "correct_work": false,
+        "error": "",
+        "file": "unknown/capture.epub",
+        "groups": [
+          "sidecars",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": true,
+        "selected": {
+          "authors": [
+            "Ivo Merrin"
+          ],
+          "identifiers": [
+            "9780141439600"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Long Return",
+          "year": 2005
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": true,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": true
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "local-no-provider-record",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "local-consensus",
+          "provider-empty",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "local-path-only",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "local-consensus",
+          "provider-empty",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [],
+        "case": "all-providers-outage",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Livia Hart/The Amber Clock.txt",
+        "groups": [
+          "provider-failure",
+          "local-consensus",
+          "required-review"
+        ],
+        "local_suggestion": true,
+        "outcome": "review",
+        "provider_failures": 1,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "clock-en",
+          "require_review": true,
+          "work": "clock",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "one-provider-outage",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "provider-failure",
+          "isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 1,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.95
+          }
+        ],
+        "case": "sibling-formats-opt-in",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sibling-formats",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.85
+          }
+        ],
+        "case": "sibling-formats-opt-in",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "sibling-formats",
+          "no-isbn"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 1.0
+          }
+        ],
+        "case": "sibling-conflicting-header",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.epub",
+        "groups": [
+          "sibling-formats",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "auto",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [
+            "9780441011582"
+          ],
+          "language": "en",
+          "publisher": "northbank press",
+          "title": "The Glass Orchard",
+          "year": 2003
+        },
+        "truth": {
+          "edition": "orchard-en",
+          "require_review": false,
+          "work": "orchard",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      },
+      {
+        "block_reason": null,
+        "candidates": [
+          {
+            "ref": "orchard-en",
+            "score": 0.55
+          }
+        ],
+        "case": "sibling-conflicting-header",
+        "correct_auto": false,
+        "correct_edition": null,
+        "correct_work": null,
+        "error": "",
+        "file": "Mira Calder/The Glass Orchard.txt",
+        "groups": [
+          "sibling-formats",
+          "required-review"
+        ],
+        "local_suggestion": false,
+        "outcome": "review",
+        "provider_failures": 0,
+        "provider_search_runs": 1,
+        "review_policy_violation": false,
+        "selected": null,
+        "truth": {
+          "edition": "window-b-en",
+          "require_review": true,
+          "work": "window-b",
+          "work_only_language": null
+        },
+        "wrong_auto": false
+      }
+    ],
+    "threshold": 0.8,
+    "totals": {
+      "auto": 19,
+      "correct_auto": 16,
+      "failed": 0,
+      "local_suggestions": 7,
+      "provider_failure_rows": 2,
+      "provider_failures": 2,
+      "review": 14,
+      "review_policy_violations": 3,
+      "review_rate": 0.424242,
+      "rows": 33,
+      "wrong_auto": 3,
+      "wrong_edition_auto": 2,
+      "wrong_work_auto": 3
+    }
+  }
+}

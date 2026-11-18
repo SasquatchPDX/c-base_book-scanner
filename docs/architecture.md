@@ -35,7 +35,13 @@ All domain models and migrations belong to the single Django app
 - `auth.py` and `middleware.py`: LDAP integration and local access checks.
 - `storage_registry.py`, `book_deletion.py`, and `metrics.py`: backend resolution,
   confirmed deletion, and persistent workflow metrics.
-- `views.py`, `urls.py`, and `templates/core/`: Django HTTP and rendered UI surfaces.
+- `intake_views.py` handles member uploads, import status and intake progress.
+  `view_helpers.py` contains request parsing, profile access and shared responses.
+  `library_views.py` serves search, browse, downloads, conversion and OCR requests.
+  `member_views.py` handles sign-in, sign-out and role checks. `health_views.py`
+  serves readiness and metrics. Scan and review workflows live in `views.py`,
+  with contributions and reading in `contributions_views.py` and
+  `review_reader_views.py`. Routes stay in `urls.py` and templates in `templates/core/`.
 
 At package level, `ebook_server.settings` configures the application,
 `ebook_server.storage` defines the storage protocol and filesystem backend,
@@ -44,8 +50,8 @@ bootstraps Django in workers. Worker entry points live in the domain service
 modules. The focused ScanTailor TypeScript editor lives in `frontend/`.
 
 The previously proposed `library`, `scan`, and `workers` packages do not exist.
-Splitting the large view module is planned in Sprint020; it is not a prerequisite
-for the Sprint019 corrections and does not require changing model app labels.
+Sprint020's HTTP module split began with digital intake. The URL configuration
+maps each route directly to its workflow module. The Django app label remains `core`.
 
 ### External service dependencies
 

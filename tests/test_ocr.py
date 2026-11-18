@@ -798,7 +798,7 @@ def test_ocr_tolerates_unknown_status_and_transient_502(
             {"status": "running"},
             502,
             502,
-            _DONE,
+            {**_DONE, "engine": "site-engine", "model": "2026.11", "language": "deu"},
         ]
     )
     try:
@@ -811,6 +811,14 @@ def test_ocr_tolerates_unknown_status_and_transient_502(
     assert job.state == ProcessingJob.JobState.SUCCESS, job.details
     assert service.polls == 7
     assert len(job.details["output_variants"]) == 1
+    variant = FileVariant.objects.get(pk=job.details["output_variants"][0]["file_variant_id"])
+    assert ocr.ocr_job_payload(job)["reported"] == {
+        "engine": "site-engine",
+        "model": "2026.11",
+        "language": "deu",
+    }
+    assert (variant.converter_tool, variant.converter_version) == ("site-engine", "2026.11")
+    assert variant.converter_options["language"] == "deu"
 
 
 @pytest.mark.django_db(transaction=True)

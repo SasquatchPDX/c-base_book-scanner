@@ -677,7 +677,7 @@ def process_ocr_job(job_id: str) -> None:
             target_formats=_coerce_target_formats(details.get("target_formats")),
             options=_coerce_mapping(details.get("request_options", {})),
         )
-        remote_job_id, request_artifacts = _submit_and_poll(
+        remote_job_id, result = _submit_and_poll(
             source_path=source_path,
             source_format=source_format,
             source_mime=source_mime,
@@ -687,14 +687,18 @@ def process_ocr_job(job_id: str) -> None:
         # The poll loop can run for many minutes; the DB connection may have been
         # dropped by the server in the meantime.
         close_old_connections()
+        reported = {"engine": result.engine, "model": result.model, "language": result.language}
+        effective_request = request.model_copy(
+            update={key: value for key, value in reported.items() if value}
+        )
         output_variants: list[dict[str, Any]] = []
-        for artifact in request_artifacts or []:
+        for artifact in result.artifacts:
             produced = _materialize_ocr_artifact(
                 source_book=book,
                 source_variant=source_variant,
                 artifact=artifact,
                 remote_job_id=remote_job_id,
-                request=request,
+                request=effective_request,
             )
             if not produced:
                 logger.warning(
@@ -705,7 +709,7 @@ def process_ocr_job(job_id: str) -> None:
                 )
             output_variants.extend(produced)
         if not output_variants:
-            offered = sorted({artifact.format for artifact in request_artifacts or []})
+            offered = sorted({artifact.format for artifact in result.artifacts})
             raise OCRClientError(
                 "OCR service finished but returned no usable output "
                 f"(requested {request.target_formats}, offered {offered or 'none'})",
@@ -716,6 +720,7 @@ def process_ocr_job(job_id: str) -> None:
             **details,
             "remote_job_id": remote_job_id,
             "remote_status": "succeeded",
+            "reported": reported,
             "output_variants": output_variants,
             "error": "",
         }
@@ -744,7 +749,7 @@ def _submit_and_poll(
     source_format: str,
     source_mime: str,
     request: OCRJobRequest,
-) -> tuple[str, list[OCRArtifactDescriptor] | None]:
+) -> tuple[str, OCRPollResult]:
     client = _get_ocr_client()
     remote_job_id = client.submit_job(
         source_path=source_path,
@@ -780,7 +785,7 @@ def _submit_and_poll(
             if remote_status == "failed":
                 raise OCRClientError(poll.error or "ocr failed")
             if remote_status == "succeeded":
-                return remote_job_id, poll.artifacts
+                return remote_job_id, poll
             if remote_status == "malformed":
                 logger.warning(
                     "ocr_unknown_status_treated_as_running",
@@ -846,9 +851,11 @@ def _resolve_source_artifact(
             with source_storage.open(source_variant.storage_identifier) as source_stream:
                 shutil.copyfileobj(source_stream, staged_file, length=1 << 20)
         except FileNotFoundError as exc:
+            staged_file.close()
             source_path.unlink(missing_ok=True)
             raise OCRJobError("source artifact missing") from exc
         except BaseException:
+            staged_file.close()
             source_path.unlink(missing_ok=True)
             raise
     if source_variant.book is not None:
@@ -925,6 +932,7 @@ def _materialize_ocr_artifact(
     with tempfile.NamedTemporaryFile(
         prefix="ocr-artifact-",
         suffix=f".{request_format}",
+        delete_on_close=False,
     ) as temp:
         digest = hashlib.sha256()
         size_bytes = 0
@@ -1044,6 +1052,7 @@ def ocr_job_payload(job: ProcessingJob) -> dict[str, Any]:
         "scan_job_id": details.get("scan_job_id"),
         "remote_job_id": details.get("remote_job_id"),
         "remote_status": details.get("remote_status"),
+        "reported": details.get("reported", {}),
         "target_formats": details.get("target_formats", []),
         "error": details.get("error", ""),
         "output_variants": details.get("output_variants", []),

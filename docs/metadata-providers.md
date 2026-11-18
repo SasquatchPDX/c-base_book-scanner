@@ -657,6 +657,14 @@ requests failed, for 30 minutes.
 
 ### Offline evaluation
 
+For end-to-end work/edition/automatic-review decisions, run
+`uv run python manage.py evaluate_intake --trial-threshold 0.80`.
+The [labelled intake scorecard](intake-evaluation.md) uses real EPUB/TXT extraction
+and intake with frozen provider records in a disposable offline database. It
+compares repository defaults with a threshold trial, measures mandatory-review guards,
+and records mistakes and provider failures without changing production settings.
+Its synthetic results are regression evidence, not a claim of field accuracy.
+
 `docs/design/data/llm-eval-labels.csv` holds 66 hand-labelled weak-name rows from
 `tests/fixtures/real_world_samples/ebooks-share-filetree.csv` (title, author,
 `is_single_book`, notes; an empty author means it was not verified). Add rows freely;

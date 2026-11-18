@@ -27,7 +27,8 @@ from . import review_reader
 from .models import ReviewTask
 from .review_reader import PreviewUnavailable, ReaderSource
 from .storage_registry import StorageConfigurationError, backend_for_location
-from .views import _can_manage_review_task, _profile_for_request
+from .view_helpers import _profile_for_request
+from .views import _can_manage_review_task
 
 logger = structlog.get_logger(__name__)
 
