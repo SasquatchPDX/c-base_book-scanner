@@ -106,10 +106,10 @@ def quarantine_finding(
 def collect_plan(
     plan: dict[str, Any], *, apply: bool = False, limit: int = 100
 ) -> list[dict[str, Any]]:
-    if plan.get("schema_version") != 1 or plan.get("errors") != []:
+    if not isinstance(plan, dict) or plan.get("schema_version") != 1 or plan.get("errors") != []:
         raise RetentionError("a complete error-free inventory is required")
     age = plan.get("min_age_days")
-    if not isinstance(age, int) or age < 1:
+    if type(age) is not int or age < 1:
         raise RetentionError("retention must be at least one day")
     findings = plan.get("findings")
     if not isinstance(findings, list) or not isinstance(plan.get("roots"), dict):
@@ -156,9 +156,16 @@ def restore_manifest(
     journal = json.loads(content)
     expected_id = str(Path(manifest_id).parent.as_posix()) + "/artifact"
     if (
-        journal.get("schema_version") != 1
+        not isinstance(journal, dict)
+        or journal.get("schema_version") != 1
         or journal.get("location") != location.identifier
         or journal.get("quarantine") != expected_id
+        or not isinstance(journal.get("root"), str)
+        or not isinstance(journal.get("original"), str)
+        or type(journal.get("bytes")) is not int
+        or journal["bytes"] < 0
+        or not isinstance(journal.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", journal["sha256"])
     ):
         raise RetentionError("invalid quarantine journal binding")
     _binding(location, journal["root"])

@@ -3033,7 +3033,6 @@ def process_stage_job(job_id: str) -> None:
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
 
-
         job.state = ProcessingJob.JobState.SUCCESS
         job.finished_at = timezone.now()
         job.details = {

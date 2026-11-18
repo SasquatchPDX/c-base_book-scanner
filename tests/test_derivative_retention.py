@@ -294,3 +294,51 @@ def test_crash_after_move_keeps_a_planned_manifest_that_can_restore(
     manifest_id = manifests[0].relative_to(storage.root).as_posix()
     retirement.restore_manifest(location, manifest_id, apply=True)
     assert storage.resolve_location(old).read_bytes() == b"old preview"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_forged_raw_candidate_and_malformed_plan_cannot_move_originals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, storage, _, old = make_retirement_case(tmp_path, monkeypatch)
+    report = plan_for_case()
+    raw = "raw/capture.png"
+    row = next(row for row in report["findings"] if row["identifier"] == raw)
+    row.update(eligible=True, sha256=storage.hash(raw))
+    before = snapshot(tmp_path)
+    # Validate every candidate before executing even the first valid candidate.
+    report["findings"].append({"eligible": True, "location": "scan"})
+    with pytest.raises(retirement.RetentionError, match="invalid quarantine candidate"):
+        retirement.collect_plan(report, apply=True)
+    assert snapshot(tmp_path) == before
+    report["findings"].pop()
+    results = retirement.collect_plan(report, apply=True)
+    assert next(result for result in results if result["identifier"] == raw)["reason"] == (
+        "unknown stage ownership"
+    )
+    assert storage.exists(raw)
+    assert not storage.exists(old)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("corruption", ["non_object", "missing_root", "invalid_digest", "bytes"])
+def test_restore_rejects_corrupt_journal_without_touching_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str
+) -> None:
+    location, storage, _, _ = make_retirement_case(tmp_path, monkeypatch)
+    result = retirement.collect_plan(plan_for_case(), apply=True)[0]
+    path = storage.resolve_location(result["manifest"])
+    journal = json.loads(path.read_text(encoding="utf-8"))
+    if corruption == "missing_root":
+        journal.pop("root")
+    elif corruption == "invalid_digest":
+        journal["sha256"] = "bad"
+    elif corruption == "bytes":
+        journal["bytes"] = True
+    else:
+        journal = []
+    path.write_text(json.dumps(journal), encoding="utf-8")
+    before = snapshot(tmp_path)
+    with pytest.raises(retirement.RetentionError, match="invalid quarantine journal"):
+        retirement.restore_manifest(location, result["manifest"], apply=True)
+    assert snapshot(tmp_path) == before

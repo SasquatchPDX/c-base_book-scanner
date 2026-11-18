@@ -13,7 +13,10 @@ from ...models import StorageLocation
 
 
 class Command(BaseCommand):
-    help = "Dry-run a derivative quarantine plan or restore manifest; --apply changes names, never purges bytes."
+    help = (
+        "Dry-run a derivative quarantine plan or restore manifest; "
+        "--apply changes names, never purges bytes."
+    )
 
     def add_arguments(self, parser: CommandParser) -> None:
         source = parser.add_mutually_exclusive_group(required=True)
