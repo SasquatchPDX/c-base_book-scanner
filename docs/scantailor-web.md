@@ -214,6 +214,11 @@ parameters.
 
 - `GET /scan/jobs/<job_id>/workspace/` — HTML workspace or JSON page/stage state.
 - `GET /scan/jobs/<job_id>/workspace/events/` — authenticated SSE state stream.
+  The first event (including reconnects) contains all stages; later events contain
+  changed stages only. Unchanged ticks send periodic keep-alive comments without
+  reloading full stage models or serializing JSON. See the [300-page event polling
+  measurements](measurements/scantailor-workspace-events.md) for the PostgreSQL
+  fingerprint path, portable token fallback, and remaining database scan cost.
 - `GET /scan/jobs/<job_id>/pages/<page_id>/stages/` — ordered stage state.
 - `GET|POST /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/` — read/update one
   stage; POST accepts `expected_revision` and returns `409` on a conflict.
