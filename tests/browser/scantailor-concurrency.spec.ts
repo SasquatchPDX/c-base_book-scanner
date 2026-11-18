@@ -30,10 +30,13 @@ const SCANTAILOR_STAGES = [
   "output",
 ] as const;
 
+/** Run every stage of the job's first page in the editor, then return to the overview. */
 async function runAllScanTailorStages(page: Page): Promise<void> {
+  const overviewUrl = page.url();
+  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  await expect(page).toHaveURL(/\/editor\/$/);
   for (const stage of SCANTAILOR_STAGES) {
     await page.locator(`[data-stage-select="${stage}"]`).click();
-    const stageRow = page.locator(`[data-stage-row][data-stage="${stage}"]`);
     const queued = page.waitForResponse(
       (response) =>
         response.request().method() === "POST" &&
@@ -41,10 +44,12 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
     );
     await page.getByRole("button", { name: "Save and run" }).click();
     await expect((await queued).status()).toBe(202);
-    await expect(stageRow.locator("[data-stage-status]")).toHaveText("success", {
-      timeout: 30_000,
-    });
+    // The page strip's status icon for this stage (#195 step 3).
+    await expect(
+      page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
+    ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   }
+  await page.goto(overviewUrl);
 }
 
 async function waitForTextAcrossReloads(
@@ -83,6 +88,8 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     await firstEditor.getByRole("button", { name: "Upload page" }).click();
     await expect(firstEditor.locator(".scan-page-card")).toHaveCount(1);
 
+    await firstEditor.getByRole("link", { name: "Open ScanTailor editor" }).click();
+    await expect(firstEditor).toHaveURL(/\/editor\/$/);
     const workspaceUrl = firstEditor.url();
     const secondEditor = await signIn(secondContext, "leela");
     await secondEditor.route("**/workspace/events/", (route) => route.abort());

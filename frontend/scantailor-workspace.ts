@@ -1,5 +1,15 @@
 import interact from "interactjs";
 
+import {
+  applyClick,
+  neighbour,
+  PageStrip,
+  sortItems,
+  type SortMode,
+  type StripItem,
+} from "./page-strip";
+import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
+
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
 export const STAGE_ORDER = [
   "deskew",
@@ -29,13 +39,15 @@ interface StageState {
   output_sha256?: string;
   last_error: string;
   invalidated_reason?: string;
+  manual?: boolean;
 }
 
 interface WorkspacePage {
   id: string;
-  active_version?: { id?: string };
+  active_version?: { id?: string; original_filename?: string };
   logical_sequence_number: number;
   side: string;
+  recognized_page_number?: string | null;
   thumbnail?: string;
   /** Token of the first stage's input (the working image); empty while it is generated. */
   work_image_token?: string;
@@ -363,6 +375,47 @@ export function artifactToken(
   return `${state.revision}-${state.output_sha256.slice(0, 16)}`;
 }
 
+/** Fill ``__PAGE__``/``__STAGE__`` placeholders of a URL template from the page. */
+export function fillUrl(template: string, pageId: string, stage = ""): string {
+  return template.replace("__PAGE__", pageId).replace("__STAGE__", stage);
+}
+
+/**
+ * The stage whose output the page strip shows for ``stage``: that stage when it has
+ * a result, else the last completed stage before it (unbroken from the first).
+ */
+export function stripSourceStage(
+  page: Pick<WorkspacePage, "stages">,
+  stage: StageName,
+): StageState | undefined {
+  let latest: StageState | undefined;
+  for (const name of STAGE_ORDER) {
+    const state = page.stages.find((candidate) => candidate.stage === name);
+    if (!state || state.status !== "success" || !artifactToken(state)) break;
+    latest = state;
+    if (name === stage) break;
+  }
+  return latest;
+}
+
+/** Full-resolution size of a page at ``stage`` for the width/height orders. */
+export function stageSize(
+  page: Pick<WorkspacePage, "stages">,
+  stage: StageName,
+): { width: number | null; height: number | null } {
+  const state = page.stages.find((candidate) => candidate.stage === stage);
+  const parameters = state?.parameters ?? {};
+  const width =
+    stage === "select_content"
+      ? positiveNumber(parameters.content_area_width)
+      : positiveNumber(parameters.output_width);
+  const height =
+    stage === "select_content"
+      ? positiveNumber(parameters.content_area_height)
+      : positiveNumber(parameters.output_height);
+  return { width, height };
+}
+
 /** Short status shown in the page list for a stage. */
 export function stageStatusLabel(state: Pick<StageState, "status">): string {
   return state.status;
@@ -476,6 +529,17 @@ class WorkspaceController {
   private eventSource: EventSource | null = null;
   private pollingTimer: number | null = null;
   private pollCursor: string | null = null;
+  private readonly viewport: HTMLElement | null;
+  private readonly surface: HTMLElement | null;
+  private readonly zoomLevel: HTMLElement | null;
+  private readonly statusHint: HTMLElement | null;
+  private readonly sortSelect: HTMLSelectElement | null;
+  private readonly keepInView: HTMLInputElement | null;
+  private readonly strip: PageStrip | null;
+  private readonly naturalOrder: string[];
+  private view: View = { zoom: 1, x: 0, y: 0 };
+  private fitPending = true;
+  private selectionAnchor: string | null = null;
   /** The preview URL being shown, without the cache-busting retry marker. */
   private previewUrl = "";
   private previewRetry: PreviewRetryState = INITIAL_PREVIEW_RETRY;
@@ -501,13 +565,37 @@ class WorkspaceController {
     for (const page of pages) {
       this.pages.set(page.id, page);
     }
+    this.naturalOrder = pages.map((page) => page.id);
+    this.viewport = root.querySelector<HTMLElement>("[data-viewport]");
+    this.surface = root.querySelector<HTMLElement>("[data-surface]");
+    this.zoomLevel = root.querySelector<HTMLElement>("[data-zoom-level]");
+    this.statusHint = root.querySelector<HTMLElement>("[data-status-hint]");
+    this.sortSelect = root.querySelector<HTMLSelectElement>("[data-strip-sort]");
+    this.keepInView = root.querySelector<HTMLInputElement>("[data-keep-in-view]");
+    const scroller = root.querySelector<HTMLElement>("[data-strip-scroll]");
+    this.strip = scroller
+      ? new PageStrip(scroller, {
+          onClick: (pageId, modifiers) => this.clickPage(pageId, modifiers),
+        })
+      : null;
+  }
+
+  private url(name: string, pageId = "", stage = ""): string {
+    return fillUrl(this.root.dataset[name] ?? "", pageId, stage);
   }
 
   start(): void {
     this.bindWorkspaceControls();
-    const firstPage = this.pages.values().next().value as WorkspacePage | undefined;
+    // The job overview links "Edit" as ?page=<id>&stage=<stage>.
+    const query = new URLSearchParams(window.location.search);
+    const requestedPage = query.get("page") ?? "";
+    const requestedStage = query.get("stage") ?? "";
+    const firstPage = this.pages.get(requestedPage) ?? this.pages.values().next().value;
     if (firstPage) {
-      this.activate(firstPage.id, STAGE_ORDER[0]);
+      this.activate(
+        firstPage.id,
+        isStageName(requestedStage) ? requestedStage : STAGE_ORDER[0],
+      );
     } else {
       this.disableEditor("Upload a page to begin editing.");
     }
@@ -525,44 +613,24 @@ class WorkspaceController {
         if (typeof pageId === "string") this.activate(pageId, value);
       });
     });
-    this.root.querySelectorAll<HTMLButtonElement>("[data-stage-open]").forEach((button) => {
+    this.root.querySelectorAll<HTMLButtonElement>("[data-stage-run-all]").forEach((button) => {
       button.addEventListener("click", () => {
-        const pageId = button.dataset.pageId;
-        const value = button.dataset.stage;
-        if (pageId && value && isStageName(value)) this.activate(pageId, value);
+        const value = button.dataset.stageRunAll ?? "";
+        if (isStageName(value)) void this.runStageForAllPages(value, button);
       });
     });
-    this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-      checkbox.addEventListener("change", () => {
-        const pageId = checkbox.dataset.pageId;
-        if (!pageId) return;
-        if (checkbox.checked) this.selectedPages.add(pageId);
-        else this.selectedPages.delete(pageId);
-        this.updateSelectionCount();
-      });
-    });
-    element<HTMLButtonElement>(this.root, "[data-select-all]").addEventListener("click", () => {
-      this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-        checkbox.checked = true;
-        const pageId = checkbox.dataset.pageId;
-        if (pageId) this.selectedPages.add(pageId);
-      });
-      this.updateSelectionCount();
-    });
-    element<HTMLButtonElement>(this.root, "[data-clear-selection]").addEventListener(
-      "click",
-      () => {
-        this.root.querySelectorAll<HTMLInputElement>("[data-page-select]").forEach((checkbox) => {
-          checkbox.checked = false;
-        });
-        this.selectedPages.clear();
-        this.updateSelectionCount();
-      },
-    );
     this.saveButton.addEventListener("click", () => void this.saveActiveStage());
     this.batchButton.addEventListener("click", () => void this.applyBatch());
+    this.bindCanvas();
+    this.bindStrip();
     this.batchScope.addEventListener("change", () => this.updateSelectionCount());
     this.image.addEventListener("load", () => {
+      if (this.fitPending) {
+        this.fitPending = false;
+        this.fitToPane();
+      } else {
+        this.applyView();
+      }
       if (
         this.activeStage === "dewarping" &&
         this.draft.dewarp_model === "curvature" &&
@@ -581,7 +649,9 @@ class WorkspaceController {
         }
       }
     });
-    window.addEventListener("resize", () => this.renderGeometry());
+    window.addEventListener("resize", () => {
+      this.fitToPane();
+    });
     this.image.addEventListener("error", () => {
       this.clearGeometry();
       void this.explainPreviewFailure(this.image.src, this.activeStage);
@@ -650,9 +720,22 @@ class WorkspaceController {
     const page = this.pages.get(pageId);
     const state = page ? stageFor(page, stage) : undefined;
     if (!page || !state) return;
+    const stageChanged = stage !== this.activeStage;
+    if (pageId !== this.activePageId || stageChanged) this.fitPending = true;
     this.activePageId = pageId;
     this.activeStage = stage;
+    if (!this.selectedPages.has(pageId)) {
+      this.selectedPages.clear();
+      this.selectedPages.add(pageId);
+      this.selectionAnchor = pageId;
+    }
     this.draft = editableParameters(stage, state.parameters ?? {});
+    const hint = this.root.querySelector<HTMLElement>(`[data-stage-select="${stage}"]`)?.dataset
+      .hint;
+    if (this.statusHint) this.statusHint.textContent = hint ?? "";
+    if (stageChanged) this.refreshStrip();
+    this.strip?.setActive(pageId, new Set(this.selectedPages), this.keepInView?.checked ?? true);
+    this.updateSelectionCount();
     this.title.textContent = `Page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}`;
     this.markActiveControls();
     this.renderControls();
@@ -677,11 +760,12 @@ class WorkspaceController {
       this.previewMode === "input"
         ? "Processing-stage input preview"
         : "Processing-stage result preview";
-    const trigger = this.stageTrigger(context.page.id, state.stage);
-    const source =
-      this.previewMode === "result"
-        ? trigger?.dataset.outputPreviewUrl
-        : trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
+    const preview = this.url("previewUrlTemplate", context.page.id, state.stage);
+    const source = preview
+      ? this.previewMode === "result"
+        ? preview
+        : `${preview}?input=true`
+      : "";
     this.image.hidden = !source;
     let url = "";
     if (source) {
@@ -726,18 +810,6 @@ class WorkspaceController {
     this.root.querySelectorAll<HTMLElement>("[data-stage-select]").forEach((item) => {
       item.classList.toggle("active", item.dataset.stageSelect === this.activeStage);
     });
-    this.root.querySelectorAll<HTMLElement>("[data-stage-open]").forEach((item) => {
-      item.classList.toggle(
-        "active",
-        item.dataset.stage === this.activeStage && item.dataset.pageId === this.activePageId,
-      );
-    });
-  }
-
-  private stageTrigger(pageId: string, stage: StageName): HTMLElement | null {
-    return this.root.querySelector<HTMLElement>(
-      `[data-stage-open][data-page-id="${pageId}"][data-stage="${stage}"]`,
-    );
   }
 
   private activeContext(): { page: WorkspacePage; state: StageState } | null {
@@ -1408,8 +1480,7 @@ class WorkspaceController {
   private async saveActiveStage(): Promise<void> {
     const context = this.activeContext();
     if (!context || !this.activePageId || !this.editable) return;
-    const trigger = this.stageTrigger(this.activePageId, this.activeStage);
-    const url = trigger?.dataset.stageUrl;
+    const url = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
     if (!url) return;
     this.saveButton.disabled = true;
     this.setMessage("Saving revision and queueing a preview…", "info");
@@ -1453,9 +1524,7 @@ class WorkspaceController {
 
   private async applyBatch(): Promise<void> {
     if (!this.editable) return;
-    const batchUrl = this.root.querySelector<HTMLElement>(
-      `[data-batch-url][data-stage="${this.activeStage}"]`,
-    )?.dataset.batchUrl;
+    const batchUrl = this.url("batchUrlTemplate", "", this.activeStage);
     if (!batchUrl) return;
     const selected = [...this.selectedPages];
     if (this.batchScope.value === "selected" && selected.length === 0) {
@@ -1517,28 +1586,229 @@ class WorkspaceController {
   }
 
   private updateStageDom(state: StageState): void {
-    const row = this.root.querySelector<HTMLElement>(
-      `[data-stage-row][data-page-id="${state.scan_page_id}"][data-stage="${state.stage}"]`,
+    const page = this.pages.get(state.scan_page_id);
+    if (page && this.strip) this.strip.update(this.stripItem(page));
+  }
+
+  // --- page strip ------------------------------------------------------------------
+
+  private stripItem(page: WorkspacePage): StripItem {
+    const source = stripSourceStage(page, this.activeStage);
+    const versionId = page.active_version?.id;
+    let thumbnailUrl = "";
+    if (source) {
+      const template = this.url("stageThumbnailTemplate", page.id, source.stage);
+      if (template) thumbnailUrl = `${template}?v=${artifactToken(source)}`;
+    } else if (versionId && page.work_image_token) {
+      const template = this.url("pageThumbnailTemplate", page.id);
+      if (template) thumbnailUrl = `${template}?v=${page.work_image_token}`;
+    } else {
+      // Working image still being generated: the full page thumbnail renders the scan.
+      thumbnailUrl = page.thumbnail ?? "";
+    }
+    const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
+    const printed = page.recognized_page_number ? `p. ${page.recognized_page_number}` : "";
+    const size = stageSize(page, this.activeStage);
+    return {
+      id: page.id,
+      label: `${page.logical_sequence_number}${side}`,
+      caption: page.active_version?.original_filename || printed,
+      thumbnailUrl,
+      width: size.width,
+      height: size.height,
+      stages: STAGE_ORDER.map((name) => {
+        const state = stageFor(page, name);
+        return {
+          stage: name,
+          label: STAGE_LABELS[name],
+          status: state?.status ?? "unknown",
+          manual: state?.manual ?? false,
+          last_error: state?.last_error ?? "",
+          invalidated_reason: state?.invalidated_reason ?? "",
+        };
+      }),
+    };
+  }
+
+  private refreshStrip(): void {
+    if (!this.strip) return;
+    const items = this.naturalOrder
+      .map((id) => this.pages.get(id))
+      .filter((page): page is WorkspacePage => page !== undefined)
+      .map((page) => this.stripItem(page));
+    const mode = (this.sortSelect?.value ?? "natural") as SortMode;
+    this.strip.setItems(items, sortItems(items, mode));
+  }
+
+  private bindStrip(): void {
+    this.sortSelect?.addEventListener("change", () => {
+      this.refreshStrip();
+      this.strip?.setActive(this.activePageId, new Set(this.selectedPages), true);
+    });
+    this.refreshStrip();
+    document.addEventListener("keydown", (event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, select, textarea, [contenteditable='true']")) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const steps: Record<string, number> = {
+        ArrowDown: 1,
+        PageDown: 1,
+        w: 1,
+        W: 1,
+        ArrowUp: -1,
+        PageUp: -1,
+        q: -1,
+        Q: -1,
+        Home: -Infinity,
+        End: Infinity,
+      };
+      const step = steps[event.key];
+      if (step === undefined || !this.strip) return;
+      const order = this.strip.displayOrder();
+      const next = Number.isFinite(step)
+        ? neighbour(order, this.activePageId, step)
+        : step < 0
+          ? (order[0] ?? null)
+          : (order[order.length - 1] ?? null);
+      if (!next) return;
+      event.preventDefault();
+      this.selectedPages.clear();
+      this.activate(next, this.activeStage);
+    });
+  }
+
+  private clickPage(pageId: string, modifiers: { ctrl: boolean; shift: boolean }): void {
+    const order = this.strip?.displayOrder() ?? this.naturalOrder;
+    const next = applyClick(
+      { selected: this.selectedPages, anchor: this.selectionAnchor ?? this.activePageId },
+      order,
+      pageId,
+      modifiers,
     );
-    if (!row) return;
-    const status = row.querySelector<HTMLElement>("[data-stage-status]");
-    if (status) {
-      status.textContent = stageStatusLabel(state);
-      status.className = `status status-${state.status}`;
-      status.title =
-        state.status === "invalidated" ? (state.invalidated_reason ?? "") : "";
+    this.selectedPages.clear();
+    for (const id of next.selected) this.selectedPages.add(id);
+    this.selectionAnchor = next.anchor;
+    if (pageId !== this.activePageId) this.activate(pageId, this.activeStage);
+    else this.strip?.setActive(pageId, new Set(this.selectedPages), false);
+    this.updateSelectionCount();
+  }
+
+  // --- canvas: pan and zoom ----------------------------------------------------------
+
+  private bindCanvas(): void {
+    const viewport = this.viewport;
+    if (!viewport) return;
+    this.image.draggable = false;
+    viewport.addEventListener(
+      "wheel",
+      (event) => {
+        if (event.ctrlKey) return; // reserved for stage gestures (deskew rotation)
+        event.preventDefault();
+        const bounds = viewport.getBoundingClientRect();
+        this.view = zoomAt(this.view, wheelFactor(event.deltaY, event.deltaMode), {
+          x: event.clientX - bounds.left,
+          y: event.clientY - bounds.top,
+        });
+        this.applyView();
+      },
+      { passive: false },
+    );
+    let drag: { id: number; x: number; y: number } | null = null;
+    viewport.addEventListener("pointerdown", (event) => {
+      const target = event.target as HTMLElement | null;
+      // Handles and boxes own their pointer events; only the background pans.
+      if (event.button !== 0 || target?.closest("[data-geometry-layer] > *")) return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      viewport.setPointerCapture(event.pointerId);
+      viewport.classList.add("panning");
+    });
+    viewport.addEventListener("pointermove", (event) => {
+      if (!drag || drag.id !== event.pointerId) return;
+      this.view = panBy(this.view, event.clientX - drag.x, event.clientY - drag.y);
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      this.applyView(false);
+    });
+    const end = (event: PointerEvent): void => {
+      if (!drag || drag.id !== event.pointerId) return;
+      drag = null;
+      viewport.classList.remove("panning");
+    };
+    viewport.addEventListener("pointerup", end);
+    viewport.addEventListener("pointercancel", end);
+    const zoomButton = (selector: string, action: () => void): void => {
+      this.root.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", action);
+    };
+    const centre = (): { x: number; y: number } => ({
+      x: viewport.clientWidth / 2,
+      y: viewport.clientHeight / 2,
+    });
+    zoomButton("[data-zoom-in]", () => {
+      this.view = zoomAt(this.view, 1.25, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-out]", () => {
+      this.view = zoomAt(this.view, 0.8, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-fit]", () => this.fitToPane());
+    zoomButton("[data-zoom-actual]", () => {
+      this.view = zoomAt(this.view, 1 / this.view.zoom, centre());
+      this.applyView();
+    });
+  }
+
+  private fitToPane(): void {
+    if (!this.viewport || !this.image.naturalWidth) {
+      this.renderGeometry();
+      return;
     }
-    const error = row.querySelector<HTMLElement>("[data-stage-error]");
-    if (error) {
-      const errorText = stageErrorText(state);
-      error.textContent = errorText;
-      error.hidden = !errorText;
+    this.view = fitView(
+      { width: this.viewport.clientWidth, height: this.viewport.clientHeight },
+      { width: this.image.naturalWidth, height: this.image.naturalHeight },
+    );
+    this.applyView();
+  }
+
+  /** Lay the image out at ``natural * zoom`` and translate it; redraw overlays if resized. */
+  private applyView(resized = true): void {
+    if (!this.surface || !this.image.naturalWidth) {
+      if (resized) this.renderGeometry();
+      return;
     }
-    const revision = row.querySelector<HTMLInputElement>("input[name='expected_revision']");
-    if (revision) revision.value = String(state.revision);
-    const preview = row.querySelector<HTMLElement>("[data-stage-preview-link]");
-    if (preview && (state.preview_storage_identifier || state.output_storage_identifier)) {
-      preview.hidden = false;
+    this.image.style.width = `${Math.round(this.image.naturalWidth * this.view.zoom)}px`;
+    this.image.style.height = `${Math.round(this.image.naturalHeight * this.view.zoom)}px`;
+    this.surface.style.transform = `translate(${Math.round(this.view.x)}px, ${Math.round(this.view.y)}px)`;
+    if (this.zoomLevel) this.zoomLevel.textContent = `${Math.round(this.view.zoom * 100)} %`;
+    if (resized) this.renderGeometry();
+  }
+
+  // --- batch: "▶" runs a stage for every page with its own settings ---------------
+
+  private async runStageForAllPages(stage: StageName, button: HTMLButtonElement): Promise<void> {
+    if (!this.editable) return;
+    const batchUrl = this.url("batchUrlTemplate", "", stage);
+    if (!batchUrl) return;
+    button.disabled = true;
+    this.setMessage(`Running ${STAGE_LABELS[stage]} for all pages…`, "info");
+    try {
+      // No parameters: every page keeps its own settings (upstream batch processing).
+      const response = await fetch(batchUrl, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        body: JSON.stringify({ preserve_exceptions: false }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as {
+        applied: { page_id: string; stage: StageState }[];
+        applied_count: number;
+      };
+      for (const item of payload.applied) this.mergeStage(item.stage);
+      this.setMessage(`Queued ${STAGE_LABELS[stage]} for ${payload.applied_count} page(s).`, "success");
+    } catch (error) {
+      this.setMessage(error instanceof Error ? error.message : "Batch run failed.", "error");
+    } finally {
+      button.disabled = !this.editable;
     }
   }
 
@@ -1614,5 +1884,5 @@ export function initializeScanTailorWorkspace(root: HTMLElement): void {
   new WorkspaceController(root, parseWorkspacePages()).start();
 }
 
-const workspace = document.querySelector<HTMLElement>("[data-scantailor-workspace]");
+const workspace = document.querySelector<HTMLElement>("[data-scantailor-editor]");
 if (workspace) initializeScanTailorWorkspace(workspace);

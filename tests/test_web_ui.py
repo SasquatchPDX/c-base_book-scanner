@@ -123,10 +123,21 @@ def test_scan_job_list_create_and_workspace_render() -> None:
     assert workspace.status_code == 200
     assert b"ScanTailor workspace" in workspace.content
     assert b"Upload the first page" in workspace.content
-    assert b"data-scantailor-workspace" in workspace.content
-    assert b'data-stage-select="deskew"' in workspace.content
-    assert b"data-stage-controls" in workspace.content
-    assert b"data-geometry-layer" in workspace.content
-    assert b"data-batch-scope" in workspace.content
-    assert b"/workspace/events/" in workspace.content
-    assert b"core/dist/scantailor-workspace.js" in workspace.content
+    # The overview links the full-viewport editor (#195 step 3) instead of embedding it.
+    assert f'href="/scan/jobs/{job.id}/editor/"'.encode() in workspace.content
+    assert b"data-stage-controls" not in workspace.content
+
+    editor = client.get(f"/scan/jobs/{job.id}/editor/")
+    assert editor.status_code == 200
+    assert b"data-scantailor-editor" in editor.content
+    assert b'data-stage-select="deskew"' in editor.content
+    assert b'data-stage-run-all="output"' in editor.content
+    assert b"data-stage-controls" in editor.content
+    assert b"data-geometry-layer" in editor.content
+    assert b"data-batch-scope" in editor.content
+    assert b"data-strip-scroll" in editor.content
+    assert b"Natural order" in editor.content
+    assert b"/workspace/events/" in editor.content
+    assert b"core/dist/scantailor-workspace.js" in editor.content
+    # Full viewport: the editor page has no site header.
+    assert b'class="site-header"' not in editor.content

@@ -68,6 +68,11 @@ urlpatterns = [
         name="scan-job-workspace",
     ),
     path(
+        "scan/jobs/<scan_job_id:job_id>/editor/",
+        views.scan_job_editor,
+        name="scan-job-editor",
+    ),
+    path(
         "scan/jobs/<scan_job_id:job_id>/workspace/state/",
         views.scan_job_workspace_state,
         name="scan-job-workspace-state",
@@ -96,6 +101,11 @@ urlpatterns = [
         "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/preview/",
         views.scan_page_stage_preview,
         name="scan-job-page-stage-preview",
+    ),
+    path(
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/thumbnail/",
+        views.scan_page_stage_thumbnail,
+        name="scan-job-page-stage-thumbnail",
     ),
     path(
         "scan/jobs/<scan_job_id:job_id>/pages/",
@@ -152,6 +162,11 @@ urlpatterns = [
         "scan/pages/<uuid:page_id>/image/",
         views.scan_page_thumbnail,
         name="scan-page-thumbnail",
+    ),
+    path(
+        "scan/pages/<uuid:page_id>/thumbnail/",
+        views.scan_page_small_thumbnail,
+        name="scan-page-small-thumbnail",
     ),
     path("scan/todos/", views.scan_todos, name="scan-todos"),
     path("scan/todos/<int:todo_id>/claim/", views.scan_todo_claim, name="scan-todo-claim"),
