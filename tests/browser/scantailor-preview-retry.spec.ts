@@ -5,7 +5,7 @@ const MIGRATED_JOB_ID = "6f1d2b3c-0195-4a50-8b7e-000000000050";
 
 // Pillow-generated 100×100 white page.
 const PAGE = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAA5klEQVR4nO3SsREAIAwDMWD/ncMK+V6qXf35zsxh5y13iNV4ViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYg1tn7z/EDxbGcl84AAAAASUVORK5CYII=",
+  "iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAIAAAD/gAIDAAAA5klEQVR4nO3SsREAIAwDMWD/ncMK+V6qXf35zsxh5y13iNV4ViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYgViBWIFYg1tn7z/EDxbGcl84AAAAASUVORK5CYII=",
   "base64",
 );
 
@@ -48,22 +48,9 @@ test("an upload whose working image is still queued appears once it is ready", a
 }) => {
   test.setTimeout(60_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Delayed working image");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "blank.png",
-    mimeType: "image/png",
-    buffer: PAGE,
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
-
   // Hold back the first input previews as the server does while the generation job
   // waits in the queue: the image request and the editor's diagnostic request both
-  // see the retryable answer, then the real image. (Routed only after the upload:
-  // request interception must not touch the multipart upload.)
+  // see the retryable answer, then the real image.
   let held = 0;
   await page.route(/\/stages\/deskew\/preview\/\?input=true/, async (route) => {
     if (held < 3) {
@@ -78,7 +65,16 @@ test("an upload whose working image is still queued appears once it is ready", a
     }
     await route.continue();
   });
-  await page.reload();
+  await page.goto("/scan/jobs/?view=html");
+  await page.getByLabel("Title hint").fill("Delayed working image");
+  await page.getByRole("button", { name: "Create workspace" }).click();
+  await page.getByLabel("Page image").setInputFiles({
+    name: "blank.png",
+    mimeType: "image/png",
+    buffer: PAGE,
+  });
+  await page.getByLabel("Sequence").fill("1");
+  await page.getByRole("button", { name: "Upload page" }).click();
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
 
   const message = page.locator("[data-editor-message]");
