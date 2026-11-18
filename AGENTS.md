@@ -349,14 +349,17 @@ The physical scanner UI should query jobs and outstanding rescan tasks from the 
 
 Build this as a modern multi-user web subsystem with separate processing workers.
 
-Required processing stages:
+Required processing stages, in this order (#195):
 
-1. Page Split
-2. Deskew
-3. Select Content
+1. Deskew
+2. Select Content
+3. Dewarping
 4. Margins
-5. Dewarping
-6. Output/Binarization
+5. Output/Binarization
+
+There is no Fix Orientation and no Page Split stage: the scanner delivers upright single
+pages. Stages are ports of the upstream Scan Tailor algorithms (GPL-3.0-or-later); see
+`docs/third-party/scantailor-port.md`.
 
 Output algorithms should eventually include Otsu, Sauvola, Wolf, Fox, Window, Grad, plus text/picture zone handling.
 

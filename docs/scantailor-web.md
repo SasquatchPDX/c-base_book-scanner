@@ -9,20 +9,28 @@ while every processing stage writes a new derived artifact and provenance.
 
 Each `(scan job, page, stage)` has a persistent `ScanTailorStageState` containing
 its input lineage, parameters, algorithm/version, revision, worker job, output and
-preview identifiers, checksums, timestamps, and status. The ordered stages are:
+preview identifiers, checksums, timestamps, and status. The ordered stages are
+(#195):
 
-1. Page Split — automatic gutter detection, manual draggable split line, or a
-   single-page pass-through. In a `single_page` job (the default, see below) it
-   completes on its own as a recorded "no split" pass-through.
-2. Deskew — projection-profile estimation with configurable search bounds or a
-   manual angle.
-3. Select Content — automatic content detection or a draggable/resizable content
+1. Deskew — projection-profile estimation with configurable search bounds or a
+   manual angle. It reads the page's active raw version directly.
+2. Select Content — automatic content detection or a draggable/resizable content
    rectangle.
-4. Margins — per-side/canvas padding and horizontal/vertical alignment.
-5. Dewarping — OpenCV projective correction using detected or draggable control
+3. Dewarping — OpenCV projective correction using detected or draggable control
    points, with an explicit bypass and deterministic failure behavior.
-6. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
+4. Margins — per-side/canvas padding and horizontal/vertical alignment.
+5. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
+
+There is no Fix Orientation and no Page Split stage: the scanner delivers upright
+single pages (owner decision in #195, superseding #55). Dewarping runs before
+Margins, unlike upstream Scan Tailor where it is part of Output; Margins therefore
+sees the dewarped content.
+
+Issue #195 replaces these stages with ports of the upstream Scan Tailor algorithms,
+one stage per PR. Until a stage is ported it keeps the behaviour described here;
+[`third-party/scantailor-port.md`](third-party/scantailor-port.md) records the
+status and divergences of each stage.
 
 The default dewarping model corrects perspective on flat pages; it does not
 correct book-spine curvature. An opt-in baseline curvature model is described below.
@@ -151,92 +159,22 @@ fixed-canvas requests. Reducing ordinary padding therefore shrinks the result ag
 The editor also recognizes legacy computed canvases equal to the input plus recorded
 padding, rather than silently resubmitting them as fixed dimensions.
 
-## Page Split and the capture layout (decision for #55)
+## Page Split removed (#195)
 
-**Question.** Is Page Split needed for this project's scanner, which captures
-every page as its own image?
-
-**Answer.** The two-page-spread case does not occur with the project's current
-scanner. The stage stays in the pipeline, but for single-page captures it is a
-recorded passthrough that needs no work from anyone.
-
-Evidence about the hardware:
-
-- **Real capture.** The owner manually tested a real 365-page self-scan (#55).
-  Every page arrived as its own image file. None of the images contained two
-  facing pages.
-- **The scanner protocol.** `docs/scanner-protocol.md` takes one image per
-  `(logical_sequence_number, side)`. A two-page opening is sent as two uploads,
-  `side=left` and `side=right`. Each upload is one page, not one spread
-  photographed twice.
-- **The reference client.** `scripts/scanner_client_example.py --spreads` pairs
-  separate image files as left and right. It never sends the same spread image
-  twice.
-- **Project documents.** No Sprint document or status note describes a camera or
-  planned hardware variant that photographs both pages at once. Sprint010 keeps
-  the protocol hardware-neutral. The only spread images in the repository are
-  synthetic test fixtures, such as the 6000×4000 smoke-test spreads in
-  `status-2026-11-10-first-hardware-pass.md`.
-- **Risk of running the splitter anyway.** Running gutter detection on
-  single-page input is not harmless. A landscape `left`/`right` image is cut at
-  the detected gutter or, failing that, at the centre. That would halve a page
-  photographed sideways without EXIF orientation.
-
-AGENTS.md requires Page Split as the first of six stages. Spread capture is also
-realistic for other setups: a single overhead camera, a flatbed, or
-already-photographed spreads. So the stage is kept, and it is made automatic
-where it has nothing to do:
-
-- `ScanJob.capture_layout` is either `single_page` (one page per image) or
-  `spread` (an image may hold two facing pages).
-- At job creation the layout is chosen in this order:
-  1. an explicit `capture_layout` field on `POST /scan/jobs/`;
-  2. otherwise, `spread` if the job's `scanner_id` is listed in
-     `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS`;
-  3. otherwise, `BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT` (default
-     `single_page`).
-- Page `side` values do not imply spreads, because `left` and `right` are
-  separate single-page images.
-- Jobs that existed before migration 0022 were set to `spread`, so their Page
-  Split behaviour did not change. To treat such a job as single-page, batch-apply
-  Page Split with `split_mode: "none"` to all pages.
-
-**`single_page` jobs.**
-
-- Every new page version (an upload or a rescan replacement) queues a Page Split
-  background job with `split_mode: "none"`.
-- The job runs the shared passthrough helper from #54. A normalised PNG is
-  byte-copied and other inputs are normalised once. No gutter detection runs.
-- The stage still produces its own output artifact, checksum, preview and
-  revision. Downstream inputs and invalidation therefore behave exactly as
-  after a real split.
-- The run records:
-  - `algorithm = single_page_passthrough`;
-  - `algorithm_version = splitter-v2`;
-  - the parameters `resolved_split_mode: "none"`, `split_skipped: true`,
-    `split_skipped_reason` and `capture_layout`.
-- The workspace shows the stage as **skipped · single page**. The API
-  serializes it with `auto_skipped: true`.
-- The page thumbnail keeps using the full-size capture, because the passthrough
-  output is the same image.
-- To split one page anyway, switch its split mode to `manual` or `auto`. That
-  is an ordinary stage edit: it bumps the revision, re-runs the stage and
-  invalidates every downstream stage.
-- A page switched this way counts as a manual exception. A later rescan does not
-  reset it to "none".
-- If the background job cannot be queued, the upload still succeeds and the
-  stage is marked failed with the reason.
-
-**`spread` jobs** keep the previous behaviour. Page Split runs only when someone
-starts it, and its default mode is `auto` gutter detection.
+Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
+deletes existing `page_split` stage rows, relinks the remaining stages in the new
+order, and marks every stage that had been queued, run or failed as invalidated
+with a new revision, so existing jobs re-run once. Raw page versions are untouched.
+Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
+`capture_layout: single_page` and ignores it, and rejects `spread`.
 
 ## Browser workspace
 
 The server-rendered page remains usable without JavaScript through individual Run
 forms. The focused TypeScript component adds:
 
-- a six-stage navigation surface and per-page editor selection;
-- direct split-line, content-box, dewarp-point, and output-zone manipulation;
+- a five-stage navigation surface and per-page editor selection;
+- direct content-box, dewarp-point, and output-zone manipulation;
 - typed controls for deskew, margins, output algorithms, and threshold settings;
 - selected-page or all-page batch application;
 - preservation of page-level manual exceptions by default;

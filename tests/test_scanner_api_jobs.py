@@ -139,7 +139,6 @@ def test_put_job_creates_open_job(key: str, settings: Any) -> None:
         "state": "open",
         "portal_url": f"https://serif.c-base.lan/j/{JOB_ID}",
         "scan_started_at": STARTED,
-        "capture_layout": "single_page",
         "events": {"sans_last_line_no": 0},
         "pages": [],
         "covers": [],
@@ -155,11 +154,11 @@ def test_put_job_creates_open_job(key: str, settings: Any) -> None:
 
 
 @pytest.mark.django_db
-def test_put_job_defaults_layout_and_falls_back_to_request_host(key: str, settings: Any) -> None:
+def test_put_job_falls_back_to_request_host(key: str, settings: Any) -> None:
     settings.BOOK_SCANNER_PUBLIC_BASE_URL = ""
     response = _put(key, f"{JOB_ID}-2", {"scan_started_at": STARTED})
     assert response.status_code == 201
-    assert response.json()["capture_layout"] == "single_page"
+    assert "capture_layout" not in response.json()
     assert response.json()["portal_url"] == f"http://testserver/j/{JOB_ID}-2"
 
 
@@ -188,14 +187,20 @@ def test_put_job_conflicts_are_409(key: str) -> None:
     assert other_time.status_code == 409
     assert _error_code(other_time) == "job_id_conflict"
 
-    other_layout = _put(key, JOB_ID, {"scan_started_at": STARTED, "capture_layout": "spread"})
-    assert other_layout.status_code == 409
-    assert _error_code(other_layout) == "job_id_conflict"
-
     job = ScanJob.objects.get(pk=JOB_ID)
     assert job.scan_started_at == datetime(2026, 11, 17, 14, 32, 1, tzinfo=UTC)
-    assert job.capture_layout == "single_page"
     assert job.source == ScanJob.Source.SCANNER
+
+
+@pytest.mark.django_db
+def test_put_job_accepts_and_ignores_legacy_single_page_layout(key: str) -> None:
+    """#195: ``capture_layout: single_page`` is still accepted, so the scanner keeps working."""
+    created = _put(key, JOB_ID, {"scan_started_at": STARTED, "capture_layout": "single_page"})
+    assert created.status_code == 201
+    # The field is not part of the job identity any more: a repeat without it is the same job.
+    again = _put(key, JOB_ID, {"scan_started_at": STARTED})
+    assert again.status_code == 200
+    assert "capture_layout" not in again.json()
 
 
 @pytest.mark.django_db
@@ -237,6 +242,9 @@ def test_put_job_rejects_bad_job_id_format(key: str, job_id: str) -> None:
         json.dumps({"scan_started_at": "2026-11-17T14:32:01"}),
         json.dumps({"scan_started_at": 1763389921}),
         json.dumps({"scan_started_at": STARTED, "capture_layout": "triptych"}),
+        # Page Split was removed (#195): two-page spreads are refused.
+        json.dumps({"scan_started_at": STARTED, "capture_layout": "spread"}),
+        json.dumps({"scan_started_at": STARTED, "capture_layout": 1}),
         # ISO-shaped but not a calendar date/time (PDXDJN on #137): 400, never 500.
         json.dumps({"scan_started_at": "2026-02-30T14:32:01Z"}),
         json.dumps({"scan_started_at": "2026-13-01T14:32:01Z"}),

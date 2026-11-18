@@ -980,12 +980,6 @@ class ScanJob(BookLinkedRecord):
         COMPLETE = "complete", "Complete"
         CANCELLED = "cancelled", "Cancelled"
 
-    class CaptureLayout(models.TextChoices):
-        """What one uploaded image contains; decides how Page Split treats it (#55)."""
-
-        SINGLE_PAGE = "single_page", "One page per image"
-        SPREAD = "spread", "Two facing pages per image"
-
     class Source(models.TextChoices):
         """Who created the job: the scanner over ``/api/scanner/v1/`` or the web UI."""
 
@@ -1008,11 +1002,6 @@ class ScanJob(BookLinkedRecord):
     source = models.CharField(max_length=16, choices=Source.choices, default=Source.WEB)
     # When the scanner started the job (§6.3); part of the registration identity.
     scan_started_at = models.DateTimeField(null=True, blank=True)
-    capture_layout = models.CharField(
-        max_length=16,
-        choices=CaptureLayout.choices,
-        default=CaptureLayout.SINGLE_PAGE,
-    )
     operator = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1534,11 +1523,12 @@ class ScanTailorStageState(models.Model):
     """Per-page stage state for ScanTailor-Web processing."""
 
     class Stage(models.TextChoices):
-        PAGE_SPLIT = "page_split", "Page split"
+        # The five ScanTailor-Web stages in pipeline order (#195). The scanner delivers
+        # upright single pages, so there is no Fix Orientation and no Page Split stage.
         DESKEW = "deskew", "Deskew"
         SELECT_CONTENT = "select_content", "Select content"
-        MARGINS = "margins", "Margins"
         DEWARPING = "dewarping", "Dewarping"
+        MARGINS = "margins", "Margins"
         OUTPUT = "output", "Output/binarization"
 
     class StageStatus(models.TextChoices):

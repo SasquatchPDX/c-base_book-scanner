@@ -6,12 +6,10 @@ import {
   curvatureCurvesForEditing,
   initializeScanTailorWorkspace,
   outputZonesForEditing,
-  isAutoSkippedSplit,
   normalizeBox,
   previewErrorMessage,
   previousStageName,
   sourceBoxToDisplay,
-  SPLIT_MODES,
   stageErrorText,
   stageStatusLabel,
   stageStatusMessage,
@@ -286,7 +284,7 @@ describe("worker warnings", () => {
 
 describe("preview error messages", () => {
   it("never tells the first stage to run a preceding stage", () => {
-    const message = previewErrorMessage("page_split", {
+    const message = previewErrorMessage("deskew", {
       status: 404,
       body: "input preview not ready",
     });
@@ -296,11 +294,11 @@ describe("preview error messages", () => {
   });
 
   it("names the actual predecessor when the input preview is missing", () => {
-    expect(previewErrorMessage("dewarping", { status: 404, body: "input preview not ready" })).toBe(
-      "The input preview is not ready. Run the Margins stage first.",
+    expect(previewErrorMessage("margins", { status: 404, body: "input preview not ready" })).toBe(
+      "The input preview is not ready. Run the Dewarping stage first.",
     );
-    expect(previousStageName("page_split")).toBeNull();
-    expect(previousStageName("deskew")).toBe("page_split");
+    expect(previousStageName("deskew")).toBeNull();
+    expect(previousStageName("dewarping")).toBe("select_content");
   });
 
   it("distinguishes storage, artifact, network and other failures", () => {
@@ -336,13 +334,13 @@ describe("stage status presentation", () => {
     const invalidated = {
       status: "invalidated",
       revision: 3,
-      last_error: "page_split updated via batch",
-      invalidated_reason: "page_split updated via batch",
+      last_error: "deskew updated via batch",
+      invalidated_reason: "deskew updated via batch",
     };
 
     expect(stageErrorText(invalidated)).toBe("");
     expect(stageStatusMessage(invalidated)).toEqual({
-      text: "Revision 3 · invalidated (page_split updated via batch)",
+      text: "Revision 3 · invalidated (deskew updated via batch)",
       tone: "info",
     });
   });
@@ -366,23 +364,13 @@ describe("stage status presentation", () => {
   });
 });
 
-describe("single-page capture page split (#55)", () => {
-  it("labels an automatically skipped split and keeps other statuses", () => {
-    const skipped = {
-      status: "success",
-      revision: 2,
-      last_error: "",
-      auto_skipped: true,
-    };
-
-    expect(isAutoSkippedSplit(skipped)).toBe(true);
-    expect(stageStatusLabel(skipped)).toBe("skipped · single page");
-    expect(stageStatusMessage(skipped).text).toContain("skipped: single-page capture");
-    expect(stageStatusLabel({ status: "success", auto_skipped: false })).toBe("success");
-    expect(stageStatusLabel({ status: "queued" })).toBe("queued");
+describe("pipeline stages (#195)", () => {
+  it("runs the five stages in order with no Page Split or Fix Orientation", () => {
+    expect(STAGE_ORDER).toEqual(["deskew", "select_content", "dewarping", "margins", "output"]);
   });
 
-  it("offers the no-split mode alongside the splitting modes", () => {
-    expect(SPLIT_MODES).toEqual(["none", "auto", "manual", "single"]);
+  it("shows the plain status in the page list", () => {
+    expect(stageStatusLabel({ status: "success" })).toBe("success");
+    expect(stageStatusLabel({ status: "queued" })).toBe("queued");
   });
 });

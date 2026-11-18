@@ -23,11 +23,10 @@ async function signIn(context: BrowserContext, username: string): Promise<Page> 
 }
 
 const SCANTAILOR_STAGES = [
-  "page_split",
   "deskew",
   "select_content",
-  "margins",
   "dewarping",
+  "margins",
   "output",
 ] as const;
 
@@ -42,9 +41,7 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
     );
     await page.getByRole("button", { name: "Save and run" }).click();
     await expect((await queued).status()).toBe(202);
-    // New jobs are single-page captures, so Page Split completes as "no split" (#55).
-    const expected = stage === "page_split" ? "skipped · single page" : "success";
-    await expect(stageRow.locator("[data-stage-status]")).toHaveText(expected, {
+    await expect(stageRow.locator("[data-stage-status]")).toHaveText("success", {
       timeout: 30_000,
     });
   }
@@ -97,28 +94,28 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
 
     const firstControls = firstEditor.locator("[data-stage-controls]");
     const secondControls = secondEditor.locator("[data-stage-controls]");
-    // The upload already completed Page Split as a single-page passthrough (#55).
-    await expect(firstControls.getByLabel("Mode")).toHaveValue("none");
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("none");
+    // Deskew is the first stage (#195) and starts in auto mode for both editors.
+    await expect(firstControls.getByLabel("Mode")).toHaveValue("auto");
+    await expect(secondControls.getByLabel("Mode")).toHaveValue("auto");
 
-    await firstControls.getByLabel("Mode").selectOption("single");
+    await firstControls.getByLabel("Mode").selectOption("manual");
     const saved = firstEditor.waitForResponse(
-      (response) => response.request().method() === "POST" && /\/stages\/page_split\/$/.test(response.url()),
+      (response) => response.request().method() === "POST" && /\/stages\/deskew\/$/.test(response.url()),
     );
     await firstEditor.getByRole("button", { name: "Save and run" }).click();
     await expect((await saved).status()).toBe(202);
     await expect(firstEditor.locator("[data-editor-message]")).toContainText("Saved.");
 
-    await secondControls.getByLabel("Mode").selectOption("manual");
+    // The second editor still holds the old revision; saving it must not overwrite.
     const conflict = secondEditor.waitForResponse(
-      (response) => response.request().method() === "POST" && /\/stages\/page_split\/$/.test(response.url()),
+      (response) => response.request().method() === "POST" && /\/stages\/deskew\/$/.test(response.url()),
     );
     await secondEditor.getByRole("button", { name: "Save and run" }).click();
     await expect((await conflict).status()).toBe(409);
     await expect(secondEditor.locator("[data-editor-message]")).toContainText(
       "Conflict detected: another editor changed this stage",
     );
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("single");
+    await expect(secondControls.getByLabel("Mode")).toHaveValue("manual");
   } finally {
     await firstContext.close();
     await secondContext.close();
