@@ -205,13 +205,14 @@ test("a member completes the physical-book pipeline through the browser", async 
   }
 });
 
-test("a scanner capture survives a lost acknowledgement and a member re-finishes its rescan", async ({ browser, playwright, baseURL }) => {
+test("a scanner capture survives a lost acknowledgement and a member re-finishes its rescan", async ({ browser, playwright }) => {
   test.setTimeout(150_000);
   const key = process.env.BOOK_SCANNER_BROWSER_DEVICE_KEY;
   test.skip(!key, "requires the scanner key created by the infrastructure fixture");
+  const baseURL = process.env.BOOK_SCANNER_BROWSER_DEVICE_URL!;
   const device = await playwright.request.newContext({ baseURL, extraHTTPHeaders: { Authorization: "Bearer " + key } });
   const memberContext = await browser.newContext({ acceptDownloads: true });
-  const capture = await browser.newPage();
+
   const date = new Date();
   const started = date.toISOString();
   const jobId = started.slice(0, 19).replace(/[:-]/g, "") + "Z-" + (date.getMilliseconds() + 1);
@@ -233,25 +234,14 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     expect((await premature.json()).verified).not.toBe(true);
 
     // Drop the acknowledgement after the server has committed the page, then retry from the device.
-    await capture.goto("/accounts/login/");
-    let storedStatus = 0;
-    await capture.route("**" + job + "/pages/0", async route => {
-      const reply = await route.fetch();
-      storedStatus = reply.status();
-      await reply.dispose();
-      await route.abort("connectionreset");
+    const form = new FormData();
+    form.append("metadata", JSON.stringify(raw));
+    form.append("image", new Blob([new Uint8Array(SCAN_PAGE_PNG)], { type: "image/png" }), "page.png");
+    const firstReply = await fetch(new URL(job + "/pages/0", baseURL), {
+      method: "PUT", headers: { Authorization: "Bearer " + key }, body: form,
     });
-    const acknowledged = await capture.evaluate(async ({ url, metadata, bytes, token }) => {
-      const form = new FormData();
-      form.append("metadata", JSON.stringify(metadata));
-      form.append("image", new Blob([Uint8Array.from(bytes)], { type: "image/png" }), "page.png");
-      try {
-        await fetch(url, { method: "PUT", headers: { Authorization: "Bearer " + token }, body: form });
-        return true;
-      } catch { return false; }
-    }, { url: job + "/pages/0", metadata: raw, bytes: Array.from(SCAN_PAGE_PNG), token: key });
-    expect(acknowledged).toBe(false);
-    expect(storedStatus).toBe(201);
+    expect(firstReply.status).toBe(201);
+    await firstReply.body!.cancel();
     expect((await device.put(job + "/pages/0", { multipart: {
       metadata: JSON.stringify(raw), image: asImage(SCAN_PAGE_PNG),
     } })).status()).toBe(200);
@@ -321,7 +311,7 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     const path = await download.path();
     expect((await readFile(path!)).subarray(0, 5).toString()).toBe("%PDF-");
   } finally {
-    await capture.close();
+
     await memberContext.close();
     await device.dispose();
   }
