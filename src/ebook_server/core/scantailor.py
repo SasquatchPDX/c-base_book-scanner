@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import shutil
-import struct
 import tempfile
 import time
 import uuid
@@ -22,12 +19,12 @@ from django.conf import settings as django_settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import curvature, output_zones
+from . import curvature, output_zones, scan_images, scan_transform
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -36,6 +33,7 @@ from .models import (
     ScanTailorStageState,
     StorageLocation,
 )
+from .storage_registry import filesystem_backend_for_location
 
 logger = structlog.get_logger(__name__)
 
@@ -53,13 +51,16 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
 }
 
 DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
-    "deskew": "projection-v1",
-    "select_content": "projection-v1",
-    "margins": "padding-v1",
+    # v2 (#195 step 2): parameters + transform op, detection at working resolution.
+    "deskew": "projection-v2",
+    "select_content": "projection-v2",
+    "margins": "padding-v2",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
     # v3: auto mode derives the quad from the text lines.
-    "dewarping": "opencv-v3",
-    "output": "opencv-zones-v2",
+    # v4: transform op, detection at working resolution (#195 step 2).
+    "dewarping": "opencv-v4",
+    # v3: rendered once from the original through the composed transform.
+    "output": "opencv-zones-v3",
 }
 
 
@@ -129,10 +130,12 @@ def _compute_sha256(path: Path) -> str:
 
 
 def _build_output_name(state: ScanTailorStageState, *, preview: bool = False) -> str:
-    # Every stage writes PNG data regardless of the input format, so the artifact
-    # name must carry the extension of the format actually written.
-    del state
-    return "preview.png" if preview else "output.png"
+    # Stages 1-4 keep a lossless working-resolution image (the next stage's input) and
+    # a JPEG preview. Output keeps the full-resolution page and a PNG preview, so
+    # binarised text stays crisp.
+    if state.stage == ScanTailorStageState.Stage.OUTPUT.value:
+        return "preview.png" if preview else "output.png"
+    return "preview.jpg" if preview else "work.png"
 
 
 def _output_namespace(state: ScanTailorStageState) -> str:
@@ -147,16 +150,6 @@ def output_identifier(state: ScanTailorStageState, *, preview: bool = False) -> 
         _output_namespace(state),
         _build_output_name(state, preview=preview),
     )
-
-
-def _resolve_input_identifier(state: ScanTailorStageState) -> str:
-    if state.input_stage_state is not None:
-        return state.input_stage_state.output_storage_identifier
-    if state.input_scan_page_version is not None:
-        return state.input_scan_page_version.storage_identifier
-    if state.input_storage_identifier:
-        return state.input_storage_identifier
-    return ""
 
 
 def _coerce_int(value: object, default: int, *, minimum: int | None = None) -> int:
@@ -538,262 +531,81 @@ def _dpi_of(image: Image.Image) -> tuple[int, int]:
 
 
 def _save_png(image: Image.Image, path: Path, dpi: tuple[int, int]) -> None:
-    image.save(path, format="PNG", dpi=dpi)
+    # Level 1: several times faster than the default and only slightly larger.
+    image.save(path, format="PNG", dpi=dpi, compress_level=1)
 
 
-def _paper_fill(image: Image.Image) -> int | tuple[int, int, int]:
-    """Background colour for new pixels: bright paper level of the image itself."""
-    small = _thumbnail(image, size=300)
-    array = np.asarray(small)
-    if array.ndim == 2:
-        return int(np.percentile(array, 90))
-    levels = np.percentile(array.reshape(-1, array.shape[2]), 90, axis=0)
-    return (int(levels[0]), int(levels[1]), int(levels[2]))
+_paper_fill = scan_transform.paper_fill
 
 
-def _thumbnail(image: Image.Image, size: int = 1200) -> Image.Image:
-    if image.width <= size and image.height <= size:
-        return image
-    copy = image.copy()
-    copy.thumbnail((size, size))
-    return copy
-
-
-def _save_preview(source: Image.Image, preview_path: Path) -> None:
-    with source.copy() as preview_image:
-        preview_image = preview_image.convert("RGB")
-        preview_image = _thumbnail(preview_image, size=960)
-        preview_image.save(preview_path, format="PNG")
-
-
-_ORIENTATION_TAG: Final[int] = int(ExifTags.Base.Orientation)
-_TRANSPOSED_ORIENTATIONS: Final[frozenset[int]] = frozenset({5, 6, 7, 8})
-
-
-def _exif_orientation(image: Image.Image) -> int:
-    try:
-        value = image.getexif().get(_ORIENTATION_TAG, 1)
-    except (OSError, ValueError, SyntaxError):
-        return 1
-    return value if isinstance(value, int) else 1
-
-
-def _orientation_from_exif_bytes(data: bytes) -> int:
-    exif = Image.Exif()
-    try:
-        exif.load(data)
-        value = exif.get(_ORIENTATION_TAG, 1)
-    except (OSError, ValueError, SyntaxError, struct.error):
-        return 1
-    return value if isinstance(value, int) else 1
-
-
-_PNG_SIGNATURE: Final[bytes] = b"\x89PNG\r\n\x1a\n"
-# Upper bounds for the chunk walk; real pages have a few hundred IDAT chunks at most.
-_PNG_MAX_CHUNKS: Final[int] = 100_000
-_PNG_MAX_EXIF_BYTES: Final[int] = 1 << 20
-# Exactly the chunks ``_save_png`` writes for an 8-bit L/RGB image (pHYs carries DPI).
-# Anything else (gAMA, cHRM, sRGB, iCCP, eXIf, sBIT, tRNS, text, ...) either changes
-# rendering/metadata or is dropped by a re-encode, so it disqualifies a byte copy.
-_PNG_PASSTHROUGH_CHUNKS: Final[frozenset[bytes]] = frozenset({b"IHDR", b"pHYs", b"IDAT", b"IEND"})
+_thumbnail = scan_transform.thumbnail
 
 
 @dataclass(frozen=True)
-class _PngLayout:
-    width: int
-    height: int
-    bit_depth: int
-    colour_type: int
-    interlace: int
-    chunk_types: frozenset[bytes]
-    phys: tuple[int, int, int] | None
-    exif: bytes | None
+class StageInput:
+    """What a stage runs on (#195 step 2).
 
-
-def _read_png_layout(path: Path) -> _PngLayout | None:
-    """Walk the PNG chunk headers of ``path`` without decompressing any image data.
-
-    Only the IHDR, pHYs and eXIf payloads are read; every other chunk is skipped by
-    seeking. Returns None for anything that is not a structurally sane PNG.
+    ``image`` is the stage input at working resolution: the page's working image,
+    transformed by every upstream op. ``full_size`` is the same input at full
+    resolution, the coordinate space of the stage's parameters. ``render_full``
+    renders that full-resolution input from the untouched original; only the Output
+    stage calls it.
     """
-    ihdr: tuple[int, int, int, int, int] | None = None
-    phys: tuple[int, int, int] | None = None
-    exif: bytes | None = None
-    seen: set[bytes] = set()
-    try:
-        with path.open("rb") as handle:
-            if handle.read(len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
-                return None
-            file_size = os.fstat(handle.fileno()).st_size
-            for _ in range(_PNG_MAX_CHUNKS):
-                head = handle.read(8)
-                if len(head) != 8:
-                    return None
-                length, chunk_type = struct.unpack(">I4s", head)
-                if handle.tell() + length + 4 > file_size:
-                    return None
-                if not seen and chunk_type != b"IHDR":
-                    return None
-                if chunk_type == b"IHDR":
-                    if seen or length != 13:
-                        return None
-                    width, height, bit_depth, colour_type, _, _, interlace = struct.unpack(
-                        ">IIBBBBB", handle.read(13)
-                    )
-                    ihdr = (width, height, bit_depth, colour_type, interlace)
-                    handle.seek(4, os.SEEK_CUR)
-                elif chunk_type == b"pHYs" and length == 9:
-                    phys = struct.unpack(">IIB", handle.read(9))
-                    handle.seek(4, os.SEEK_CUR)
-                elif chunk_type == b"eXIf" and length <= _PNG_MAX_EXIF_BYTES:
-                    exif = handle.read(length)
-                    handle.seek(4, os.SEEK_CUR)
-                else:
-                    handle.seek(length + 4, os.SEEK_CUR)
-                seen.add(chunk_type)
-                if chunk_type == b"IEND":
-                    break
-            else:
-                return None
-    except (OSError, struct.error):
-        return None
-    if ihdr is None or b"IDAT" not in seen or ihdr[0] == 0 or ihdr[1] == 0:
-        return None
-    width, height, bit_depth, colour_type, interlace = ihdr
-    return _PngLayout(
-        width=width,
-        height=height,
-        bit_depth=bit_depth,
-        colour_type=colour_type,
-        interlace=interlace,
-        chunk_types=frozenset(seen),
-        phys=phys,
-        exif=exif,
-    )
+
+    image: Image.Image
+    full_size: tuple[int, int]
+    render_full: Callable[[], Image.Image]
+    dpi: tuple[int, int] = (DEFAULT_DPI, DEFAULT_DPI)
+
+    @property
+    def scale(self) -> tuple[float, float]:
+        return (self.image.width / self.full_size[0], self.image.height / self.full_size[1])
 
 
-def _phys_matches_encoder(phys: tuple[int, int, int] | None) -> bool:
-    """True when pHYs holds exactly what ``_save_png`` writes for the DPI it implies."""
-    if phys is None:
-        return False
-    x_ppm, y_ppm, unit = phys
-    if unit != 1:
-        return False
-    dpi = _sanitize_dpi((x_ppm * 0.0254, y_ppm * 0.0254))
-    if dpi is None:
-        return False
-    return (int(dpi[0] / 0.0254 + 0.5), int(dpi[1] / 0.0254 + 0.5)) == (x_ppm, y_ppm)
+@dataclass
+class StageResult:
+    """A stage's output: ``image`` at working resolution (Output: full resolution)."""
+
+    image: Image.Image
+    full_size: tuple[int, int]
+    parameters: dict[str, Any]
+    full_resolution: bool = False
 
 
-def _is_normalised_png(path: Path) -> bool:
-    """True when re-encoding ``path`` via ``_load_image``/``_save_png`` would change nothing.
-
-    That is a non-interlaced 8-bit greyscale or RGB PNG (IHDR bit depth 8, colour
-    type 0 or 2) whose only chunks are the ones ``_save_png`` itself writes (IHDR,
-    a pHYs with an in-range DPI, IDAT, IEND): exactly what every stage writes. Such
-    a file can be byte-copied as an unchanged stage output instead of being decoded
-    and re-encoded (#54). 16-bit, 1/2/4-bit, palette, alpha and interlaced files,
-    and files with colour-management, EXIF, transparency or text chunks, are not
-    eligible and take the normalising re-encode. Only chunk headers are read; no
-    image data is decompressed.
-    """
-    layout = _read_png_layout(path)
-    return (
-        layout is not None
-        and layout.bit_depth == 8
-        and layout.colour_type in {0, 2}
-        and layout.interlace == 0
-        and layout.chunk_types <= _PNG_PASSTHROUGH_CHUNKS
-        and _phys_matches_encoder(layout.phys)
-    )
+type StageRunner = Callable[[ScanTailorStageState, StageInput], StageResult]
 
 
-def _write_unchanged(
-    image: Image.Image,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> None:
-    """Persist ``image`` (the decoded, unmodified stage input) as this stage's output.
-
-    When the input file already is a normalised PNG its bytes are copied verbatim,
-    skipping the full-resolution PNG re-encode; the stage still gets its own output
-    artifact (identical bytes, so identical SHA-256) and preview. Anything else
-    (raw TIFF/JPEG uploads, 16-bit, palette, interlaced, alpha, EXIF/ICC/gamma
-    chunks, ...) is normalised by a re-encode as before.
-    """
-    if _is_normalised_png(source_path):
-        shutil.copyfile(source_path, output_path)
-    else:
-        _save_png(image, output_path, _dpi_of(image))
-    _save_preview(image, preview_path)
-
-
-def _passthrough(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
-    """Copy a stage input through unchanged (normalised PNG; byte copy when possible)."""
-    image = _load_image(source_path)
-    _write_unchanged(image, source_path, output_path, preview_path)
-    return {"algorithm": "copy"}
-
-
-def _copy_fallback(source_path: Path, output_path: Path, preview_path: Path) -> dict[str, Any]:
-    return _passthrough(source_path, output_path, preview_path)
-
-
-def _record_image_dimensions(
-    source_path: Path,
-    output_path: Path,
+def _transform_result(
     parameters: dict[str, Any],
-) -> dict[str, Any]:
-    """Record current input/output sizes; always overwrite so they never go stale."""
-    recorded = dict(parameters)
-    source_size = _oriented_size(source_path)
-    if source_size is not None:
-        recorded["input_width"], recorded["input_height"] = source_size
-    output_size = _oriented_size(output_path)
-    if output_size is not None:
-        recorded["output_width"], recorded["output_height"] = output_size
-    return recorded
+    stage_input: StageInput,
+    op: scan_transform.Op,
+    updates: dict[str, Any],
+) -> StageResult:
+    """Apply ``op`` at working resolution and record it with the stage's parameters."""
+    return StageResult(
+        image=scan_transform.apply(stage_input.image, op, stage_input.scale),
+        full_size=scan_transform.output_size(op, stage_input.full_size),
+        parameters=_as_recorded_parameters(parameters, {**updates, "transform": op}),
+    )
 
 
-def _oriented_size(path: Path) -> tuple[int, int] | None:
-    """Size ``_load_image`` would report, honouring EXIF orientation, without decoding.
-
-    For a PNG the size comes from IHDR and the orientation from its eXIf chunk (if
-    any), so nothing is decompressed; Pillow's ``PngImageFile.getexif()`` would
-    fully decode the image when there is no eXIf chunk. A PNG with an iTXt chunk may
-    carry an XMP orientation, so it goes through Pillow, like every other format
-    (whose EXIF Pillow reads from the header).
-    """
-    layout = _read_png_layout(path)
-    if layout is not None and b"iTXt" not in layout.chunk_types:
-        if (
-            Image.MAX_IMAGE_PIXELS is not None
-            and layout.width * layout.height > 2 * Image.MAX_IMAGE_PIXELS
-        ):
-            return None
-        orientation = _orientation_from_exif_bytes(layout.exif) if layout.exif else 1
-        if orientation in _TRANSPOSED_ORIENTATIONS:
-            return layout.height, layout.width
-        return layout.width, layout.height
-    try:
-        with Image.open(path) as opened:
-            width, height = opened.size
-            if _exif_orientation(opened) in _TRANSPOSED_ORIENTATIONS:
-                return height, width
-            return width, height
-    except (OSError, UnidentifiedImageError, ValueError, SyntaxError, Image.DecompressionBombError):
-        return None
+def _box_to_full(
+    box: tuple[int, int, int, int], stage_input: StageInput
+) -> tuple[int, int, int, int]:
+    """A working-resolution box in full-resolution coordinates, clamped to the input."""
+    sx, sy = stage_input.scale
+    width, height = stage_input.full_size
+    left = max(0, min(width - 1, int(box[0] / sx)))
+    top = max(0, min(height - 1, int(box[1] / sy)))
+    right = max(left + 1, min(width, ceil(box[2] / sx - 1e-6)))
+    bottom = max(top + 1, min(height, ceil(box[3] / sy - 1e-6)))
+    return left, top, right, bottom
 
 
-def _run_copy(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    del state
-    return _copy_fallback(source_path, output_path, preview_path)
+def _run_copy(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    return _transform_result(
+        dict(state.parameters or {}), stage_input, scan_transform.IDENTITY, {"algorithm": "copy"}
+    )
 
 
 def _candidate_angles(start: float, stop: float, step: float) -> list[float]:
@@ -876,89 +688,60 @@ def _estimate_deskew_angle(image: Image.Image, parameters: dict[str, Any]) -> fl
     return float(round(best_angle, 3))
 
 
-def _run_deskew(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    source = _load_image(source_path)
-
+def _run_deskew(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
     parameters = dict(state.parameters or {})
-
     manual = parameters.get("manual_angle")
     if manual is not None:
         angle = _coerce_float(manual, 0.0)
         mode = "manual"
     else:
-        angle = _estimate_deskew_angle(source, parameters)
+        angle = _estimate_deskew_angle(stage_input.image, parameters)
         mode = "auto"
-
-    if abs(angle) < 1e-9:
-        _write_unchanged(source, source_path, output_path, preview_path)
-    else:
-        output = source.rotate(
-            angle,
-            resample=Image.Resampling.BICUBIC,
-            expand=True,
-            fillcolor=_paper_fill(source),
-        )
-        _save_png(output, output_path, _dpi_of(source))
-        _save_preview(output, preview_path)
-
-    return _as_recorded_parameters(
+    return _transform_result(
         parameters,
-        {
-            "deskew_mode": mode,
-            "angle": angle,
-        },
+        stage_input,
+        scan_transform.rotate(angle),
+        {"deskew_mode": mode, "angle": angle},
     )
 
 
-def _run_select_content(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    source = _load_image(source_path)
-
+def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("content_mode", "auto")).strip().lower()
     if mode not in {"auto", "manual"}:
         mode = "auto"
     explicit_box = parameters.get("content_box")
+    full_width, full_height = stage_input.full_size
+    detected_box: tuple[int, int, int, int] | None = None
     if mode == "manual":
         detected_box = _coerce_box(
             {
-                "x1": parameters.get("x1"),
-                "y1": parameters.get("y1"),
-                "x2": parameters.get("x2"),
-                "y2": parameters.get("y2"),
-                "left": parameters.get("left"),
-                "top": parameters.get("top"),
-                "right": parameters.get("right"),
-                "bottom": parameters.get("bottom"),
-                "width": parameters.get("width"),
-                "height": parameters.get("height"),
+                key: parameters.get(key)
+                for key in (
+                    "x1",
+                    "y1",
+                    "x2",
+                    "y2",
+                    "left",
+                    "top",
+                    "right",
+                    "bottom",
+                    "width",
+                    "height",
+                )
             },
             explicit_box,
-            source.size,
+            stage_input.full_size,
         )
-    else:
-        detected_box = None
     if detected_box is None:
-        detected_box = _detect_content_box(source)
+        detected_box = _box_to_full(_detect_content_box(stage_input.image), stage_input)
         mode = "auto"
 
     left, top, right, bottom = detected_box
-    output = source.crop((left, top, right, bottom))
-    with output as out:
-        _save_png(out, output_path, _dpi_of(source))
-        _save_preview(out, preview_path)
-
-    return _as_recorded_parameters(
+    return _transform_result(
         parameters,
+        stage_input,
+        scan_transform.crop(detected_box, stage_input.full_size),
         {
             "content_mode": mode,
             "content_box": {
@@ -971,8 +754,8 @@ def _run_select_content(
             },
             "content_area_width": right - left,
             "content_area_height": bottom - top,
-            "source_width": source.width,
-            "source_height": source.height,
+            "source_width": full_width,
+            "source_height": full_height,
         },
     )
 
@@ -1109,13 +892,8 @@ def _detect_content_box(image: Image.Image) -> tuple[int, int, int, int]:
     return (left, top, right, bottom)
 
 
-def _run_margins(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    source = _load_image(source_path)
+def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    source_width, source_height = stage_input.full_size
 
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("margins_mode", "auto")).strip().lower()
@@ -1128,57 +906,24 @@ def _run_margins(
     bottom = _coerce_int(parameters.get("bottom"), default_margin, minimum=0)
     left = _coerce_int(parameters.get("left"), default_margin, minimum=0)
 
-    if default_margin:
-        if top == default_margin:
-            top = default_margin
-        if right == default_margin:
-            right = default_margin
-        if bottom == default_margin:
-            bottom = default_margin
-        if left == default_margin:
-            left = default_margin
-
-    requested_width = _coerce_int(parameters.get("canvas_width"), source.width + left + right)
-    requested_height = _coerce_int(parameters.get("canvas_height"), source.height + top + bottom)
-
-    target_w = max(requested_width, source.width + left + right)
-    target_h = max(requested_height, source.height + top + bottom)
+    requested_width = _coerce_int(parameters.get("canvas_width"), source_width + left + right)
+    requested_height = _coerce_int(parameters.get("canvas_height"), source_height + top + bottom)
+    target_w = max(requested_width, source_width + left + right)
+    target_h = max(requested_height, source_height + top + bottom)
 
     align_x = str(parameters.get("align_x", "center")).strip().lower()
     align_y = str(parameters.get("align_y", "center")).strip().lower()
+    spare_x = max(0, target_w - (source_width + left + right))
+    spare_y = max(0, target_h - (source_height + top + bottom))
+    extra_x = 0 if align_x == "left" else spare_x if align_x == "right" else spare_x // 2
+    extra_y = 0 if align_y == "top" else spare_y if align_y == "bottom" else spare_y // 2
 
-    # The loader guarantees L or RGB; pad with the page's own paper colour.
-    fill = _paper_fill(source)
-    canvas = Image.new(source.mode, (target_w, target_h), fill)
-
-    spare_x = max(0, target_w - (source.width + left + right))
-    spare_y = max(0, target_h - (source.height + top + bottom))
-    if spare_x < 0 or spare_y < 0:
-        spare_x = max(0, spare_x)
-        spare_y = max(0, spare_y)
-
-    if align_x == "left":
-        extra_x = 0
-    elif align_x == "right":
-        extra_x = spare_x
-    else:
-        extra_x = spare_x // 2
-
-    if align_y == "top":
-        extra_y = 0
-    elif align_y == "bottom":
-        extra_y = spare_y
-    else:
-        extra_y = spare_y // 2
-
-    offset_x = left + extra_x
-    offset_y = top + extra_y
-    canvas.paste(source, (offset_x, offset_y))
-    _save_png(canvas, output_path, _dpi_of(source))
-    _save_preview(canvas, preview_path)
-
-    return _as_recorded_parameters(
+    return _transform_result(
         parameters,
+        stage_input,
+        scan_transform.pad(
+            (left + extra_x, top + extra_y), (target_w, target_h), stage_input.full_size
+        ),
         {
             "margins_mode": mode,
             "margin_top": top,
@@ -1754,71 +1499,47 @@ def _dewarp_result(applied: str, **fields: Any) -> dict[str, Any]:
 
 
 def _dewarp_passthrough(
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-    **fields: Any,
-) -> dict[str, Any]:
-    _copy_fallback(source_path, output_path, preview_path)
-    return _dewarp_result("passthrough", **fields)
+    parameters: dict[str, Any], stage_input: StageInput, **fields: Any
+) -> StageResult:
+    """Keep the page as it is (identity op) and say why in the dewarping result keys."""
+    return _transform_result(
+        parameters, stage_input, scan_transform.IDENTITY, _dewarp_result("passthrough", **fields)
+    )
 
 
-def _run_perspective_dewarp(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
+def _run_perspective_dewarp(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("dewarp_mode", "auto")).strip().lower()
     if mode not in {"auto", "manual", "bypass"}:
         mode = "auto"
-
     if mode == "bypass":
-        return _dewarp_passthrough(source_path, output_path, preview_path, dewarp_mode="bypass")
+        return _dewarp_passthrough(parameters, stage_input, dewarp_mode="bypass")
 
-    source = _load_image(source_path)
-
-    if cv2 is None or np is None:
-        if mode == "manual":
-            resolved_points = _coerce_dewarp_points(parameters.get("dewarp_points"), source.size)
-            fields: dict[str, Any] = {"dewarp_mode": "manual"}
-            if resolved_points is not None:
-                fields["dewarp_source_points"] = _ordered_quad_points(resolved_points)
-                fields["dewarp_warning"] = "missing_library_fallback"
-            return _dewarp_passthrough(source_path, output_path, preview_path, **fields)
-        return _dewarp_passthrough(
-            source_path, output_path, preview_path, dewarp_mode="missing_library_fallback"
-        )
-
-    manual_points = _coerce_dewarp_points(
-        parameters.get("dewarp_points"),
-        source.size,
-    )
-
+    full_size = stage_input.full_size
+    manual_points = _coerce_dewarp_points(parameters.get("dewarp_points"), full_size)
     source_quad: Quad
     detection = "manual"
     recorded_mode = "manual" if mode == "manual" else "auto"
     if mode == "manual" and manual_points is not None:
         source_quad = _ordered_quad_points(manual_points)
     else:
-        detected = _auto_dewarp_points(source)
+        detected = _auto_dewarp_points(stage_input.image)
         if detected is None:
             return _dewarp_passthrough(
-                source_path,
-                output_path,
-                preview_path,
+                parameters,
+                stage_input,
                 dewarp_mode="auto_fallback",
                 dewarp_detection="none",
                 dewarp_warning="auto_detection_found_no_text_lines_or_page_outline",
             )
-        source_quad, detection = detected
-        if _dewarp_correction_is_negligible(source_quad, source.size):
+        work_quad, detection = detected
+        sx, sy = stage_input.scale
+        source_quad = _ordered_quad_points([(round(x / sx), round(y / sy)) for x, y in work_quad])
+        if _dewarp_correction_is_negligible(source_quad, full_size):
             # Already upright: don't resample (and soften) the page for nothing.
             return _dewarp_passthrough(
-                source_path,
-                output_path,
-                preview_path,
+                parameters,
+                stage_input,
                 dewarp_mode="auto",
                 dewarp_detection=detection,
                 dewarp_source_points=source_quad,
@@ -1827,35 +1548,36 @@ def _run_perspective_dewarp(
             )
 
     try:
-        geometry = _dewarp_output_geometry(source_quad, source.size)
-        if geometry.rejection:
-            # Near-degenerate quad: rendering would allocate a huge canvas of mostly
-            # extrapolated (or mirrored) pixels. Keep the page as it is instead.
-            return _dewarp_passthrough(
-                source_path,
-                output_path,
-                preview_path,
-                dewarp_mode=recorded_mode,
-                dewarp_detection=detection,
-                dewarp_source_points=source_quad,
-                dewarp_canvas_clipped=geometry.clipped,
-                dewarp_correction="rejected_degenerate_quad",
-                dewarp_warning=geometry.rejection,
-            )
-        src = np.array(source.convert("RGB"))
-        paper = _paper_fill(source.convert("RGB"))
-        warped = cv2.warpPerspective(
-            src,
-            geometry.matrix,
-            (geometry.canvas_width, geometry.canvas_height),
-            flags=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=paper,
+        geometry = _dewarp_output_geometry(source_quad, full_size)
+    except Exception as exc:  # pragma: no cover - geometry failures
+        return _dewarp_passthrough(
+            parameters,
+            stage_input,
+            dewarp_mode="processing_error_fallback",
+            dewarp_source_points=source_quad,
+            dewarp_detection=detection,
+            dewarp_error=str(exc),
         )
-        output = Image.fromarray(warped)
-        _save_png(output, output_path, _dpi_of(source))
-        _save_preview(output, preview_path)
-        return _dewarp_result(
+    if geometry.rejection:
+        # Near-degenerate quad: rendering would allocate a huge canvas of mostly
+        # extrapolated (or mirrored) pixels. Keep the page as it is instead.
+        return _dewarp_passthrough(
+            parameters,
+            stage_input,
+            dewarp_mode=recorded_mode,
+            dewarp_detection=detection,
+            dewarp_source_points=source_quad,
+            dewarp_canvas_clipped=geometry.clipped,
+            dewarp_correction="rejected_degenerate_quad",
+            dewarp_warning=geometry.rejection,
+        )
+    return _transform_result(
+        parameters,
+        stage_input,
+        scan_transform.perspective(
+            geometry.matrix, (geometry.canvas_width, geometry.canvas_height)
+        ),
+        _dewarp_result(
             "perspective",
             dewarp_mode=recorded_mode,
             dewarp_source_points=source_quad,
@@ -1868,111 +1590,76 @@ def _run_perspective_dewarp(
             dewarp_detection=detection,
             dewarp_correction="applied",
             dewarp_warning="",
-        )
-    except Exception as exc:  # pragma: no cover - geometry failures
-        return _dewarp_passthrough(
-            source_path,
-            output_path,
-            preview_path,
-            dewarp_mode="processing_error_fallback",
-            dewarp_source_points=source_quad,
-            dewarp_detection=detection,
-            dewarp_error=str(exc),
-        )
+        ),
+    )
 
 
-def _curvature_passthrough(
-    source: Image.Image,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-    **metadata: Any,
-) -> dict[str, Any]:
-    # Same normalized/byte-copy contract as perspective bypass, without decoding
-    # twice or making several full-resolution copies merely to write a preview.
-    if _is_normalised_png(source_path):
-        shutil.copyfile(source_path, output_path)
-    else:
-        _save_png(source, output_path, _dpi_of(source))
-    _save_preview(curvature.reduced_image(source, 960), preview_path)
-    return _dewarp_result("passthrough", **metadata)
+def _scale_curves(curves: list[list[list[float]]], sx: float, sy: float) -> list[list[list[float]]]:
+    """Scale pixel-centre curve coordinates by ``sx``, ``sy`` (see scan_transform)."""
+    return [[[(x + 0.5) * sx - 0.5, (y + 0.5) * sy - 0.5] for x, y in curve] for curve in curves]
 
 
-def _run_curvature_dewarp(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
+def _run_curvature_dewarp(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("dewarp_mode", "auto")).strip().lower()
     if mode not in {"auto", "manual", "bypass"}:
         mode = "auto"
-    source = _load_image(source_path)
     if mode == "bypass":
-        return _curvature_passthrough(
-            source,
-            source_path,
-            output_path,
-            preview_path,
-            dewarp_mode="bypass",
-            dewarp_model="curvature",
+        return _dewarp_passthrough(
+            parameters, stage_input, dewarp_mode="bypass", dewarp_model="curvature"
         )
+    full_size = stage_input.full_size
     try:
-        if cv2 is None or np is None:
-            raise RuntimeError("curvature library unavailable")
-        curves = (
-            curvature.normalize_curves(parameters.get("dewarp_curves"), source.size)
-            if mode == "manual"
-            else curvature.detect_curves(source)
-        )
-        output, geometry = curvature.render(
-            source, curves, _paper_fill(curvature.reduced_image(source, 300))
-        )
-        metadata = dict(
-            dewarp_mode=mode,
-            dewarp_model="curvature",
-            curvature_curves=curves,
-            curvature_model_version=curvature.VERSION,
-            dewarp_warning="",
-            **geometry,
-        )
-        if geometry["dewarp_correction"] == "none_needed":
-            del output
-            return _curvature_passthrough(
-                source, source_path, output_path, preview_path, **metadata
-            )
-        _save_png(output, output_path, _dpi_of(source))
-        _save_preview(curvature.reduced_image(output, 960), preview_path)
-        return _dewarp_result("curvature", **metadata)
+        if mode == "manual":
+            proposed = parameters.get("dewarp_curves")
+        else:
+            sx, sy = stage_input.scale
+            detected = curvature.detect_curves(stage_input.image)
+            proposed = _scale_curves(detected, 1.0 / sx, 1.0 / sy)
+            # Scaling back to full resolution may round a point onto the far edge.
+            proposed = [
+                [
+                    [min(max(x, 0.0), full_size[0] - 1.0), min(max(y, 0.0), full_size[1] - 1.0)]
+                    for x, y in curve
+                ]
+                for curve in proposed
+            ]
+        curves, padding, maximum = curvature.measure(proposed, full_size)
     except Exception as exc:
-        return _curvature_passthrough(
-            source,
-            source_path,
-            output_path,
-            preview_path,
+        return _dewarp_passthrough(
+            parameters,
+            stage_input,
             dewarp_model="curvature",
             dewarp_mode=mode,
             dewarp_warning=f"Curvature correction was not applied: {exc}",
             dewarp_correction="curvature_fallback",
             curvature_model_version=curvature.VERSION,
         )
-
-
-def _run_dewarping(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    if (state.parameters or {}).get("dewarp_model") == "curvature":
-        return _run_curvature_dewarp(state, source_path, output_path, preview_path)
-    return _run_perspective_dewarp(
-        state,
-        source_path,
-        output_path,
-        preview_path,
+    metadata: dict[str, Any] = {
+        "dewarp_mode": mode,
+        "dewarp_model": "curvature",
+        "curvature_curves": curves,
+        "curvature_model_version": curvature.VERSION,
+        "curvature_max_displacement": maximum,
+        "curvature_padding": padding,
+        "dewarp_warning": "",
+    }
+    if padding == 0:
+        return _dewarp_passthrough(
+            parameters, stage_input, dewarp_correction="none_needed", **metadata
+        )
+    return _transform_result(
+        parameters,
+        stage_input,
+        scan_transform.curvature_op(curves, padding),
+        _dewarp_result("curvature", dewarp_correction="applied", **metadata),
     )
+
+
+def _run_dewarping(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    if (state.parameters or {}).get("dewarp_model") == "curvature":
+        return _run_curvature_dewarp(state, stage_input)
+    return _run_perspective_dewarp(state, stage_input)
 
 
 def _coerce_output_mode(value: object, default: str = "otsu") -> str:
@@ -2212,28 +1899,37 @@ def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any])
     return result
 
 
-def _run_output(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    source = _load_image(source_path)
+def _zones_to_full(zones: list[dict[str, Any]], stage_input: StageInput) -> list[dict[str, Any]]:
+    """Auto-detected zones are found at working resolution; store them at full."""
+    scaled = []
+    for zone in zones:
+        box = _box_to_full(tuple(int(value) for value in zone["box"]), stage_input)  # type: ignore[arg-type]
+        scaled.append({**zone, "box": list(box)})
+    return scaled
+
+
+def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    """Render the page once at full resolution from the original, then binarise it."""
     parameters = dict(state.parameters or {})
     mode = _coerce_output_mode(parameters.get("output_mode"), default="otsu")
     zone_mode = str(parameters.get("zone_mode", "auto")).strip().lower()
     if zone_mode not in {"auto", "manual", "off"}:
         zone_mode = "auto"
+    full_width, full_height = stage_input.full_size
     if mode == "copy":
-        _copy_fallback(source_path, output_path, preview_path)
-        return {
-            "output_mode": "copy",
-            "output_applied": "copy",
-            "output_width": source.width,
-            "output_height": source.height,
-            "resolved_zones": [],
-            "output_warning": "",
-        }
+        return StageResult(
+            image=stage_input.render_full(),
+            full_size=stage_input.full_size,
+            full_resolution=True,
+            parameters={
+                "output_mode": "copy",
+                "output_applied": "copy",
+                "output_width": full_width,
+                "output_height": full_height,
+                "resolved_zones": [],
+                "output_warning": "",
+            },
+        )
     text_algorithm = _coerce_output_mode(parameters.get("text_algorithm"), default="sauvola")
     picture_algorithm = _coerce_output_mode(parameters.get("picture_algorithm"), default="copy")
     keep_color = _coerce_bool(parameters.get("keep_color"), False)
@@ -2241,11 +1937,10 @@ def _run_output(
         picture_algorithm = "copy"
     zones: list[dict[str, Any]] = []
     warning = None
+    source = stage_input.render_full()
     try:
-        if cv2 is None or np is None:
-            raise RuntimeError("opencv missing")
         if zone_mode == "auto":
-            zones = output_zones.detect_zones(source)
+            zones = _zones_to_full(output_zones.detect_zones(stage_input.image), stage_input)
         elif zone_mode == "manual":
             zones = _output_zones(parameters, source.size)
         # With Keep color, unclassified areas remain source pixels too; only
@@ -2275,8 +1970,6 @@ def _run_output(
         warning = str(exc)
         result = source.copy()
         applied = "copy_fallback"
-    _save_png(result, output_path, _dpi_of(source))
-    _save_preview(result, preview_path)
     payload: dict[str, Any] = {
         "output_mode": mode,
         "output_applied": applied,
@@ -2296,26 +1989,12 @@ def _run_output(
                 payload[f"{kind}_box"] = list(legacy_box)
     else:
         payload["zones"] = []
-    if warning is not None:
-        payload["output_warning"] = warning
-    return payload
+    return StageResult(
+        image=result, full_size=source.size, parameters=payload, full_resolution=True
+    )
 
 
-_STAGE_RUNNERS: dict[
-    str,
-    dict[
-        str,
-        Callable[
-            [
-                ScanTailorStageState,
-                Path,
-                Path,
-                Path,
-            ],
-            dict[str, Any],
-        ],
-    ],
-] = {
+_STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
     ScanTailorStageState.Stage.DESKEW.value: {
         "copy": _run_copy,
         "projection_deskew": _run_deskew,
@@ -2352,17 +2031,7 @@ _STAGE_RUNNERS: dict[
 }
 
 
-def _resolve_stage_algorithm(
-    state: ScanTailorStageState,
-) -> Callable[
-    [
-        ScanTailorStageState,
-        Path,
-        Path,
-        Path,
-    ],
-    dict[str, Any],
-]:
+def _resolve_stage_algorithm(state: ScanTailorStageState) -> StageRunner:
     stage_algorithms = _STAGE_RUNNERS.get(state.stage, {})
     algorithm = (state.algorithm or "").strip()
     runner = stage_algorithms.get(algorithm)
@@ -2460,6 +2129,95 @@ def stage_job_payload(job: ProcessingJob) -> dict[str, Any]:
     }
 
 
+def _upstream_chain(state: ScanTailorStageState) -> list[ScanTailorStageState]:
+    """The stages feeding ``state``, first stage first."""
+    chain: list[ScanTailorStageState] = []
+    current = state.input_stage_state
+    while current is not None and len(chain) < len(stage_order()):
+        chain.append(current)
+        current = current.input_stage_state
+    chain.reverse()
+    return chain
+
+
+def _page_version(
+    state: ScanTailorStageState, chain: list[ScanTailorStageState]
+) -> ScanPageVersion:
+    first = chain[0] if chain else state
+    version = first.input_scan_page_version or state.scan_page.active_version()
+    if version is None:
+        raise RuntimeError("missing source artifact: the page has no active version")
+    return version
+
+
+def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -> StageInput:
+    """The working-resolution input of ``state`` plus a full-resolution renderer.
+
+    Stage 1 reads the page's working image; every later stage reads its predecessor's
+    working-resolution output. ``render_full`` composes every upstream op on the
+    untouched original, which only the Output stage needs.
+    """
+    chain = _upstream_chain(state)
+    version = _page_version(state, chain)
+    page_image = scan_images.ensure_page_image(version)
+    ops: list[scan_transform.Op] = []
+    if not chain:
+        work_identifier = page_image.work_storage_identifier
+        full_size = (page_image.full_width, page_image.full_height)
+    else:
+        for upstream in chain:
+            op = (upstream.parameters or {}).get("transform")
+            if not isinstance(op, dict):
+                raise RuntimeError(
+                    f"upstream stage {upstream.stage} has no recorded transform; re-run it"
+                )
+            ops.append(op)
+        predecessor = chain[-1]
+        work_identifier = predecessor.output_storage_identifier
+        parameters = predecessor.parameters or {}
+        try:
+            full_size = (int(parameters["output_width"]), int(parameters["output_height"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"upstream stage {predecessor.stage} has no recorded size; re-run it"
+            ) from exc
+    if not work_identifier:
+        raise RuntimeError("missing source artifact")
+    work_path = storage.resolve_location(work_identifier)
+    if not work_path.exists():
+        raise RuntimeError(f"source missing: {work_identifier}")
+
+    def render_full() -> Image.Image:
+        original_path = filesystem_backend_for_location(version.storage_location).resolve_location(
+            version.storage_identifier
+        )
+        original = _load_image(original_path)
+        return scan_transform.apply_chain(original, ops, original.size)
+
+    return StageInput(
+        image=_load_image(work_path),
+        full_size=full_size,
+        render_full=render_full,
+        dpi=(page_image.dpi_x, page_image.dpi_y),
+    )
+
+
+def _write_stage_artifacts(
+    result: StageResult, stage_input: StageInput, output: Path, preview: Path
+) -> None:
+    if result.full_resolution:
+        _save_png(result.image, output, stage_input.dpi)
+        sx, sy = stage_input.scale
+        preview_size = (
+            max(1, round(result.image.width * sx)),
+            max(1, round(result.image.height * sy)),
+        )
+        scan_images.save_work_png(scan_images.downscale(result.image, preview_size), preview)
+        return
+    scan_images.save_work_png(result.image, output)
+    scan_images.save_preview_jpeg(result.image, preview)
+
+
 def process_stage_job(job_id: str) -> None:
     try:
         job = ProcessingJob.objects.select_related("file_variant").get(job_id=job_id)
@@ -2528,14 +2286,7 @@ def process_stage_job(job_id: str) -> None:
     )
 
     try:
-        source_identifier = _resolve_input_identifier(state)
-        if not source_identifier:
-            raise RuntimeError("missing source artifact")
         storage = _scan_storage()
-        source_path = storage.resolve_location(source_identifier)
-        if not source_path.exists():
-            raise RuntimeError(f"source missing: {source_identifier}")
-
         storage_location = _scan_storage_location()
         artifact_identifier = output_identifier(state)
         preview_identifier = output_identifier(state, preview=True)
@@ -2543,28 +2294,26 @@ def process_stage_job(job_id: str) -> None:
         runner = _resolve_stage_algorithm(state)
         # Per-phase timings for the structured log (#195 section 8.3).
         timer_start = time.perf_counter()
+        stage_input = _stage_input(state, storage)
+        input_done = time.perf_counter()
+        result = runner(state, stage_input)
+        run_done = time.perf_counter()
         with tempfile.TemporaryDirectory(prefix="stages-") as tempdir:
-            staged_output = Path(tempdir) / "output.png"
-            staged_preview = Path(tempdir) / "preview.png"
-            output_updates = runner(
-                state,
-                source_path,
-                staged_output,
-                staged_preview,
+            staged_output = Path(tempdir) / _build_output_name(state)
+            staged_preview = Path(tempdir) / _build_output_name(state, preview=True)
+            _write_stage_artifacts(result, stage_input, staged_output, staged_preview)
+            encode_done = time.perf_counter()
+            merged = dict(state.parameters or {})
+            merged.update(result.parameters)
+            merged.update(
+                {
+                    "input_width": stage_input.full_size[0],
+                    "input_height": stage_input.full_size[1],
+                    "output_width": result.full_size[0],
+                    "output_height": result.full_size[1],
+                }
             )
-            run_done = time.perf_counter()
-            if not staged_output.exists() or not staged_preview.exists():
-                raise RuntimeError("processing did not produce expected outputs")
-            output_params = output_updates if isinstance(output_updates, dict) else {}
-            output_params = _record_image_dimensions(
-                source_path,
-                staged_output,
-                output_params,
-            )
-            if output_params:
-                merged = dict(state.parameters or {})
-                merged.update(output_params)
-                state.parameters = merged
+            state.parameters = merged
             output_size = staged_output.stat().st_size
             output_sha = _compute_sha256(staged_output)
             hash_done = time.perf_counter()
@@ -2601,8 +2350,10 @@ def process_stage_job(job_id: str) -> None:
             stage=state.stage,
             output_size_bytes=output_size,
             duration_ms=round((time.perf_counter() - timer_start) * 1000, 1),
-            run_ms=round((run_done - timer_start) * 1000, 1),
-            hash_ms=round((hash_done - run_done) * 1000, 1),
+            input_ms=round((input_done - timer_start) * 1000, 1),
+            run_ms=round((run_done - input_done) * 1000, 1),
+            encode_ms=round((encode_done - run_done) * 1000, 1),
+            hash_ms=round((hash_done - encode_done) * 1000, 1),
             store_db_ms=round((publish_done - hash_done) * 1000, 1),
         )
     except Exception as exc:

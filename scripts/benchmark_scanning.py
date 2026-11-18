@@ -1,13 +1,14 @@
 """Benchmark the ScanTailor-Web stage pipeline (#195, section 8).
 
-Runs every stage runner of ``core.scantailor`` in pipeline order (Deskew, Select
-Content, Dewarping, Margins, Output) on a set of page images, without a database or a
-queue. Each stage reads the previous stage's output file, as the worker does. The per
-stage time is split into phases by wrapping the shared helpers:
+Runs the pipeline as the worker does, without a database or a queue: first the
+upload-time ``page_image`` step (decode the scan once, write the working image and
+thumbnail), then every stage runner of ``core.scantailor`` in pipeline order (Deskew,
+Select Content, Dewarping, Margins, Output). Stages 1-4 read and write working-resolution
+images and record a transform op; Output renders the original once through the
+composed ops. Each step's time is split into phases by wrapping the shared helpers:
 
-- ``decode``: ``_load_image`` (full decode, EXIF transpose, mode normalisation);
-- ``encode``: ``_save_png`` of the full-resolution intermediate;
-- ``preview``: ``_save_preview`` (copy, resize and a second PNG);
+- ``decode``: ``_load_image`` (decode, EXIF transpose, mode normalisation);
+- ``encode``: writing the stage's artifact and preview;
 - ``hash``: SHA-256 of the output, as ``process_stage_job`` does before publishing;
 - ``compute``: the rest (detection and pixel work).
 
@@ -40,7 +41,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-PHASES = ("decode", "encode", "preview", "hash", "compute")
+PHASES = ("decode", "encode", "hash", "compute")
 
 
 def _setup_django() -> None:
@@ -94,19 +95,22 @@ def _phase_timers(scantailor: Any, totals: dict[str, float]) -> Iterator[None]:
 
         return wrapper
 
-    originals = {
-        "_load_image": scantailor._load_image,
-        "_save_png": scantailor._save_png,
-        "_save_preview": scantailor._save_preview,
-    }
-    scantailor._load_image = timed("decode", originals["_load_image"])
-    scantailor._save_png = timed("encode", originals["_save_png"])
-    scantailor._save_preview = timed("preview", originals["_save_preview"])
+    from ebook_server.core import scan_images
+
+    patched = [
+        (scantailor, "_load_image", "decode"),
+        (scantailor, "_save_png", "encode"),
+        (scan_images, "save_work_png", "encode"),
+        (scan_images, "save_preview_jpeg", "encode"),
+    ]
+    originals = [(module, name, getattr(module, name)) for module, name, _ in patched]
+    for module, name, phase in patched:
+        setattr(module, name, timed(phase, getattr(module, name)))
     try:
         yield
     finally:
-        for name, function in originals.items():
-            setattr(scantailor, name, function)
+        for module, name, function in originals:
+            setattr(module, name, function)
 
 
 def _sha256(path: Path) -> None:
@@ -116,36 +120,76 @@ def _sha256(path: Path) -> None:
             digest.update(chunk)
 
 
-def run(pages: list[Path], workdir: Path) -> dict[str, Any]:
-    from ebook_server.core import scantailor
+def _benchmark_page(page: Path, prefix: str, timed_step: Callable[..., None]) -> None:
+    """Time the page-image step and every stage of one page (see the module docstring)."""
+    from ebook_server.core import scan_images, scan_transform, scantailor
     from ebook_server.core.models import ScanTailorStageState
 
-    stages = scantailor.stage_order()
+    context: dict[str, Any] = {"ops": []}
+
+    def page_image() -> Path:
+        # What scan_images.ensure_page_image does once per uploaded version.
+        image = scantailor._load_image(page)
+        dpi = scantailor._dpi_of(image)
+        work = scan_images.downscale(image, scan_images.work_size(image.size, dpi))
+        path = Path(f"{prefix}-work.png")
+        scan_images.save_work_png(work, path)
+        scan_images.save_preview_jpeg(scantailor._thumbnail(work, 400), Path(f"{prefix}-t.jpg"))
+        context.update(work=path, full_size=image.size, dpi=dpi)
+        return path
+
+    def render_full() -> Any:
+        original = scantailor._load_image(page)
+        return scan_transform.apply_chain(original, list(context["ops"]), original.size)
+
+    def stage_step(stage: str) -> Path:
+        algorithm = scantailor.DEFAULT_STAGE_ALGORITHM[stage]
+        runner = scantailor._STAGE_RUNNERS[stage][algorithm]
+        state = ScanTailorStageState(stage=stage, parameters={}, algorithm=algorithm)
+        stage_input = scantailor.StageInput(
+            image=scantailor._load_image(context["work"]),
+            full_size=context["full_size"],
+            render_full=render_full,
+            dpi=context["dpi"],
+        )
+        result = runner(state, stage_input)
+        output = Path(f"{prefix}-{stage}.png")
+        scantailor._write_stage_artifacts(
+            result, stage_input, output, Path(f"{prefix}-{stage}-preview")
+        )
+        if "transform" in result.parameters:
+            context["ops"].append(result.parameters["transform"])
+        context.update(work=output, full_size=result.full_size)
+        return output
+
+    timed_step("page_image", page_image)
+    for stage in scantailor.stage_order():
+        timed_step(stage, stage_step, stage)
+
+
+def run(pages: list[Path], workdir: Path) -> dict[str, Any]:
+    from ebook_server.core import scantailor
+
     per_stage: dict[str, list[dict[str, float]]] = defaultdict(list)
     failures: list[str] = []
+
+    def timed_step(name: str, step: Callable[..., Path], *args: Any) -> None:
+        totals: dict[str, float] = defaultdict(float)
+        started = time.perf_counter()
+        with _phase_timers(scantailor, totals):
+            output = step(*args)
+        hash_started = time.perf_counter()
+        _sha256(output)
+        totals["hash"] = time.perf_counter() - hash_started
+        total = time.perf_counter() - started
+        totals["compute"] = max(0.0, total - sum(totals[p] for p in PHASES if p != "compute"))
+        per_stage[name].append({"total": total, **{p: totals[p] for p in PHASES}})
+
     for page_index, page in enumerate(pages):
-        source = page
-        for stage in stages:
-            algorithm = scantailor.DEFAULT_STAGE_ALGORITHM[stage]
-            runner = scantailor._STAGE_RUNNERS[stage][algorithm]
-            state = ScanTailorStageState(stage=stage, parameters={}, algorithm=algorithm)
-            output = workdir / f"{page_index:04d}-{stage}.png"
-            preview = workdir / f"{page_index:04d}-{stage}-preview.png"
-            totals: dict[str, float] = defaultdict(float)
-            started = time.perf_counter()
-            try:
-                with _phase_timers(scantailor, totals):
-                    runner(state, source, output, preview)
-                hash_started = time.perf_counter()
-                _sha256(output)
-                totals["hash"] = time.perf_counter() - hash_started
-            except Exception as exc:  # report and continue with the next page
-                failures.append(f"{page.name} {stage}: {exc}")
-                break
-            total = time.perf_counter() - started
-            totals["compute"] = max(0.0, total - sum(totals[p] for p in PHASES if p != "compute"))
-            per_stage[stage].append({"total": total, **{p: totals[p] for p in PHASES}})
-            source = output
+        try:
+            _benchmark_page(page, str(workdir / f"{page_index:04d}"), timed_step)
+        except Exception as exc:  # report and continue with the next page
+            failures.append(f"{page.name}: {exc}")
     return {"stages": per_stage, "failures": failures}
 
 

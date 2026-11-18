@@ -11,10 +11,11 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from ebook_server.core import curvature, scantailor
+from ebook_server.core import curvature, scan_images, scan_transform, scantailor
 from ebook_server.core.models import ScanPage, ScanTailorStageState
 from ebook_server.core.storage_registry import backend_for_location
 from tests.curvature_fixtures import curled_page, straightness
+from tests.stage_helpers import run_stage
 from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
 
 
@@ -36,20 +37,19 @@ def test_synthetic_curvature_improves_pixel_straightness_and_replays(amplitude: 
     print(f"Synthetic amplitude={amplitude}: baseline RMS {before:.3f}px -> {after:.3f}px")
 
 
-def test_bypass_and_failed_estimation_keep_pixels(tmp_path: Path) -> None:
-    source = tmp_path / "source.png"
-    Image.new("RGB", (300, 500), (245, 240, 235)).save(source)
+def test_bypass_and_failed_estimation_keep_pixels() -> None:
+    source = Image.new("RGB", (300, 500), (245, 240, 235))
     for mode in ("auto", "bypass", "manual"):
         state = cast(
             ScanTailorStageState,
             SimpleNamespace(parameters={"dewarp_model": "curvature", "dewarp_mode": mode}),
         )
-        metadata = scantailor._run_dewarping(
-            state, source, tmp_path / "out.png", tmp_path / "preview.png"
-        )
+        result = run_stage(scantailor._run_dewarping, state, source)
+        metadata = result.parameters
         assert metadata["dewarp_applied"] == "passthrough"
         assert metadata["algorithm"] == "copy"
-        assert Image.open(source).tobytes() == Image.open(tmp_path / "out.png").tobytes()
+        assert metadata["transform"] == {"op": "identity"}
+        assert source.tobytes() == result.image.tobytes()
         if mode != "bypass":
             assert metadata["dewarp_warning"]
 
@@ -103,36 +103,40 @@ def test_padding_keeps_all_four_input_corners() -> None:
 def test_full_resolution_stage_decodes_writes_and_bounds_preview(
     tmp_path: Path,
     mode: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Curves are validated and sized at full resolution, rendered at working scale."""
     source = Image.new(mode, (4000, 6000), 255 if mode == "L" else (255, 255, 255))
     draw = ImageDraw.Draw(source)
     for y in range(100, 5900, 100):
         draw.line((50, y, 3950, y), fill=0, width=2)
     path = tmp_path / "full-resolution.png"
     source.save(path)
-    del draw, source
+    del draw
     before = path.read_bytes()
-    preview_sizes = []
-    original_preview = scantailor._save_preview
-
-    def record_preview(image: Image.Image, destination: Path) -> None:
-        preview_sizes.append(image.size)
-        original_preview(image, destination)
-
-    monkeypatch.setattr(scantailor, "_save_preview", record_preview)
     curves = [[[0, y + 100], [2000, y], [3999, y + 100]] for y in (600, 2400, 4800)]
     state = cast(
         ScanTailorStageState,
         SimpleNamespace(parameters={"dewarp_mode": "manual", "dewarp_curves": curves}),
     )
-    metadata = scantailor._run_curvature_dewarp(
-        state, path, tmp_path / "out.png", tmp_path / "preview.png"
+    work_size = scan_images.work_size(source.size, (300, 300))
+    work = scan_images.downscale(source, work_size)
+    stage_input = scantailor.StageInput(
+        image=work,
+        full_size=source.size,
+        render_full=lambda: scantailor._load_image(path),
     )
+    result = scantailor._run_curvature_dewarp(state, stage_input)
+    metadata = result.parameters
     assert metadata["dewarp_applied"] == "curvature", metadata
-    with Image.open(tmp_path / "out.png") as output:
-        assert output.size == (4000, 6104)
-    assert preview_sizes and all(max(size) <= 960 for size in preview_sizes)
+    assert metadata["transform"]["op"] == "curvature"
+    assert result.full_size == (4000, 6104)
+    # the working-resolution render stays bounded and scales with the page
+    assert max(work.size) <= scan_images.WORK_MAX_EDGE
+    assert result.image.width == work.width
+    assert result.image.height == pytest.approx(6104 * work.height / 6000, abs=2)
+    # the full-resolution op reproduces the full-size output
+    full = scan_transform.apply(source, metadata["transform"])
+    assert full.size == (4000, 6104)
     assert path.read_bytes() == before
 
 
@@ -198,7 +202,7 @@ def test_opt_in_worker_provenance_manual_replay_and_switch_back() -> None:
     assert bypass.parameters["dewarp_applied"] == "passthrough"
     restored = run({"dewarp_model": "perspective", "dewarp_mode": "auto"})
     assert restored.algorithm == "projective_dewarp"
-    assert restored.algorithm_version == "opencv-v3"
+    assert restored.algorithm_version == "opencv-v4"
     assert restored.parameters["curvature_curves"] is None
     assert restored.output_storage_location is not None
     storage = backend_for_location(restored.output_storage_location)

@@ -27,6 +27,7 @@ from .models import (
     ScanCover,
     ScanJob,
     ScanLog,
+    ScanPageImage,
     ScanPageVersion,
     ScanTailorStageState,
     SourceLocation,
@@ -96,6 +97,15 @@ def artifact_references() -> Iterable[ArtifactReference]:
         ):
             if identifier:
                 yield ArtifactReference(kind, str(state.pk), identifier, digest, location)
+    for page_image in ScanPageImage.objects.select_related("storage_location").iterator():
+        for kind, identifier in (
+            ("page_work_image", page_image.work_storage_identifier),
+            ("page_thumbnail", page_image.thumbnail_storage_identifier),
+        ):
+            if identifier:
+                yield ArtifactReference(
+                    kind, str(page_image.pk), identifier, "", page_image.storage_location
+                )
     for opf_state in (
         BookOpfState.objects.filter(written_generation__gt=0).select_related("book").iterator()
     ):

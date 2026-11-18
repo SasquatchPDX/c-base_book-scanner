@@ -36,6 +36,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
+from ebook_server.jobs import enqueue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -46,6 +47,7 @@ from . import (
     intake,
     ocr,
     scan_identification,
+    scan_images,
     scan_lifecycle,
     scan_logs,
     scan_pipeline,
@@ -59,6 +61,7 @@ from .models import (
     ProcessingJob,
     ScanJob,
     ScanPage,
+    ScanPageImage,
     ScanPageVersion,
     ScanTailorStageState,
     ScanTodo,
@@ -760,6 +763,14 @@ def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
     version = page.active_version()
     if version is None:
         return None
+    page_image = ScanPageImage.objects.filter(version=version).first()
+    if page_image is not None:
+        # Rendering from the working image avoids decoding the full scan (#195).
+        return _ThumbnailSource(
+            storage=backend_for_location(page_image.storage_location),
+            identifier=page_image.work_storage_identifier,
+            cache_key=f"{version.id}-{version.checksum_sha256[:32]}-{page_image.generator_version}",
+        )
     return _ThumbnailSource(
         storage=(
             backend_for_location(version.storage_location)
@@ -769,6 +780,18 @@ def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
         identifier=version.storage_identifier,
         cache_key=f"{version.id}-{version.checksum_sha256[:32]}",
     )
+
+
+def _page_work_identifier(page: ScanPage) -> str:
+    """Working image of the page's active version; queues it when it is missing."""
+    version = page.active_version()
+    if version is None:
+        return ""
+    page_image = ScanPageImage.objects.filter(version=version).first()
+    if page_image is None:
+        enqueue(scan_images.generate_page_image_job, version.pk)
+        return ""
+    return page_image.work_storage_identifier
 
 
 def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
@@ -1492,7 +1515,8 @@ def scan_page_stage_preview(
             or state.input_stage_state.output_storage_identifier
         )
     elif wants_input:
-        identifier = state.input_storage_identifier
+        # The first stage edits the page's working image (#195), never the raw scan.
+        identifier = _page_work_identifier(state.scan_page)
     else:
         identifier = state.preview_storage_identifier or state.output_storage_identifier
     if not identifier:

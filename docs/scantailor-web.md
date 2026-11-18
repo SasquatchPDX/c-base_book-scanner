@@ -159,6 +159,41 @@ fixed-canvas requests. Reducing ordinary padding therefore shrinks the result ag
 The editor also recognizes legacy computed canvases equal to the input plus recorded
 padding, rather than silently resubmitting them as fixed dimensions.
 
+## Pipeline architecture: transforms, not images (#195 step 2)
+
+Upstream Scan Tailor passes an `ImageTransformation` and parameters from filter to
+filter and renders full-resolution pixels only in Output. ScanTailor-Web now does the
+same:
+
+- **Working image, made once.** When a page version is committed, a background job
+  (`scan_images.generate_page_image_job`) decodes the scan once and stores a
+  `ScanPageImage`: a lossless working image at about 150 dpi (long edge at least
+  1600 px and at most 2400 px, never upscaled) and a 400 px JPEG thumbnail. Versions
+  are immutable, so these files never change. A stage that runs before the job
+  finished builds the image itself.
+- **Stages 1-4 record a transform op.** Deskew, Select Content, Dewarping and Margins
+  run detection on their working-resolution input and store one op in
+  `parameters["transform"]`, in the full-resolution coordinates of their input
+  (`rotate`, `crop`, `perspective`, `curvature`, `pad` or `identity`; see
+  `core/scan_transform.py`). All other parameters (content box, quad, curves,
+  margins) stay in full-resolution coordinates too, and every run records
+  `input_width/height` and `output_width/height` at full resolution, computed from
+  the ops without rendering anything.
+- **Working-resolution artifacts.** Each of these stages stores its output at working
+  resolution (`work.png`, PNG compression level 1), which is the next stage's input,
+  and a JPEG preview (`preview.jpg`). They never decode or write the full scan.
+- **Output renders once.** The Output stage composes every upstream op and renders
+  the untouched original once at full resolution, then binarises it
+  (`output.png`, with the scan's DPI) and writes a working-resolution `preview.png`.
+  Auto-detected zones are found on the working image and stored at full resolution.
+- **Scales agree.** An op applied at working resolution previews what Output renders
+  (`tests/test_scan_transform.py` checks every op against a downscaled full render).
+  Scaling uses pixel-centre coordinates.
+
+Migration 0050 invalidates every processed stage, because stages processed before
+this change have no recorded op; they re-run once. `scripts/benchmark_scanning.py`
+times the `page_image` step and each stage on this pipeline.
+
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049

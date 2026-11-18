@@ -1250,6 +1250,40 @@ class ScanPageVersion(models.Model):
         return f"{self.scan_page_id}:v{self.version}:{self.checksum_sha256[:8]}"
 
 
+class ScanPageImage(models.Model):
+    """Working-resolution image and thumbnail of one page version, made once (#195).
+
+    Every interactive stage detects and renders on the working image instead of
+    decoding the full-resolution scan again; only the Output stage reads the original.
+    Page versions are immutable, so this row and its files never change.
+    """
+
+    version = models.OneToOneField(
+        ScanPageVersion,
+        on_delete=models.CASCADE,
+        related_name="page_image",
+    )
+    # The decoded original after EXIF orientation: the coordinate space of stage 1.
+    full_width = models.PositiveIntegerField()
+    full_height = models.PositiveIntegerField()
+    dpi_x = models.PositiveIntegerField()
+    dpi_y = models.PositiveIntegerField()
+    work_width = models.PositiveIntegerField()
+    work_height = models.PositiveIntegerField()
+    storage_location = models.ForeignKey(
+        StorageLocation,
+        on_delete=models.PROTECT,
+        related_name="scan_page_images",
+    )
+    work_storage_identifier = models.CharField(max_length=512)
+    thumbnail_storage_identifier = models.CharField(max_length=512)
+    generator_version = models.CharField(max_length=32)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self) -> str:
+        return f"{self.version_id}:{self.work_width}x{self.work_height}"
+
+
 class ScanCover(models.Model):
     """Immutable versions of a scan job's raw front/back cover photo (#128, §4.3, §6.6).
 
