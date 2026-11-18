@@ -92,7 +92,7 @@ const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
     "align_x",
     "align_y",
   ],
-  dewarping: ["dewarp_mode", "dewarp_points"],
+  dewarping: ["dewarp_mode", "dewarp_model", "dewarp_points", "dewarp_curves"],
   output: [
     "output_mode",
     "keep_color",
@@ -166,6 +166,28 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
     }
   }
   return editable;
+}
+
+/** Explicitly copy only baseline geometry when an operator starts manual editing. */
+export function curvatureCurvesForEditing(parameters: JsonObject): number[][][] {
+  const raw =
+    parameters.dewarp_mode === "manual" ? parameters.dewarp_curves : parameters.curvature_curves;
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(0, 32).flatMap((curve): number[][][] => {
+    if (
+      !Array.isArray(curve) ||
+      curve.length < 3 ||
+      curve.length > 17 ||
+      !curve.every(
+        (point) =>
+          Array.isArray(point) &&
+          point.length === 2 &&
+          point.every((value) => typeof value === "number" && Number.isFinite(value)),
+      )
+    )
+      return [];
+    return [curve.map((point) => [...point] as number[])];
+  });
 }
 
 export interface OutputZone {
@@ -389,6 +411,7 @@ class WorkspaceController {
   private previewMode: "input" | "result" = "input";
   private activePageId: string | null = null;
   private activeStage: StageName = "page_split";
+  private activeCurvatureCurve = 0;
   private draft: JsonObject = {};
   private interactions: InteractableHandle[] = [];
   private eventSource: EventSource | null = null;
@@ -475,7 +498,16 @@ class WorkspaceController {
     this.saveButton.addEventListener("click", () => void this.saveActiveStage());
     this.batchButton.addEventListener("click", () => void this.applyBatch());
     this.batchScope.addEventListener("change", () => this.updateSelectionCount());
-    this.image.addEventListener("load", () => this.renderGeometry());
+    this.image.addEventListener("load", () => {
+      if (
+        this.activeStage === "dewarping" &&
+        this.draft.dewarp_model === "curvature" &&
+        this.draft.dewarp_mode === "manual" &&
+        curvatureCurvesForEditing(this.draft).length < 2
+      )
+        this.renderControls();
+      this.renderGeometry();
+    });
     window.addEventListener("resize", () => this.renderGeometry());
     this.image.addEventListener("error", () => {
       this.clearGeometry();
@@ -657,7 +689,111 @@ class WorkspaceController {
   }
 
   private renderDewarpControls(): void {
-    this.addSelect("Mode", "dewarp_mode", ["auto", "manual", "bypass"], "auto", true);
+    const model = this.draft.dewarp_model === "curvature" ? "curvature" : "perspective";
+    this.draft.dewarp_model = model;
+    this.addSelectValue("Dewarp model", model, ["perspective", "curvature"], (value) => {
+      this.draft.dewarp_model = value;
+      if (value === "perspective") delete this.draft.dewarp_curves;
+      else delete this.draft.dewarp_points;
+      this.renderControls();
+      this.showPreview("input");
+    });
+    const mode = String(this.draft.dewarp_mode ?? "auto");
+    this.draft.dewarp_mode = mode;
+    this.addSelectValue("Mode", mode, ["auto", "manual", "bypass"], (value) => {
+      this.draft.dewarp_mode = value;
+      if (value !== "manual") {
+        delete this.draft.dewarp_curves;
+        delete this.draft.dewarp_points;
+      }
+      this.renderControls();
+      this.showPreview("input");
+    });
+    if (model !== "curvature") return;
+    const note = document.createElement("p"); note.className = "muted";
+    note.textContent = "Opt-in baseline correction: inspect the Result preview before finishing.";
+    this.controls.append(note);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Edit detected baselines";
+    button.addEventListener("click", () => {
+      this.draft.dewarp_curves = curvatureCurvesForEditing(
+        this.activeContext()?.state.parameters ?? {},
+      );
+      this.draft.dewarp_mode = "manual";
+      this.renderControls();
+      this.showPreview("input");
+    });
+    this.controls.append(button);
+    if (mode !== "manual") return;
+    let curves = curvatureCurvesForEditing(this.draft);
+    const size = this.sourceSize();
+    if (curves.length < 2 && size.width > 2 && size.height > 10) {
+      curves = [0.25, 0.75].map((ratio) => [
+        [0, size.height * ratio],
+        [size.width / 2, size.height * ratio],
+        [size.width - 1, size.height * ratio],
+      ]);
+    }
+    this.draft.dewarp_curves = curves;
+    if (curves.length < 2) return;
+    this.activeCurvatureCurve = Math.min(this.activeCurvatureCurve, curves.length - 1);
+    this.addSelectValue(
+      "Baseline",
+      String(this.activeCurvatureCurve + 1),
+      curves.map((_, index) => String(index + 1)),
+      (value) => {
+        this.activeCurvatureCurve = Number(value) - 1;
+        this.renderControls();
+        this.renderGeometry();
+      },
+    );
+    curves[this.activeCurvatureCurve]!.forEach((point, index) => {
+      const label = document.createElement("label");
+      label.textContent = `Baseline point ${index + 1} y`;
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "0";
+      input.max = String(size.height - 1);
+      input.step = "0.1";
+      input.value = String(point[1]);
+      input.addEventListener("change", () => {
+        point[1] = clamp(finiteNumber(input.value, point[1] ?? 0), 0, size.height - 1);
+        this.renderGeometry();
+      });
+      label.append(input);
+      this.controls.append(label);
+    });
+    for (const action of ["Add baseline", "Remove baseline"]) {
+      const control = document.createElement("button");
+      control.type = "button";
+      control.textContent = action;
+      control.disabled = action === "Add baseline" ? curves.length >= 32 : curves.length <= 2;
+      control.addEventListener("click", () => {
+        if (action === "Remove baseline") curves.splice(this.activeCurvatureCurve, 1);
+        else {
+          const ys = curves
+            .map((curve) => curve[Math.floor(curve.length / 2)]![1]!)
+            .sort((a, b) => a - b);
+          let y = size.height / 2;
+          let gap = 0;
+          for (let i = 1; i < ys.length; i++)
+            if (ys[i]! - ys[i - 1]! > gap) {
+              gap = ys[i]! - ys[i - 1]!;
+              y = (ys[i]! + ys[i - 1]!) / 2;
+            }
+          curves.push([
+            [0, y],
+            [size.width / 2, y],
+            [size.width - 1, y],
+          ]);
+          this.activeCurvatureCurve = curves.length - 1;
+        }
+        this.renderControls();
+        this.renderGeometry();
+      });
+      this.controls.append(control);
+    }
   }
 
   private renderOutputControls(): void {
@@ -879,7 +1015,10 @@ class WorkspaceController {
         }
         break;
       case "dewarping":
-        if (this.draft.dewarp_mode === "manual") this.renderDewarpPoints(source, display);
+        if (this.draft.dewarp_mode === "manual") {
+          if (this.draft.dewarp_model === "curvature") this.renderCurvatureCurves(source, display);
+          else this.renderDewarpPoints(source, display);
+        }
         break;
       case "output": {
         const manual = this.draft.zone_mode === "manual";
@@ -1050,6 +1189,67 @@ class WorkspaceController {
       x2: left + finiteNumber(target.style.width.replace("px", ""), target.offsetWidth),
       y2: top + finiteNumber(target.style.height.replace("px", ""), target.offsetHeight),
     };
+  }
+
+  private renderCurvatureCurves(source: Size, display: Size): void {
+    const curves = this.draft.dewarp_curves as number[][][] | undefined;
+    if (!Array.isArray(curves)) return;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("geometry-lines");
+    this.geometryLayer.append(svg);
+    curves.forEach((curve, curveIndex) => {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("fill", "none"); line.setAttribute("stroke", curveIndex === this.activeCurvatureCurve ? "#f9c74f" : "#90be6d"); line.setAttribute("stroke-width", "2");
+      svg.append(line);
+      const redraw = () =>
+        line.setAttribute(
+          "points",
+          curve
+            .map(
+              (p) =>
+                `${(p[0]! / source.width) * display.width},${(p[1]! / source.height) * display.height}`,
+            )
+            .join(" "),
+        );
+      redraw();
+      if (curveIndex !== this.activeCurvatureCurve) return;
+      curve.forEach((point, index) => {
+        const handle = document.createElement("div");
+        handle.className = "geometry-point";
+        handle.setAttribute("aria-label", `Baseline ${curveIndex + 1} control point ${index + 1}`);
+        const position = () => {
+          handle.style.left = `${(point[0]! / source.width) * display.width}px`;
+          handle.style.top = `${(point[1]! / source.height) * display.height}px`;
+        };
+        position();
+        this.geometryLayer.append(handle);
+        this.interactions.push(
+          interact(handle).draggable({
+            modifiers: [interact.modifiers.restrictRect({ restriction: "parent" })],
+            listeners: {
+              move: (event) => {
+                point[0] = clamp(
+                  point[0]! + (event.dx / display.width) * source.width,
+                  0,
+                  source.width - 1,
+                );
+                point[1] = clamp(
+                  point[1]! + (event.dy / display.height) * source.height,
+                  0,
+                  source.height - 1,
+                );
+                position();
+                redraw();
+              },
+              end: () => {
+                this.renderControls();
+                this.renderGeometry();
+              },
+            },
+          }),
+        );
+      });
+    });
   }
 
   private renderDewarpPoints(source: Size, display: Size): void {
