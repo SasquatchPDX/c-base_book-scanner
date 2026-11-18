@@ -16,12 +16,56 @@ from django.contrib.postgres.indexes import GinIndex
 from django.contrib.postgres.search import SearchVectorField
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models.fields.json import KT
 from django.db.models.functions import Lower
 from django.utils.timezone import now
 
 from .scan_job_ids import MAX_SCAN_JOB_ID_LENGTH, new_scan_job_id
+
+
+class BookLinkedRecord(models.Model):
+    """Serialize book reassignment and retain the old parent for search signals (#158).
+
+    The read and UPDATE must share a row lock: two simultaneous A→B and A→C
+    edits must invalidate B as well as A/C. No extra lookup is needed when the
+    caller explicitly saves fields other than the book relation.
+    """
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        # Preserve Django's positional-save compatibility as well as keyword calls.
+        fields = kwargs.get("update_fields", args[3] if len(args) > 3 else None)
+        if fields is not None:
+            # update_fields may be a one-shot iterable; do not consume it before
+            # Model.save gets to validate and apply it.
+            fields = frozenset(fields)
+            if "update_fields" in kwargs:
+                kwargs["update_fields"] = fields
+            elif len(args) > 3:
+                args = (*args[:3], fields, *args[4:])
+        if self.pk is None or (fields is not None and not {"book", "book_id"}.intersection(fields)):
+            super().save(*args, **kwargs)
+            return
+        using = kwargs.get("using", args[2] if len(args) > 2 else None) or router.db_for_write(
+            type(self), instance=self
+        )
+        with transaction.atomic(using=using):
+            previous = (
+                type(self)
+                ._base_manager.using(using)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values_list("book_id", flat=True)
+                .first()
+            )
+            self.__dict__["_search_previous_book_id"] = previous
+            try:
+                super().save(*args, **kwargs)
+            finally:
+                self.__dict__.pop("_search_previous_book_id", None)
 
 
 class UserRole(models.TextChoices):
@@ -161,7 +205,7 @@ class GenreAlias(models.Model):
         return f"{self.alias} -> {self.genre_id}"
 
 
-class BookGenre(models.Model):
+class BookGenre(BookLinkedRecord):
     """Book-to-genre link with provenance (#50).
 
     Uses the original auto-created ``core_book_genres`` table. Automatic assignment never
@@ -526,7 +570,7 @@ class BookOpfState(models.Model):
         return f"{self.book_id}: {self.written_generation}/{self.requested_generation}"
 
 
-class Identifier(models.Model):
+class Identifier(BookLinkedRecord):
     """Identifiers associated with a book (ISBN-10, ISBN-13, DOI, etc.)."""
 
     class IdentifierType(models.TextChoices):
@@ -648,7 +692,7 @@ class BookSearchFacet(models.Model):
         return f"{self.kind}={self.value}"
 
 
-class CoverImage(models.Model):
+class CoverImage(BookLinkedRecord):
     """Stored front/back cover image per book."""
 
     class CoverPosition(models.TextChoices):
@@ -789,7 +833,7 @@ class CoverThumbnailFile(models.Model):
         return self.storage_identifier
 
 
-class FileVariant(models.Model):
+class FileVariant(BookLinkedRecord):
     """One concrete representation of a book."""
 
     class VariantFormat(models.TextChoices):
@@ -904,7 +948,7 @@ class FileVariant(models.Model):
         return f"{self.book_id}:{self.format}:{self.original_filename}"
 
 
-class ScanJob(models.Model):
+class ScanJob(BookLinkedRecord):
     """Persistent scan job for physical book capture."""
 
     class State(models.TextChoices):
