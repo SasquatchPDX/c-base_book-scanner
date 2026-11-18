@@ -168,7 +168,8 @@ def reference_index() -> tuple[dict[str, list[ArtifactReference]], list[str]]:
 
 STAGE_FILE = re.compile(
     r"^scan-jobs/(?P<job>[^/]+)/(?P<page>[0-9a-f-]{36})/(?P<stage>[a-z_]+)/"
-    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png)$"
+    # work.png / preview.jpg: working-resolution artifacts of stages 1-4 (#195 step 2).
+    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png|work\.png|preview\.jpg)$"
 )
 
 
