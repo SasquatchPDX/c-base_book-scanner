@@ -188,19 +188,15 @@ def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
     "Live" covers the queue itself plus the started, scheduled and deferred
     registries, i.e. every RQ job that may still execute. Job functions take the
     database row id as their first argument, so the set identifies rows that still
-    have an RQ job. ``None`` means Redis could not be consulted (or the inline queue
-    is in use) and callers must not assume anything about queued work.
+    have an RQ job; a batch job taking a list of row ids (``process_stage_jobs``)
+    contributes every member (see :func:`rq_job_row_ids`). ``None`` means Redis could
+    not be consulted (or the inline queue is in use) and callers must not assume
+    anything about queued work.
     """
     queue = get_queue()
     rq_queue = getattr(queue, "queue", None)
     if rq_queue is None:
         return None, None
-    from rq.registry import (
-        DeferredJobRegistry,
-        ScheduledJobRegistry,
-        StartedJobRegistry,
-    )
-
     # LLM identification jobs run on their own queue (#26); inspect it too.
     rq_queues = [rq_queue]
     llm_queue = getattr(get_queue(llm_queue_name()), "queue", None)
@@ -210,8 +206,7 @@ def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
         jobs: list[Any] = []
         for inspected in rq_queues:
             jobs.extend(inspected.get_jobs())
-            for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry):
-                registry = registry_cls(queue=inspected)
+            for registry in _live_registries(inspected):
                 jobs.extend(
                     inspected.fetch_job(registry_job_id(member))
                     for member in registry.get_job_ids()
@@ -219,8 +214,37 @@ def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
         scheduler = scheduler_active(rq_queue)
     except Exception:
         return None, None
-    ids = {str(job.args[0]) for job in jobs if job is not None and job.args}
+    ids = {row_id for job in jobs if job is not None for row_id in rq_job_row_ids(job)}
     return ids, scheduler
+
+
+def rq_job_row_ids(job: Any) -> list[str]:
+    """Database row ids an RQ job works on: its first positional argument.
+
+    Most job functions take one row id. Batch functions such as
+    ``scantailor.process_stage_jobs`` take a list of row ids; each member counts, so a
+    healthy queued chunk is never mistaken for a lost job (#195).
+    """
+    if not job.args:
+        return []
+    first = job.args[0]
+    if isinstance(first, list | tuple | set | frozenset):
+        return [str(member) for member in first]
+    return [str(first)]
+
+
+def _live_registries(rq_queue: Queue) -> list[Any]:
+    """RQ registries whose jobs may still execute (started, scheduled, deferred)."""
+    from rq.registry import (
+        DeferredJobRegistry,
+        ScheduledJobRegistry,
+        StartedJobRegistry,
+    )
+
+    return [
+        registry_cls(queue=rq_queue)
+        for registry_cls in (StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry)
+    ]
 
 
 def _rq_registries(rq_queue: Queue) -> list[Any]:
@@ -267,9 +291,11 @@ def discard_rq_jobs(func_name: str, first_args: set[str]) -> int | None:
         removed = 0
         for job_id, entries in members.items():
             job = rq_queue.fetch_job(job_id)
-            if job is None or job.func_name != func_name or not job.args:
+            if job is None or job.func_name != func_name:
                 continue
-            if str(job.args[0]) not in first_args:
+            row_ids = rq_job_row_ids(job)
+            # A batch job is deleted only when every row it carries is discarded.
+            if not row_ids or not set(row_ids) <= first_args:
                 continue
             for registry, raw in entries:
                 registry.connection.zrem(registry.key, raw)

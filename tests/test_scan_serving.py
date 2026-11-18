@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 from django.db import connection
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
+from PIL import Image
 
-from ebook_server.core import scantailor, views
-from ebook_server.core.models import ScanPage, ScanTailorStageState
+from ebook_server.core import scan_thumbnails, scantailor, views
+from ebook_server.core.models import (
+    ScanPage,
+    ScanPageImage,
+    ScanTailorStageState,
+    StorageLocation,
+)
+from ebook_server.core.storage_registry import backend_for_location
 from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
 
 
@@ -126,6 +135,124 @@ def test_workspace_thumbnail_urls_are_tokenised_and_change_with_the_artifact() -
     assert client.get(stage_url)["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
     # The old URL still answers, but no longer as an immutable copy.
     assert client.get(raw_url)["Cache-Control"] == views.SCAN_ARTIFACT_REVALIDATE
+
+
+def _landscape_png() -> bytes:
+    image = Image.new("RGB", (48, 24), (255, 255, 255))
+    for x in range(48):
+        for y in range(24):
+            image.putpixel((x, y), (x * 5 % 256, y * 10 % 256, 128))
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def _reference_thumbnail(
+    tmp_path: Path, name: str, location: StorageLocation | None, identifier: str
+) -> bytes:
+    storage = (
+        backend_for_location(location) if location is not None else views._default_scan_storage()
+    )
+    target = tmp_path / f"{name}.jpg"
+    scan_thumbnails.render_jpeg_thumbnail(
+        storage, identifier, target, views.SCAN_THUMBNAIL_MAX_EDGE
+    )
+    return target.read_bytes()
+
+
+def _body(response: Any) -> bytes:
+    return b"".join(response.streaming_content)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_thumbnail_bytes_and_token_come_from_one_selection_under_invalidation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of #198: invalidating Deskew mid-request must not mislabel the bytes."""
+    client, job = _create_scan_job("serving-thumbnail-race")
+    _upload_scan_page(
+        client, str(job.id), sequence=1, side="single", payload=_landscape_png(), filename="p.png"
+    )
+    page = ScanPage.objects.get(scan_job_id=job.id, logical_sequence_number=1)
+    _run(client, str(job.id), page, "deskew", {"manual_angle": 90})
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    version = page.active_version()
+    assert version is not None
+    page_image = ScanPageImage.objects.get(version=version)
+    stage_token = f"s{deskew.id}-{deskew.revision}-{deskew.output_sha256[:16]}-p"
+    work_token = f"v{version.id}-{version.checksum_sha256[:16]}-w{page_image.generator_version}"
+    stage_bytes = _reference_thumbnail(
+        tmp_path, "stage", deskew.preview_storage_location, deskew.preview_storage_identifier
+    )
+    work_bytes = _reference_thumbnail(
+        tmp_path, "work", page_image.storage_location, page_image.work_storage_identifier
+    )
+    assert stage_bytes != work_bytes
+    expected = {stage_token: stage_bytes, work_token: work_bytes}
+
+    workspace = client.get(f"/scan/jobs/{job.id}/workspace/").json()
+    assert workspace["pages"][0]["thumbnail"].endswith(f"?v={stage_token}")
+
+    # The invalidation lands right after the view first read the stage rows (the
+    # first walk over the stage order), i.e. while it is still answering.
+    stage_order = scantailor.stage_order
+    calls = 0
+
+    def invalidating_stage_order() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            ScanTailorStageState.objects.filter(scan_page=page).update(
+                status=ScanTailorStageState.StageStatus.INVALIDATED
+            )
+        return stage_order()
+
+    monkeypatch.setattr(scantailor, "stage_order", invalidating_stage_order)
+    url = f"/scan/pages/{page.id}/image/"
+    raced = client.get(f"{url}?v={stage_token}")
+    monkeypatch.setattr(scantailor, "stage_order", stage_order)
+    assert calls >= 1
+    assert raced.status_code == 200
+    raced_token = raced["ETag"].strip('"')
+    assert raced_token in expected
+    assert _body(raced) == expected[raced_token]
+    if raced["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE:
+        assert raced_token == stage_token
+
+    # Afterwards the page shows its working image; the old URL still answers, but
+    # with the new bytes it must neither claim the old token nor be immutable.
+    stale = client.get(f"{url}?v={stage_token}")
+    assert stale["ETag"] == f'"{work_token}"'
+    assert stale["Cache-Control"] == views.SCAN_ARTIFACT_REVALIDATE
+    assert _body(stale) == work_bytes
+    current = client.get(f"{url}?v={work_token}")
+    assert current["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
+    assert _body(current) == work_bytes
+    workspace = client.get(f"/scan/jobs/{job.id}/workspace/").json()
+    assert workspace["pages"][0]["thumbnail"].endswith(f"?v={work_token}")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_thumbnail_token_distinguishes_raw_scan_from_working_image(tmp_path: Path) -> None:
+    """The raw-scan and working-image thumbnails differ, so their tokens must too."""
+    client, job = _create_scan_job("serving-thumbnail-raw")
+    _upload_scan_page(
+        client, str(job.id), sequence=1, side="single", payload=_landscape_png(), filename="p.png"
+    )
+    page = ScanPage.objects.get(scan_job_id=job.id, logical_sequence_number=1)
+    version = page.active_version()
+    assert version is not None
+    with_image = client.get(f"/scan/pages/{page.id}/image/")
+    ScanPageImage.objects.filter(version=version).delete()
+    raw = client.get(f"/scan/pages/{page.id}/image/")
+    raw_token = f"v{version.id}-{version.checksum_sha256[:16]}-r"
+    assert raw["ETag"] == f'"{raw_token}"'
+    assert with_image["ETag"] != raw["ETag"]
+    assert _body(raw) == _reference_thumbnail(
+        tmp_path, "raw", version.storage_location, version.storage_identifier
+    )
+    workspace = client.get(f"/scan/jobs/{job.id}/workspace/").json()
+    assert workspace["pages"][0]["thumbnail"].endswith(f"?v={raw_token}")
 
 
 @pytest.mark.django_db(transaction=True)
