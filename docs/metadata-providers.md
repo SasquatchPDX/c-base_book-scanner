@@ -242,6 +242,22 @@ authors without placeholder creators such as "Microsoft Office User", "Owner" or
 authors. They are applied only when a reviewer accepts a candidate that has no
 authors of its own, and only to a Book without authors; provider authors always win.
 
+**Local consensus suggestion.** A file that no provider record fits still goes to review. Local
+consensus (`local_identity.py`, `BOOK_SCANNER_IDENTIFICATION_LOCAL_CONSENSUS`, on by default)
+only makes that review faster. If at least two *independent* origins name the same title and a
+plausible author is known, the import's evidence records `local_identity`, and the review page
+shows it as a pre-filled suggestion. The origins are:
+- the path: file name, folder layout and Calibre sidecar, which count as one witness;
+- the text header, but only a title it states on its own, such as a `Title:` label or a Project
+  Gutenberg header. A header line that merely repeats the file name doesn't count;
+- the embedded metadata.
+
+When a provider record names the same title and author, the suggestion confirms that record,
+and the reviewer accepts it in one click. Its score is unchanged. Otherwise the manual-metadata
+form is pre-filled. Local consensus never accepts a book. It gives no suggestion when a provider
+names the title by a different author, and genre folders ("Science Fiction", "Short Stories")
+never count as authors. Providers that failed during the search are noted on the suggestion.
+
 **Ties.** Candidates at or above the threshold whose score is within
 `BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN` (default 0.02) of the best one count as
 tied (the comparison allows for floating-point rounding, so 1.0 and 0.98 tie). With

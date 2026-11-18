@@ -3520,6 +3520,31 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             needs_review = top_candidate is None
         if sidecar_conflicts:
             needs_review = True
+        if needs_review and assessment is None and not sidecar_conflicts:
+            # The file's own independent evidence (path, text header, embedded metadata)
+            # may agree on what it is. That only pre-fills the review: external
+            # verification is mandatory, so local consensus never accepts a book.
+            from . import local_identity
+
+            local = local_identity.local_consensus(
+                metadata,
+                signals,
+                candidates,
+                filename=job.original_filename,
+                provider_outcomes=provider_outcomes,
+            )
+            if local is not None:
+                metadata[local_identity.LOCAL_IDENTITY_KEY] = local.evidence
+                job.evidence = metadata
+                _save_job(job, update_fields=["evidence", "updated_at"])
+                logger.info(
+                    "intake_local_consensus_suggested",
+                    import_job_id=str(job.id),
+                    title_origins=list(local.title_origins),
+                    author_source=local.author_source,
+                    confirms_provider=(local.confirms or {}).get("provider_id"),
+                    provider_outage=list(local.provider_outage),
+                )
         if needs_review:
             _archive_for_review(job, candidates)
             if assessment is None:

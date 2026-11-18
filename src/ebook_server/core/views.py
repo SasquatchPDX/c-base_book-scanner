@@ -70,6 +70,7 @@ from . import (
     library_visibility,
     llm,
     llm_identification,
+    local_identity,
     metadata_search,
     multipart,
     ocr,
@@ -1300,6 +1301,48 @@ def _auto_accept_block(task: ReviewTask) -> dict[str, Any] | None:
         ),
         "details": details if isinstance(details, dict) else {},
         "suggested_authors": _parse_author_list(evidence.get(intake.SUGGESTED_AUTHORS_KEY)),
+    }
+
+
+def _local_suggestion(
+    task: ReviewTask, candidates: list[MetadataCandidate]
+) -> dict[str, Any] | None:
+    """The file's local-consensus suggestion (``local_identity``), for the review page.
+
+    ``confirmed_candidate`` is the current provider candidate the suggestion confirms;
+    without one the suggestion pre-fills manual metadata. Never accepted by itself.
+    """
+    evidence = task.embedded_metadata if isinstance(task.embedded_metadata, dict) else {}
+    local = evidence.get(local_identity.LOCAL_IDENTITY_KEY)
+    if not isinstance(local, dict) or not isinstance(local.get("title"), str):
+        return None
+    confirms = local.get("confirms") if isinstance(local.get("confirms"), dict) else None
+    confirmed = None
+    if confirms is not None:
+        confirmed = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.provider_id == confirms.get("provider_id")
+                and candidate.provider_ref == confirms.get("provider_ref")
+            ),
+            None,
+        )
+    outage = local.get("provider_outage")
+    origins = local.get("title_origins")
+    return {
+        "title": local["title"],
+        "authors": _parse_author_list(local.get("authors")),
+        "language": local.get("language") if isinstance(local.get("language"), str) else "",
+        "title_origins": [o for o in origins if isinstance(o, str)]
+        if isinstance(origins, list)
+        else [],
+        "author_source": local.get("author_source"),
+        "provider_outage": [p for p in outage if isinstance(p, str)]
+        if isinstance(outage, list)
+        else [],
+        "confirmed_candidate": confirmed,
+        "confirmed_candidate_id": confirmed.pk if confirmed is not None else None,
     }
 
 
@@ -4570,6 +4613,12 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
     ]
     auto_accept_block = _auto_accept_block(task)
     payload["auto_accept_block"] = auto_accept_block
+    local_suggestion = _local_suggestion(task, candidates)
+    payload["local_suggestion"] = (
+        {key: value for key, value in local_suggestion.items() if key != "confirmed_candidate"}
+        if local_suggestion is not None
+        else None
+    )
     llm_panel = _llm_panel(task)
     payload["llm_suggestion"] = llm_panel["suggestion_payload"] if llm_panel else None
     multipart_group = multipart.group_for_task(task)
@@ -4631,6 +4680,7 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
                 "task": task,
                 "payload": payload,
                 "auto_accept_block": auto_accept_block,
+                "local_suggestion": local_suggestion,
                 "multipart": multipart_group,
                 "candidates": candidates,
                 "all_genres": list(Genre.objects.order_by("name")),

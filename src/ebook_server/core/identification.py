@@ -1794,6 +1794,11 @@ def _title_match_score(left: str, right: str) -> float:
     return (set_score + sort_score) / 200.0
 
 
+def title_match_score(left: str, right: str) -> float:
+    """Public form of ``_title_match_score`` for other modules (1.0: the same title)."""
+    return _title_match_score(left, right)
+
+
 def _author_name_tokens(name: str) -> list[str]:
     """Lowercased, punctuation-free name tokens with "Last, First" reordered."""
     if name.count(",") == 1:
