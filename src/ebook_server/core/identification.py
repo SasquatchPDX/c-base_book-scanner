@@ -2059,6 +2059,138 @@ def authors_conflict(candidate_authors: list[str], evidence_authors: list[str]) 
     )
 
 
+# Volume, part and series markers ("Band 2", "Vol. II", "Second Series", "Teil 1",
+# "Book Three", "2. Band"). Providers keep the subtitle that carries them out of the
+# title (DNB "Gesammelte Werke : Band 1"), so two volumes share their full title.
+_NUMBER_WORDS: dict[str, int] = {
+    **dict.fromkeys(("one", "first", "eins", "erste", "erster", "erstes", "ersten"), 1),
+    **dict.fromkeys(("two", "second", "zwei", "zweite", "zweiter", "zweites", "zweiten"), 2),
+    **dict.fromkeys(("three", "third", "drei", "dritte", "dritter", "drittes", "dritten"), 3),
+    **dict.fromkeys(("four", "fourth", "vier", "vierte", "vierter", "viertes", "vierten"), 4),
+    **dict.fromkeys(("five", "fifth", "fünf", "fünfte", "fünfter", "fünftes", "fünften"), 5),
+    **dict.fromkeys(("six", "sixth", "sechs", "sechste", "sechster", "sechstes"), 6),
+    **dict.fromkeys(("seven", "seventh", "sieben", "siebte", "siebter", "siebtes"), 7),
+    **dict.fromkeys(("eight", "eighth", "acht", "achte", "achter", "achtes"), 8),
+    **dict.fromkeys(("nine", "ninth", "neun", "neunte", "neunter", "neuntes"), 9),
+    **dict.fromkeys(("ten", "tenth", "zehn", "zehnte", "zehnter", "zehntes"), 10),
+}
+_VOLUME_KINDS: dict[str, str] = {
+    **dict.fromkeys(("band", "bd", "vol", "volume", "tome", "tomo"), "volume"),
+    **dict.fromkeys(("book", "buch", "livre"), "volume"),
+    **dict.fromkeys(("teil", "part", "pt", "partie"), "part"),
+    **dict.fromkeys(("series", "serie", "folge", "reihe"), "series"),
+}
+_ROMAN_NUMERAL = r"(?=[ivxlc])c{0,3}(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})"
+_WORD_NUMBER = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+_MARKER_KIND = "|".join(sorted(_VOLUME_KINDS, key=len, reverse=True))
+# "Band 2", "Vol. II", "Book Three", "Part 1".
+_KIND_THEN_NUMBER = re.compile(
+    rf"\b(?P<kind>{_MARKER_KIND})\.?\s*(?P<number>\d+|{_ROMAN_NUMERAL}|{_WORD_NUMBER})\b",
+    re.IGNORECASE,
+)
+# "Second Series", "2. Band", "2nd Volume", "Zweiter Teil".
+_NUMBER_THEN_KIND = re.compile(
+    rf"\b(?P<number>\d+|{_WORD_NUMBER})(?:\.|st|nd|rd|th)?\s+(?P<kind>{_MARKER_KIND})\b",
+    re.IGNORECASE,
+)
+# A subtitle that is only a number or a roman numeral ("II", "3") names a volume too.
+_BARE_NUMBER = re.compile(rf"^(?:\d+|{_ROMAN_NUMERAL})\.?$", re.IGNORECASE)
+_ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100}
+
+
+def _marker_number(value: str) -> int | None:
+    value = value.lower().rstrip(".")
+    if value.isdigit():
+        return int(value)
+    if value in _NUMBER_WORDS:
+        return _NUMBER_WORDS[value]
+    if not value or any(char not in _ROMAN_VALUES for char in value):
+        return None
+    total = 0
+    for index, char in enumerate(value):
+        current = _ROMAN_VALUES[char]
+        following = _ROMAN_VALUES[value[index + 1]] if index + 1 < len(value) else 0
+        total += -current if current < following else current
+    return total
+
+
+def volume_markers(*texts: str | None) -> set[tuple[str, int]]:
+    """``(kind, number)`` volume, part and series markers named in ``texts``.
+
+    ``volume_markers("Gesammelte Werke", "Band 1")`` is ``{("volume", 1)}`` and
+    ``volume_markers("Essays", "Second Series")`` is ``{("series", 2)}``. Kinds are
+    normalised (Band/Vol./Volume/Book -> volume, Teil/Part -> part), numbers too
+    (2, II, Two, Second, Zweiter -> 2).
+    """
+    markers: set[tuple[str, int]] = set()
+    for text in texts:
+        if not text:
+            continue
+        for pattern in (_KIND_THEN_NUMBER, _NUMBER_THEN_KIND):
+            for match in pattern.finditer(text):
+                number = _marker_number(match.group("number"))
+                if number is not None:
+                    markers.add((_VOLUME_KINDS[match.group("kind").lower()], number))
+        bare = text.strip()
+        if _BARE_NUMBER.fullmatch(bare):
+            number = _marker_number(bare)
+            if number is not None:
+                markers.add(("volume", number))
+    return markers
+
+
+def _candidate_subtitle(candidate: IdentificationCandidate) -> str | None:
+    """The provider subtitle (normalised into ``description`` by ``_normalize_candidate``)."""
+    raw_subtitle = candidate.raw.get("subtitle")
+    subtitle = raw_subtitle if isinstance(raw_subtitle, str) else candidate.description
+    return subtitle.strip() if subtitle and subtitle.strip() else None
+
+
+def _candidate_volume_markers(candidate: IdentificationCandidate) -> set[tuple[str, int]]:
+    # ``description`` is the provider subtitle (DNB "Gesammelte Werke : Band 1" keeps
+    # "Band 1" there); a free-text blurb in ``raw`` is not read, its "the second book
+    # of the trilogy" would not name this record's volume.
+    return volume_markers(
+        candidate.title,
+        candidate.description,
+        _candidate_subtitle(candidate),
+        candidate.edition,
+    )
+
+
+def candidates_name_different_parts(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """Whether two same-titled records are different volumes, parts or series of it.
+
+    "Gesammelte Werke : Band 1" and "Gesammelte Werke : Band 2", or Emerson's "Essays:
+    First Series" and "Essays: Second Series", share their full title and author but
+    have different contents. They differ when their volume/part/series markers (from
+    title, subtitle, description and edition) differ, or when both records name a
+    subtitle and the subtitles are not the same.
+    """
+    if _candidate_volume_markers(left) != _candidate_volume_markers(right):
+        return True
+    left_subtitle = _candidate_subtitle(left)
+    right_subtitle = _candidate_subtitle(right)
+    return bool(
+        left_subtitle and right_subtitle and _title_match_score(left_subtitle, right_subtitle) < 1.0
+    )
+
+
+def _authors_name_same_people(left: list[str], right: list[str]) -> bool:
+    """Each side's authors are, by full-name variant matching, among the other side's.
+
+    Stricter than ``authors_conflict``: a surname-only credit ("Herbert") is no
+    evidence that it is the same person as "Brian Herbert" or "Frank Herbert".
+    """
+    return (
+        min(_author_coverage(left, right), _author_coverage(right, left))
+        >= AUTHOR_VARIANT_MATCH_SCORE
+    )
+
+
 def candidates_describe_same_book(
     left: IdentificationCandidate,
     right: IdentificationCandidate,
@@ -2066,9 +2198,11 @@ def candidates_describe_same_book(
     """True when two provider records evidently describe the same book (edition).
 
     They share an ISBN (10/13-equivalent). Otherwise both must name the same title
-    (full title score) and agreeing authors, and nothing may tell their editions apart:
-    when both list ISBNs those sets are disjoint here, i.e. two different editions, and
-    when both name languages these must overlap. Used to tell a harmless tie (two
+    (full title score) and the same people as authors (compatible full names; a bare
+    surname is not enough), and nothing may tell their editions apart: when both list
+    ISBNs those sets are disjoint here, i.e. two different editions, when both name
+    languages these must overlap, and their volume/part/series markers ("Band 1",
+    "Second Series") must agree. Used to tell a harmless tie (two
     providers returning one book) from an ambiguous one (two different books or
     editions scoring the same).
     """
@@ -2078,6 +2212,9 @@ def candidates_describe_same_book(
         return True
     if left_isbns and right_isbns:
         return False
+    # "Essays: First Series" and "Essays: Second Series" are different books.
+    if _candidate_volume_markers(left) != _candidate_volume_markers(right):
+        return False
     left_languages = _candidate_languages(left)
     right_languages = _candidate_languages(right)
     if left_languages and right_languages and not left_languages & right_languages:
@@ -2086,7 +2223,67 @@ def candidates_describe_same_book(
         return False
     if not left.authors or not right.authors:
         return False
-    return not authors_conflict(left.authors, right.authors)
+    # Full names must be compatible: "Dune" by "Herbert" and "Dune" by "Brian Herbert"
+    # may be two people's books.
+    return _authors_name_same_people(left.authors, right.authors)
+
+
+def candidates_describe_same_work(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """True when two provider records are the same work, possibly different editions.
+
+    They share an ISBN, or they have the same full title, name no different volume,
+    part, series or subtitle (``candidates_name_different_parts``) and credit the same
+    people (full names compatible; a bare surname does not bridge two people). Unlike
+    ``candidates_describe_same_book`` neither different ISBNs nor different languages
+    tell them apart: two editions or translations of "Lady Susan" by Jane Austen are
+    one work.
+    """
+    if _edition_isbn13s(left) & _edition_isbn13s(right):
+        return True
+    if candidates_name_different_parts(left, right):
+        return False
+    if _title_match_score(left.title, right.title) < 1.0:
+        return False
+    if not left.authors or not right.authors:
+        return False
+    return _authors_name_same_people(left.authors, right.authors)
+
+
+def editions_disagree_on_language(candidates: list[IdentificationCandidate]) -> bool:
+    """Whether same-work candidates name different languages (e.g. translations)."""
+    named = [_candidate_languages(candidate) for candidate in candidates]
+    named = [languages for languages in named if languages]
+    return len(named) > 1 and not set.intersection(*(set(n) for n in named))
+
+
+def work_only(
+    candidate: IdentificationCandidate, *, drop_language: bool = False
+) -> IdentificationCandidate:
+    """``candidate`` as the work only: no ISBN, publisher, year or subtitle of one edition.
+
+    Used when several editions of the work fit the file equally and the file itself
+    names no ISBN. The description goes too: on provider records it is one edition's
+    subtitle. ``drop_language`` also removes the language when those editions
+    disagree on it and the file names none.
+    """
+    stripped = replace(
+        candidate,
+        isbn10=None,
+        isbn13=None,
+        description=None,
+        publisher=None,
+        edition=None,
+        publication_year=None,
+        edition_isbns=(),
+        edition_publishers=(),
+        concrete_edition=False,
+    )
+    if drop_language:
+        stripped = replace(stripped, language=None, edition_languages=(), work_languages=())
+    return stripped
 
 
 # Reasons an otherwise acceptable candidate stands for another edition than the file.
@@ -2287,6 +2484,43 @@ def _strong_match_settings() -> StrongMatchSettings:
     )
 
 
+# The matched title is only one part of a multi-part file name whose other parts are
+# neither numbers nor the candidate's authors: "Dune - House Harkonnen" names a series
+# and a book, "Gold - 03 - Frustration" a collection and one of its stories.
+PARTIAL_TITLE_HINT = "partial_title_hint"
+
+
+def _is_partial_title_hint(
+    signals: IdentificationInput, title_hint: str, candidate_authors: list[str]
+) -> bool:
+    """Whether ``title_hint`` is one segment of a longer file-name title hint.
+
+    The other segments make it partial unless each one is a bare number or names one of
+    ``candidate_authors`` ("Foundation - Isaac Asimov" is a whole title plus its author).
+    Hints are split exactly as file-name title hints are made (``_FILENAME_SEPARATOR``
+    after ``_normalize_filename_stem``), so "Dune -House Harkonnen" and
+    "Dune--House Harkonnen" are as partial as "Dune - House Harkonnen".
+    """
+    if not title_hint:
+        return False
+    hint = default_process(title_hint)
+    for whole in signals.title_hints:
+        segments = _FILENAME_SEPARATOR.split(_normalize_filename_stem(whole))
+        parts = [part.strip() for part in segments if part.strip().strip("-")]
+        if len(parts) < 2 or hint not in {default_process(part) for part in parts}:
+            continue
+        others = [
+            part
+            for part in parts
+            if default_process(part) != hint
+            and not _NUMERIC_SEGMENT.match(part)
+            and _author_match_score([part], candidate_authors) < AUTHOR_VARIANT_MATCH_SCORE
+        ]
+        if others:
+            return True
+    return False
+
+
 def _strong_match_assessment(
     signals: IdentificationInput,
     candidate: IdentificationCandidate,
@@ -2326,6 +2560,10 @@ def _strong_match_assessment(
         blocked_by.append("author_evidence_conflict")
     if title_hint and default_process(title_hint) == default_process(author_hint):
         blocked_by.append("title_and_author_from_same_hint")
+    if title_source == EVIDENCE_FILENAME and _is_partial_title_hint(
+        signals, title_hint, candidate.authors
+    ):
+        blocked_by.append(PARTIAL_TITLE_HINT)
 
     # ISBN, language and publisher are compared with the candidate's own edition, as
     # in edition_conflicts (#37): a work-level value proves the work, not the edition.
@@ -2486,14 +2724,31 @@ def _apply_strong_match_rule(
 
     assessment = _strong_match_assessment(signals, top, config)
     blocked_by = list(assessment["blocked_by"])
-    runner_up_score = candidates[1].score if len(candidates) > 1 else None
+    # Other editions of the same work (DNB, Google Books and Open Library often return
+    # several) are no competing books: they neither tie with nor rival the top one.
+    rivals = [other for other in candidates[1:] if not candidates_describe_same_work(top, other)]
+    same_work_editions = len(candidates) - 1 - len(rivals)
+    runner_up_score = rivals[0].score if rivals else None
     if runner_up_score is not None and top.score - runner_up_score <= config.tie_margin:
         blocked_by.append("near_tied_candidate")
     elif any(
-        not _strong_match_assessment(signals, other, config)["blocked_by"]
-        for other in candidates[1:]
+        not _strong_match_assessment(signals, other, config)["blocked_by"] for other in rivals
     ):
         blocked_by.append("multiple_qualifying_candidates")
+    # Without a file ISBN, other editions of the work at (nearly) the same score mean the
+    # file's edition is unknown: accept the work, not one arbitrary edition's details.
+    tied_editions = [
+        other
+        for other in candidates[1:]
+        if top.score - other.score <= config.tie_margin
+        and candidates_describe_same_work(top, other)
+    ]
+    edition_ambiguous = not signals.isbns and bool(tied_editions)
+    language_ambiguous = (
+        edition_ambiguous
+        and not signals.language
+        and editions_disagree_on_language([top, *tied_editions])
+    )
 
     applied = not blocked_by
     evidence = {
@@ -2511,6 +2766,9 @@ def _apply_strong_match_rule(
         "title_source": assessment["title_source"],
         "strongest_title_source": assessment["strongest_title_source"],
         "missing_coauthors": assessment["missing_coauthors"],
+        "same_work_editions": same_work_editions,
+        "edition_ambiguous": edition_ambiguous,
+        "language_ambiguous": language_ambiguous,
     }
     if applied:
         logger.info(
@@ -2519,8 +2777,11 @@ def _apply_strong_match_rule(
             provider_id=top.provider_id,
             base_score=top.score,
         )
+    base = (
+        work_only(top, drop_language=language_ambiguous) if applied and edition_ambiguous else top
+    )
     promoted = replace(
-        top,
+        base,
         score=max(top.score, AUTO_ACCEPT_SCORE) if applied else top.score,
         raw={**top.raw, STRONG_MATCH_EVIDENCE_KEY: evidence},
     )

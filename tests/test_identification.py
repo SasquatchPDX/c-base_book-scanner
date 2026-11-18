@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from django.test import override_settings
 
+from ebook_server.core import identification
 from ebook_server.core.identification import (
     AUTHOR_VARIANT_MATCH_SCORE,
     AUTO_ACCEPT_SCORE,
@@ -552,20 +554,100 @@ def test_title_match_without_author_match_does_not_auto_accept() -> None:
     assert "author_not_strong" in _rule_evidence(candidates[0])["blocked_by"]
 
 
-def test_near_tied_candidates_do_not_auto_accept() -> None:
+def test_editions_of_the_same_work_do_not_tie_and_accept_the_work_only() -> None:
+    # DNB, Google Books and Open Library often return several records of one work at
+    # the same score. They are no rival books, but without a file ISBN the file's
+    # edition is unknown: the work is accepted without any one edition's details.
     candidates = _resolve(
         _signals(title="Poems", author="Emily Dickinson"),
         [
-            {"key": "/works/OL1W", "title": "Poems", "author_name": ["Emily Dickinson"]},
+            {
+                "key": "/works/OL1W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "isbn": ["9780141191744"],
+                "publisher": ["Penguin"],
+                "first_publish_year": 1890,
+            },
             {"key": "/works/OL2W", "title": "Poems", "author_name": ["Emily Dickinson"]},
         ],
     )
 
-    assert all(candidate.score < AUTO_ACCEPT_SCORE for candidate in candidates)
-    evidence = _rule_evidence(candidates[0])
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["applied"] is True
+    assert evidence["blocked_by"] == []
+    assert evidence["same_work_editions"] == 1
+    assert evidence["edition_ambiguous"] is True
+    assert (top.isbn10, top.isbn13, top.publisher, top.publication_year) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert top.edition_isbns == ()
+
+
+def test_translations_of_the_same_work_do_not_tie_and_drop_the_language() -> None:
+    # A file without language: an English and a German "Poems" are one work, and the
+    # language of neither edition is the file's.
+    candidates = _resolve(
+        _signals(title="Poems", author="Emily Dickinson"),
+        [
+            {
+                "key": "/works/OL1W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "language": ["eng"],
+            },
+            {
+                "key": "/works/OL2W",
+                "title": "Poems",
+                "author_name": ["Emily Dickinson"],
+                "language": ["ger"],
+            },
+        ],
+    )
+
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["language_ambiguous"] is True
+    assert top.language is None
+
+
+def test_near_tied_rival_book_still_blocks() -> None:
+    signals = _signals(title="Poems", author="Emily Dickinson")
+    top = _resolve(signals, [{"title": "Poems", "author_name": ["Emily Dickinson"]}])[0]
+    base = dataclasses.replace(top, score=0.85, raw={})
+    rival = dataclasses.replace(base, provider_ref="other", authors=["Emily Brontë"])
+
+    ranked = identification._apply_strong_match_rule(signals, [base, rival])
+
+    evidence = _rule_evidence(ranked[0])
     assert evidence["applied"] is False
     assert evidence["blocked_by"] == ["near_tied_candidate"]
-    assert evidence["runner_up_score"] == pytest.approx(0.85)
+    assert evidence["same_work_editions"] == 0
+
+
+def test_single_edition_keeps_its_details() -> None:
+    candidates = _resolve(
+        _signals(title="The Hobbit", author="J.R.R. Tolkien"),
+        [
+            {
+                "title": "The Hobbit",
+                "author_name": ["J.R.R. Tolkien"],
+                "isbn": ["9780261102217"],
+                "first_publish_year": 1937,
+            }
+        ],
+    )
+
+    top = candidates[0]
+    assert top.score >= AUTO_ACCEPT_SCORE
+    assert _rule_evidence(top)["edition_ambiguous"] is False
+    assert top.publication_year == 1937
 
 
 def test_clear_winner_over_weaker_candidate_auto_accepts() -> None:
@@ -665,3 +747,146 @@ def test_build_identification_input_reads_publication_year() -> None:
     )
 
     assert signals.publication_year == 1951
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("Dune - House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        # Lopsided and doubled separators split the title hints too (review of #151).
+        ("Dune -House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        ("Dune--House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        ("Dune_-_House Harkonnen.txt", {"title": "Dune", "author_name": ["Frank Herbert"]}),
+        ("Gold - 03 - Frustration.txt", {"title": "Gold", "author_name": ["Isaac Asimov"]}),
+        ("Gold - 01 - cal.txt", {"title": "Gold", "author_name": ["Isaac Asimov"]}),
+    ],
+)
+def test_one_part_of_a_multi_part_file_name_is_not_auto_accepted(
+    filename: str, payload: dict[str, Any]
+) -> None:
+    # The folder names the author, so the author check passes; the title only matches the
+    # series/collection part of the file name.
+    author = payload["author_name"][0]
+    signals = build_identification_input(
+        source_path=f"/library/{author}/{filename}",
+        original_filename=filename,
+        extracted_metadata={"path_layout": {"authors": [author], "title": None}},
+    )
+    candidates = _resolve(signals, [payload])
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert "partial_title_hint" in _rule_evidence(candidates[0])["blocked_by"]
+
+
+def test_title_plus_author_file_name_is_not_partial() -> None:
+    signals = build_identification_input(
+        source_path="/incoming/Foundation - Isaac Asimov.txt",
+        original_filename="Foundation - Isaac Asimov.txt",
+        extracted_metadata={},
+    )
+    candidates = _resolve(signals, [{"title": "Foundation", "author_name": ["Isaac Asimov"]}])
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    assert "partial_title_hint" not in _rule_evidence(candidates[0])["blocked_by"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "title", "author"),
+    [
+        ("Asimov, Isaac - Foundation.txt", "Foundation", "Isaac Asimov"),
+        ("J.R.R. Tolkien - The Hobbit.txt", "The Hobbit", "J. R. R. Tolkien"),
+        ("Tolkien, J.R.R. - The Hobbit - 1937.txt", "The Hobbit", "J. R. R. Tolkien"),
+        ("Isaac Asimov - Foundation (1951).txt", "Foundation", "Isaac Asimov"),
+    ],
+)
+def test_author_title_file_names_still_auto_accept(filename: str, title: str, author: str) -> None:
+    # The other segments are the author or a year: the title hint is the whole title.
+    signals = build_identification_input(
+        source_path=f"/incoming/{filename}", original_filename=filename, extracted_metadata={}
+    )
+    candidates = _resolve(signals, [{"title": title, "author_name": [author]}])
+
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == []
+
+
+# --- Volumes and series of one title are different works (review of #150) ----------
+
+
+@pytest.mark.parametrize(
+    ("subtitles", "author", "title"),
+    [
+        (("Band 1", "Band 2"), "Johann Wolfgang von Goethe", "Gesammelte Werke"),
+        (("First Series", "Second Series"), "Ralph Waldo Emerson", "Essays"),
+        (("Vol. I", "Vol. II"), "Ralph Waldo Emerson", "Essays"),
+        (("Teil 1", "Teil 2"), "Johann Wolfgang von Goethe", "Faust"),
+        (("Book One", "Book Two"), "Ralph Waldo Emerson", "Essays"),
+    ],
+)
+def test_separate_volumes_with_one_title_still_tie(
+    subtitles: tuple[str, str], author: str, title: str
+) -> None:
+    # DNB splits "Gesammelte Werke : Band 1" into title and subtitle, so both volumes
+    # share the full title and author. They have different contents: a near tie that
+    # goes to review, not one "work" auto-accepted as Band 1.
+    candidates = _resolve(
+        _signals(title=title, author=author),
+        [
+            {"key": "a", "title": title, "subtitle": subtitles[0], "author_name": [author]},
+            {"key": "b", "title": title, "subtitle": subtitles[1], "author_name": [author]},
+        ],
+    )
+
+    top = candidates[0]
+    assert top.score < AUTO_ACCEPT_SCORE
+    evidence = _rule_evidence(top)
+    assert evidence["blocked_by"] == ["near_tied_candidate"]
+    assert evidence["same_work_editions"] == 0
+
+
+def test_goethe_volumes_with_their_own_isbns_still_tie() -> None:
+    # The reviewer's probe on #150, each volume with its own ISBN.
+    candidates = _resolve(
+        _signals(title="Gesammelte Werke", author="Johann Wolfgang von Goethe"),
+        [
+            {
+                "key": "a",
+                "title": "Gesammelte Werke",
+                "subtitle": "Band 1",
+                "author_name": ["Johann Wolfgang von Goethe"],
+                "isbn": ["9780141191744"],
+            },
+            {
+                "key": "b",
+                "title": "Gesammelte Werke",
+                "subtitle": "Band 2",
+                "author_name": ["Johann Wolfgang von Goethe"],
+                "isbn": ["9780451524935"],
+            },
+        ],
+    )
+
+    assert candidates[0].score < AUTO_ACCEPT_SCORE
+    assert _rule_evidence(candidates[0])["blocked_by"] == ["near_tied_candidate"]
+
+
+@pytest.mark.parametrize(
+    ("texts", "expected"),
+    [
+        (("Gesammelte Werke", "Band 1"), {("volume", 1)}),
+        (("Essays", "Second Series"), {("series", 2)}),
+        (("Essays: First Series",), {("series", 1)}),
+        (("Werke", "Bd. 2"), {("volume", 2)}),
+        (("Works", "Vol. IV"), {("volume", 4)}),
+        (("Works", "Volume 3"), {("volume", 3)}),
+        (("Faust", "Zweiter Teil"), {("part", 2)}),
+        (("Faust", "2. Teil"), {("part", 2)}),
+        (("Dune Messiah", "Book Two"), {("volume", 2)}),
+        (("Werke", "II"), {("volume", 2)}),
+        (("The Hobbit", "or There and Back Again"), set()),
+        (("I, Robot", None), set()),
+        (("Book of the New Sun", "Part of the trilogy"), set()),
+    ],
+)
+def test_volume_markers(texts: tuple[str | None, ...], expected: set[tuple[str, int]]) -> None:
+    assert identification.volume_markers(*texts) == expected
