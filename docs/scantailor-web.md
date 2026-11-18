@@ -99,6 +99,18 @@ error, queues processing, and invalidates every downstream stage. A replacement
 scan page similarly invalidates dependent artifacts without deleting the old page
 version.
 
+The editor's **Input** and **Result** buttons distinguish the editable source from
+the processed image. A successful run selects Result automatically, with geometry
+handles hidden; switch to Input to adjust geometry. Worker fallback warnings appear
+beside the preview even when the stage completes successfully. Updates work through
+both live events and compatibility polling.
+
+Margins record computed dimensions as `resolved_canvas_width` and
+`resolved_canvas_height`; `canvas_width` and `canvas_height` are reserved for explicit
+fixed-canvas requests. Reducing ordinary padding therefore shrinks the result again.
+The editor also recognizes legacy computed canvases equal to the input plus recorded
+padding, rather than silently resubmitting them as fixed dimensions.
+
 ## Page Split and the capture layout (decision for #55)
 
 **Question.** Is Page Split needed for this project's scanner, which captures

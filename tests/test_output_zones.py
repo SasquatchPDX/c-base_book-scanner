@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -145,7 +146,18 @@ def test_detection_and_threshold_scratch_are_bounded(
         return original(gray, *args, **kwargs)
 
     monkeypatch.setattr(scantailor, "_binarize_with_cv2", recording)
-    illustrated_page().resize((2200, 3080)).save(tmp_path / "source.png")
+    large = illustrated_page().resize((2200, 3080))
+    masks: list[tuple[int, ...]] = []
+    components = cv2.connectedComponentsWithStats
+
+    def bounded_components(mask: Any, *args: Any, **kwargs: Any) -> Any:
+        masks.append(mask.shape)
+        return components(mask, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "connectedComponentsWithStats", bounded_components)
+    output_zones.detect_zones(large)
+    assert masks and all(max(shape) <= output_zones.MAX_DETECTION_EDGE for shape in masks)
+    large.save(tmp_path / "source.png")
     _output, result = run_output(
         tmp_path, {"output_mode": "sauvola", "zone_mode": "off", "window_size": 501}
     )

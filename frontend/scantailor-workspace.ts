@@ -145,6 +145,26 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
       editable[key] = structuredClone(parameters[key]);
     }
   }
+  if (stage === "margins") {
+    // Older workers stored automatic canvas dimensions under the request keys.
+    // Recover that common case without discarding a larger, explicitly sized canvas.
+    for (const [axis, before, after] of [
+      ["width", "left", "right"],
+      ["height", "top", "bottom"],
+    ] as const) {
+      const size = positiveNumber(parameters[`input_${axis}`] ?? parameters[`source_${axis}`]);
+      const padding =
+        finiteNumber(parameters[`margin_${before}`], 0) +
+        finiteNumber(parameters[`margin_${after}`], 0);
+      if (
+        !(`resolved_canvas_${axis}` in parameters) &&
+        size &&
+        parameters[`canvas_${axis}`] === size + padding
+      ) {
+        delete editable[`canvas_${axis}`];
+      }
+    }
+  }
   return editable;
 }
 
@@ -176,6 +196,17 @@ export function outputZonesForEditing(parameters: JsonObject): OutputZone[] {
     const box = parameters[`${kind}_box`];
     return Array.isArray(box) && box.length === 4 ? [{ kind, box: box.map(Number) }] : [];
   });
+}
+
+export function stageWorkerWarnings(parameters: JsonObject): string {
+  return [parameters.dewarp_warning, parameters.output_warning]
+    .filter((warning): warning is string => typeof warning === "string" && warning.trim() !== "")
+    .map((warning) =>
+      warning === "auto_detection_found_no_text_lines_or_page_outline"
+        ? "Automatic dewarping found no reliable text lines or page outline; the input was kept unchanged."
+        : warning,
+    )
+    .join(" · ");
 }
 
 /** Outcome of re-requesting a preview image that failed to load. */
@@ -350,6 +381,10 @@ class WorkspaceController {
   private readonly batchScope: HTMLSelectElement;
   private readonly preserveExceptions: HTMLInputElement;
   private readonly selectionCount: HTMLElement;
+  private readonly inputButton: HTMLButtonElement;
+  private readonly resultButton: HTMLButtonElement;
+  private readonly warnings: HTMLElement;
+  private previewMode: "input" | "result" = "input";
   private activePageId: string | null = null;
   private activeStage: StageName = "page_split";
   private draft: JsonObject = {};
@@ -371,6 +406,9 @@ class WorkspaceController {
     this.batchScope = element(root, "[data-batch-scope]");
     this.preserveExceptions = element(root, "[data-preserve-exceptions]");
     this.selectionCount = element(root, "[data-selection-count]");
+    this.inputButton = element(root, "[data-preview-input]");
+    this.resultButton = element(root, "[data-preview-result]");
+    this.warnings = element(root, "[data-stage-warnings]");
     for (const page of pages) {
       this.pages.set(page.id, page);
     }
@@ -388,6 +426,8 @@ class WorkspaceController {
   }
 
   private bindWorkspaceControls(): void {
+    this.inputButton.addEventListener("click", () => this.showPreview("input"));
+    this.resultButton.addEventListener("click", () => this.showPreview("result"));
     this.root.querySelectorAll<HTMLButtonElement>("[data-stage-select]").forEach((button) => {
       button.addEventListener("click", () => {
         const value = button.dataset.stageSelect ?? "";
@@ -472,18 +512,51 @@ class WorkspaceController {
     this.title.textContent = `Page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}`;
     this.markActiveControls();
     this.renderControls();
-    const trigger = this.stageTrigger(pageId, stage);
-    const source = trigger?.dataset.inputPreviewUrl || page.thumbnail || "";
-    if (source) {
-      this.image.hidden = false;
-      this.image.src = `${source}${source.includes("?") ? "&" : "?"}revision=${state.revision}`;
-    } else {
-      this.image.hidden = true;
-      this.clearGeometry();
-    }
+    this.showPreview("input");
     this.saveButton.disabled = !this.editable;
     const message = stageStatusMessage(state);
     this.setMessage(message.text, message.tone);
+  }
+
+  private showPreview(mode: "input" | "result"): void {
+    const context = this.activeContext();
+    if (!context) return;
+    const state = context.state;
+    const hasResult =
+      state.status === "success" &&
+      Boolean(state.preview_storage_identifier || state.output_storage_identifier);
+    this.resultButton.disabled = !hasResult;
+    this.previewMode = mode === "result" && hasResult ? "result" : "input";
+    this.inputButton.setAttribute("aria-pressed", String(this.previewMode === "input"));
+    this.resultButton.setAttribute("aria-pressed", String(this.previewMode === "result"));
+    this.image.alt =
+      this.previewMode === "input"
+        ? "Processing-stage input preview"
+        : "Processing-stage result preview";
+    const trigger = this.stageTrigger(context.page.id, state.stage);
+    const source =
+      this.previewMode === "result"
+        ? trigger?.dataset.outputPreviewUrl
+        : trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
+    this.image.hidden = !source;
+    if (source) {
+      const url = `${source}${source.includes("?") ? "&" : "?"}revision=${state.revision}-${state.status}`;
+      if (this.image.getAttribute("src") !== url) this.image.src = url;
+    }
+    const warning = state.status === "success" ? stageWorkerWarnings(state.parameters) : "";
+    this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
+    this.warnings.hidden = !warning;
+    this.geometryLayer.hidden = this.previewMode === "result";
+    this.renderGeometry();
+  }
+
+  private updateActivePreview(state: StageState, previous?: StageState): void {
+    if (state.scan_page_id !== this.activePageId || state.stage !== this.activeStage) return;
+    const justCompleted =
+      state.status === "success" &&
+      (previous?.status !== "success" || previous.revision !== state.revision);
+    this.showPreview(justCompleted ? "result" : this.previewMode);
+    if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
   }
 
   private markActiveControls(): void {
@@ -597,7 +670,12 @@ class WorkspaceController {
     const detected = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
     if (this.draft.zone_mode !== "off") {
       this.addSelect("Text algorithm", "text_algorithm", algorithms, "sauvola");
-      this.addSelect("Picture algorithm (Keep color uses copy)", "picture_algorithm", algorithms, "copy");
+      this.addSelect(
+        "Picture algorithm (Keep color uses copy)",
+        "picture_algorithm",
+        algorithms,
+        "copy",
+      );
     }
     if (this.draft.zone_mode === "manual") {
       if (!("zones" in this.draft)) this.draft.zones = detected;
@@ -651,6 +729,7 @@ class WorkspaceController {
       this.addZoneButton(`Edit detected regions (${detected.length})`, () => {
         this.draft.zone_mode = "manual";
         this.draft.zones = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
+        this.showPreview("input");
         this.renderControls();
         this.renderGeometry();
       });
@@ -782,6 +861,7 @@ class WorkspaceController {
 
   private renderGeometry(): void {
     this.clearGeometry();
+    if (this.previewMode === "result") return;
     if (!this.image.complete || !this.image.naturalWidth || this.image.hidden) return;
     const source = this.sourceSize();
     const display = this.displaySize();
@@ -1072,7 +1152,12 @@ class WorkspaceController {
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as { stage: StageState };
       this.mergeStage(payload.stage);
-      this.setMessage("Saved. The worker is generating the new preview.", "success");
+      this.setMessage(
+        payload.stage.status === "success"
+          ? "Saved. Result preview is ready."
+          : "Saved. The worker is generating the new preview.",
+        "success",
+      );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Stage update failed.", "error");
     } finally {
@@ -1138,9 +1223,11 @@ class WorkspaceController {
     const page = this.pages.get(incoming.scan_page_id);
     if (!page) return;
     const index = page.stages.findIndex((state) => state.stage === incoming.stage);
+    const previous = index >= 0 ? page.stages[index] : undefined;
     if (index >= 0) page.stages[index] = incoming;
     else page.stages.push(incoming);
     this.updateStageDom(incoming);
+    this.updateActivePreview(incoming, previous);
   }
 
   private updateStageDom(state: StageState): void {
@@ -1184,14 +1271,6 @@ class WorkspaceController {
       this.eventSource.addEventListener("workspace", (event) => {
         const payload = JSON.parse((event as MessageEvent<string>).data) as WorkspaceEvent;
         for (const state of payload.stages) this.mergeStage(state);
-        const context = this.activeContext();
-        if (context && ["success", "failed"].includes(context.state.status)) {
-          const trigger = this.stageTrigger(context.page.id, context.state.stage);
-          const source = trigger?.dataset.inputPreviewUrl;
-          if (source && this.image.src) {
-            this.image.src = `${source}${source.includes("?") ? "&" : "?"}revision=${context.state.revision}-${context.state.status}`;
-          }
-        }
       });
       this.eventSource.addEventListener("error", () => {
         this.liveStatus.textContent = "Live updates reconnecting…";
@@ -1214,8 +1293,12 @@ class WorkspaceController {
       if (!response.ok) return;
       const payload = (await response.json()) as { pages: WorkspacePage[] };
       for (const page of payload.pages) {
+        const previous = this.pages.get(page.id);
         this.pages.set(page.id, page);
-        for (const state of page.stages) this.updateStageDom(state);
+        for (const state of page.stages) {
+          this.updateStageDom(state);
+          this.updateActivePreview(state, previous && stageFor(previous, state.stage));
+        }
       }
     } catch {
       this.liveStatus.textContent = "Workspace refresh failed; retrying…";

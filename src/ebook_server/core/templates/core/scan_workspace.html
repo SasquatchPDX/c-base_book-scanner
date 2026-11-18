@@ -122,6 +122,12 @@
         </div>
       </div>
       <div class="editor-stage-controls" data-stage-controls></div>
+      <div class="editor-actions" role="group" aria-label="Stage preview">
+        <button type="button" data-preview-input aria-pressed="true">Input</button>
+        <button type="button" data-preview-result aria-pressed="false" disabled>Result</button>
+        <small>Use Input to edit page geometry; Result shows the completed stage.</small>
+      </div>
+      <p class="editor-message" data-stage-warnings role="status" hidden></p>
       <div class="geometry-frame">
         <img data-editor-image alt="Processing-stage input preview" hidden>
         <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
@@ -171,6 +177,7 @@
                 data-stage="{{ stage.stage }}"
                 data-stage-url="{% url 'scan-job-page-stage' job.id page.id stage.stage %}"
                 data-input-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}?input=true"
+                data-output-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}"
               >Edit</button>
               <a data-stage-preview-link {% if not stage.preview_storage_identifier and not stage.output_storage_identifier %}hidden{% endif %} href="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}">Preview</a>
               {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}

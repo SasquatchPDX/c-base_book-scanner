@@ -121,6 +121,10 @@ pandoc \
   --metadata publisher="Ada Digital Self-Publishing" \
   --output "${book_scanner_browser_epub}"
 export BOOK_SCANNER_BROWSER_EPUB_FIXTURE="${book_scanner_browser_epub}"
+export BOOK_SCANNER_BROWSER_TIED_EPUB="${book_scanner_storage_root}/Browser Edition Twins.epub"
+pandoc "${book_scanner_project_root}/tests/fixtures/browser-digital-library.html" \
+  --from html --to epub3 --metadata title="Browser Edition Twins" \
+  --metadata author="Ada Digital" --metadata lang=en --output "${BOOK_SCANNER_BROWSER_TIED_EPUB}"
 uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120
 uv run python manage.py migrate --noinput

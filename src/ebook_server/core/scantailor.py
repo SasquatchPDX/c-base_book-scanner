@@ -1496,8 +1496,8 @@ def _run_margins(
             "margin_left": left,
             "align_x": align_x,
             "align_y": align_y,
-            "canvas_width": target_w,
-            "canvas_height": target_h,
+            "resolved_canvas_width": target_w,
+            "resolved_canvas_height": target_h,
         },
     )
 

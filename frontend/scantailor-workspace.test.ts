@@ -14,6 +14,7 @@ import {
   stageErrorText,
   stageStatusLabel,
   stageStatusMessage,
+  stageWorkerWarnings,
   STAGE_ORDER,
 } from "./scantailor-workspace";
 
@@ -88,7 +89,7 @@ describe("editable stage parameters", () => {
       },
     };
     document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
-      <div id="zones-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-stage-select="output">Output</button><button data-stage-open data-page-id="page" data-stage="output" data-stage-url="/output"></button></div>`;
+      <div id="zones-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-stage-select="output">Output</button><button data-stage-open data-page-id="page" data-stage="output" data-stage-url="/output"></button></div>`;
     const fetcher = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -115,6 +116,35 @@ describe("editable stage parameters", () => {
     expect(posted.parameters).not.toHaveProperty("resolved_zones");
     vi.unstubAllGlobals();
     document.body.replaceChildren();
+  });
+  it("does not resubmit a legacy computed margin canvas as a fixed request", () => {
+    expect(
+      editableParameters("margins", {
+        margin: 20,
+        input_width: 100,
+        input_height: 200,
+        margin_left: 20,
+        margin_right: 20,
+        margin_top: 20,
+        margin_bottom: 20,
+        canvas_width: 140,
+        canvas_height: 240,
+      }),
+    ).toEqual({ margin: 20 });
+    // A larger fixed canvas, and new explicit requests, remain intentional settings.
+    expect(
+      editableParameters("margins", {
+        input_width: 100,
+        canvas_width: 300,
+      }),
+    ).toEqual({ canvas_width: 300 });
+    expect(
+      editableParameters("margins", {
+        input_width: 100,
+        canvas_width: 100,
+        resolved_canvas_width: 100,
+      }),
+    ).toEqual({ canvas_width: 100 });
   });
   it("keeps manual geometry while excluding worker-derived provenance", () => {
     expect(
@@ -149,6 +179,18 @@ describe("editable stage parameters", () => {
       picture_algorithm: "window",
     });
     expect(parameters).not.toHaveProperty("worker_job_id");
+  });
+});
+
+describe("worker warnings", () => {
+  it("shows recorded fallback explanations and ignores absent or malformed values", () => {
+    expect(stageWorkerWarnings({ dewarp_warning: "No reliable page geometry found" })).toBe(
+      "No reliable page geometry found",
+    );
+    expect(stageWorkerWarnings({ output_warning: "Fell back to Otsu", dewarp_warning: null })).toBe(
+      "Fell back to Otsu",
+    );
+    expect(stageWorkerWarnings({ output_warning: [], dewarp_warning: " " })).toBe("");
   });
 });
 
