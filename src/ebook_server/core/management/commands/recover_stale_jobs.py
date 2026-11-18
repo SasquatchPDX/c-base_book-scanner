@@ -8,7 +8,7 @@ from typing import Any
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from ebook_server.core import intake, scan_pipeline
+from ebook_server.core import conversion, intake, scan_pipeline
 from ebook_server.core.models import ProcessingJob, ScanJob, ScanLog
 from ebook_server.jobs import is_stale_running, rq_pending_job_args, stale_after
 
@@ -118,6 +118,12 @@ class Command(BaseCommand):
         return recovered
 
     def _fail(self, job: ProcessingJob, reason: str) -> None:
+        if job.job_type == ProcessingJob.JobType.CONVERSION:
+            if not conversion.recover_stale_conversion_job(
+                job, f"recovered by recover_stale_jobs: {reason}"
+            ):
+                self.stdout.write(f"  -> conversion {job.job_id} changed meanwhile; left alone")
+            return
         details = dict(job.details) if isinstance(job.details, dict) else {}
         details["error"] = f"recovered by recover_stale_jobs: {reason}"
         job.state = ProcessingJob.JobState.FAILED
