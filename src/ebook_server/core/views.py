@@ -36,7 +36,6 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
-from ebook_server.jobs import enqueue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -782,15 +781,28 @@ def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
     )
 
 
-def _page_work_identifier(page: ScanPage) -> str:
-    """Working image of the page's active version; queues it when it is missing."""
+# Seconds the editor should wait before asking again for a working image being generated.
+PAGE_IMAGE_RETRY_AFTER_SECONDS = 2
+
+
+def _page_work_identifier(page: ScanPage) -> str | None:
+    """Working image of the page's active version.
+
+    Returns ``""`` when the page has no version, and ``None`` while the working
+    image is still being generated: pages uploaded before migration 0050, or a new
+    upload whose generation job has not run yet. The request never decodes the
+    scan itself; it queues the (deduplicated) background job and looks again,
+    because an inline queue, or a fast worker, may already have finished it.
+    """
     version = page.active_version()
     if version is None:
         return ""
     page_image = ScanPageImage.objects.filter(version=version).first()
     if page_image is None:
-        enqueue(scan_images.generate_page_image_job, version.pk)
-        return ""
+        scan_images.request_page_image(version.pk)
+        page_image = ScanPageImage.objects.filter(version=version).first()
+    if page_image is None:
+        return None
     return page_image.work_storage_identifier
 
 
@@ -1516,7 +1528,14 @@ def scan_page_stage_preview(
         )
     elif wants_input:
         # The first stage edits the page's working image (#195), never the raw scan.
-        identifier = _page_work_identifier(state.scan_page)
+        work_identifier = _page_work_identifier(state.scan_page)
+        if work_identifier is None:
+            # Being generated: a distinct, retryable answer the editor polls on.
+            pending = HttpResponse("input preview not ready", status=503, content_type="text/plain")
+            pending["Retry-After"] = str(PAGE_IMAGE_RETRY_AFTER_SECONDS)
+            pending["Cache-Control"] = "no-store"
+            return pending
+        identifier = work_identifier
     else:
         identifier = state.preview_storage_identifier or state.output_storage_identifier
     if not identifier:
