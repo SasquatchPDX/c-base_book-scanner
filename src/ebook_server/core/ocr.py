@@ -31,7 +31,7 @@ from ebook_server.jobs import (
 )
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import archive_layout, conversion, intake
+from . import archive_layout, conversion, intake, worker_failures
 from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
@@ -731,6 +731,8 @@ def process_ocr_job(job_id: str) -> None:
     except Exception as exc:  # pragma: no cover - defensive
         close_old_connections()
         _fail_ocr_job(ocr_job, str(exc))
+        if worker_failures.retry_pending(ocr_job):
+            raise
     finally:
         for cleanup_path in cleanup_paths:
             cleanup_path.unlink(missing_ok=True)
@@ -1021,8 +1023,9 @@ def _fail_ocr_job(job: ProcessingJob, message: str) -> None:
     details = _ensure_dict(job.details)
     details["error"] = message
     details["remote_status"] = "failed"
-    job.state = ProcessingJob.JobState.FAILED
-    job.finished_at = timezone.now()
+    pending = worker_failures.retry_pending(job)
+    job.state = ProcessingJob.JobState.QUEUED if pending else ProcessingJob.JobState.FAILED
+    job.finished_at = None if pending else timezone.now()
     job.details = details
     job.save(update_fields=["state", "finished_at", "details"])
     logger.error(

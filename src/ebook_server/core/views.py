@@ -87,6 +87,7 @@ from . import (
     scanner_rescans,
     scantailor,
     search,
+    worker_failure_views,
 )
 from . import thumbnails as thumbnails_module
 from .metrics import PersistentStateCollector
@@ -1120,7 +1121,16 @@ def scan_api_login_required(view: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-def _can_manage_review_task(profile: AppUserProfile, task: ReviewTask) -> bool:
+def _can_manage_review_task(
+    profile: AppUserProfile,
+    task: ReviewTask,
+    *,
+    allow_worker_failure: bool = False,
+) -> bool:
+    if task.processing_job_id is not None:
+        return allow_worker_failure and (
+            profile.role == "admin" or task.uploader_id == profile.user_id
+        )
     if profile.role == "admin":
         return True
     import_job = task.import_job
@@ -1133,6 +1143,8 @@ def _can_manage_review_task(profile: AppUserProfile, task: ReviewTask) -> bool:
 
 
 def _review_owner_id(task: ReviewTask) -> int | None:
+    if task.processing_job_id is not None:
+        return task.uploader_id
     import_job = task.import_job
     if import_job is not None:
         return import_job.uploader_id
@@ -1208,6 +1220,11 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
 def _serialize_task(task: ReviewTask) -> dict[str, Any]:
     source_type = "import" if task.import_job_id is not None else "scan"
     source_id = task.import_job_id or task.scan_job_id
+    if task.processing_job_id is not None:
+        source_type = "processing"
+        processing_job = task.processing_job
+        assert processing_job is not None
+        source_id = processing_job.job_id
     return {
         "id": str(task.id),
         "state": task.state,
@@ -4390,6 +4407,7 @@ def _review_queue_queryset(profile: AppUserProfile) -> Any:
             "import_job__source_location",
             "scan_job",
             "scan_job__operator",
+            "processing_job",
         )
         .filter(state__in=REVIEW_QUEUE_STATES)
         .annotate(
@@ -4401,12 +4419,17 @@ def _review_queue_queryset(profile: AppUserProfile) -> Any:
     )
     if profile.role != "admin":
         tasks = tasks.filter(
-            Q(import_job__uploader=profile.user) | Q(scan_job__operator=profile.user)
+            Q(import_job__uploader=profile.user)
+            | Q(scan_job__operator=profile.user)
+            | Q(processing_job__isnull=False, uploader=profile.user)
         )
     return tasks
 
 
 def _review_queue_filters(request: HttpRequest) -> dict[str, Any]:
+    task_type = request.GET.get("task_type", "").strip()
+    if task_type not in ReviewTask.TaskType.values:
+        task_type = ""
     state = request.GET.get("state", "").strip()
     if state not in {choice.value for choice in REVIEW_QUEUE_STATES}:
         state = ""
@@ -4420,6 +4443,7 @@ def _review_queue_filters(request: HttpRequest) -> dict[str, Any]:
     if source not in {"upload", "scan"} and not source.isdigit():
         source = ""
     return {
+        "task_type": task_type,
         "source": source,
         "state": state,
         "min_score": _parse_score(request.GET.get("min_score")),
@@ -4430,6 +4454,8 @@ def _review_queue_filters(request: HttpRequest) -> dict[str, Any]:
 
 
 def _apply_review_queue_filters(tasks: Any, filters: dict[str, Any]) -> Any:
+    if filters["task_type"]:
+        tasks = tasks.filter(task_type=filters["task_type"])
     source = filters["source"]
     if source == "upload":
         tasks = tasks.filter(import_job__isnull=False, import_job__source_location__isnull=True)
@@ -4461,7 +4487,7 @@ def _apply_review_queue_filters(tasks: Any, filters: dict[str, Any]) -> Any:
 def _review_queue_querystring(filters: dict[str, Any], page_size: int) -> str:
     """Filter state for pagination links, so paging never drops the active filters."""
     params: dict[str, str] = {"view": "html", "page_size": str(page_size)}
-    for key in ("source", "state", "has_candidates", "sort"):
+    for key in ("source", "state", "has_candidates", "sort", "task_type"):
         if filters[key]:
             params[key] = filters[key]
     for key in ("min_score", "max_score"):
@@ -4536,6 +4562,7 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
                 "filters": filters,
                 "querystring": _review_queue_querystring(filters, page_size),
                 "source_locations": SourceLocation.objects.order_by("name"),
+                "task_types": ReviewTask.TaskType.choices,
                 "batch_min_score": min_score,
                 "batch_ambiguity_margin": margin,
                 "batch_max_tasks": review_batch.batch_max_tasks(),
@@ -4638,8 +4665,10 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
-    if not _can_manage_review_task(profile, task):
+    if not _can_manage_review_task(profile, task, allow_worker_failure=True):
         return HttpResponseForbidden()
+    if task.processing_job_id is not None:
+        return worker_failure_views.detail(request, task)
 
     payload = _serialize_task(task)
     candidates = list(_review_candidates(task))

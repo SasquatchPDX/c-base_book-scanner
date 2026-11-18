@@ -1,0 +1,29 @@
+{% extends "core/base.html" %}
+{% block title %}Worker recovery · Hackerspace Library{% endblock %}
+{% block content %}
+<div class="narrow">
+  <p class="eyebrow">Worker recovery</p>
+  <h1>{{ task.inferred_title }} needs attention</h1>
+  <p>{{ task.source_filename }}</p>
+  <p>Original files are retained. A retry creates a new background job using the same request settings. This task records every attempt and closes when a retry succeeds.</p>
+  <span class="status status-{{ task.state }}">{{ task.get_state_display }}</span>
+  {% for attempt in attempts %}
+  <section class="action-panel">
+    <h2>Attempt {{ forloop.counter }} · {{ attempt.state }}</h2>
+    <p><a href="{{ attempt.url }}?view=html">{{ attempt.job_type }} job {{ attempt.job_id }}</a></p>
+    {% if attempt.error %}<pre class="error">{{ attempt.error }}</pre>{% endif %}
+    {% if attempt.finished_at %}<p>Finished {{ attempt.finished_at }}</p>{% endif %}
+  </section>
+  {% endfor %}
+  {% if can_recover %}
+  <form method="post" action="{% url 'review-worker-recovery' task.id %}">
+    {% csrf_token %}
+    <input type="hidden" name="expected_job_id" value="{{ latest.job_id }}">
+    <button type="submit" name="action" value="retry">Retry job</button>
+    <button type="submit" class="secondary" name="action" value="acknowledge">Acknowledge failure</button>
+  </form>
+  {% elif retry_active %}<p role="status">A retry is queued or running. Reload this task to see its outcome.</p>
+  {% else %}<p>{{ task.decision_notes }}</p>{% endif %}
+  <p><a href="{% url 'review-queue' %}?view=html&amp;task_type=worker_failure">Worker failure queue</a></p>
+</div>
+{% endblock %}

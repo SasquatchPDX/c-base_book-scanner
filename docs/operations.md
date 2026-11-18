@@ -1337,6 +1337,7 @@ unreferenced temporary artifacts; Python cleanup cannot run after `SIGKILL`.
 
 ```bash
 uv run rq worker --with-scheduler --config ebook_server.rq_settings \
+  --worker-class ebook_server.recovery_worker.RecoveryWorker \
   --url redis://localhost:6379/0 ebook-server
 ```
 

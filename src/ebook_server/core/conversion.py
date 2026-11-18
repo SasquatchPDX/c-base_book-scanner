@@ -30,7 +30,7 @@ from django.utils import timezone
 from ebook_server.jobs import get_queue, is_stale_running, tunable_setting
 from ebook_server.storage import StorageBackend
 
-from . import archive_layout, intake
+from . import archive_layout, intake, worker_failures
 from .models import Book, FileVariant, ProcessingJob
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import (
@@ -397,6 +397,8 @@ def process_conversion_job(job_id: str) -> None:
     source_variant = conversion_job.file_variant
     if source_variant is None:
         _fail_conversion_job(conversion_job, "missing source variant", token=token)
+        if worker_failures.retry_pending(conversion_job):
+            raise ConversionError("missing source variant")
         return
     logger.info(
         "conversion_started",
@@ -432,7 +434,9 @@ def process_conversion_job(job_id: str) -> None:
         )
     except Exception as exc:  # pragma: no cover - defensive path
         close_old_connections()
-        _fail_conversion_job(conversion_job, str(exc), token=token)
+        failed = _fail_conversion_job(conversion_job, str(exc), token=token)
+        if failed and worker_failures.retry_pending(conversion_job):
+            raise
     finally:
         if prepared is not None:
             _discard_unpublished_conversion(prepared, registered=registered)
@@ -706,8 +710,9 @@ def _fail_conversion_job(job: ProcessingJob, message: str, *, token: str | None 
         elif not _owns_conversion(current, token):
             return False
         details = dict(current.details) if isinstance(current.details, dict) else {}
-        current.state = ProcessingJob.JobState.FAILED
-        current.finished_at = timezone.now()
+        pending = worker_failures.retry_pending(current)
+        current.state = ProcessingJob.JobState.QUEUED if pending else ProcessingJob.JobState.FAILED
+        current.finished_at = None if pending else timezone.now()
         current.details = {**details, "error": message}
         current.save(update_fields=["state", "finished_at", "details"])
     logger.error(

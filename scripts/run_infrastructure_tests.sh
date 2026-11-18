@@ -164,6 +164,7 @@ fi
 uv run rq worker \
   --with-scheduler \
   --config ebook_server.rq_settings \
+  --worker-class ebook_server.recovery_worker.RecoveryWorker \
   --url "${BOOK_SCANNER_REDIS_URL}" \
   ebook-server \
   >"${book_scanner_worker_log}" 2>&1 &
