@@ -1,0 +1,347 @@
+{
+  "rounds": 20,
+  "postgres_version": 170010,
+  "timings_ms": {
+    "baseline": {
+      "app_cache_cold": {
+        "ranked": {
+          "p50": 279.5,
+          "p95": 362.6
+        },
+        "facets": {
+          "p50": 621.8,
+          "p95": 791.1
+        },
+        "cursor": {
+          "p50": 172.3,
+          "p95": 207.4
+        }
+      },
+      "warm": {
+        "ranked": {
+          "p50": 227.9,
+          "p95": 273.9
+        },
+        "facets": {
+          "p50": 568.1,
+          "p95": 610.9
+        },
+        "cursor": {
+          "p50": 78.0,
+          "p95": 103.0
+        }
+      }
+    },
+    "with_intake": {
+      "app_cache_cold": {
+        "ranked": {
+          "p50": 331.5,
+          "p95": 437.4
+        },
+        "facets": {
+          "p50": 709.3,
+          "p95": 829.3
+        },
+        "cursor": {
+          "p50": 186.2,
+          "p95": 212.0
+        }
+      },
+      "warm": {
+        "ranked": {
+          "p50": 138.2,
+          "p95": 212.4
+        },
+        "facets": {
+          "p50": 327.7,
+          "p95": 535.6
+        },
+        "cursor": {
+          "p50": 49.9,
+          "p95": 103.9
+        }
+      }
+    }
+  },
+  "intake": {
+    "count": 35,
+    "import_ms": {
+      "p50": 606.2,
+      "p95": 920.3
+    },
+    "book_to_index_ms": {
+      "p50": 274.2,
+      "p95": 357.0
+    }
+  },
+  "slowest_query_plans": {
+    "baseline/ranked": {
+      "query_ms": 107.5,
+      "plan": [
+        "Limit  (cost=19186.97..19189.89 rows=25 width=20) (actual time=100.605..110.602 rows=25 loops=1)",
+        "  Buffers: shared hit=8340 read=8191",
+        "  ->  Gather Merge  (cost=19186.97..22556.07 rows=28876 width=20) (actual time=100.603..110.594 rows=25 loops=1)",
+        "        Workers Planned: 2",
+        "        Workers Launched: 2",
+        "        Buffers: shared hit=8340 read=8191",
+        "        ->  Sort  (cost=18186.95..18223.04 rows=14438 width=20) (actual time=90.156..90.163 rows=19 loops=3)",
+        "              Sort Key: (ts_rank(core_booksearchdocument.document, '''garden'':*'::tsquery)) DESC, core_booksearchdocument.book_created_at DESC, core_booksearchdocument.book_id DESC",
+        "              Sort Method: top-N heapsort  Memory: 28kB",
+        "              Buffers: shared hit=8340 read=8191",
+        "              Worker 0:  Sort Method: top-N heapsort  Memory: 28kB",
+        "              Worker 1:  Sort Method: top-N heapsort  Memory: 28kB",
+        "              ->  Parallel Seq Scan on core_booksearchdocument  (cost=8.42..17779.52 rows=14438 width=20) (actual time=0.151..82.815 rows=21891 loops=3)",
+        "                    Filter: ((NOT (ANY (book_id = (hashed SubPlan 1).col1))) AND ((document @@ '''garden'':*'::tsquery) OR ((title_sort)::text ~~ '%garden%'::text) OR (author_text ~~ '%garden%'::text)))",
+        "                    Rows Removed by Filter: 28109",
+        "                    Buffers: shared hit=8294 read=8191",
+        "                    SubPlan 1",
+        "                      ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.016..0.019 rows=0 loops=3)",
+        "                            ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.016..0.018 rows=0 loops=3)",
+        "                                  Join Filter: (u0.book_id = v0.book_id)",
+        "                                  ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.015..0.016 rows=0 loops=3)",
+        "                                        Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                  ->  Seq Scan on core_scanjob u0  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                        Filter: ((state)::text = 'complete'::text)",
+        "                            ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_1  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                  Index Cond: (book_id = v0.book_id)",
+        "                                  Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "Planning:",
+        "  Buffers: shared hit=13",
+        "Planning Time: 1.329 ms",
+        "Execution Time: 110.867 ms"
+      ]
+    },
+    "baseline/facets": {
+      "query_ms": 262.3,
+      "plan": [
+        "Limit  (cost=12052.91..12053.03 rows=50 width=12) (actual time=296.119..296.129 rows=6 loops=1)",
+        "  Buffers: shared hit=96433",
+        "  ->  Sort  (cost=12052.91..12065.82 rows=5167 width=12) (actual time=296.116..296.124 rows=6 loops=1)",
+        "        Sort Key: (count(core_booksearchfacet.id)) DESC, core_booksearchfacet.value",
+        "        Sort Method: quicksort  Memory: 25kB",
+        "        Buffers: shared hit=96433",
+        "        ->  HashAggregate  (cost=11829.59..11881.26 rows=5167 width=12) (actual time=296.045..296.093 rows=6 loops=1)",
+        "              Group Key: core_booksearchfacet.value",
+        "              Batches: 1  Memory Usage: 217kB",
+        "              Buffers: shared hit=96433",
+        "              ->  Nested Loop  (cost=5957.83..11803.76 rows=5167 width=12) (actual time=67.294..275.771 rows=34429 loops=1)",
+        "                    Buffers: shared hit=96433",
+        "                    ->  HashAggregate  (cost=5957.40..5995.55 rows=3815 width=16) (actual time=67.222..81.702 rows=23551 loops=1)",
+        "                          Group Key: w0.book_id",
+        "                          Batches: 1  Memory Usage: 1809kB",
+        "                          Buffers: shared hit=1641",
+        "                          ->  Merge Join  (cost=9.27..5947.87 rows=3815 width=16) (actual time=0.140..50.729 rows=23551 loops=1)",
+        "                                Merge Cond: (w0.book_id = u0.book_id)",
+        "                                Buffers: shared hit=1641",
+        "                                ->  Index Only Scan using booksearch_language_idx on core_booksearchdocument w0  (cost=8.84..4018.40 rows=22895 width=8) (actual time=0.090..12.277 rows=45293 loops=1)",
+        "                                      Index Cond: (language = 'de'::text)",
+        "                                      Filter: (NOT (ANY (book_id = (hashed SubPlan 1).col1)))",
+        "                                      Heap Fetches: 1806",
+        "                                      Buffers: shared hit=822",
+        "                                      SubPlan 1",
+        "                                        ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.009..0.012 rows=0 loops=1)",
+        "                                              ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.009..0.011 rows=0 loops=1)",
+        "                                                    Join Filter: (u0_1.book_id = v0.book_id)",
+        "                                                    ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.008..0.009 rows=0 loops=1)",
+        "                                                          Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                                    ->  Seq Scan on core_scanjob u0_1  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                                          Filter: ((state)::text = 'complete'::text)",
+        "                                              ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_2  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                                    Index Cond: (book_id = v0.book_id)",
+        "                                                    Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "                                ->  Index Only Scan using booksearchfacet_lookup_idx on core_booksearchfacet u0  (cost=0.42..1771.59 rows=24997 width=8) (actual time=0.041..17.069 rows=78042 loops=1)",
+        "                                      Index Cond: ((kind = 'format'::text) AND (value = 'epub'::text))",
+        "                                      Heap Fetches: 2053",
+        "                                      Buffers: shared hit=819",
+        "                    ->  Index Scan using core_booksearchfacet_book_id_b969090d on core_booksearchfacet  (cost=0.42..1.51 rows=1 width=20) (actual time=0.006..0.007 rows=1 loops=23551)",
+        "                          Index Cond: (book_id = w0.book_id)",
+        "                          Filter: ((kind)::text = 'format'::text)",
+        "                          Rows Removed by Filter: 3",
+        "                          Buffers: shared hit=94792",
+        "Planning:",
+        "  Buffers: shared hit=46",
+        "Planning Time: 2.436 ms",
+        "Execution Time: 297.502 ms"
+      ]
+    },
+    "baseline/cursor": {
+      "query_ms": 7.2,
+      "plan": [
+        "Sort  (cost=596.56..596.60 rows=13 width=807) (actual time=0.625..0.635 rows=25 loops=1)",
+        "  Sort Key: core_book.title",
+        "  Sort Method: quicksort  Memory: 39kB",
+        "  Buffers: shared hit=203",
+        "  ->  Nested Loop Left Join  (cost=9.44..596.32 rows=13 width=807) (actual time=0.124..0.516 rows=25 loops=1)",
+        "        Buffers: shared hit=203",
+        "        ->  Nested Loop Left Join  (cost=9.13..267.95 rows=13 width=562) (actual time=0.080..0.224 rows=25 loops=1)",
+        "              Buffers: shared hit=67",
+        "              ->  Index Scan using core_book_pkey on core_book  (cost=8.84..159.92 rows=13 width=381) (actual time=0.062..0.099 rows=25 loops=1)",
+        "                    Index Cond: (id = ANY ('{50000,49999,49998,49997,49996,49995,49994,49993,49992,49991,49990,49989,49988,49987,49986,49985,49984,49983,49982,49981,49980,49979,49978,49977,49976}'::bigint[]))",
+        "                    Filter: (NOT (ANY (id = (hashed SubPlan 3).col1)))",
+        "                    Buffers: shared hit=16",
+        "                    SubPlan 3",
+        "                      ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.010..0.012 rows=0 loops=1)",
+        "                            ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.009..0.011 rows=0 loops=1)",
+        "                                  Join Filter: (u0_2.book_id = v0.book_id)",
+        "                                  ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.009..0.009 rows=0 loops=1)",
+        "                                        Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                  ->  Seq Scan on core_scanjob u0_2  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                        Filter: ((state)::text = 'complete'::text)",
+        "                            ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_3  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                  Index Cond: (book_id = v0.book_id)",
+        "                                  Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "              ->  Index Scan using core_coverimage_pkey on core_coverimage  (cost=0.29..8.31 rows=1 width=181) (actual time=0.004..0.004 rows=1 loops=25)",
+        "                    Index Cond: (id = core_book.front_cover_id)",
+        "                    Buffers: shared hit=51",
+        "        ->  Memoize  (cost=0.30..8.32 rows=1 width=181) (actual time=0.001..0.001 rows=0 loops=25)",
+        "              Cache Key: core_book.back_cover_id",
+        "              Cache Mode: logical",
+        "              Hits: 24  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB",
+        "              ->  Index Scan using core_coverimage_pkey on core_coverimage t3  (cost=0.29..8.31 rows=1 width=181) (actual time=0.010..0.010 rows=0 loops=1)",
+        "                    Index Cond: (id = core_book.back_cover_id)",
+        "        SubPlan 1",
+        "          ->  Limit  (cost=0.42..8.46 rows=1 width=32) (actual time=0.005..0.005 rows=1 loops=25)",
+        "                Buffers: shared hit=68",
+        "                ->  Index Scan using uniq_cover_thumbnail_size on core_coverthumbnail u0  (cost=0.42..8.46 rows=1 width=32) (actual time=0.004..0.004 rows=1 loops=25)",
+        "                      Index Cond: ((cover_id = core_book.front_cover_id) AND ((size)::text = 'small'::text))",
+        "                      Filter: ((source_sha256)::text = (core_coverimage.sha256)::text)",
+        "                      Buffers: shared hit=68",
+        "        SubPlan 2",
+        "          ->  Limit  (cost=0.42..8.46 rows=1 width=32) (actual time=0.004..0.004 rows=1 loops=25)",
+        "                Buffers: shared hit=68",
+        "                ->  Index Scan using uniq_cover_thumbnail_size on core_coverthumbnail u0_1  (cost=0.42..8.46 rows=1 width=32) (actual time=0.003..0.003 rows=1 loops=25)",
+        "                      Index Cond: ((cover_id = core_book.front_cover_id) AND ((size)::text = 'medium'::text))",
+        "                      Filter: ((source_sha256)::text = (core_coverimage.sha256)::text)",
+        "                      Buffers: shared hit=68",
+        "Planning:",
+        "  Buffers: shared hit=25",
+        "Planning Time: 2.347 ms",
+        "Execution Time: 1.107 ms"
+      ]
+    },
+    "with_intake/ranked": {
+      "query_ms": 73.8,
+      "plan": [
+        "Limit  (cost=19186.97..19189.89 rows=25 width=20) (actual time=47.911..53.066 rows=25 loops=1)",
+        "  Buffers: shared hit=4945 read=11586",
+        "  ->  Gather Merge  (cost=19186.97..22556.07 rows=28876 width=20) (actual time=47.909..53.061 rows=25 loops=1)",
+        "        Workers Planned: 2",
+        "        Workers Launched: 2",
+        "        Buffers: shared hit=4945 read=11586",
+        "        ->  Sort  (cost=18186.95..18223.04 rows=14438 width=20) (actual time=42.590..42.595 rows=19 loops=3)",
+        "              Sort Key: (ts_rank(core_booksearchdocument.document, '''garden'':*'::tsquery)) DESC, core_booksearchdocument.book_created_at DESC, core_booksearchdocument.book_id DESC",
+        "              Sort Method: top-N heapsort  Memory: 28kB",
+        "              Buffers: shared hit=4945 read=11586",
+        "              Worker 0:  Sort Method: top-N heapsort  Memory: 28kB",
+        "              Worker 1:  Sort Method: top-N heapsort  Memory: 28kB",
+        "              ->  Parallel Seq Scan on core_booksearchdocument  (cost=8.42..17779.52 rows=14438 width=20) (actual time=0.051..39.016 rows=21891 loops=3)",
+        "                    Filter: ((NOT (ANY (book_id = (hashed SubPlan 1).col1))) AND ((document @@ '''garden'':*'::tsquery) OR ((title_sort)::text ~~ '%garden%'::text) OR (author_text ~~ '%garden%'::text)))",
+        "                    Rows Removed by Filter: 28120",
+        "                    Buffers: shared hit=4899 read=11586",
+        "                    SubPlan 1",
+        "                      ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.007..0.009 rows=0 loops=3)",
+        "                            ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.006..0.008 rows=0 loops=3)",
+        "                                  Join Filter: (u0.book_id = v0.book_id)",
+        "                                  ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.006..0.006 rows=0 loops=3)",
+        "                                        Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                  ->  Seq Scan on core_scanjob u0  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                        Filter: ((state)::text = 'complete'::text)",
+        "                            ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_1  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                  Index Cond: (book_id = v0.book_id)",
+        "                                  Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "Planning:",
+        "  Buffers: shared hit=13",
+        "Planning Time: 0.619 ms",
+        "Execution Time: 53.215 ms"
+      ]
+    },
+    "with_intake/facets": {
+      "query_ms": 84.8,
+      "plan": [
+        "Limit  (cost=11939.16..11939.28 rows=50 width=12) (actual time=82.920..82.929 rows=50 loops=1)",
+        "  Buffers: shared hit=96467",
+        "  ->  Sort  (cost=11939.16..11945.91 rows=2699 width=12) (actual time=82.919..82.925 rows=50 loops=1)",
+        "        Sort Key: (count(core_booksearchfacet.id)) DESC, core_booksearchfacet.value",
+        "        Sort Method: quicksort  Memory: 27kB",
+        "        Buffers: shared hit=96467",
+        "        ->  HashAggregate  (cost=11822.51..11849.50 rows=2699 width=12) (actual time=82.886..82.901 rows=60 loops=1)",
+        "              Group Key: core_booksearchfacet.value",
+        "              Batches: 1  Memory Usage: 121kB",
+        "              Buffers: shared hit=96467",
+        "              ->  Nested Loop  (cost=5960.89..11809.01 rows=2699 width=12) (actual time=20.668..80.797 rows=16444 loops=1)",
+        "                    Buffers: shared hit=96467",
+        "                    ->  HashAggregate  (cost=5960.46..5998.62 rows=3816 width=16) (actual time=20.636..25.167 rows=23551 loops=1)",
+        "                          Group Key: w0.book_id",
+        "                          Batches: 1  Memory Usage: 1809kB",
+        "                          Buffers: shared hit=1675",
+        "                          ->  Merge Join  (cost=9.27..5950.92 rows=3816 width=16) (actual time=0.051..16.282 rows=23551 loops=1)",
+        "                                Merge Cond: (w0.book_id = u0.book_id)",
+        "                                Buffers: shared hit=1675",
+        "                                ->  Index Only Scan using booksearch_language_idx on core_booksearchdocument w0  (cost=8.84..4018.40 rows=22895 width=8) (actual time=0.031..4.061 rows=45293 loops=1)",
+        "                                      Index Cond: (language = 'de'::text)",
+        "                                      Filter: (NOT (ANY (book_id = (hashed SubPlan 1).col1)))",
+        "                                      Heap Fetches: 1897",
+        "                                      Buffers: shared hit=856",
+        "                                      SubPlan 1",
+        "                                        ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.005..0.007 rows=0 loops=1)",
+        "                                              ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.005..0.007 rows=0 loops=1)",
+        "                                                    Join Filter: (u0_1.book_id = v0.book_id)",
+        "                                                    ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.005..0.006 rows=0 loops=1)",
+        "                                                          Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                                    ->  Seq Scan on core_scanjob u0_1  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                                          Filter: ((state)::text = 'complete'::text)",
+        "                                              ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_2  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                                    Index Cond: (book_id = v0.book_id)",
+        "                                                    Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "                                ->  Index Only Scan using booksearchfacet_lookup_idx on core_booksearchfacet u0  (cost=0.42..1775.51 rows=25003 width=8) (actual time=0.015..5.777 rows=78042 loops=1)",
+        "                                      Index Cond: ((kind = 'format'::text) AND (value = 'epub'::text))",
+        "                                      Heap Fetches: 2053",
+        "                                      Buffers: shared hit=819",
+        "                    ->  Index Scan using core_booksearchfacet_book_id_b969090d on core_booksearchfacet  (cost=0.42..1.51 rows=1 width=20) (actual time=0.002..0.002 rows=1 loops=23551)",
+        "                          Index Cond: (book_id = w0.book_id)",
+        "                          Filter: ((kind)::text = 'genre'::text)",
+        "                          Rows Removed by Filter: 4",
+        "                          Buffers: shared hit=94792",
+        "Planning:",
+        "  Buffers: shared hit=48",
+        "Planning Time: 0.670 ms",
+        "Execution Time: 83.261 ms"
+      ]
+    },
+    "with_intake/cursor": {
+      "query_ms": 11.5,
+      "plan": [
+        "Finalize Aggregate  (cost=4944.53..4944.54 rows=1 width=8) (actual time=11.079..13.974 rows=1 loops=1)",
+        "  Buffers: shared hit=1246",
+        "  ->  Gather  (cost=4944.31..4944.52 rows=2 width=8) (actual time=10.558..13.961 rows=3 loops=1)",
+        "        Workers Planned: 2",
+        "        Workers Launched: 2",
+        "        Buffers: shared hit=1246",
+        "        ->  Partial Aggregate  (cost=3944.31..3944.32 rows=1 width=8) (actual time=7.581..7.584 rows=1 loops=3)",
+        "              Buffers: shared hit=1246",
+        "              ->  Parallel Index Only Scan using core_booksearchdocument_pkey on core_booksearchdocument  (cost=8.84..3866.19 rows=31250 width=0) (actual time=0.124..5.592 rows=50012 loops=3)",
+        "                    Filter: (NOT (ANY (book_id = (hashed SubPlan 1).col1)))",
+        "                    Heap Fetches: 6404",
+        "                    Buffers: shared hit=1246",
+        "                    SubPlan 1",
+        "                      ->  Nested Loop Anti Join  (cost=0.42..8.42 rows=1 width=8) (actual time=0.086..0.087 rows=0 loops=3)",
+        "                            Buffers: shared hit=42",
+        "                            ->  Nested Loop Anti Join  (cost=0.00..0.01 rows=1 width=8) (actual time=0.085..0.087 rows=0 loops=3)",
+        "                                  Join Filter: (u0.book_id = v0.book_id)",
+        "                                  Buffers: shared hit=42",
+        "                                  ->  Seq Scan on core_scanjob v0  (cost=0.00..0.00 rows=1 width=8) (actual time=0.085..0.085 rows=0 loops=3)",
+        "                                        Filter: ((NOT refinish_needed) AND (book_id IS NOT NULL) AND ((state)::text <> 'complete'::text))",
+        "                                        Buffers: shared hit=42",
+        "                                  ->  Seq Scan on core_scanjob u0  (cost=0.00..0.00 rows=1 width=8) (never executed)",
+        "                                        Filter: ((state)::text = 'complete'::text)",
+        "                            ->  Index Scan using core_filevariant_book_id_db9408da on core_filevariant u0_1  (cost=0.42..8.47 rows=2 width=8) (never executed)",
+        "                                  Index Cond: (book_id = v0.book_id)",
+        "                                  Filter: (((processing_state)::text = 'complete'::text) AND ((source_type)::text = ANY ('{upload,incoming_folder,network_source}'::text[])))",
+        "Planning:",
+        "  Buffers: shared hit=10",
+        "Planning Time: 0.237 ms",
+        "Execution Time: 14.083 ms"
+      ]
+    }
+  }
+}
