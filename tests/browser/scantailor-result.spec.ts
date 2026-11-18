@@ -41,6 +41,13 @@ for (const transport of ["events", "polling"] as const) {
       await save();
     }
 
+    // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
+    await page.locator('[data-stage-select="dewarping"]').click();
+    await save();
+    await expect(page.locator("[data-stage-warnings]")).toContainText(
+      "the input was kept unchanged",
+    );
+
     await page.locator('[data-stage-select="margins"]').click();
     await page.getByLabel("All margins (pixels)").fill("20");
     await save();
@@ -62,7 +69,6 @@ for (const transport of ["events", "polling"] as const) {
       .toBe(100);
 
     await page.locator('[data-stage-select="dewarping"]').click();
-    await save();
     await expect(page.locator("[data-stage-warnings]")).toContainText(
       "the input was kept unchanged",
     );
