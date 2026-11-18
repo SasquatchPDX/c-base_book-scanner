@@ -1450,7 +1450,7 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
     if stage == "dewarping":
         if str(parameters.get("dewarp_mode", "")).strip().lower() == "manual":
             return True
-        return "dewarp_points" in parameters
+        return "dewarp_points" in parameters or "dewarp_curves" in parameters
     if stage == "output":
         if str(parameters.get("zone_mode", "")).strip().lower() == "manual":
             return True
@@ -1512,6 +1512,12 @@ def _apply_stage_payload_to_state(
         elif stage == "margins":
             if _contains_stage_manual_override(stage, merged):
                 merged.setdefault("margins_mode", "manual")
+        elif stage == "dewarping":
+            model = merged.get("dewarp_model")
+            if isinstance(model, str) and model in {"perspective", "curvature"}:
+                state.algorithm = (
+                    "baseline_curvature" if model == "curvature" else "projective_dewarp"
+                )
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
