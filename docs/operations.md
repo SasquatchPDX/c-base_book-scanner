@@ -400,6 +400,50 @@ timedatectl show -p NTPSynchronized --value   # must print "yes"
 To take the scanner out of service, empty `BOOK_SCANNER_SCANNER_API_KEY_SHA256`
 and restart the web service; the API then answers `503`.
 
+### Checking an onboarding in one command
+
+`scripts/check_scanner_onboarding.sh` runs the checks of step 4 and of
+"Acceptance on the VM" below together and prints `PASS`, `FAIL` or `SKIP` per
+check, then `RESULT: PASS` or `RESULT: FAIL` (exit status 0 or 1). It needs
+bash, openssl, curl and python3, reads the key from the file and never prints
+it or puts it on a command line.
+
+On the Pi, as the user that runs sans (adds the key-file mode check):
+
+```bash
+scripts/check_scanner_onboarding.sh --pi \
+  --url https://serif.lan.example/ \
+  --ca-file ~/.config/sans/serif-ca.pem \
+  --key-file ~/.config/sans/serif-api-key
+```
+
+On the VM, with a copy of the key in a 0600 file (delete it afterwards), and
+also probing book-scanner.conf's loopback plain-HTTP listener:
+
+```bash
+scripts/check_scanner_onboarding.sh \
+  --url https://serif.lan.example/ --ca-file /etc/ssl/serif/serif-ca.pem \
+  --key-file ~/serif-api-key --http-url http://127.0.0.1:8080/
+```
+
+| Check | Passes when |
+|---|---|
+| `key-file-mode` | (`--pi` only) the key file is mode 0600 |
+| `tls13` | `openssl s_client -tls1_3` completes and verifies the CA and the host name |
+| `tls12-refused` | a TLS 1.2-only handshake fails |
+| `ping` | `GET /api/scanner/v1/ping` with the key answers `200` with `api_version`, `server_time` and `limits` |
+| `ping-no-key` | the same request without the key answers `401` |
+| `plain-http` | `/api/scanner/v1/ping` over plain HTTP (`--http-url`, default `http://<host>/`) answers `403` |
+| `clock-skew` | `server_time` is within `--max-skew` seconds (default 2) of the local clock |
+| `ntp-synced` | `timedatectl` reports `NTPSynchronized=yes` (`SKIP` without timedatectl; `--no-ntp-status` turns it off) |
+
+`--resolve <address>` connects to an address instead of resolving the host
+name (the certificate is still checked against the host name), for a host
+whose DNS is not set up yet. `--dry-run` validates the arguments and lists
+the checks without connecting. CI runs the script against the nginx harness
+of `scripts/test_scanner_tls_proxy.sh`, including a wrong key and a 0644 key
+file.
+
 ### Acceptance on the VM
 
 CI proves the nginx rules against a live nginx
@@ -421,6 +465,60 @@ curl -s -o /dev/null -w '%{http_code}\n' http://serif.lan.example/api/scanner/v1
 ```
 
 Then run the onboarding steps with the real scanner.
+
+### Rehearsing migrations before an upgrade
+
+The scanner work brings migrations that rewrite large tables (notably
+`0041_scanjob_string_pk`, see the upgrade note in `docs/scanner-protocol.md`).
+`scripts/rehearse_migrations.sh` runs every pending migration against a
+throwaway copy of the production database before the real upgrade:
+
+1. `pg_dump --format=custom` of `SOURCE_DATABASE_URL`, in a read-only
+   transaction. Nothing else touches the source.
+2. `createdb` a uniquely named scratch database through `ADMIN_DATABASE_URL`
+   and `pg_restore` the dump into it (`--no-owner --no-privileges`).
+3. `manage.py check_scan_job_integrity --snapshot`: scan job IDs and the row
+   counts of the scan tables (jobs, pages, page versions, todos, stage states,
+   logs, events) and of every foreign key to `core_scanjob`.
+4. `manage.py migrate` on the copy, timed.
+5. Post-checks: `migrate --check`, `makemigrations --check`, and
+   `check_scan_job_integrity --compare`: every pre-existing scan job ID still
+   resolves (compared in canonical form), the counts are unchanged, no row
+   references a missing job, and a sample of `/scan/jobs/<id>/` URLs answers
+   `200` through the Django test client (inside a rolled-back transaction).
+6. A PASS/FAIL report with the time of each step, then `dropdb` of the copy
+   (`--keep` keeps it for inspection).
+
+Run it on the VM from the checkout, as the service user, with the
+deployment's environment loaded (only `BOOK_SCANNER_DATABASE_URL` is
+overridden, to point at the copy):
+
+```bash
+cd /srv/book-scanner          # the checkout
+set -a; . ./.env; set +a      # or the systemd EnvironmentFile
+SOURCE_DATABASE_URL='postgresql://book_scanner:...@127.0.0.1/book_scanner' \
+ADMIN_DATABASE_URL='postgresql://postgres:...@127.0.0.1/postgres' \
+  scripts/rehearse_migrations.sh            # --keep, --sample 50, --scratch-name NAME
+```
+
+- `ADMIN_DATABASE_URL` names a maintenance database (normally `postgres`); its
+  role needs `CREATEDB` and must be able to restore the dump, including the
+  extensions the app uses. The copy is owned by that role. It can be another
+  PostgreSQL server, which keeps the load off production.
+- The script refuses to run (exit 3) when the scratch name equals the source
+  or admin database name, or when the two URLs point to the same database.
+- Passwords are taken out of the URLs and passed to the PostgreSQL tools in
+  `PGPASSWORD`; they never appear on a command line or in the output. The dump
+  lives in a 0700 temporary directory (`REHEARSAL_WORK_DIR`, default `$TMPDIR`)
+  that is removed on exit; it holds production data, so keep it on the VM.
+- The client tools must be at least the server's version; set `PG_BINDIR`
+  (for example `/usr/lib/postgresql/17/bin`) when the default ones are older.
+- Exit status: 0 PASS, 1 FAIL, 2 usage error, 3 refused. The `manage.py
+  migrate` time is the expected downtime for the real upgrade (stop the web
+  and worker units while it runs).
+
+CI runs the script end to end (`tests/integration/test_rehearse_migrations_postgres.py`)
+against a database seeded at the pre-0041 state.
 
 ## Authentication modes
 
