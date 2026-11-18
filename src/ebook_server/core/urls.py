@@ -5,7 +5,7 @@ from __future__ import annotations
 from django.urls import path, register_converter
 from django.views.generic import RedirectView
 
-from . import contributions_views, views
+from . import contributions_views, intake_views, views
 from .scan_job_ids import ScanJobIdConverter
 
 # Scan job IDs are a canonical UUID (web jobs) or a scanner-assigned ID (#126).
@@ -19,7 +19,7 @@ urlpatterns = [
     path("healthz/dependencies/", views.readiness),
     path("metrics/", views.prometheus_metrics, name="prometheus-metrics"),
     path("library/", views.library_home, name="library-home"),
-    path("library/intake/", views.intake_progress_view, name="intake-progress"),
+    path("library/intake/", intake_views.intake_progress_view, name="intake-progress"),
     path("library/books/", views.library_books, name="library-books"),
     path("library/authors/", views.library_authors, name="library-authors"),
     path(
@@ -189,8 +189,8 @@ urlpatterns = [
         name="scan-identification-job-status",
     ),
     path("admin-only/", views.admin_only, name="admin-only"),
-    path("imports/upload/", views.upload_file, name="imports-upload"),
-    path("imports/<uuid:job_id>/", views.import_status, name="imports-status"),
+    path("imports/upload/", intake_views.upload_file, name="imports-upload"),
+    path("imports/<uuid:job_id>/", intake_views.import_status, name="imports-status"),
     path("reviews/", views.review_queue, name="review-queue"),
     path("reviews/batch-accept/", views.review_batch_accept, name="review-batch-accept"),
     path("reviews/<int:task_id>/", views.review_detail, name="review-detail"),
