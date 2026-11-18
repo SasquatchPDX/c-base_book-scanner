@@ -697,8 +697,9 @@ def store_page(
             )
             scan_pipeline.invalidate_scan_job_library_artifacts(locked)
             stored = StoredItem(True, version.version, metadata.sha256, locked.state)
-            destination = None  # the version row now owns the published file
-            return stored
+        destination = None  # the version row now owns the published file
+        transaction.on_commit(lambda: scantailor.auto_complete_single_page_split(page), robust=True)
+        return stored
     finally:
         _delete_quietly(storage, destination)
 

@@ -66,7 +66,7 @@ def test_check_storage_root_and_write_probe(tmp_path: Path) -> None:
 
 
 def test_readiness_check_reports_down_for_missing_root(tmp_path: Path) -> None:
-    from ebook_server.core.views import _check_storage
+    from ebook_server.core.health_views import _check_storage
 
     with override_settings(APP_DATA_DIR=tmp_path / "gone", STORAGE_REQUIRE_EXISTING_ROOT=True):
         result = _check_storage()

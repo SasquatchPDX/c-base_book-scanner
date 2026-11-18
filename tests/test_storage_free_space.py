@@ -10,7 +10,7 @@ from django.core.management import call_command
 from django.test import override_settings
 
 from ebook_server import storage as storage_module
-from ebook_server.core import intake, views
+from ebook_server.core import health_views, intake
 from ebook_server.core.models import ImportJob, SourceLocation
 from ebook_server.storage import (
     InsufficientStorageError,
@@ -129,9 +129,9 @@ def test_ingest_sources_stops_queueing_when_archive_would_fill(
 def test_health_reports_low_free_space_as_degraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(views, "free_bytes", lambda _path: RESERVE - 1)
+    monkeypatch.setattr(health_views, "free_bytes", lambda _path: RESERVE - 1)
     with override_settings(APP_DATA_DIR=tmp_path):
-        result = views._check_storage()
+        result = health_views._check_storage()
 
     assert result.status == "degraded"
     assert result.details is not None

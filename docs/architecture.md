@@ -37,7 +37,10 @@ All domain models and migrations belong to the single Django app
   confirmed deletion, and persistent workflow metrics.
 - `intake_views.py` handles member uploads, import status and intake progress.
   `view_helpers.py` contains request parsing, profile access and shared responses.
-  The other HTTP workflows live in `views.py`, `contributions_views.py` and
+  `library_views.py` serves search, browse, downloads, conversion and OCR requests.
+  `member_views.py` handles sign-in, sign-out and role checks. `health_views.py`
+  serves readiness and metrics. Scan and review workflows live in `views.py`,
+  with contributions and reading in `contributions_views.py` and
   `review_reader_views.py`. Routes stay in `urls.py` and templates in `templates/core/`.
 
 At package level, `ebook_server.settings` configures the application,
