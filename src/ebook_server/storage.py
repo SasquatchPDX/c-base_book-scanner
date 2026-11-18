@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import tempfile
 import unicodedata
 import uuid
@@ -24,6 +25,24 @@ MAX_PUBLISH_ATTEMPTS = 16
 
 class StorageUnavailableError(OSError):
     """Raised when the configured storage root is missing, unmounted, or not writable."""
+
+
+@dataclass(frozen=True)
+class StorageEntry:
+    identifier: str
+    size_bytes: int
+    mtime_ns: int
+    ctime_ns: int
+    inode: int
+    device: int
+    mode: int
+
+    @property
+    def regular(self) -> bool:
+        return stat.S_ISREG(self.mode)
+
+    def signature(self) -> tuple[int, ...]:
+        return (self.size_bytes, self.mtime_ns, self.ctime_ns, self.inode, self.device, self.mode)
 
 
 def cap_filename(name: str, limit: int = MAX_STORAGE_FILENAME_LENGTH) -> str:
@@ -593,6 +612,70 @@ class LocalFilesystemStorage:
     def stat(self, location: str) -> tuple[int, int]:
         result = self.resolve_location(location).stat()
         return result.st_size, result.st_mtime_ns
+
+    def entry(self, location: str) -> StorageEntry:
+        """Inspect a confined regular path without accepting symlink components."""
+        relative = Path(location)
+        if (
+            relative.is_absolute()
+            or relative.drive
+            or "\\" in location
+            or any(part in {".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("unsafe storage identifier")
+        current = Path(self.root).resolve()
+        for part in relative.parts:
+            current /= part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError("symlink storage entries are protected")
+        info = current.lstat()
+        return StorageEntry(
+            location,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_ino,
+            info.st_dev,
+            info.st_mode,
+        )
+
+    def inventory(self, *, limit: int = 10000) -> Iterator[StorageEntry]:
+        """Read-only bounded walk; never descend into symlinks or quarantine."""
+        base = Path(self.root).resolve()
+        if not base.is_dir():
+            raise StorageUnavailableError("inventory root is unavailable")
+        pending = [(base, 0)]
+        visited = 0
+        while pending:
+            directory, depth = pending.pop()
+            if depth > 32:
+                raise StorageUnavailableError("inventory depth limit reached")
+            with os.scandir(directory) as entries:
+                for item in entries:
+                    visited += 1
+                    if visited > limit:
+                        raise StorageUnavailableError(
+                            "inventory entry limit reached; select a location or raise --limit"
+                        )
+                    identifier = Path(item.path).relative_to(base).as_posix()
+                    # DirEntry's cached Windows metadata can omit inode/device;
+                    # use the same lstat source as the later identity recheck.
+                    info = Path(item.path).lstat()
+                    if stat.S_ISDIR(info.st_mode):
+                        if depth == 0 and item.name in {".quarantine", ".trash"}:
+                            continue
+                        pending.append((Path(item.path), depth + 1))
+                    else:
+                        yield StorageEntry(
+                            identifier,
+                            info.st_size,
+                            info.st_mtime_ns,
+                            info.st_ctime_ns,
+                            info.st_ino,
+                            info.st_dev,
+                            info.st_mode,
+                        )
 
     def prune_empty_parents(self, location: str) -> None:
         """Remove now-empty folders above ``location``, up to (not including) the root."""
