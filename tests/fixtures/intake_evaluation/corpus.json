@@ -1,0 +1,1016 @@
+{
+  "schema_version": 1,
+  "description": "Hand-labelled synthetic intake scenarios. Titles/authors are fictional; checksummed ISBNs are protocol fixtures, not asserted bibliographic assignments. Frozen provider records measure deterministic decisions, not live retrieval or field accuracy. Rationales explain each work/edition/review label.",
+  "works": {
+    "orchard": {
+      "title": "The Glass Orchard",
+      "authors": [
+        "Mira Calder"
+      ]
+    },
+    "return": {
+      "title": "The Long Return",
+      "authors": [
+        "Ivo Merrin"
+      ]
+    },
+    "returns": {
+      "title": "The Long Returns",
+      "authors": [
+        "Ivo Merrin"
+      ]
+    },
+    "window-a": {
+      "title": "Night Window",
+      "authors": [
+        "Ada Stone"
+      ]
+    },
+    "window-b": {
+      "title": "Night Window",
+      "authors": [
+        "Theo Vale"
+      ]
+    },
+    "garden": {
+      "title": "Signal Garden",
+      "authors": [
+        "Nora Vale",
+        "Emil Voss"
+      ]
+    },
+    "clock": {
+      "title": "The Amber Clock",
+      "authors": [
+        "Livia Hart"
+      ]
+    }
+  },
+  "editions": {
+    "orchard-en": {
+      "work": "orchard",
+      "isbn13": "9780441011582",
+      "publisher": "Northbank Press",
+      "language": "en",
+      "year": 2003
+    },
+    "orchard-fr": {
+      "work": "orchard",
+      "isbn13": "9780575074347",
+      "publisher": "Rivage Editions",
+      "language": "fr",
+      "year": 2004
+    },
+    "orchard-second": {
+      "work": "orchard",
+      "isbn13": "9780141439518",
+      "publisher": "Horizon Books",
+      "language": "en",
+      "year": 2010
+    },
+    "return-en": {
+      "work": "return",
+      "isbn13": "9780141439600",
+      "publisher": "Northbank Press",
+      "language": "en",
+      "year": 2005
+    },
+    "returns-en": {
+      "work": "returns",
+      "isbn13": "9780307277671",
+      "publisher": "Horizon Books",
+      "language": "en",
+      "year": 2008
+    },
+    "window-a-en": {
+      "work": "window-a",
+      "isbn13": null,
+      "publisher": "Small Harbour",
+      "language": "en",
+      "year": 2001
+    },
+    "window-b-en": {
+      "work": "window-b",
+      "isbn13": null,
+      "publisher": "Small Harbour",
+      "language": "en",
+      "year": 2002
+    },
+    "garden-en": {
+      "work": "garden",
+      "isbn13": null,
+      "publisher": "Signal Press",
+      "language": "en",
+      "year": 2014
+    },
+    "clock-en": {
+      "work": "clock",
+      "isbn13": null,
+      "publisher": "Clock Press",
+      "language": "en",
+      "year": 2012
+    }
+  },
+  "cases": [
+    {
+      "id": "isbn-exact-edition",
+      "groups": [
+        "isbn",
+        "editions"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Embedded ISBN, language and publisher confirm the edition."
+    },
+    {
+      "id": "isbn10-equivalent",
+      "groups": [
+        "isbn",
+        "editions"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "0441011586"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "ISBN-10 and ISBN-13 identify the same edition."
+    },
+    {
+      "id": "isbn-other-edition",
+      "groups": [
+        "isbn",
+        "editions",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-fr"
+      ],
+      "rationale": "Another edition of the same work cannot confirm the file ISBN."
+    },
+    {
+      "id": "isbn-unconfirmed",
+      "groups": [
+        "isbn",
+        "editions",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "A record without its own ISBN cannot confirm the file ISBN.",
+      "record_overrides": {
+        "orchard-en": {
+          "isbn_13": []
+        }
+      }
+    },
+    {
+      "id": "isbn-author-conflict",
+      "groups": [
+        "isbn",
+        "authors",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "An ISBN match cannot override contradictory provider authors.",
+      "record_overrides": {
+        "orchard-en": {
+          "author_name": [
+            "Theo Vale"
+          ]
+        }
+      }
+    },
+    {
+      "id": "isbn-language-conflict",
+      "groups": [
+        "isbn",
+        "editions",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "An ISBN cannot erase an edition language conflict.",
+      "record_overrides": {
+        "orchard-en": {
+          "language": "fr"
+        }
+      }
+    },
+    {
+      "id": "isbn-tied-matching-edition",
+      "groups": [
+        "isbn",
+        "editions"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-fr",
+        "orchard-en"
+      ],
+      "rationale": "The matching edition must win regardless of provider result order."
+    },
+    {
+      "id": "no-isbn-clean-embedded",
+      "groups": [
+        "no-isbn"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "A verified exact title/author can identify a file without ISBN."
+    },
+    {
+      "id": "no-isbn-text-header",
+      "groups": [
+        "no-isbn",
+        "local-consensus"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.txt",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {}
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Labelled TXT headers participate in actual extraction."
+    },
+    {
+      "id": "no-isbn-fuzzy-threshold",
+      "groups": [
+        "no-isbn",
+        "threshold-boundary"
+      ],
+      "files": [
+        {
+          "path": "Ivo Merrin/capture.epub",
+          "work": "return",
+          "edition": "return-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Long Retun",
+            "authors": [
+              "Ivo Merrin"
+            ]
+          }
+        }
+      ],
+      "records": [
+        "return-en"
+      ],
+      "rationale": "A small title typo gives a borderline correct candidate."
+    },
+    {
+      "id": "no-isbn-near-title-wrong-work",
+      "groups": [
+        "no-isbn",
+        "threshold-boundary",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Ivo Merrin/capture.epub",
+          "work": "returns",
+          "edition": "returns-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Long Returns",
+            "authors": [
+              "Ivo Merrin"
+            ]
+          }
+        }
+      ],
+      "records": [
+        "return-en"
+      ],
+      "rationale": "The plural title is a distinct work by the same author; a lower threshold may choose the wrong work."
+    },
+    {
+      "id": "no-isbn-placeholder-author",
+      "groups": [
+        "no-isbn",
+        "authors",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Placeholder provider authors never justify acceptance.",
+      "record_overrides": {
+        "orchard-en": {
+          "author_name": [
+            "Unknown"
+          ]
+        }
+      }
+    },
+    {
+      "id": "no-isbn-wrong-author",
+      "groups": [
+        "no-isbn",
+        "authors",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "The provider title belongs to another author.",
+      "record_overrides": {
+        "orchard-en": {
+          "author_name": [
+            "Theo Vale"
+          ]
+        }
+      }
+    },
+    {
+      "id": "same-title-different-work-tie",
+      "groups": [
+        "no-isbn",
+        "ambiguity",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "unattributed/Night Window.epub",
+          "work": "window-a",
+          "edition": "window-a-en",
+          "require_review": true,
+          "metadata": {
+            "title": "Night Window",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "window-a-en",
+        "window-b-en"
+      ],
+      "rationale": "An authorless file cannot disambiguate identical titles by different people."
+    },
+    {
+      "id": "work-only-two-editions",
+      "groups": [
+        "no-isbn",
+        "editions",
+        "work-only"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": null,
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "language": "en"
+          },
+          "work_only_language": "en"
+        }
+      ],
+      "records": [
+        "orchard-en",
+        "orchard-second"
+      ],
+      "rationale": "Two fitting editions prove a work without authorizing arbitrary edition-specific fields."
+    },
+    {
+      "id": "work-only-translations",
+      "groups": [
+        "no-isbn",
+        "editions",
+        "work-only"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": null,
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ]
+          }
+        }
+      ],
+      "records": [
+        "orchard-en",
+        "orchard-fr"
+      ],
+      "rationale": "Fitting translations without file language must yield only a work."
+    },
+    {
+      "id": "edition-publisher-conflict",
+      "groups": [
+        "no-isbn",
+        "editions",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-second"
+      ],
+      "rationale": "A different publisher requires review."
+    },
+    {
+      "id": "edition-language-conflict",
+      "groups": [
+        "no-isbn",
+        "editions",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-fr"
+      ],
+      "rationale": "An English file must not be assigned the French edition."
+    },
+    {
+      "id": "publisher-tool-noise",
+      "groups": [
+        "no-isbn",
+        "editions"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "calibre 9.11.0",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Converter names are not publisher conflicts."
+    },
+    {
+      "id": "coauthors-complete",
+      "groups": [
+        "no-isbn",
+        "coauthors"
+      ],
+      "files": [
+        {
+          "path": "Nora Vale/Signal Garden.epub",
+          "work": "garden",
+          "edition": "garden-en",
+          "require_review": false,
+          "metadata": {
+            "title": "Signal Garden",
+            "authors": [
+              "Nora Vale",
+              "Emil Voss"
+            ],
+            "publisher": "Signal Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "garden-en"
+      ],
+      "rationale": "Both contributors must survive canonical matching."
+    },
+    {
+      "id": "coauthors-reordered",
+      "groups": [
+        "no-isbn",
+        "coauthors"
+      ],
+      "files": [
+        {
+          "path": "Nora Vale/Signal Garden.epub",
+          "work": "garden",
+          "edition": "garden-en",
+          "require_review": false,
+          "metadata": {
+            "title": "Signal Garden",
+            "authors": [
+              "Emil Voss",
+              "Nora Vale"
+            ],
+            "publisher": "Signal Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "garden-en"
+      ],
+      "rationale": "Contributor order does not define a different work."
+    },
+    {
+      "id": "coauthors-contradictory",
+      "groups": [
+        "no-isbn",
+        "coauthors",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Nora Vale/Signal Garden.epub",
+          "work": "garden",
+          "edition": "garden-en",
+          "require_review": true,
+          "metadata": {
+            "title": "Signal Garden",
+            "authors": [
+              "Nora Vale",
+              "Emil Voss"
+            ],
+            "publisher": "Signal Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "garden-en"
+      ],
+      "rationale": "Replacing one coauthor contradicts embedded evidence.",
+      "record_overrides": {
+        "garden-en": {
+          "author_name": [
+            "Nora Vale",
+            "Theo Vale"
+          ]
+        }
+      }
+    },
+    {
+      "id": "sidecar-agrees",
+      "groups": [
+        "sidecars",
+        "no-isbn"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          },
+          "sidecar": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "A Calibre-style OPF sidecar agrees with embedded metadata."
+    },
+    {
+      "id": "sidecar-contradicts",
+      "groups": [
+        "sidecars",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          },
+          "sidecar": {
+            "title": "The Long Return",
+            "authors": [
+              "Ivo Merrin"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en",
+        "return-en"
+      ],
+      "rationale": "Misleading sidecars must not silently override embedded metadata."
+    },
+    {
+      "id": "sidecar-only-misleading",
+      "groups": [
+        "sidecars",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "unknown/capture.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": true,
+          "metadata": {},
+          "sidecar": {
+            "title": "The Long Return",
+            "authors": [
+              "Ivo Merrin"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        }
+      ],
+      "records": [
+        "return-en"
+      ],
+      "rationale": "Adversarial control: the body is Orchard but its only metadata is an incorrect sidecar; count any automatic error honestly."
+    },
+    {
+      "id": "local-no-provider-record",
+      "groups": [
+        "local-consensus",
+        "provider-empty",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Livia Hart/The Amber Clock.txt",
+          "work": "clock",
+          "edition": "clock-en",
+          "require_review": true,
+          "metadata": {}
+        }
+      ],
+      "records": [],
+      "rationale": "Independent TXT content and path can suggest identity, never bypass external verification."
+    },
+    {
+      "id": "local-path-only",
+      "groups": [
+        "local-consensus",
+        "provider-empty",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Livia Hart/The Amber Clock.txt",
+          "work": "clock",
+          "edition": "clock-en",
+          "require_review": true,
+          "metadata": {},
+          "text": "An unlabelled page of fictional prose.\n"
+        }
+      ],
+      "records": [],
+      "rationale": "The path is not a second independent title origin."
+    },
+    {
+      "id": "all-providers-outage",
+      "groups": [
+        "provider-failure",
+        "local-consensus",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Livia Hart/The Amber Clock.txt",
+          "work": "clock",
+          "edition": "clock-en",
+          "require_review": true,
+          "metadata": {}
+        }
+      ],
+      "records": [],
+      "rationale": "Outages must be distinguishable from clean no-results.",
+      "provider_failure": "all"
+    },
+    {
+      "id": "one-provider-outage",
+      "groups": [
+        "provider-failure",
+        "isbn"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "One failed provider must not prevent another confirming an edition.",
+      "provider_failure": "one"
+    },
+    {
+      "id": "sibling-formats-opt-in",
+      "groups": [
+        "sibling-formats",
+        "no-isbn"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en"
+          }
+        },
+        {
+          "path": "Mira Calder/The Glass Orchard.txt",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {}
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Same-stem formats may share one externally verified Book when source opt-in is set.",
+      "sibling_formats": true
+    },
+    {
+      "id": "sibling-conflicting-header",
+      "groups": [
+        "sibling-formats",
+        "required-review"
+      ],
+      "files": [
+        {
+          "path": "Mira Calder/The Glass Orchard.epub",
+          "work": "orchard",
+          "edition": "orchard-en",
+          "require_review": false,
+          "metadata": {
+            "title": "The Glass Orchard",
+            "authors": [
+              "Mira Calder"
+            ],
+            "publisher": "Northbank Press",
+            "language": "en",
+            "isbn": "9780441011582"
+          }
+        },
+        {
+          "path": "Mira Calder/The Glass Orchard.txt",
+          "work": "window-b",
+          "edition": "window-b-en",
+          "require_review": true,
+          "metadata": {}
+        }
+      ],
+      "records": [
+        "orchard-en"
+      ],
+      "rationale": "Same-stem files with conflicting content must not inherit another work.",
+      "sibling_formats": true
+    }
+  ]
+}
