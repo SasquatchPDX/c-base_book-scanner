@@ -1642,6 +1642,8 @@ class ScanTailorStageState(models.Model):
         indexes = [
             models.Index(fields=["scan_job", "scan_page", "stage"]),
             models.Index(fields=["status"]),
+            # Workspace delta endpoint: rows of one job changed since a cursor (#195).
+            models.Index(fields=["scan_job", "updated_at"], name="stage_state_job_updated"),
             models.Index(fields=["scan_page", "revision"]),
         ]
 

@@ -26,12 +26,14 @@ interface StageState {
   parameters: JsonObject;
   output_storage_identifier: string;
   preview_storage_identifier: string;
+  output_sha256?: string;
   last_error: string;
   invalidated_reason?: string;
 }
 
 interface WorkspacePage {
   id: string;
+  active_version?: { id?: string };
   logical_sequence_number: number;
   side: string;
   thumbnail?: string;
@@ -42,6 +44,11 @@ interface WorkspaceEvent {
   job_id: string;
   state: string;
   updated_at: string;
+  stages: StageState[];
+}
+
+interface WorkspaceStateDelta {
+  cursor: string;
   stages: StageState[];
 }
 
@@ -284,6 +291,17 @@ export function stageErrorText(state: Pick<StageState, "status" | "last_error">)
   return state.status === "failed" ? state.last_error || "Stage failed" : "";
 }
 
+/**
+ * Content token of a stage's current artifacts, as the server computes it (#195).
+ * Preview URLs carry it as ``?v=``; the server caches such URLs for good.
+ */
+export function artifactToken(
+  state: Pick<StageState, "status" | "revision" | "output_sha256"> | undefined,
+): string {
+  if (!state || state.status !== "success" || !state.output_sha256) return "";
+  return `${state.revision}-${state.output_sha256.slice(0, 16)}`;
+}
+
 /** Short status shown in the page list for a stage. */
 export function stageStatusLabel(state: Pick<StageState, "status">): string {
   return state.status;
@@ -396,6 +414,7 @@ class WorkspaceController {
   private interactions: InteractableHandle[] = [];
   private eventSource: EventSource | null = null;
   private pollingTimer: number | null = null;
+  private pollCursor: string | null = null;
 
   constructor(root: HTMLElement, pages: WorkspacePage[]) {
     this.root = root;
@@ -554,7 +573,20 @@ class WorkspaceController {
         : trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
     this.image.hidden = !source;
     if (source) {
-      const url = `${source}${source.includes("?") ? "&" : "?"}revision=${state.revision}-${state.status}`;
+      const index = STAGE_ORDER.indexOf(state.stage);
+      const previousName = index > 0 ? STAGE_ORDER[index - 1] : undefined;
+      let token: string;
+      if (this.previewMode === "result") {
+        token = artifactToken(state);
+      } else if (previousName) {
+        token = artifactToken(stageFor(context.page, previousName));
+      } else {
+        const versionId = context.page.active_version?.id;
+        token = versionId ? `page-${versionId}` : "";
+      }
+      // An untokenised URL still needs a per-run cache buster.
+      const query = token ? `v=${token}` : `revision=${state.revision}-${state.status}`;
+      const url = `${source}${source.includes("?") ? "&" : "?"}${query}`;
       if (this.image.getAttribute("src") !== url) this.image.src = url;
     }
     const warning = state.status === "success" ? stageWorkerWarnings(state.parameters) : "";
@@ -1411,28 +1443,24 @@ class WorkspaceController {
       });
       return;
     }
-    const workspaceUrl = this.root.dataset.workspaceUrl;
-    if (workspaceUrl) {
+    const stateUrl = this.root.dataset.workspaceStateUrl;
+    if (stateUrl) {
       this.liveStatus.textContent = "Live updates unavailable; using compatibility polling";
-      this.pollingTimer = window.setInterval(() => void this.pollWorkspace(workspaceUrl), 5000);
+      this.pollingTimer = window.setInterval(() => void this.pollWorkspace(stateUrl), 5000);
     }
   }
 
-  private async pollWorkspace(workspaceUrl: string): Promise<void> {
+  /** Compatibility polling: fetch only the stage rows changed since the last cursor. */
+  private async pollWorkspace(stateUrl: string): Promise<void> {
     try {
-      const response = await fetch(workspaceUrl, {
-        credentials: "same-origin",
-      });
+      const url = this.pollCursor
+        ? `${stateUrl}?since=${encodeURIComponent(this.pollCursor)}`
+        : stateUrl;
+      const response = await fetch(url, { credentials: "same-origin" });
       if (!response.ok) return;
-      const payload = (await response.json()) as { pages: WorkspacePage[] };
-      for (const page of payload.pages) {
-        const previous = this.pages.get(page.id);
-        this.pages.set(page.id, page);
-        for (const state of page.stages) {
-          this.updateStageDom(state);
-          this.updateActivePreview(state, previous && stageFor(previous, state.stage));
-        }
-      }
+      const payload = (await response.json()) as WorkspaceStateDelta;
+      for (const state of payload.stages) this.mergeStage(state);
+      this.pollCursor = payload.cursor;
     } catch {
       this.liveStatus.textContent = "Workspace refresh failed; retrying…";
     }

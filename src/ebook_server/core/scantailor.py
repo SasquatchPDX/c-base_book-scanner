@@ -17,7 +17,6 @@ import numpy as np
 import structlog
 from django.conf import settings as django_settings
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -390,23 +389,37 @@ def ensure_stage_states_for_pages(
     return by_page
 
 
+def _invalidate(states: Any, reason: str) -> int:
+    """Mark ``states`` invalidated in one UPDATE (#195 §8.2 item 13).
+
+    ``updated_at`` is set explicitly: ``QuerySet.update`` skips ``auto_now``, and the
+    live workspace stream detects changes through it.
+    """
+    return int(
+        states.update(
+            status=ScanTailorStageState.StageStatus.INVALIDATED,
+            invalidated_reason=reason,
+            last_error="",
+            updated_at=timezone.now(),
+        )
+    )
+
+
 def invalidate_downstream_states(
     page: ScanPage,
     *,
     from_stage: str,
     reason: str,
-) -> None:
+) -> int:
     stages = downstream_stages(from_stage)
     if not stages:
-        return
-    query = Q()
-    for stage in stages:
-        query |= Q(scan_job=page.scan_job, scan_page=page, stage=stage)
-    for state in ScanTailorStageState.objects.filter(query):
-        state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.invalidated_reason = reason
-        state.last_error = ""
-        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
+        return 0
+    return _invalidate(
+        ScanTailorStageState.objects.filter(
+            scan_job_id=page.scan_job_id, scan_page=page, stage__in=stages
+        ),
+        reason,
+    )
 
 
 def mark_state_stale(
@@ -414,13 +427,11 @@ def mark_state_stale(
     scan_job_id: str,
     page_id: str,
     reason: str,
-) -> None:
-    states = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
-    for state in states:
-        state.status = ScanTailorStageState.StageStatus.INVALIDATED
-        state.invalidated_reason = reason
-        state.last_error = ""
-        state.save(update_fields=["status", "invalidated_reason", "last_error", "updated_at"])
+) -> int:
+    return _invalidate(
+        ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id),
+        reason,
+    )
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -2053,6 +2064,7 @@ def request_stage_job(
     *,
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
+    dispatch: bool = True,
 ) -> ProcessingJob:
     """Create and dispatch the worker job for ``state`` at its current revision.
 
@@ -2105,16 +2117,48 @@ def request_stage_job(
     state.algorithm = algorithm
     state.algorithm_version = algorithm_version
     state.updated_at = now
-    dispatch_stage_job(str(job.job_id))
+    if dispatch:
+        dispatch_stage_job(str(job.job_id))
     return job
 
 
+# Pages per batch job: big enough to amortise the per-job overhead, small enough that
+# an interactive edit queued at the front never waits long behind a running chunk.
+STAGE_BATCH_CHUNK: Final[int] = 8
+
+
 def dispatch_stage_job(job_id: str) -> None:
+    """Run one interactive stage job before any queued batch work (#195 §8.2 item 11).
+
+    Upstream Scan Tailor processes the page the user is looking at first. Here a
+    single-page edit goes to the front of the queue; batch chunks go to the back.
+    """
     queue = get_queue()
     if queue is None:
         process_stage_job(job_id)
         return
-    queue.enqueue(process_stage_job, job_id)
+    queue.enqueue(process_stage_job, job_id, at_front=True)
+
+
+def process_stage_jobs(job_ids: list[str]) -> None:
+    """Run a chunk of batch stage jobs; each keeps its own revision checks."""
+    for job_id in job_ids:
+        process_stage_job(job_id)
+
+
+def dispatch_stage_batch(job_ids: Sequence[str]) -> int:
+    """Queue batch stage jobs in chunks of :data:`STAGE_BATCH_CHUNK`; return the chunk count."""
+    chunks = [
+        list(job_ids[index : index + STAGE_BATCH_CHUNK])
+        for index in range(0, len(job_ids), STAGE_BATCH_CHUNK)
+    ]
+    queue = get_queue()
+    for chunk in chunks:
+        if queue is None:
+            process_stage_jobs(chunk)
+        else:
+            queue.enqueue(process_stage_jobs, chunk)
+    return len(chunks)
 
 
 def stage_job_payload(job: ProcessingJob) -> dict[str, Any]:

@@ -14,8 +14,10 @@ Group=book-scanner
 # settings.py reads ".env" from the working directory, so this must be the
 # checkout root (the directory containing manage.py and .env).
 WorkingDirectory=/opt/book-scanner
-# Required for headless Calibre PDF conversion.
-Environment=QT_QPA_PLATFORM=offscreen
+# QT_QPA_PLATFORM: required for headless Calibre PDF conversion.
+# BOOK_SCANNER_WORKER_THREADS: one worker per core (see README), so image libraries
+# stay single-threaded inside each worker.
+Environment=QT_QPA_PLATFORM=offscreen BOOK_SCANNER_WORKER_THREADS=1
 # --with-scheduler is mandatory on at least one worker (delayed retries); it is
 # safe on every instance because only one holds the scheduler lock at a time.
 ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --worker-class ebook_server.recovery_worker.RecoveryWorker --url redis://127.0.0.1:6379/0 ebook-server
