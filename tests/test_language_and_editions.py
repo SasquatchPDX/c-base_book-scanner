@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -19,12 +20,14 @@ from ebook_server.core.identification import (
     EDITION_ISBN_UNCONFIRMED,
     EDITION_LANGUAGE_MISMATCH,
     EDITION_PUBLISHER_MISMATCH,
+    STRONG_MATCH_EVIDENCE_KEY,
     IdentificationInput,
     OpenLibraryMetadataProvider,
     _normalize_candidate,
     build_identification_input,
     edition_conflicts,
     edition_evidence,
+    publisher_signal,
     resolve_candidates,
 )
 from ebook_server.core.languages import normalize_language, normalize_languages
@@ -410,6 +413,182 @@ def test_isbn_confirmed_edition_tolerates_an_imprint_publisher() -> None:
     assert edition_conflicts(candidate, signals) == []
 
 
+# --- Converter names and web addresses are no publisher (#144) --------------------
+#
+# Tools write their own name into the publisher field ("calibre 5.42.0", "Adobe
+# InDesign CS6"). That is no publisher signal, so it must not block the file's own
+# edition. Domain-shaped imprints ("Tor.com") are real publishers and must still reveal
+# another edition.
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Real publishers, including names that contain a web domain: kept.
+        ("Ace Books", "ace books"),
+        ("  Little,  Brown and Company ", "little, brown and company"),
+        ("Tor.com", "tor.com"),
+        ("Tor.com Publishing", "tor.com publishing"),
+        ("Amazon.com Services LLC", "amazon.com services llc"),
+        ("Smashwords.com", "smashwords.com"),
+        ("Books.de", "books.de"),
+        ("Ebook.de", "ebook.de"),
+        ("Verlag Rote Bete", "verlag rote bete"),
+        ("O'Reilly Media", "o'reilly media"),
+        ("Web Publishing Ltd", "web publishing ltd"),
+        ("St. Martin's Press", "st. martin's press"),
+        ("Dover Publications, Inc.", "dover publications, inc."),
+        ("S.Fischer", "s.fischer"),
+        ("C.H.Beck", "c.h.beck"),
+        ("Pages Publishing", "pages publishing"),
+        ("Sigil Press", "sigil press"),
+        # A web address next to a real name is dropped, the name kept.
+        ("Tor.com (www.tor.com)", "tor.com"),
+        ("Some Press https://somepress.example", "some press"),
+        # Converters and authoring tools, with or without versions and URLs: dropped.
+        ("calibre", ""),
+        ("Calibre 5.42.0", ""),
+        ("calibre (3.48.0) [https://calibre-ebook.com]", ""),
+        ("calibre-ebook.com", ""),
+        ("Adobe Acrobat", ""),
+        ("Adobe Acrobat Pro DC 21.1", ""),
+        ("Adobe InDesign CS6", ""),
+        ("Adobe InDesign CC 2019 (Macintosh)", ""),
+        ("Adobe PDF Library 15.0", ""),
+        ("Acrobat Distiller 9.0.0 (Windows)", ""),
+        ("Microsoft Word", ""),
+        ("Microsoft® Word 2016", ""),
+        ("LibreOffice 7.4", ""),
+        ("OpenOffice.org 3.2", ""),
+        ("Pages", ""),
+        ("Sigil", ""),
+        ("pandoc", ""),
+        ("ABBYY FineReader 11", ""),
+        ("Kindle Previewer 3.0", ""),
+        ("KindleGen v2.9", ""),
+        ("ePub Bud (www.epubbud.com)", ""),
+        ("pubOne.Info", ""),
+        # Placeholders and bare web addresses: dropped.
+        ("Unknown", ""),
+        ("Unknown Publisher", ""),
+        ("[s.n.]", ""),
+        ("n/a", ""),
+        ("-", ""),
+        ("http://example.org/books", ""),
+        ("https://foo", ""),
+        ("www.example.com", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_publisher_signal_ignores_converters_and_web_addresses(
+    raw: str | None, expected: str
+) -> None:
+    assert publisher_signal(raw) == expected
+
+
+def test_converter_publisher_is_no_edition_conflict() -> None:
+    """A file whose 'publisher' is the converter site is not blocked as another edition."""
+    signals = build_identification_input(
+        source_path="/lib/Alastair Reynolds/Absolution Gap (1169)/Absolution Gap.epub",
+        original_filename="Absolution Gap - Alastair Reynolds.epub",
+        extracted_metadata={
+            "title": "Absolution Gap",
+            "authors": ["Alastair Reynolds"],
+            "publisher": "ePub Bud (www.epubbud.com)",
+            "language": "en",
+        },
+    )
+    assert signals.publisher == ""
+    candidate = _normalize_candidate("openlibrary", SEARCH_DOC, signals)
+    assert EDITION_PUBLISHER_MISMATCH not in edition_conflicts(candidate, signals)
+
+
+# All Systems Red: the file says Tor.com (its US publisher); Open Library's selected
+# edition is the Gollancz one. No ISBN and no language, so only the exact-title +
+# strong-author rule lifts the score to the threshold (#91 / #144 review).
+ALL_SYSTEMS_RED_DOC: dict[str, Any] = {
+    "key": "/works/OL17741532W",
+    "title": "All Systems Red",
+    "author_name": ["Martha Wells"],
+    "first_publish_year": 2017,
+    "language": ["eng"],
+    "publisher": ["Tor.com", "Gollancz"],
+    "editions": {
+        "numFound": 1,
+        "docs": [
+            {
+                "key": "/books/OL50000001M",
+                "title": "All Systems Red",
+                "language": ["eng"],
+                "publisher": ["Gollancz"],
+                "publish_date": ["2018"],
+            }
+        ],
+    },
+}
+
+
+def _decide_all_systems_red(file_publisher: str) -> intake.AutoAcceptDecision:
+    signals = build_identification_input(
+        source_path="/incoming/All Systems Red.epub",
+        original_filename="All Systems Red.epub",
+        extracted_metadata={
+            "title": "All Systems Red",
+            "authors": ["Martha Wells"],
+            "publisher": file_publisher,
+        },
+    )
+    with (
+        patch(
+            "ebook_server.core.identification.urlopen",
+            _fake_urlopen({"search.json": {"docs": [ALL_SYSTEMS_RED_DOC]}}, []),
+        ),
+        patch(
+            "ebook_server.core.identification._provider_instances",
+            lambda: [OpenLibraryMetadataProvider()],
+        ),
+    ):
+        candidates = resolve_candidates(signals)
+    assert candidates[0].publisher == "gollancz"
+    assert candidates[0].raw[STRONG_MATCH_EVIDENCE_KEY]["applied"] is True
+    assert candidates[0].score >= AUTO_ACCEPT_SCORE
+    return intake.decide_auto_accept(candidates, ["Martha Wells"], file_evidence=signals)
+
+
+@pytest.mark.parametrize(
+    "file_publisher", ["Tor.com", "Tor.com Publishing", "Tor.com (www.tor.com)"]
+)
+def test_domain_shaped_publisher_still_blocks_the_wrong_edition(file_publisher: str) -> None:
+    decision = _decide_all_systems_red(file_publisher)
+    assert decision.candidate is None
+    assert decision.blocked_reason == intake.BLOCK_EDITION_CONFLICT
+    assert decision.details["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
+
+
+@pytest.mark.parametrize(
+    "file_publisher", ["calibre 5.42.0", "Adobe InDesign CS6", "ePub Bud (www.epubbud.com)"]
+)
+def test_converter_publisher_does_not_block_the_strong_match(file_publisher: str) -> None:
+    decision = _decide_all_systems_red(file_publisher)
+    assert decision.blocked_reason is None
+    assert decision.candidate is not None
+    assert decision.candidate.title == "All Systems Red"
+
+
+def test_multipart_group_signals_skip_converter_publishers() -> None:
+    from ebook_server.core.multipart import _group_signals
+
+    group = cast(Any, SimpleNamespace(folder="/incoming/Martha Wells/All Systems Red"))
+    converter_only = [SimpleNamespace(evidence={"publisher": "calibre 5.42.0"})]
+    assert _group_signals(group, cast(Any, converter_only)).publisher is None
+    mixed = [
+        SimpleNamespace(evidence={"publisher": "Adobe InDesign CS6"}),
+        SimpleNamespace(evidence={"publisher": "Tor.com"}),
+    ]
+    assert _group_signals(group, cast(Any, mixed)).publisher == "tor.com"
+
+
 # --- Sparse concrete editions (#37 review on 3e71293) -----------------------------
 #
 # The selected Ace edition lacks one field. The work lists (en/fr, Gollancz/Ace) must
@@ -504,6 +683,11 @@ def test_intake_routes_sparse_edition_probes_to_review(
     assert top is not None
     assert top.isbn13 == "9780441011582"
     assert float(top.score) == pytest.approx(0.85)
+    # The #9 exact-title + strong-author rule must not promote it either: the edition's
+    # missing field is uncertainty while the work lists the file's value.
+    rule = top.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
+    assert rule["applied"] is False
+    assert f"edition_{missing}_unknown" in rule["blocked_by"]
     assert not Book.objects.exists()
     assert not Identifier.objects.filter(normalized_value="9780441011582").exists()
 

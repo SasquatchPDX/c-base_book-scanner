@@ -240,6 +240,47 @@ def book_folder(book: Book, storage: StorageBackend) -> str:
     raise RuntimeError(f"could not assign a unique archive folder to book {book.pk}")
 
 
+def proposed_book_folder(book: Book, storage: StorageBackend) -> str:
+    """The folder a reorganize would give ``book`` now, without claiming it.
+
+    Its current folder is kept when that is already the folder (or the disambiguated
+    form of the folder) its metadata implies.
+    """
+    current = (book.archive_folder or "").lower()
+    for candidate in _folder_candidates(render_book_folder(book), book.pk):
+        if candidate.lower() == current:
+            return book.archive_folder
+        if not _folder_in_use(candidate, book, storage):
+            return candidate
+    raise RuntimeError(f"no free archive folder for book {book.pk}")
+
+
+def claim_planned_book_folder(book: Book, folder: str, storage: StorageBackend) -> bool:
+    """Make ``folder`` (taken from a reviewed reorganize plan) ``book``'s folder.
+
+    Claims exactly the planned folder, never a substitute: returns True when the book
+    already owns it or it was free and is now assigned, False when another Book owns
+    it or an unowned folder appeared there since the plan (the plan is then stale).
+    Files are not moved here; the caller moves them.
+    """
+    with transaction.atomic():
+        locked = Book.objects.select_for_update().get(pk=book.pk)
+        current = locked.archive_folder or ""
+        if current.lower() == folder.lower():
+            book.archive_folder = current
+            return True
+        if _folder_in_use(folder, locked, storage):
+            return False
+        try:
+            with transaction.atomic():
+                Book.objects.filter(pk=locked.pk).update(archive_folder=folder)
+        except IntegrityError:
+            return False
+    book.archive_folder = folder
+    logger.info("archive_folder_reassigned", book_id=book.pk)
+    return True
+
+
 def pending_destination(storage: StorageBackend, job: ImportJob) -> str:
     """Storage id for an original archived before its Book is known.
 

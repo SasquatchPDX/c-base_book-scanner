@@ -77,6 +77,12 @@ def _signals(terms: dict[str, Any]) -> identification.IdentificationInput:
     )
 
 
+def _scanner_opf_evidence(scan_job: ScanJob) -> dict[str, Any]:
+    notes = scan_job.notes if isinstance(scan_job.notes, dict) else {}
+    handed = notes.get("scanner_opf")
+    return {"scanner_opf": handed} if isinstance(handed, dict) else {}
+
+
 def _create_or_refresh_review(
     scan_job: ScanJob,
     candidates: list[identification.IdentificationCandidate],
@@ -108,6 +114,8 @@ def _create_or_refresh_review(
         "embedded_metadata": {
             "scanner_id": scan_job.scanner_id,
             "expected_page_count": scan_job.expected_page_count,
+            # Why finish handed a job with a scanner OPF to identification (#130).
+            **_scanner_opf_evidence(scan_job),
         },
         "state": ReviewTask.State.OPEN,
         "decision": (

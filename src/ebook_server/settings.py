@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _package_version
 from pathlib import Path
@@ -36,6 +37,7 @@ DEFAULT_METADATA_USER_AGENT = (
     "(+https://github.com/SasquatchPDX/c-base_book-scanner; self-hosted hackerspace library)"
 )
 DEV_SECRET_KEY = "dev-only-secret-change-me-before-production-0123456789abcdef"
+SCANNER_KEY_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Settings(BaseSettings):
@@ -54,6 +56,9 @@ class Settings(BaseSettings):
     # "author_title" (Author/Title/, Calibre-style), "calibre" (Author/Title (id)/),
     # "job" (the original books/<import job id>/), or a custom template.
     archive_layout: str = "author_title"
+    # Write a Calibre-compatible metadata.opf into each book's archive folder (derived,
+    # regenerated in the background when metadata changes; see core.book_opf).
+    write_book_opf: bool = True
     source_min_age_seconds: int = 60
     ingest_max_auto_attempts: int = 3
     ingest_batch_size: int = 100
@@ -61,6 +66,15 @@ class Settings(BaseSettings):
     # Exclusive worker lease on an ImportJob; 0 = queue job timeout + 5 minutes.
     ingest_lease_seconds: int = 0
     sidecar_covers_enabled: bool = True
+    # Cover thumbnails (#28): a regenerable cache on the application VM. Empty root means
+    # `<storage_root>/cover-thumbnails`. With an accel prefix (for example
+    # `/_protected/cover-thumbnails/`) Django checks permissions and hands the file to
+    # nginx with X-Accel-Redirect; see deploy/nginx/book-scanner.conf.
+    cover_thumbnail_root: str = ""
+    cover_thumbnail_accel_prefix: str = ""
+    # Unreferenced thumbnail files are deleted by `collect_cover_thumbnails` only after
+    # this grace period, so a worker that just saw a shared file can still publish it.
+    cover_thumbnail_gc_grace_seconds: int = 24 * 60 * 60
     multipart_detection: bool = True
     sidecar_metadata_enabled: bool = True
     redis_url: str | None = None
@@ -110,11 +124,21 @@ class Settings(BaseSettings):
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
+    # Exact-title + strong-author rule for matches without ISBN confirmation
+    # (docs/metadata-providers.md).
+    identification_strong_match_enabled: bool = True
+    identification_strong_match_min_title: float = 1.0
+    identification_strong_match_min_author: float = 0.9
+    identification_strong_match_tie_margin: float = 0.05
+    identification_strong_match_year_tolerance: int = 2
     # Candidates within this score margin of the best one count as tied for auto-accept.
     identification_tie_margin: float = 0.02
     identification_work_isbn_bonus: float = 0.3
     # Identify a file from agreeing independent local evidence when no provider fits.
     identification_local_consensus: bool = True
+    # Extra file-publisher values that name a converter, tool or site rather than a
+    # publisher; added to identification.DEFAULT_IGNORED_PUBLISHERS (JSON list via env).
+    identification_ignored_publishers: list[str] = []
     review_queue_page_size: int = 50
     review_batch_min_score: float = 0.75
     review_batch_ambiguity_margin: float = 0.05
@@ -168,6 +192,15 @@ class Settings(BaseSettings):
     # project's own scanner) or ``spread`` (one photo holds two facing pages).
     scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
     scan_spread_scanner_ids: list[str] = []
+    # Scanner device API v1 (/api/scanner/v1/, libreflip contract §7.2, #125). There is
+    # one scanner with one key; this is the key's SHA-256 as lowercase hex (generate it
+    # with manage.py generate_scanner_key). Empty disables the API (every request 503).
+    # The public base URL builds portal links handed to the scanner; production requires
+    # it (https://) only while the scanner API is enabled.
+    scanner_api_key_sha256: str = ""
+    public_base_url: str = ""
+    scanner_max_image_bytes: int = 50 * 1024 * 1024
+    scanner_max_opf_bytes: int = 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_file=(".env",),
@@ -175,10 +208,42 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def validate_scanner_api(self) -> Settings:
+        errors: list[str] = []
+        self.scanner_api_key_sha256 = self.scanner_api_key_sha256.strip().lower()
+        if self.scanner_api_key_sha256 and not SCANNER_KEY_SHA256_PATTERN.match(
+            self.scanner_api_key_sha256
+        ):
+            errors.append("scanner_api_key_sha256 must be 64 hex characters (a SHA-256)")
+        if self.scanner_max_image_bytes <= 0:
+            errors.append("scanner_max_image_bytes must be positive")
+        if self.scanner_max_opf_bytes <= 0:
+            errors.append("scanner_max_opf_bytes must be positive")
+        if self.public_base_url.strip():
+            parsed = urlparse(self.public_base_url.strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                errors.append("public_base_url must be an absolute http(s):// URL")
+            elif parsed.query or parsed.fragment:
+                errors.append("public_base_url must not carry a query or fragment")
+        if errors:
+            raise ValueError("invalid scanner API configuration: " + "; ".join(errors))
+        return self
+
+    @model_validator(mode="after")
     def validate_production_safety(self) -> Settings:
         if self.environment != "production":
             return self
         errors: list[str] = []
+        # The scanner API is opt-in: deployments without a scanner key need no public
+        # base URL. Once a key is configured, portal links must be https://.
+        public_base_url = urlparse(self.public_base_url.strip())
+        if (self.scanner_api_key_sha256 or self.public_base_url.strip()) and (
+            public_base_url.scheme != "https" or not public_base_url.hostname
+        ):
+            errors.append(
+                "public_base_url must be set to an https:// URL when the scanner API is"
+                " enabled (scanner_api_key_sha256 is set)"
+            )
         if self.secret_key.get_secret_value() == DEV_SECRET_KEY:
             errors.append("secret_key must be changed")
         if not self.allowed_hosts or "*" in self.allowed_hosts:
@@ -249,6 +314,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # The scanner key is refused outside /api/scanner/v1/ before any session is loaded.
+    "ebook_server.core.middleware.ScannerKeyMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -313,6 +380,9 @@ BOOK_SCANNER_ARCHIVE_DIRNAME = "library-artifacts"
 # Folder layout inside the archive. Changing it applies to newly archived files only;
 # existing files stay where they are until an admin runs a reorganize.
 BOOK_SCANNER_ARCHIVE_LAYOUT = settings.archive_layout
+# A derived, Calibre-compatible metadata.opf in each book folder (book-scoped layouts
+# only; never on read-only, indexed-in-place locations). See core.book_opf.
+BOOK_SCANNER_WRITE_BOOK_OPF = settings.write_book_opf
 STORAGE_REQUIRE_EXISTING_ROOT = settings.storage_require_existing_root
 STORAGE_SENTINEL_FILE = settings.storage_sentinel_file
 BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = settings.storage_min_free_bytes
@@ -329,6 +399,9 @@ BOOK_SCANNER_INGEST_BATCH_SIZE = settings.ingest_batch_size
 BOOK_SCANNER_INGEST_MAX_PER_HOUR = settings.ingest_max_per_hour
 BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
+BOOK_SCANNER_COVER_THUMBNAIL_ROOT = settings.cover_thumbnail_root
+BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX = settings.cover_thumbnail_accel_prefix
+BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS = max(settings.cover_thumbnail_gc_grace_seconds, 0)
 BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
 # An empty value (e.g. a blank line in .env) means "use the default", never a blank UA.
@@ -367,9 +440,21 @@ BOOK_SCANNER_GOOGLE_BOOKS_API_KEY = settings.google_books_api_key.get_secret_val
 BOOK_SCANNER_IDENTIFICATION_SIBLING_BONUS = settings.identification_sibling_bonus
 BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT = settings.identification_auto_accept
 BOOK_SCANNER_IDENTIFICATION_REVIEW = settings.identification_review
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED = settings.identification_strong_match_enabled
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE = settings.identification_strong_match_min_title
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR = (
+    settings.identification_strong_match_min_author
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN = (
+    settings.identification_strong_match_tie_margin
+)
+BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE = (
+    settings.identification_strong_match_year_tolerance
+)
 BOOK_SCANNER_IDENTIFICATION_TIE_MARGIN = settings.identification_tie_margin
 BOOK_SCANNER_IDENTIFICATION_WORK_ISBN_BONUS = settings.identification_work_isbn_bonus
 BOOK_SCANNER_IDENTIFICATION_LOCAL_CONSENSUS = settings.identification_local_consensus
+BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS = settings.identification_ignored_publishers
 BOOK_SCANNER_REVIEW_QUEUE_PAGE_SIZE = settings.review_queue_page_size
 BOOK_SCANNER_REVIEW_BATCH_MIN_SCORE = settings.review_batch_min_score
 BOOK_SCANNER_REVIEW_BATCH_AMBIGUITY_MARGIN = settings.review_batch_ambiguity_margin
@@ -407,6 +492,13 @@ BOOK_SCANNER_CONTRIBUTIONS_RETENTION_MONTHS = settings.contributions_retention_m
 BOOK_SCANNER_CONTRIBUTIONS_SEASON = settings.contributions_season
 BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
 BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
+# Normalised to end in "/" so links are built as PUBLIC_BASE_URL + "j/<job_id>".
+BOOK_SCANNER_PUBLIC_BASE_URL = (
+    settings.public_base_url.strip().rstrip("/") + "/" if settings.public_base_url.strip() else ""
+)
+BOOK_SCANNER_SCANNER_API_KEY_SHA256 = settings.scanner_api_key_sha256
+BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES = settings.scanner_max_image_bytes
+BOOK_SCANNER_SCANNER_MAX_OPF_BYTES = settings.scanner_max_opf_bytes
 
 SECURE_SSL_REDIRECT = settings.secure_ssl_redirect
 SECURE_HSTS_SECONDS = settings.secure_hsts_seconds

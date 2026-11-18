@@ -23,11 +23,76 @@ create a review task and archive the original without assigning canonical Book
 metadata. The previous threshold correction is protected by upload and COPY/MOVE
 regression tests.
 
-The scorer is not yet tuned for ISBN-less imports: title and author alone
-contribute at most 0.85 and author hints can dilute the score.
-`BOOK_SCANNER_IDENTIFICATION_REVIEW` currently
-does not affect intake acceptance. Task D must give that setting a tested role or
-remove it; do not lower auto-accept merely to reduce the review queue.
+Title and author alone contribute at most 0.85 to the score, author hints can
+dilute it, and language/publisher comparisons in the score need normalization.
+`BOOK_SCANNER_IDENTIFICATION_REVIEW` currently does not affect intake acceptance.
+Task D must give that setting a tested role or remove it; do not lower auto-accept
+merely to reduce the review queue.
+
+### Auto-accept without an ISBN (exact title + strong author rule)
+
+Many books predate ISBNs, and plain-text files rarely carry language or publisher
+metadata, so a correct title+author match would otherwise always stop at 0.85 and
+go to review. Instead of lowering the global threshold, a separate, conservative
+rule lets such a match reach auto-accept. When the top candidate scores below
+`BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`, its score is raised to that threshold only
+if **all** of the following hold:
+
+- **Exact title:** some title hint has a title score of at least
+  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_TITLE` (default 1.0, i.e. the same
+  words after case/punctuation normalization). Subset titles ("Foundation" vs
+  "Foundation and Earth") do not qualify.
+- **Strongest title evidence agrees:** the matched title hint must come from the
+  strongest title source present (embedded > sidecar > header > folder layout >
+  filename), or that stronger evidence must name the candidate's title too (same
+  title, a "Title: Subtitle" form, or a " - " segment of it). An EPUB embedding "The
+  Dragon in the Sea" uploaded as "Dune - Frank Herbert.epub" is not promoted to a Dune
+  candidate (`stronger_title_evidence_disagrees`).
+- **Strong author:** the typed author score (see above) is at least
+  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_MIN_AUTHOR` (default 0.9). Filename
+  guesses are alternatives, so an "Author - Title" filename costs nothing, but
+  embedded/layout coauthors must all be covered: a candidate that omits a genuine
+  coauthor (`missing_coauthor`, e.g. Good Omens credited to Terry Pratchett alone) or
+  names nobody from an explicit author list (`author_evidence_conflict`, the #92
+  guard's test) is not promoted. The title and author must come from different
+  hints. Improvements to author-name matching (such as name variants) apply to this
+  rule automatically.
+- **No conflicting signal:** if the file has an ISBN, the candidate's own edition
+  must carry an ISBN and one must match; work-level ISBNs of other editions do not
+  count (otherwise `conflicting_isbn` / `file_isbn_unconfirmed`). If the file has a
+  language, it must be among the edition's languages as normalised for #36 (`en` =
+  `eng` = `english`; see "Edition checks before auto-accept"). A concrete edition
+  that states no language or publisher while its work lists some is uncertain, so
+  a file with that field is not promoted (`edition_language_unknown` /
+  `edition_publisher_unknown`); the file may be another edition of the work. If the
+  file has a publication year, it must not be more than
+  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_YEAR_TOLERANCE` (default 2) years before
+  the candidate's year. A later year is a reprint and is not a conflict. Missing
+  values on either side are not conflicts.
+- **No ambiguity:** the runner-up is more than
+  `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN` (default 0.05) below the top
+  candidate, and no other candidate also passes the rule. Two near-identical records
+  (two works titled "Poems" by the same author, or the same book returned twice)
+  therefore go to review.
+
+`BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED` (default true) turns the rule
+off. Whenever the rule is evaluated, the decision is stored on the top candidate's
+`raw_payload` under `_auto_accept_rule`. The record lists `rule`, `applied`,
+`blocked_by` (the failed conditions), `base_score`, `runner_up_score`, the title and
+author scores, the hints that matched, `title_source` / `strongest_title_source` and
+`missing_coauthors`, so reviewers and audits can see why a
+candidate was or was not auto-accepted. The rule runs inside `resolve_candidates`,
+so it applies equally to upload/incoming/network intake, review re-searches and
+scan-job identification.
+
+The rule only raises a score; it does not bypass the other auto-accept checks. A
+promoted candidate goes through intake's author, edition and title-evidence checks
+(see "Author checks before auto-accept" below) like any other candidate at the
+threshold. If its provider
+record names no real authors, or its authors conflict with the file's embedded
+authors, the import still goes to review with `auto_accept_blocked` set. Its
+`_auto_accept_rule` record then says `applied: true`, and the import evidence says
+why the accept was blocked anyway.
 
 Author names are compared per name, not by exact string. Case, punctuation,
 spacing, and "Last, First" order are ignored, so "H P Lovecraft" equals
@@ -74,6 +139,27 @@ ISO 639-1 code, or the 639-3 code when no two-letter code exists. `UND`, `mul`,
 Normalization is for comparison only; the Book keeps the provider's code form.
 Publisher comparison ignores case, punctuation and noise words such as "Books",
 "Press", "Ltd", "Verlag", and then needs a rapidfuzz `token_set_ratio` of at least 90.
+
+The file's publisher passes through `identification.publisher_signal()` first (for
+single files in `build_identification_input` and for multi-part groups in
+`multipart._group_signals`). Values that name no publisher become "no publisher
+signal" (no bonus, no edition conflict):
+
+- converters, authoring tools and placeholders from the built-in
+  `DEFAULT_IGNORED_PUBLISHERS` list (calibre, Adobe Acrobat/InDesign/Distiller/PDF
+  Library, Microsoft Word, LibreOffice/OpenOffice, Pages, Sigil, Pandoc, ABBYY
+  FineReader, Kindle Previewer/KindleGen, ePub Bud, "Unknown", "Unknown Publisher",
+  "n/a", "[s.n.]", ...), also when followed only by version tokens
+  (`Calibre 5.42.0`, `Adobe InDesign CS6`, `calibre (3.48.0) [https://calibre-ebook.com]`);
+- a bare web address (`https://...`, `www....`).
+
+A web address next to a real name is removed and the name kept (`Tor.com
+(www.tor.com)` becomes `tor.com`). Names that merely contain a domain (`Tor.com`,
+`Tor.com Publishing`, `Amazon.com Services LLC`, `Smashwords.com`, `Books.de`) are
+real imprints and stay a publisher signal, so a Tor.com file still reveals a Gollancz
+edition as `edition_publisher_mismatch`. `BOOK_SCANNER_IDENTIFICATION_IGNORED_PUBLISHERS`
+(a JSON list in the environment, default `[]`) adds deployment-specific entries to the
+built-in list; entries are compared case-insensitively after whitespace normalization.
 
 ### Work versus edition
 
@@ -139,8 +225,15 @@ so intake (`intake.decide_auto_accept`) also checks the top candidate's authors:
   candidate's authors is the same person as any of the file's embedded authors,
   using the name matching above. A bare surname on one side ("Tolkien") agrees with
   a full name that ends in it. Missing file authors are not a conflict.
+- **Stronger title evidence disagrees** (`stronger_title_evidence_disagrees`): the
+  same title-provenance check as the strong-match rule above, applied to every
+  candidate at or above the threshold however its score got there. A Dune candidate
+  matching only "Dune - Frank Herbert.epub" while the EPUB embeds "The Dragon in the
+  Sea" is held for review even when title, author and a shared language already
+  score 0.90 without the rule. The details record the candidate title, the matched
+  hint's source and the strongest titles.
 
-Either case sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
+Any of these cases sets `LOW_CONFIDENCE`, opens a review task, keeps every candidate in
 `REVIEW` state (none is shown as a `MATCH`), and records in the import's evidence:
 `auto_accept_blocked` (the reason above), `auto_accept_block_details` (provider,
 score, candidate and file authors) and `suggested_authors` (the file's embedded

@@ -272,12 +272,17 @@ def test_folder_author_drives_identification_end_to_end(
     assert job.evidence[PATH_LAYOUT_EVIDENCE_KEY]["template"] == "{author}/**"
     top = job.metadata_candidates.order_by("-score").first()
     assert top is not None
-    # Perfect title (0.55) + perfect author (0.30); plain text carries no language,
-    # publisher or description, so it stays just below auto-accept and goes to review.
-    assert float(top.score) == pytest.approx(0.85)
-    assert job.state == ImportJob.State.LOW_CONFIDENCE
-    task = ReviewTask.objects.get(import_job=job)
-    assert task.inferred_authors == ["William Gibson"]
+    # Perfect title (0.55) + perfect author (0.30) = 0.85; plain text carries no
+    # language, publisher or description. The folder author is the strong-author
+    # evidence the exact-title + strong-author rule (#9) needs, so the candidate is
+    # raised to the auto-accept threshold and the import completes without review.
+    assert float(top.score) == pytest.approx(0.86)
+    evidence = top.raw_payload["_auto_accept_rule"]
+    assert evidence["applied"] is True
+    assert evidence["base_score"] == pytest.approx(0.85)
+    assert evidence["author_hint"] == "William Gibson"
+    assert job.state == ImportJob.State.COMPLETE
+    assert not ReviewTask.objects.filter(import_job=job).exists()
     assert book.exists()
 
 
