@@ -4,12 +4,16 @@
   <div class="section-heading">
     <div>
       <p class="eyebrow">Human review</p>
-      <h1>Metadata decisions</h1>
+      <h1>Review tasks</h1>
     </div>
     <span>{{ count }} open</span>
   </div>
   <form class="filter-panel" method="get" aria-label="Filter review tasks">
     <input type="hidden" name="view" value="html">
+    <label>Task type<select name="task_type">
+      <option value="">All task types</option>
+      {% for value, label in task_types %}<option value="{{ value }}" {% if filters.task_type == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select></label>
     <label>
       Source<select name="source">
         <option value="">All sources</option>
@@ -65,16 +69,16 @@
       {% for row in rows %}
         <article class="review-row">
           <label class="review-select" title="Select for batch accept">
-            <input type="checkbox" name="task_ids" value="{{ row.task.id }}" aria-label="Select {{ row.task.inferred_title|default:row.task.source_filename }}">
+            <input type="checkbox" name="task_ids" value="{{ row.task.id }}" aria-label="Select {{ row.task.inferred_title|default:row.task.source_filename }}"{% if row.task.processing_job_id %} disabled{% endif %}>
           </label>
           <div class="grow">
             <h2><a href="{% url 'review-detail' row.task.id %}?view=html">{{ row.task.inferred_title|default:row.task.source_filename }}</a></h2>
             <p>{{ row.task.source_filename }}</p>
-            <p class="muted">{% for author in row.task.inferred_authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}No inferred author{% endfor %}</p>
+            <p class="muted">{{ row.task.get_task_type_display }}{% if not row.task.processing_job_id %} · {% for author in row.task.inferred_authors %}{{ author }}{% if not forloop.last %}, {% endif %}{% empty %}No inferred author{% endfor %}{% endif %}</p>
             {% if row.group.others %}<p class="muted sibling-formats">+{{ row.group.other_count }} other format{{ row.group.other_count|pluralize }} of this book: {% for other, item in row.group.others %}<a href="{% url 'review-detail' other.id %}?view=html">{{ other.source_filename }}</a> ({{ item.candidate_count }} candidate{{ item.candidate_count|pluralize }}){% if not forloop.last %}, {% endif %}{% endfor %}. Resolving this one offers its book to the others; each is linked automatically only if its own evidence agrees.</p>{% endif %}
             <p class="muted">
-              {% if row.task.import_job.source_location %}{{ row.task.import_job.source_location.name }}{% elif row.task.import_job_id %}Web upload{% else %}Scan job{% endif %}
-              · {{ row.candidate_count }} candidate{{ row.candidate_count|pluralize }}
+              {% if row.task.processing_job_id %}Worker job · open the task to retry or acknowledge{% elif row.task.import_job.source_location %}{{ row.task.import_job.source_location.name }}{% elif row.task.import_job_id %}Web upload{% else %}Scan job{% endif %}
+              {% if not row.task.processing_job_id %}· {{ row.candidate_count }} candidate{{ row.candidate_count|pluralize }}{% endif %}
               {% if row.top_candidate %}· top: {{ row.top_candidate.title }} ({{ row.top_candidate.score }}){% endif %}
               {% if row.eligibility.reason == 'ambiguous' %}· near-tied runner-up ({{ row.eligibility.runner_up_score|floatformat:2 }}){% endif %}
             </p>

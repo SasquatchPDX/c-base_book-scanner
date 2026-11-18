@@ -64,6 +64,8 @@ def _run_rq_worker(queue_name: str, *, environment: dict[str, str] | None = None
             os.environ["BOOK_SCANNER_REDIS_URL"],
             "--config",
             "ebook_server.rq_settings",
+            "--worker-class",
+            "ebook_server.recovery_worker.RecoveryWorker",
             queue_name,
         ],
         cwd=Path(__file__).resolve().parents[2],

@@ -39,9 +39,10 @@ All domain models and migrations belong to the single Django app
   `view_helpers.py` contains request parsing, profile access and shared responses.
   `library_views.py` serves search, browse, downloads, conversion and OCR requests.
   `member_views.py` handles sign-in, sign-out and role checks. `health_views.py`
-  serves readiness and metrics. Scan and review workflows live in `views.py`,
-  with contributions and reading in `contributions_views.py` and
-  `review_reader_views.py`. Routes stay in `urls.py` and templates in `templates/core/`.
+  serves readiness and metrics. `views.py` handles scan jobs and ScanTailor editing.
+  `review_views.py` handles the review queue and metadata decisions, while
+  `worker_failure_views.py` handles recovery actions. Contributions and reading use
+  `contributions_views.py` and `review_reader_views.py`. Routes stay in `urls.py` and templates in `templates/core/`.
 
 At package level, `ebook_server.settings` configures the application,
 `ebook_server.storage` defines the storage protocol and filesystem backend,

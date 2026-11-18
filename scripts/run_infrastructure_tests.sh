@@ -128,6 +128,7 @@ pandoc "${book_scanner_project_root}/tests/fixtures/browser-digital-library.html
 uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120
 uv run python manage.py migrate --noinput
+uv run python manage.py shell -c 'from tests.browser_fixtures import seed_worker_failure_review; seed_worker_failure_review()'
 uv run python manage.py check
 # tests/integration includes test_rehearse_migrations_postgres.py, which runs
 # scripts/rehearse_migrations.sh end to end against this PostgreSQL (pg_dump and friends
@@ -196,6 +197,7 @@ fi
 uv run rq worker \
   --with-scheduler \
   --config ebook_server.rq_settings \
+  --worker-class ebook_server.recovery_worker.RecoveryWorker \
   --url "${BOOK_SCANNER_REDIS_URL}" \
   ebook-server \
   >"${book_scanner_worker_log}" 2>&1 &

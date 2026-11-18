@@ -26,9 +26,9 @@ from django.views.decorators.http import require_GET
 from . import review_reader
 from .models import ReviewTask
 from .review_reader import PreviewUnavailable, ReaderSource
+from .review_views import _can_manage_review_task
 from .storage_registry import StorageConfigurationError, backend_for_location
 from .view_helpers import _profile_for_request
-from .views import _can_manage_review_task
 
 logger = structlog.get_logger(__name__)
 

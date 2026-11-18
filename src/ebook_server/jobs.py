@@ -43,6 +43,7 @@ RQ_ENQUEUE_OPTIONS = frozenset(
         "at_front",
         "on_success",
         "on_failure",
+        "on_stopped",
     },
 )
 
@@ -66,6 +67,15 @@ class ConfiguredQueue:
         )
         kwargs.setdefault("result_ttl", settings.BOOK_SCANNER_QUEUE_RESULT_TTL_SECONDS)
         kwargs.setdefault("failure_ttl", settings.BOOK_SCANNER_QUEUE_FAILURE_TTL_SECONDS)
+        if getattr(func, "__name__", "") in {
+            "process_conversion_job",
+            "process_ocr_job",
+            "process_scan_finalization_job",
+        }:
+            from ebook_server.core.worker_failures import rq_failure_callback, rq_stopped_callback
+
+            kwargs.setdefault("on_failure", rq_failure_callback)
+            kwargs.setdefault("on_stopped", rq_stopped_callback)
         if "retry" not in kwargs and settings.BOOK_SCANNER_QUEUE_RETRY_MAX > 0:
             # In rq 2.x a retry with an interval is *scheduled*, and scheduled
             # jobs only run when some worker was started with --with-scheduler.

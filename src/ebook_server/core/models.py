@@ -1657,6 +1657,13 @@ class ProcessingJob(models.Model):
         null=True,
         blank=True,
     )
+    recovery_task = models.ForeignKey(
+        "ReviewTask",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="worker_attempts",
+    )
     job_type = models.CharField(max_length=32, choices=JobType.choices)
     state = models.CharField(max_length=16, choices=JobState.choices, default=JobState.QUEUED)
     details = models.JSONField(default=dict, blank=True)
@@ -2050,6 +2057,7 @@ class ReviewTask(models.Model):
         SOURCE_REVIEW = "source_review", "Source review"
         QUALITY_REVIEW = "quality_review", "Quality review"
         MULTIPART_WORK = "multipart_work", "Multi-part work"
+        WORKER_FAILURE = "worker_failure", "Worker failure"
 
     class State(models.TextChoices):
         OPEN = "open", "Open"
@@ -2068,6 +2076,8 @@ class ReviewTask(models.Model):
         SPLIT_PARTS = "split_parts", "Not one work: import parts separately"
         # A scanner-OPF conflict (#130): keep or replace the Book's field values.
         METADATA_CONFLICT = "metadata_conflict", "Resolved a metadata conflict"
+        RETRY_JOB = "retry_job", "Retry failed job"
+        ACKNOWLEDGE_FAILURE = "acknowledge_failure", "Acknowledge worker failure"
 
     import_job = models.ForeignKey(
         ImportJob,
@@ -2082,6 +2092,13 @@ class ReviewTask(models.Model):
         related_name="review_tasks",
         null=True,
         blank=True,
+    )
+    processing_job = models.OneToOneField(
+        ProcessingJob,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="failure_review",
     )
     task_type = models.CharField(
         max_length=32,
@@ -2157,8 +2174,15 @@ class ReviewTask(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(
-                    models.Q(import_job__isnull=False, scan_job__isnull=True)
-                    | models.Q(import_job__isnull=True, scan_job__isnull=False)
+                    models.Q(
+                        import_job__isnull=False, scan_job__isnull=True, processing_job__isnull=True
+                    )
+                    | models.Q(
+                        import_job__isnull=True, scan_job__isnull=False, processing_job__isnull=True
+                    )
+                    | models.Q(
+                        import_job__isnull=True, scan_job__isnull=True, processing_job__isnull=False
+                    )
                 ),
                 name="review_has_exactly_one_source",
             ),
@@ -2174,6 +2198,8 @@ class ReviewTask(models.Model):
             return False
         if role == UserRole.ADMIN:
             return True
+        if self.processing_job_id is not None:
+            return user.pk == self.uploader_id
         import_job = self.import_job
         if import_job is not None:
             return user == import_job.uploader
@@ -2183,7 +2209,7 @@ class ReviewTask(models.Model):
         return False
 
     def __str__(self) -> str:
-        source_id = self.import_job_id or self.scan_job_id
+        source_id = self.import_job_id or self.scan_job_id or self.processing_job_id
         return f"{source_id}:{self.task_type}:{self.state}"
 
 
