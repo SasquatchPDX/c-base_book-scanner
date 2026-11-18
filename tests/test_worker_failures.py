@@ -381,8 +381,22 @@ def test_historical_reconciliation_is_bounded_and_preserves_acknowledgments() ->
     assert ProcessingJob.objects.count() == 2
 
 
-def test_recovery_schema_rollback_is_explicitly_irreversible() -> None:
-    from importlib import import_module
+def test_recovery_schema_rollback_preserves_populated_history() -> None:
+    from django.db import connection
+    from django.db.migrations.exceptions import IrreversibleError
+    from django.db.migrations.executor import MigrationExecutor
 
-    migration = import_module("ebook_server.core.migrations.0048_worker_failure_reviews")
-    assert not migration.Migration.operations[-1].reversible
+    previous = [("core", "0047_member_request_limits")]
+    current = [("core", "0048_worker_failure_reviews")]
+    try:
+        MigrationExecutor(connection).migrate(previous)
+        MigrationExecutor(connection).migrate(current)
+        job = failed_job()
+        with pytest.raises(IrreversibleError, match="Recovery history exists"):
+            MigrationExecutor(connection).migrate(previous)
+        # The guard runs before removing either FK or the three-source constraint.
+        job.refresh_from_db()
+        assert ReviewTask.objects.filter(processing_job=job).exists()
+        assert job.recovery_task_id is not None
+    finally:
+        MigrationExecutor(connection).migrate(current)

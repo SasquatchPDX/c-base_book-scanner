@@ -3,6 +3,20 @@
 import django.db.models.deletion
 from django.conf import settings
 from django.db import migrations, models
+from django.db.migrations.exceptions import IrreversibleError
+
+
+def preserve_recovery_history(apps, schema_editor):
+    reviews = apps.get_model("core", "ReviewTask")
+    jobs = apps.get_model("core", "ProcessingJob")
+    alias = schema_editor.connection.alias
+    if (
+        reviews.objects.using(alias).filter(processing_job__isnull=False).exists()
+        or jobs.objects.using(alias).filter(recovery_task__isnull=False).exists()
+    ):
+        raise IrreversibleError(
+            "Recovery history exists; restore a pre-0048 snapshot instead of discarding it."
+        )
 
 
 class Migration(migrations.Migration):
@@ -11,8 +25,7 @@ class Migration(migrations.Migration):
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
-    # Recovery histories cannot fit the old two-source review constraint. Refuse
-    # rollback explicitly instead of deleting human decisions or failing midway.
+    # The last operation reverses first, before any schema changes.
     operations = [
         migrations.RemoveConstraint(
             model_name="reviewtask",
@@ -100,5 +113,5 @@ class Migration(migrations.Migration):
                 name="review_has_exactly_one_source",
             ),
         ),
-        migrations.RunPython(migrations.RunPython.noop),
+        migrations.RunPython(migrations.RunPython.noop, preserve_recovery_history),
     ]
