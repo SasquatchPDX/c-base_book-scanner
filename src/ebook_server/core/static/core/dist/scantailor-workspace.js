@@ -4235,10 +4235,22 @@ function g(e) {
 		box: [...e.box]
 	}]) : ["text", "picture"].flatMap((t) => {
 		let n = e[`${t}_box`];
-		return Array.isArray(n) && n.length === 4 ? [{
+		if (!(Array.isArray(n) && n.length === 4) && !k(n)) return [];
+		let r = T(n, {
+			x1: 0,
+			y1: 0,
+			x2: 1,
+			y2: 1
+		});
+		return [{
 			kind: t,
-			box: n.map(Number)
-		}] : [];
+			box: [
+				r.x1,
+				r.y1,
+				r.x2,
+				r.y2
+			]
+		}];
 	});
 }
 function _(e) {

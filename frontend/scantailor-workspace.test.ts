@@ -70,6 +70,9 @@ describe("editable stage parameters", () => {
         picture_box: [1, 2, 30, 40],
       }),
     ).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
+    expect(outputZonesForEditing({
+      zone_mode: "manual", picture_box: { x1: 1, y1: 2, width: 29, height: 38 },
+    })).toEqual([{ kind: "picture", box: [1, 2, 30, 40] }]);
   });
 
   it("edits, adds and removes multiple detected regions through real controls", async () => {

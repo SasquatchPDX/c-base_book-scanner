@@ -194,7 +194,9 @@ export function outputZonesForEditing(parameters: JsonObject): OutputZone[] {
   }
   return (["text", "picture"] as const).flatMap((kind) => {
     const box = parameters[`${kind}_box`];
-    return Array.isArray(box) && box.length === 4 ? [{ kind, box: box.map(Number) }] : [];
+    if (!(Array.isArray(box) && box.length === 4) && !isObject(box)) return [];
+    const normalized = normalizeBox(box, { x1: 0, y1: 0, x2: 1, y2: 1 });
+    return [{ kind, box: [normalized.x1, normalized.y1, normalized.x2, normalized.y2] }];
   });
 }
 
