@@ -297,6 +297,8 @@ libreflip scanner API contract
 ([libreflip/serif#37](https://github.com/libreflip/serif/pull/37), decision D1). Registering an
 existing ID with different data is rejected (409), never overwritten.
 
+The scanner API's endpoints, states and implemented contract decisions are summarised in `docs/scanner-protocol.md`.
+
 A scan job should support fields such as:
 
 - job ID

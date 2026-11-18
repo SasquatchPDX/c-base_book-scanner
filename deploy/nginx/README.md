@@ -36,8 +36,9 @@ pinned Nginx container to the host Uvicorn process and must not be deployed.
 
 The scanner device API `/api/scanner/v1/` must only be reachable inside the
 LAN and only over TLS 1.3 (contract: libreflip/serif
-`docs/sans-serif-interface.md` §3, currently
-[libreflip/serif#37](https://github.com/libreflip/serif/pull/37)).
+`docs/sans-serif-interface.md` §3, merged in
+[libreflip/serif#37](https://github.com/libreflip/serif/pull/37), pinned at
+[`d120d15`](https://github.com/libreflip/serif/blob/d120d156d30bc422bdb535e469c5711704c689cb/docs/sans-serif-interface.md)).
 `serif-lan-tls.conf` is the front end for that: a `listen 443 ssl` server with
 `ssl_protocols TLSv1.3`, LAN `allow`/`deny`, `server_tokens off`, a 150m
 server-level `client_max_body_size` and 64m for `/api/scanner/`, plus a
@@ -55,7 +56,7 @@ server-level `client_max_body_size` and 64m for `/api/scanner/`, plus a
 - Replace the `REPLACE` placeholders: the LAN host name (must match the
   certificate) and the certificate paths.
 - `book-scanner.conf`'s plain-HTTP `listen 8080` server answers `403` on
-  `/api/scanner/`, so a device key never travels over plain HTTP through it.
+  `/api/scanner/`, so the scanner key never travels over plain HTTP through it.
   On the VM, bind it to `127.0.0.1:8080` or delete that server block, so the
   portal is only reachable through the TLS server.
 - Set `BOOK_SCANNER_SECURE_PROXY_SSL_HEADER=true`. Without it Django sees
