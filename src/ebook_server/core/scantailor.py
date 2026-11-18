@@ -25,6 +25,7 @@ from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
+from . import output_zones
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -59,7 +60,7 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
     # v3: auto mode derives the quad from the text lines.
     "dewarping": "opencv-v3",
-    "output": "opencv-v1",
+    "output": "opencv-zones-v2",
 }
 
 
@@ -2364,6 +2365,76 @@ def _binarize_with_cv2(
     return Image.fromarray(output.astype(np.uint8))
 
 
+OUTPUT_TILE_EDGE: Final = 768
+
+
+def _output_zones(parameters: dict[str, Any], size: tuple[int, int]) -> list[dict[str, Any]]:
+    """Normalize authored lists, or replay legacy text_box/picture_box parameters."""
+    if "zones" in parameters:
+        entries = parameters["zones"]
+        if not isinstance(entries, list) or len(entries) > output_zones.MAX_ZONES:
+            raise ValueError("zones must be a list of at most 64 regions")
+    else:
+        entries = [
+            {"kind": kind, "box": parameters.get(f"{kind}_box")}
+            for kind in ("text", "picture")
+            if parameters.get(f"{kind}_box") is not None
+        ]
+    zones = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("kind") not in {"text", "picture"}:
+            raise ValueError("each zone needs kind text or picture and a box")
+        box = _coerce_box({}, entry.get("box"), size)
+        if box is None:
+            raise ValueError("zone box must have positive area inside the input")
+        zones.append({"kind": entry["kind"], "box": list(box), "source": "manual"})
+    return zones
+
+
+def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any]) -> Image.Image:
+    """Bound float-array scratch to a tile plus a ≤251-pixel local-window halo."""
+    if mode == "copy":
+        return source.copy()
+    window = min(501, max(3, _coerce_int(parameters.get("window_size"), 35)))
+    halo = _odd_window(window) // 2 + 2
+    result = Image.new("L", source.size, 255)
+    # Otsu is global, including when the output is tiled. Pillow's histogram uses
+    # one byte per pixel, avoiding page-sized float/label arrays.
+    cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
+    for top in range(0, source.height, OUTPUT_TILE_EDGE):
+        for left in range(0, source.width, OUTPUT_TILE_EDGE):
+            right, bottom = (
+                min(source.width, left + OUTPUT_TILE_EDGE),
+                min(source.height, top + OUTPUT_TILE_EDGE),
+            )
+            box = (
+                max(0, left - halo),
+                max(0, top - halo),
+                min(source.width, right + halo),
+                min(source.height, bottom + halo),
+            )
+            tile = source.crop(box).convert("L")
+            if cutoff is not None:
+                processed = tile.point(lambda value: 255 if value > cutoff else 0)
+                if _coerce_bool(parameters.get("invert"), False):
+                    processed = ImageOps.invert(processed)
+            else:
+                processed = _binarize_with_cv2(
+                    np.asarray(tile),
+                    tile,
+                    mode,
+                    window_size=window,
+                    k=_coerce_float(parameters.get("k"), 0.33),
+                    r=_coerce_float(parameters.get("r"), 128.0),
+                    invert=_coerce_bool(parameters.get("invert"), False),
+                )
+            result.paste(
+                processed.crop((left - box[0], top - box[1], right - box[0], bottom - box[1])),
+                (left, top),
+            )
+    return result
+
+
 def _run_output(
     state: ScanTailorStageState,
     source_path: Path,
@@ -2371,131 +2442,86 @@ def _run_output(
     preview_path: Path,
 ) -> dict[str, Any]:
     source = _load_image(source_path)
-
     parameters = dict(state.parameters or {})
-    output_mode = _coerce_output_mode(parameters.get("output_mode"), default="otsu")
-    keep_color = _coerce_bool(parameters.get("keep_color"), default=False)
-    invert = _coerce_bool(parameters.get("invert"), default=False)
-    zone_mode = _normalize_zone_mode(parameters.get("zone_mode"), default="auto")
-    warning: str | None = None
-
-    output_size = source.size
-    grayscale = source.convert("L")
-
-    if output_mode == "copy":
+    mode = _coerce_output_mode(parameters.get("output_mode"), default="otsu")
+    zone_mode = str(parameters.get("zone_mode", "auto")).strip().lower()
+    if zone_mode not in {"auto", "manual", "off"}:
+        zone_mode = "auto"
+    if mode == "copy":
         _copy_fallback(source_path, output_path, preview_path)
         return {
             "output_mode": "copy",
-            "output_width": output_size[0],
-            "output_height": output_size[1],
+            "output_applied": "copy",
+            "output_width": source.width,
+            "output_height": source.height,
+            "resolved_zones": [],
+            "output_warning": "",
         }
-
-    window_size = _coerce_int(parameters.get("window_size"), 35, minimum=3)
-    k = _coerce_float(parameters.get("k"), 0.33)
-    r = _coerce_float(parameters.get("r"), 128.0)
-    text_algorithm = _coerce_output_mode(
-        parameters.get("text_algorithm"),
-        default=output_mode,
-    )
-    picture_algorithm = _coerce_output_mode(
-        parameters.get("picture_algorithm"),
-        default=output_mode,
-    )
-
+    text_algorithm = _coerce_output_mode(parameters.get("text_algorithm"), default="sauvola")
+    picture_algorithm = _coerce_output_mode(parameters.get("picture_algorithm"), default="copy")
+    keep_color = _coerce_bool(parameters.get("keep_color"), False)
+    if keep_color:
+        picture_algorithm = "copy"
+    zones: list[dict[str, Any]] = []
+    warning = None
     try:
         if cv2 is None or np is None:
             raise RuntimeError("opencv missing")
-
-        if zone_mode == "manual":
-            zones = _zone_rectangles(parameters, source.size)
-            text_box = zones["text"]
-            picture_box = zones["picture"]
-
-            if text_box is not None:
-                region = source.crop(text_box)
-                region_output = _binarize_with_cv2(
-                    np.array(region.convert("L")),
-                    region,
-                    text_algorithm,
-                    window_size=window_size,
-                    k=k,
-                    r=r,
-                    invert=invert,
-                )
-            else:
-                region_output = None
-
-            if picture_box is not None:
-                region = source.crop(picture_box)
-                picture_output = _binarize_with_cv2(
-                    np.array(region.convert("L")),
-                    region,
-                    picture_algorithm,
-                    window_size=window_size,
-                    k=k,
-                    r=r,
-                    invert=invert,
-                )
-            else:
-                picture_output = None
-
-            full_output = _binarize_with_cv2(
-                np.array(grayscale),
-                grayscale,
-                output_mode,
-                window_size=window_size,
-                k=k,
-                r=r,
-                invert=invert,
-            )
-            result = full_output
-            if region_output is not None and text_box is not None:
-                result.paste(region_output, text_box)
-            if picture_output is not None and picture_box is not None:
-                result.paste(picture_output, picture_box)
-        else:
-            result = _binarize_with_cv2(
-                np.array(grayscale),
-                grayscale,
-                output_mode,
-                window_size=window_size,
-                k=k,
-                r=r,
-                invert=invert,
-            )
-    except Exception as exc:  # pragma: no cover - geometry and library edge cases
-        warning = str(exc)
-        fallback_threshold = _coerce_int(_pil_otsu_threshold(grayscale), 128)
-        result = grayscale.point(
-            lambda value, cutoff=fallback_threshold: 255 if value > cutoff else 0,
+        if zone_mode == "auto":
+            zones = output_zones.detect_zones(source)
+        elif zone_mode == "manual":
+            zones = _output_zones(parameters, source.size)
+        # With Keep color, unclassified areas remain source pixels too; only
+        # identified/authored text regions are binarized.
+        result = source.copy() if keep_color else _threshold_tiles(source, mode, parameters)
+        # Copy means source pixels, even on a colour photo when keep_color is off.
+        # Never destroy RGB first and then merely label the grayscale output RGB.
+        preserve_rgb = keep_color or (
+            source.mode == "RGB"
+            and picture_algorithm == "copy"
+            and any(z["kind"] == "picture" for z in zones)
         )
-
-    if not keep_color and result.mode != "L":
-        result = result.convert("L")
-    if keep_color and result.mode != "RGB":
-        result = result.convert("RGB")
-
+        if preserve_rgb:
+            result = result.convert("RGB")
+        # Pictures win overlaps, independently of the list's order.
+        for kind, algorithm in (("text", text_algorithm), ("picture", picture_algorithm)):
+            for zone in zones:
+                if zone["kind"] != kind:
+                    continue
+                box = tuple(zone["box"])
+                region = source.crop(box)
+                processed = _threshold_tiles(region, algorithm, parameters)
+                result.paste(processed, box)
+        applied = "zoned" if zones else "whole_page"
+    except Exception as exc:
+        # Uncertain layout or processing must not silently destroy pictures.
+        warning = str(exc)
+        result = source.copy()
+        applied = "copy_fallback"
     _save_png(result, output_path, _dpi_of(source))
     _save_preview(result, preview_path)
-    output_payload: dict[str, Any] = {
-        "output_mode": output_mode,
-        "output_width": output_size[0],
-        "output_height": output_size[1],
+    payload: dict[str, Any] = {
+        "output_mode": mode,
+        "output_applied": applied,
+        "output_width": source.width,
+        "output_height": source.height,
+        "zone_mode": zone_mode,
+        "resolved_zones": zones,
+        "text_algorithm": text_algorithm,
+        "picture_algorithm": picture_algorithm,
+        "zone_detector_version": output_zones.DETECTOR_VERSION if zone_mode == "auto" else None,
+        "output_warning": warning or "",
     }
     if zone_mode == "manual":
-        zones = _zone_rectangles(parameters, source.size)
-        if zones["text"] is not None:
-            output_payload["text_box"] = list(zones["text"])
-        if zones["picture"] is not None:
-            output_payload["picture_box"] = list(zones["picture"])
-        output_payload["text_algorithm"] = text_algorithm
-        output_payload["picture_algorithm"] = picture_algorithm
-        output_payload["zone_mode"] = "manual"
+        payload["zones"] = zones
+        for kind, legacy_box in _zone_rectangles(parameters, source.size).items():
+            if legacy_box is not None:
+                payload[f"{kind}_box"] = list(legacy_box)
     else:
-        output_payload["zone_mode"] = "auto"
+        payload["zones"] = []
     if warning is not None:
-        output_payload["output_warning"] = warning
-    return output_payload
+        payload["output_warning"] = warning
+    return payload
 
 
 _STAGE_RUNNERS: dict[

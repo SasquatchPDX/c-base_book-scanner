@@ -40,12 +40,53 @@ robust fits through the outer line ends give the sides (a ragged side mirrors th
 aligned one). A page outline contour is the fallback. An already-upright page is
 passed through without resampling (`dewarp_correction="none_needed"`). When
 nothing is found, the result records `dewarp_mode="auto_fallback"` with a
-`dewarp_warning`. Text/picture separation is manual only:
-`zone_mode="auto"` currently applies one algorithm to the whole page. The output
-option named `fox` uses scikit-image's Niblack implementation, and `wolf` uses a
-local-contrast approximation. Correcting those advertised names and establishing
-curvature fixtures remain Sprint019 work; curvature correction and automatic
-segmentation are planned in Sprint020.
+`dewarp_warning`. Curvature correction remains Sprint020 work.
+
+### Output zones (`opencv-zones-v2`)
+
+`zone_mode="auto"` detects multiple continuous-tone/halftone picture regions and
+groups the remaining glyphs into text blocks using OpenCV morphology and connected
+components. Detection runs on an image at most 1200 pixels on its longest edge,
+then maps rectangles back to source coordinates. The detector is a heuristic,
+not semantic recognition: inspect illustrated pages before finishing them.
+
+Text regions default to Sauvola; picture regions default to `copy`. Picture copy
+keeps the normalized source pixels, including RGB colours even if `keep_color`
+is false. It never converts a photograph to grayscale and then merely relabels
+the result RGB. `keep_color` protects picture and unclassified source pixels;
+only text regions are binarized, and the composed output stays RGB. It overrides
+the picture algorithm to `copy`, which is recorded in the result. Pictures win
+overlapping text regions. Outside regions, the selected output algorithm runs;
+`zone_mode="off"` deliberately uses that algorithm over the whole page.
+
+The worker records `resolved_zones` (`kind`, `box`, `source`) and the detector
+version. Choose **Edit detected regions** to make an explicit manual list. The
+editor supports adding, deleting, changing type, dragging/resizing, and numeric
+coordinates for up to 64 regions. Manual `zones` are recorded as human choices
+and survive batch application with **Preserve manual exceptions** enabled.
+Old `text_box` and `picture_box` parameters remain readable; a rerun records the
+equivalent list. Automatic runs redetect from the current input instead of
+reusing geometry after an upstream change. Derived detection metadata is never
+submitted as editable parameters.
+
+Layout detection allocates arrays only at reduced resolution. Thresholding uses
+768-pixel tiles with a local-window halo capped at 253 pixels; Otsu retains a
+global threshold. Full-size source/output Pillow images remain necessary, but
+there are no page-sized float or component-label arrays. Large local-statistic
+regions use tile-local contrast estimates. On a detection or processing error,
+the normalized source is copied and the result records `output_applied="copy_fallback"`
+and `output_warning`. `output_mode="copy"` bypasses zoning and thresholding.
+Successful execution alone does not establish output quality.
+
+CI runs a real Tesseract English acceptance case on a synthetic illustrated page:
+text character-error rate must be at most 5%, no worse than whole-page output by
+more than one percentage point, and picture pixel error must be below 15% of the
+whole-page result. The local Tesseract 5.5.2 run measured 0% CER for both paths,
+with picture detail retained. This is a repeatable layout regression, not proof
+of OCR quality on photographed books or the hackerspace AI server. The six output
+modes use OpenCV/NumPy statistics; Fox is a Niblack-style threshold with a noise
+floor and Wolf uses the Wolf–Jolion local-statistics formula, not a claim of
+bit-identical ScanTailor Advanced output.
 
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
