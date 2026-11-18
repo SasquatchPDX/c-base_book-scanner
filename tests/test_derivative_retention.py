@@ -342,3 +342,15 @@ def test_restore_rejects_corrupt_journal_without_touching_bytes(
     with pytest.raises(retirement.RetentionError, match="invalid quarantine journal"):
         retirement.restore_manifest(location, result["manifest"], apply=True)
     assert snapshot(tmp_path) == before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_working_resolution_stage_files_are_recognised_as_stage_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#195 step 2: superseded work.png/preview.jpg must be reclaimable like PNG outputs."""
+    _, _, state, _ = make_retirement_case(tmp_path, monkeypatch)
+    prefix = f"scan-jobs/{state.scan_job_id}/{state.scan_page_id}/deskew"
+    for name in ("work.png", "preview.jpg", "output.png", "preview.png"):
+        assert storage_inventory.stage_for(f"{prefix}/v1/{name}") == (state, 1)
+    assert storage_inventory.stage_for(f"{prefix}/v1/other.jpg") == (None, 0)
