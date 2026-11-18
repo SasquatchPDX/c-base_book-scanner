@@ -246,6 +246,29 @@ def test_discard_rq_jobs_clears_queue_and_every_registry(monkeypatch: pytest.Mon
     assert {job.id for job in fake_jobs.values() if job.deleted} == {"queued", "running", "retry"}
 
 
+def test_discard_rq_jobs_deletes_a_batch_job_only_with_all_its_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_jobs = {
+        "whole": FakeJob("whole", IMPORT_JOB_FUNC, (["job-a", "job-b"],)),  # type: ignore[arg-type]
+        "partial": FakeJob("partial", IMPORT_JOB_FUNC, (["job-a", "job-z"],)),  # type: ignore[arg-type]
+    }
+    connection = FakeConnection(members={"started": [], "failed": []})
+    queue = FakeQueue(jobs=fake_jobs, queued=["whole", "partial"])
+    registries = [FakeRegistry(key, connection) for key in connection.members]
+
+    @dataclass
+    class FakeConfiguredQueue:
+        queue: FakeQueue
+
+    monkeypatch.setattr(jobs, "get_queue", lambda: FakeConfiguredQueue(queue))
+    monkeypatch.setattr(jobs, "_rq_registries", lambda _queue: registries)
+
+    assert jobs.discard_rq_jobs(IMPORT_JOB_FUNC, {"job-a", "job-b"}) == 1
+    assert queue.queued == ["partial"]
+    assert fake_jobs["whole"].deleted and not fake_jobs["partial"].deleted
+
+
 def test_discard_rq_jobs_without_queue_reports_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(jobs, "get_queue", lambda: None)
     assert jobs.discard_rq_jobs(IMPORT_JOB_FUNC, {"job-a"}) is None

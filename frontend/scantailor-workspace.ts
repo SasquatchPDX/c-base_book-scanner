@@ -49,6 +49,8 @@ interface WorkspacePage {
   side: string;
   recognized_page_number?: string | null;
   thumbnail?: string;
+  /** Token of the first stage's input (the working image); empty while it is generated. */
+  work_image_token?: string;
   stages: StageState[];
 }
 
@@ -273,6 +275,9 @@ export function previewErrorMessage(stage: StageName, failure: PreviewFailure): 
   if (status === null) {
     return "Could not load the preview because of a network error. Check your connection and try again.";
   }
+  if (previewIsBeingPrepared(failure)) {
+    return "The page image is still being prepared. It will appear automatically.";
+  }
   if (status === 404 && body === "input preview not ready") {
     const previous = previousStageName(stage);
     if (previous === null) {
@@ -296,6 +301,62 @@ export function previewErrorMessage(stage: StageName, failure: PreviewFailure): 
     return "The preview was downloaded but could not be displayed as an image.";
   }
   return `Could not load the preview (HTTP ${status}).`;
+}
+
+/** Retries of a preview that is being prepared: about one minute in total. */
+export const PREVIEW_RETRY_MAX_ATTEMPTS = 10;
+const PREVIEW_RETRY_BASE_MS = 1000;
+const PREVIEW_RETRY_MAX_MS = 8000;
+
+export const PREVIEW_RETRY_EXHAUSTED_MESSAGE =
+  "The page image is taking longer than expected to prepare. Reopen this page later.";
+
+/** Where the editor is in recovering one preview URL. */
+export interface PreviewRetryState {
+  /** Retries made because the server was still preparing the image. */
+  attempts: number;
+  /** Whether the image was already reloaded because the diagnostic request succeeded. */
+  reloadedAfterOk: boolean;
+}
+
+export const INITIAL_PREVIEW_RETRY: PreviewRetryState = { attempts: 0, reloadedAfterOk: false };
+
+/**
+ * The server is still generating the page's working image (pages uploaded before
+ * the working images existed, or a new upload whose job has not run yet).
+ */
+export function previewIsBeingPrepared(failure: PreviewFailure): boolean {
+  return failure.status === 503 && failure.body.trim().toLowerCase() === "input preview not ready";
+}
+
+/**
+ * Decide how to recover a preview that failed to load: reload it after ``delay``
+ * milliseconds, or give up (``null``).
+ *
+ * - The diagnostic request succeeded: the image became ready in between, so reload
+ *   it at once, but only once, so an image the browser cannot decode never loops.
+ * - The image is still being prepared: retry with exponential backoff, bounded.
+ * - Anything else is not going to fix itself: give up and explain.
+ */
+export function nextPreviewRetry(
+  failure: PreviewFailure,
+  state: PreviewRetryState,
+): { delay: number; state: PreviewRetryState } | null {
+  if (failure.status !== null && failure.status >= 200 && failure.status < 300) {
+    return state.reloadedAfterOk ? null : { delay: 0, state: { ...state, reloadedAfterOk: true } };
+  }
+  if (!previewIsBeingPrepared(failure) || state.attempts >= PREVIEW_RETRY_MAX_ATTEMPTS) {
+    return null;
+  }
+  return {
+    delay: Math.min(PREVIEW_RETRY_BASE_MS * 2 ** state.attempts, PREVIEW_RETRY_MAX_MS),
+    state: { ...state, attempts: state.attempts + 1 },
+  };
+}
+
+/** ``url`` with a cache-busting retry marker, so the browser requests it again. */
+export function previewRetryUrl(url: string, attempt: number): string {
+  return `${url}${url.includes("?") ? "&" : "?"}retry=${attempt}`;
 }
 
 /** Error text for a stage, shown only for genuine failures (not routine invalidation). */
@@ -479,6 +540,10 @@ class WorkspaceController {
   private view: View = { zoom: 1, x: 0, y: 0 };
   private fitPending = true;
   private selectionAnchor: string | null = null;
+  /** The preview URL being shown, without the cache-busting retry marker. */
+  private previewUrl = "";
+  private previewRetry: PreviewRetryState = INITIAL_PREVIEW_RETRY;
+  private previewRetryTimer: number | null = null;
 
   constructor(root: HTMLElement, pages: WorkspacePage[]) {
     this.root = root;
@@ -574,6 +639,15 @@ class WorkspaceController {
       )
         this.renderControls();
       this.renderGeometry();
+      if (this.previewRetry !== INITIAL_PREVIEW_RETRY) {
+        // Recovered after a retry: replace the "being prepared" note.
+        this.previewRetry = INITIAL_PREVIEW_RETRY;
+        const state = this.activeContext()?.state;
+        if (state) {
+          const message = stageStatusMessage(state);
+          this.setMessage(message.text, message.tone);
+        }
+      }
     });
     window.addEventListener("resize", () => {
       this.fitToPane();
@@ -588,13 +662,23 @@ class WorkspaceController {
   /**
    * The ``<img>`` error event carries no status or body, so re-request the
    * failed URL to find out why and show a message that matches the cause.
+   *
+   * When the image turns out to be available after all, or the server is still
+   * preparing it, the image is reloaded (with backoff, bounded) so it appears
+   * without the member having to navigate away.
    */
   private async explainPreviewFailure(source: string, stage: StageName): Promise<void> {
     if (!source) return;
-    this.setMessage("Loading the preview failed; checking why…", "error");
+    if (this.previewRetry === INITIAL_PREVIEW_RETRY) {
+      this.setMessage("Loading the preview failed; checking why…", "error");
+    }
     let failure: PreviewFailure;
     try {
       const response = await fetch(source, { credentials: "same-origin" });
+      if (response.ok) {
+        // Only the status matters; the image element downloads it again.
+        void response.body?.cancel().catch(() => undefined);
+      }
       const body = response.ok ? "" : await response.text();
       failure = { status: response.status, body };
     } catch {
@@ -602,7 +686,34 @@ class WorkspaceController {
     }
     // Ignore stale answers if the editor moved to another page/stage meanwhile.
     if (this.image.src !== source || this.activeStage !== stage) return;
-    this.setMessage(previewErrorMessage(stage, failure), "error");
+    const retry = nextPreviewRetry(failure, this.previewRetry);
+    if (retry) {
+      this.previewRetry = retry.state;
+      if (retry.delay > 0) this.setMessage(previewErrorMessage(stage, failure), "info");
+      this.schedulePreviewReload(retry.delay);
+      return;
+    }
+    this.setMessage(
+      previewIsBeingPrepared(failure)
+        ? PREVIEW_RETRY_EXHAUSTED_MESSAGE
+        : previewErrorMessage(stage, failure),
+      "error",
+    );
+  }
+
+  private schedulePreviewReload(delay: number): void {
+    this.cancelPreviewReload();
+    const url = this.previewUrl;
+    const attempt = this.previewRetry.attempts + (this.previewRetry.reloadedAfterOk ? 1 : 0);
+    this.previewRetryTimer = window.setTimeout(() => {
+      this.previewRetryTimer = null;
+      if (url && this.previewUrl === url) this.image.src = previewRetryUrl(url, attempt);
+    }, delay);
+  }
+
+  private cancelPreviewReload(): void {
+    if (this.previewRetryTimer !== null) window.clearTimeout(this.previewRetryTimer);
+    this.previewRetryTimer = null;
   }
 
   private activate(pageId: string, stage: StageName): void {
@@ -656,6 +767,7 @@ class WorkspaceController {
         : `${preview}?input=true`
       : "";
     this.image.hidden = !source;
+    let url = "";
     if (source) {
       const index = STAGE_ORDER.indexOf(state.stage);
       const previousName = index > 0 ? STAGE_ORDER[index - 1] : undefined;
@@ -665,13 +777,18 @@ class WorkspaceController {
       } else if (previousName) {
         token = artifactToken(stageFor(context.page, previousName));
       } else {
-        const versionId = context.page.active_version?.id;
-        token = versionId ? `page-${versionId}` : "";
+        token = context.page.work_image_token ?? "";
       }
       // An untokenised URL still needs a per-run cache buster.
       const query = token ? `v=${token}` : `revision=${state.revision}-${state.status}`;
-      const url = `${source}${source.includes("?") ? "&" : "?"}${query}`;
-      if (this.image.getAttribute("src") !== url) this.image.src = url;
+      url = `${source}${source.includes("?") ? "&" : "?"}${query}`;
+    }
+    // A retry in progress for the same URL keeps going; a new URL starts afresh.
+    if (url !== this.previewUrl) {
+      this.cancelPreviewReload();
+      this.previewRetry = INITIAL_PREVIEW_RETRY;
+      this.previewUrl = url;
+      if (url) this.image.src = url;
     }
     const warning = state.status === "success" ? stageWorkerWarnings(state.parameters) : "";
     this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
@@ -1482,9 +1599,12 @@ class WorkspaceController {
     if (source) {
       const template = this.url("stageThumbnailTemplate", page.id, source.stage);
       if (template) thumbnailUrl = `${template}?v=${artifactToken(source)}`;
-    } else if (versionId) {
+    } else if (versionId && page.work_image_token) {
       const template = this.url("pageThumbnailTemplate", page.id);
-      if (template) thumbnailUrl = `${template}?v=page-${versionId}`;
+      if (template) thumbnailUrl = `${template}?v=${page.work_image_token}`;
+    } else {
+      // Working image still being generated: the full page thumbnail renders the scan.
+      thumbnailUrl = page.thumbnail ?? "";
     }
     const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
     const printed = page.recognized_page_number ? `p. ${page.recognized_page_number}` : "";

@@ -170,7 +170,14 @@ same:
   `ScanPageImage`: a lossless working image at about 150 dpi (long edge at least
   1600 px and at most 2400 px, never upscaled) and a 400 px JPEG thumbnail. Versions
   are immutable, so these files never change. A stage that runs before the job
-  finished builds the image itself.
+  finished builds the image itself. The editor's Deskew input preview never decodes
+  the scan in the request: when the image is missing it queues the job (once; a
+  short-lived Redis marker deduplicates repeated requests), looks again (an inline
+  queue or a fast worker may already be done) and otherwise answers
+  `503 input preview not ready` with `Retry-After: 2`. The editor then reloads the
+  image with backoff (1, 2, 4, then 8 s; about a minute in total) and shows it as
+  soon as it is ready. If its diagnostic request finds the image already available,
+  it reloads it at once.
 - **Stages 1-4 record a transform op.** Deskew, Select Content, Dewarping and Margins
   run detection on their working-resolution input and store one op in
   `parameters["transform"]`, in the full-resolution coordinates of their input
@@ -190,8 +197,13 @@ same:
   (`tests/test_scan_transform.py` checks every op against a downscaled full render).
   Scaling uses pixel-centre coordinates.
 
-Migration 0050 invalidates every processed stage, because stages processed before
-this change have no recorded op; they re-run once. `scripts/benchmark_scanning.py`
+Migration 0050 invalidates every processed stage of jobs that can still be
+processed (open, capturing, paused, raw scan), because stages processed before this
+change have no recorded op; they re-run once. Finalizing, complete and cancelled
+jobs reject stage re-runs, so their results are kept as they are. The migration
+does not create `ScanPageImage` rows (that would decode every scan); existing pages
+get them on first open, or ahead of time with
+`manage.py backfill_scan_page_images` (see `docs/operations.md`). `scripts/benchmark_scanning.py`
 times the `page_image` step and each stage on this pipeline.
 
 ## Serving and scheduling (#195 step 2b)
@@ -225,9 +237,17 @@ times the `page_image` step and each stage on this pipeline.
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
-deletes existing `page_split` stage rows, relinks the remaining stages in the new
-order, and marks every stage that had been queued, run or failed as invalidated
-with a new revision, so existing jobs re-run once. Raw page versions are untouched.
+deletes existing `page_split` stage rows and relinks the remaining stages in the
+new order. On jobs that still accept processing (open, capturing, paused, raw
+scan) it marks every stage that had been queued, run or failed as invalidated
+with a new revision, so those jobs re-run once. Finalizing, complete and
+cancelled jobs keep their stage statuses, revisions and outputs: the lifecycle
+refuses stage re-runs in those states, and the outputs are the history behind
+the published book. When a replacement page reopens a complete job (raw scan,
+re-finish needed), that page is invalidated as usual and the re-finish reuses
+the other pages' recorded outputs. Raw page versions are untouched. The
+migration rehearsal's integrity check expects exactly the deleted `page_split`
+rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
 `capture_layout: single_page` and ignores it, and rejects `spread`.
 

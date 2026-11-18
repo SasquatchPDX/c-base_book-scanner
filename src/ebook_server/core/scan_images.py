@@ -24,7 +24,7 @@ from django.db import IntegrityError, transaction
 from django.db.models.signals import post_save
 from PIL import Image
 
-from ebook_server.jobs import enqueue
+from ebook_server.jobs import enqueue, get_queue
 
 from .models import ScanPageImage, ScanPageVersion
 from .storage_registry import filesystem_backend_for_location
@@ -38,6 +38,8 @@ WORK_MAX_EDGE: Final[int] = 2400
 THUMBNAIL_EDGE: Final[int] = 400
 # Fast lossless encoding: the working image is an intermediate, never downloaded.
 WORK_PNG_COMPRESS_LEVEL: Final[int] = 1
+# A queued generation is not queued again for this long (editor retries, page reloads).
+REQUEST_DEDUPE_SECONDS: Final[int] = 120
 
 
 def work_scale(size: tuple[int, int], dpi: tuple[int, int]) -> float:
@@ -154,11 +156,46 @@ def generate_page_image_job(version_id: int) -> None:
     )
 
 
+def _request_key(version_id: int) -> str:
+    return f"ebook-server:scan-page-image-requested:{version_id}"
+
+
+def request_page_image(version_id: int) -> bool:
+    """Queue generation of a version's page image unless it is already queued.
+
+    Returns whether a job was queued. With an RQ queue a short-lived marker in the
+    queue's Redis (shared by every web and worker process) makes a reader that keeps
+    asking for a missing image (the editor retrying its preview, several members
+    opening the same page) queue one job, not one per request. Without RQ the job
+    runs inline, so the image exists when this returns and nothing needs dedupe. The
+    job is idempotent, so a lost marker only costs a redundant job.
+    """
+    queue = get_queue()
+    connection = getattr(getattr(queue, "queue", None), "connection", None)
+    if connection is not None:
+        try:
+            fresh = connection.set(_request_key(version_id), 1, nx=True, ex=REQUEST_DEDUPE_SECONDS)
+        except Exception:  # Redis hiccup: queueing twice is harmless
+            fresh = True
+        if not fresh:
+            return False
+    enqueue(generate_page_image_job, version_id)
+    return True
+
+
+def missing_page_image_versions(*, include_inactive: bool = False) -> Any:
+    """Versions that have no page image yet, e.g. uploaded before migration 0050."""
+    versions = ScanPageVersion.objects.filter(page_image__isnull=True)
+    if not include_inactive:
+        versions = versions.filter(is_active=True)
+    return versions.order_by("pk")
+
+
 def _on_version_saved(sender: Any, instance: ScanPageVersion, created: bool, **_: Any) -> None:
     if not created:
         return
     version_id = instance.pk
-    transaction.on_commit(lambda: enqueue(generate_page_image_job, version_id), robust=True)
+    transaction.on_commit(lambda: request_page_image(version_id), robust=True)
 
 
 def connect_signals() -> None:

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from django.core.management import call_command
+from django.http import StreamingHttpResponse
 from PIL import Image, ImageDraw
 
 from ebook_server.core import scan_images, scantailor
@@ -153,3 +156,140 @@ def test_missing_working_image_is_rebuilt_and_decode_errors_fail_the_stage() -> 
     state = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     assert state.status == ScanTailorStageState.StageStatus.FAILED
     assert "cannot read image" in state.last_error
+
+
+def _input_preview_url(job_id: str, page_id: str) -> str:
+    return f"/scan/jobs/{job_id}/pages/{page_id}/stages/deskew/preview/?input=true"
+
+
+def _migrated_page(name: str) -> tuple[Any, Any, ScanPage, Any]:
+    """A page whose version has no ScanPageImage, as after migration 0050."""
+    client, job = _create_scan_job(name)
+    _upload_scan_page(
+        client,
+        str(job.id),
+        sequence=1,
+        side="single",
+        payload=_scan_bytes(900, 1200),
+        filename="p.png",
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1)
+    version = page.active_version()
+    assert version is not None
+    ScanPageImage.objects.filter(version=version).delete()
+    # Opening the workspace creates the page's stage rows, as in the browser.
+    assert client.get(f"/scan/jobs/{job.id}/workspace/").status_code == 200
+    assert not ScanPageImage.objects.filter(version=version).exists()
+    return client, job, page, version
+
+
+@pytest.mark.django_db(transaction=True)
+def test_first_input_preview_of_a_migrated_page_is_served_once_generated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, job, page, version = _migrated_page("scan-images-first-open")
+    generated: list[int] = []
+    real_job = scan_images.generate_page_image_job
+
+    def counting_job(version_id: int) -> None:
+        generated.append(version_id)
+        real_job(version_id)
+
+    monkeypatch.setattr(scan_images, "generate_page_image_job", counting_job)
+
+    # The queue finished the job by the time the request looked again: no 404 first.
+    response = client.get(_input_preview_url(str(job.id), str(page.id)))
+    assert response.status_code == 200
+    body = b"".join(cast(Iterable[bytes], cast(StreamingHttpResponse, response).streaming_content))
+    with Image.open(io.BytesIO(body)) as image:
+        assert image.format == "PNG"
+        assert image.size == (900, 1200)
+    assert generated == [version.pk]
+
+    client.get(_input_preview_url(str(job.id), str(page.id)))
+    assert generated == [version.pk], "an existing working image is not generated again"
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.keys: dict[str, Any] = {}
+
+    def set(self, key: str, value: Any, *, nx: bool = False, ex: int | None = None) -> bool:
+        assert ex is not None and ex > 0
+        if nx and key in self.keys:
+            return False
+        self.keys[key] = value
+        return True
+
+
+class _FakeQueue:
+    """Stands in for jobs.ConfiguredQueue: records jobs instead of running them."""
+
+    def __init__(self) -> None:
+        self.queue = type("RQQueue", (), {"connection": _FakeRedis()})()
+        self.jobs: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def enqueue(self, func: Any, *args: Any, **kwargs: Any) -> None:
+        self.jobs.append((func, args))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_input_preview_is_retryable_while_generation_is_queued_and_queued_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, job, page, version = _migrated_page("scan-images-queued")
+    queue = _FakeQueue()
+    monkeypatch.setattr(scan_images, "get_queue", lambda: queue)
+    monkeypatch.setattr(
+        scan_images, "enqueue", lambda func, *args, **kwargs: queue.enqueue(func, *args)
+    )
+    url = _input_preview_url(str(job.id), str(page.id))
+
+    for _ in range(3):  # the editor keeps asking while the worker is busy
+        response = client.get(url)
+        assert response.status_code == 503
+        assert response.content == b"input preview not ready"
+        assert response["Retry-After"] == "2"
+        assert "no-store" in response["Cache-Control"]
+    assert queue.jobs == [(scan_images.generate_page_image_job, (version.pk,))]
+
+    scan_images.generate_page_image_job(version.pk)  # the worker gets to it
+    response = client.get(url)
+    assert response.status_code == 200
+    assert len(queue.jobs) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_backfill_command_generates_missing_working_images() -> None:
+    _client, _job, _page, version = _migrated_page("scan-images-backfill")
+    out = io.StringIO()
+    call_command("backfill_scan_page_images", "--dry-run", stdout=out)
+    assert "1 without a working image (dry run" in out.getvalue()
+    assert not ScanPageImage.objects.filter(version=version).exists()
+
+    out = io.StringIO()
+    call_command("backfill_scan_page_images", stdout=out)  # no queue: runs inline
+    assert "1 without a working image, 1 queued" in out.getvalue()
+    assert ScanPageImage.objects.filter(version=version).exists()
+
+    out = io.StringIO()
+    call_command("backfill_scan_page_images", stdout=out)
+    assert "0 without a working image" in out.getvalue()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_browser_fixture_migrated_page_opens_with_its_input_preview() -> None:
+    from django.test import Client
+
+    from ebook_server.core.models import get_or_create_profile
+    from tests.browser_fixtures import MIGRATED_SCAN_JOB_ID, seed_migrated_scan_page
+
+    seed_migrated_scan_page()
+    page = ScanPage.objects.get(scan_job_id=MIGRATED_SCAN_JOB_ID)
+    assert not ScanPageImage.objects.filter(version__scan_page=page).exists()
+    client = Client()
+    client.force_login(get_or_create_profile("fry").user)
+    assert client.get(f"/scan/jobs/{MIGRATED_SCAN_JOB_ID}/workspace/").status_code == 200
+    response = client.get(_input_preview_url(MIGRATED_SCAN_JOB_ID, str(page.id)))
+    assert response.status_code == 200
+    assert ScanPageImage.objects.filter(version__scan_page=page).count() == 1

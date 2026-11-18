@@ -57,6 +57,51 @@ def seed_worker_failure_review() -> None:
     conversion.process_conversion_job(str(job.job_id))
 
 
+MIGRATED_SCAN_JOB_ID = "6f1d2b3c-0195-4a50-8b7e-000000000050"
+
+
+def seed_migrated_scan_page() -> None:
+    """A scan page as migration 0050 leaves it: a version without a ScanPageImage.
+
+    ``bulk_create`` skips the ``post_save`` signal, so no generation job is queued; the
+    editor's first input preview has to queue it and show the image once it is ready.
+    """
+    from PIL import Image
+
+    from ebook_server.core import views
+    from ebook_server.core.models import ScanJob, ScanPage, ScanPageVersion, get_or_create_profile
+
+    operator = get_or_create_profile("fry").user
+    job = ScanJob.objects.create(
+        id=MIGRATED_SCAN_JOB_ID,
+        operator=operator,
+        state=ScanJob.State.CAPTURED,
+        provisional_title="Browser migrated page",
+    )
+    page = ScanPage.objects.create(scan_job=job, logical_sequence_number=1)
+    buffer = BytesIO()
+    Image.new("L", (120, 90), 240).save(buffer, format="PNG", dpi=(300, 300))
+    payload = buffer.getvalue()
+    identifier = f"browser-fixtures/{MIGRATED_SCAN_JOB_ID}/0001-single.png"
+    views._default_scan_storage().write_atomic(identifier, payload)
+    ScanPageVersion.objects.bulk_create(
+        [
+            ScanPageVersion(
+                scan_page=page,
+                storage_location=views._default_scan_storage_location(),
+                storage_identifier=identifier,
+                checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                mime_type="image/png",
+                size_bytes=len(payload),
+                version=1,
+                uploader=operator,
+                original_filename="migrated.png",
+                is_active=True,
+            )
+        ]
+    )
+
+
 class BrowserMetadataProvider:
     """Stable provider boundary for the full physical-book browser scenario."""
 

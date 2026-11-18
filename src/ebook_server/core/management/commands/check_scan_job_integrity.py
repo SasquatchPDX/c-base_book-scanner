@@ -11,7 +11,12 @@ Two modes:
     Take the same snapshot of the (migrated) database and compare it with ``PATH``:
     identical job ID sets, unchanged row and foreign-key counts, no dangling references,
     and a sample of scan jobs that open through ``/scan/jobs/<id>/`` with the Django
-    test client. The sample request runs inside a transaction that is rolled back, so
+    test client.
+
+    Rows that a migration retires on purpose (:data:`RETIRED_ROWS`, e.g. the Page Split
+    stage states that 0049 deletes) are counted separately. Exactly those rows may
+    disappear; every other row must still be there, so an unexpected loss of the same
+    size is still reported. The sample request runs inside a transaction that is rolled back, so
     the temporary user and session it needs never persist.
 
 The command exits non-zero (``CommandError``) on any mismatch.
@@ -34,7 +39,7 @@ from django.urls import reverse
 
 from ...scan_job_ids import normalize_scan_job_id
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 SCAN_JOB_LABEL = "core.scanjob"
 # Row counts reported for these tables when they exist (logs/events arrived later).
 SCAN_TABLES = (
@@ -46,6 +51,11 @@ SCAN_TABLES = (
     "core_scanlog",
     "core_scanevent",
 )
+# Rows a migration deletes on purpose: table -> (column, value, why). Their count is
+# recorded per table and per scan-job reference column of that table.
+RETIRED_ROWS: dict[str, tuple[str, str, str]] = {
+    "core_scantailorstagestate": ("stage", "page_split", "Page Split stage removed (#195)"),
+}
 
 
 def canonical_scan_job_id(value: object) -> str:
@@ -72,6 +82,15 @@ def _count(sql: str) -> int:
     return int(row[0]) if row else 0
 
 
+def _literal(value: str) -> str:
+    """SQL string literal for a constant from :data:`RETIRED_ROWS` (never user input)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _count_retired(table: str, condition: str) -> int:
+    return _count(f"SELECT count(*) FROM {connection.ops.quote_name(table)} WHERE {condition}")
+
+
 def take_snapshot() -> dict[str, Any]:
     quote = connection.ops.quote_name
     existing = set(connection.introspection.table_names())
@@ -87,6 +106,10 @@ def take_snapshot() -> dict[str, Any]:
     }
     references = {}
     dangling = {}
+    retired = {}
+    for table, (column, value, _why) in RETIRED_ROWS.items():
+        if table in existing:
+            retired[table] = _count_retired(table, f"{quote(column)} = {_literal(value)}")
     for table, column in scan_job_reference_columns():
         if table not in existing:
             continue
@@ -94,6 +117,12 @@ def take_snapshot() -> dict[str, Any]:
         references[key] = _count(
             f"SELECT count(*) FROM {quote(table)} WHERE {quote(column)} IS NOT NULL"
         )
+        if table in retired:
+            retired_column, value, _why = RETIRED_ROWS[table]
+            retired[key] = _count_retired(
+                table,
+                f"{quote(column)} IS NOT NULL AND {quote(retired_column)} = {_literal(value)}",
+            )
         dangling[key] = _count(
             f"SELECT count(*) FROM {quote(table)} AS ref "
             f"WHERE ref.{quote(column)} IS NOT NULL AND NOT EXISTS ("
@@ -107,6 +136,7 @@ def take_snapshot() -> dict[str, Any]:
         "tables": tables,
         "references": references,
         "dangling": dangling,
+        "retired": retired,
     }
 
 
@@ -121,13 +151,29 @@ def compare_snapshots(before: dict[str, Any], after: dict[str, Any]) -> list[str
         problems.append(f"{len(missing)} scan job ID(s) no longer resolve, e.g. {missing[:5]}")
     if added:
         problems.append(f"{len(added)} unexpected new scan job ID(s), e.g. {added[:5]}")
+    retired_before = before.get("retired", {})
+    retired_after = after.get("retired", {})
     for group in ("tables", "references"):
         for key, count in sorted(before.get(group, {}).items()):
             now = after[group].get(key)
             if now is None:
                 problems.append(f"{key}: present before ({count} rows), missing after")
-            elif now != count:
-                problems.append(f"{key}: {count} rows before, {now} after")
+                continue
+            was_retired = int(retired_before.get(key, 0))
+            still_retired = int(retired_after.get(key, 0))
+            if still_retired > was_retired:
+                problems.append(
+                    f"{key}: {still_retired} retired row(s) after, only {was_retired} before"
+                )
+            # Only the retired rows may go; every other row must survive.
+            if now - still_retired != count - was_retired:
+                expected = count - was_retired + still_retired
+                detail = (
+                    f" (expected {expected}: {was_retired - still_retired} retired row(s) removed)"
+                    if was_retired
+                    else ""
+                )
+                problems.append(f"{key}: {count} rows before, {now} after{detail}")
     for key, count in sorted(after["dangling"].items()):
         if count:
             problems.append(f"{key}: {count} row(s) reference a scan job that does not exist")
@@ -202,9 +248,15 @@ class Command(BaseCommand):
             f"scan job IDs: {len(before.get('scan_job_ids', []))} before, "
             f"{len(after['scan_job_ids'])} after"
         )
+        retired_before = before.get("retired", {})
+        retired_after = after.get("retired", {})
         for group in ("tables", "references"):
             for key, count in sorted(after[group].items()):
-                self.stdout.write(f"  {key}: {before.get(group, {}).get(key, '-')} -> {count}")
+                removed = int(retired_before.get(key, 0)) - int(retired_after.get(key, 0))
+                note = f" ({removed} retired row(s) removed)" if removed > 0 else ""
+                self.stdout.write(
+                    f"  {key}: {before.get(group, {}).get(key, '-')} -> {count}{note}"
+                )
         self.stdout.write(f"sample scan-job URLs checked: {checked}")
         if problems:
             for problem in problems:

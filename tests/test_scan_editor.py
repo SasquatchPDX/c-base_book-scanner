@@ -103,7 +103,8 @@ def test_small_page_thumbnail_comes_from_the_page_image() -> None:
     page = _page(client, str(job.id))
     version = page.active_version()
     assert version is not None
-    response = client.get(f"/scan/pages/{page.id}/thumbnail/?v=page-{version.id}")
+    token = client.get(f"/scan/jobs/{job.id}/workspace/").json()["pages"][0]["work_image_token"]
+    response = client.get(f"/scan/pages/{page.id}/thumbnail/?v={token}")
     assert response.status_code == 200
     assert response["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
     assert response["Content-Type"] == "image/jpeg"

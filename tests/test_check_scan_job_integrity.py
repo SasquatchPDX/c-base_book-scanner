@@ -120,3 +120,82 @@ def test_command_compare_fails_when_a_job_disappears(tmp_path: Path) -> None:
 def test_command_compare_rejects_unreadable_snapshot(tmp_path: Path) -> None:
     with pytest.raises(CommandError, match="cannot read snapshot"):
         call_command("check_scan_job_integrity", "--compare", str(tmp_path / "missing.json"))
+
+
+def _seed_page_split(jobs: list[ScanJob]) -> None:
+    """Pre-0049 Page Split rows; the stage column has no database constraint."""
+    for job in jobs[:2]:
+        page = ScanPage.objects.get(scan_job=job)
+        ScanTailorStageState.objects.create(scan_job=job, scan_page=page, stage="page_split")
+
+
+def _delete_one(stage: str) -> None:
+    state = ScanTailorStageState.objects.filter(stage=stage).first()
+    assert state is not None
+    state.delete()
+
+
+def test_snapshot_counts_retired_page_split_rows() -> None:
+    _seed_page_split(_seed())
+    snapshot = take_snapshot()
+    assert snapshot["tables"]["core_scantailorstagestate"] == 5
+    assert snapshot["retired"] == {
+        "core_scantailorstagestate": 2,
+        "core_scantailorstagestate.scan_job_id": 2,
+    }
+
+
+def test_compare_accepts_exactly_the_retired_rows_disappearing() -> None:
+    _seed_page_split(_seed())
+    before = take_snapshot()
+    ScanTailorStageState.objects.filter(stage="page_split").delete()
+    after = take_snapshot()
+    assert after["retired"]["core_scantailorstagestate"] == 0
+    assert compare_snapshots(before, after) == []
+
+
+def test_compare_still_reports_other_losses_next_to_retired_rows() -> None:
+    _seed_page_split(_seed())
+    before = take_snapshot()
+    # One retired row and one ordinary stage row go: the same net count as half the
+    # intended deletion plus a loss, which must not hide behind the retired rows.
+    _delete_one("page_split")
+    _delete_one("deskew")
+    problems = compare_snapshots(before, take_snapshot())
+    assert (
+        "core_scantailorstagestate: 5 rows before, 3 after (expected 4: 1 retired row(s) removed)"
+    ) in problems
+    assert any(p.startswith("core_scantailorstagestate.scan_job_id") for p in problems)
+
+
+def test_compare_reports_a_loss_equal_to_the_retired_count() -> None:
+    _seed_page_split(_seed())
+    before = take_snapshot()
+    # Two ordinary rows lost while the Page Split rows stay: net -2, like the intended
+    # deletion, but no retired row went.
+    _delete_one("deskew")
+    _delete_one("deskew")
+    problems = compare_snapshots(before, take_snapshot())
+    assert any(p.startswith("core_scantailorstagestate: 5 rows before, 3 after") for p in problems)
+
+
+def test_compare_rejects_new_retired_rows() -> None:
+    jobs = _seed()
+    before = take_snapshot()
+    _seed_page_split(jobs)
+    ScanTailorStageState.objects.filter(stage="deskew").exclude(scan_job=jobs[2]).delete()
+    problems = compare_snapshots(before, take_snapshot())
+    assert any("2 retired row(s) after, only 0 before" in p for p in problems)
+
+
+def test_command_compare_reports_removed_retired_rows(tmp_path: Path) -> None:
+    _seed_page_split(_seed())
+    snapshot = tmp_path / "before.json"
+    call_command("check_scan_job_integrity", "--snapshot", str(snapshot), stdout=StringIO())
+    ScanTailorStageState.objects.filter(stage="page_split").delete()
+    out = StringIO()
+    call_command(
+        "check_scan_job_integrity", "--compare", str(snapshot), "--sample", "0", stdout=out
+    )
+    assert "core_scantailorstagestate: 5 -> 3 (2 retired row(s) removed)" in out.getvalue()
+    assert "integrity: OK" in out.getvalue()

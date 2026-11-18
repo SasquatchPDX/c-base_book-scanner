@@ -1,10 +1,11 @@
 """End-to-end run of ``scripts/rehearse_migrations.sh`` against the CI PostgreSQL.
 
 A source database is created at the pre-0041 state (``core.0040_cover_thumbnail``, UUID
-scan job keys) and seeded with scan jobs, pages, todos and ScanTailor stage states. The
-script then dumps it, restores it into a scratch database, migrates the copy to the
-latest state and checks it. The test asserts a PASS report, that the source database was
-left at 0040 and that the scratch database was dropped.
+scan job keys) and seeded with scan jobs, pages, todos and ScanTailor stage states,
+including Page Split rows that migration 0049 retires. The script then dumps it,
+restores it into a scratch database, migrates the copy to the latest state and checks
+it. The test asserts a PASS report, that the source database was left at 0040 and that
+the scratch database was dropped.
 
 The PostgreSQL client tools must match the server (17). When the host has none of that
 version, the tools run from the pinned server image through ``docker run``.
@@ -59,8 +60,22 @@ pages = Page.objects.bulk_create(
     ]
 )
 Todo.objects.bulk_create([Todo(scan_job_id=p.scan_job_id, scan_page=p) for p in pages[::2]])
+# Every third page has a Page Split row that feeds its Deskew row. Migration 0049 deletes
+# exactly these (#195); the integrity check must accept that and nothing more.
+splits = {
+    p.id: Stage.objects.create(scan_job_id=p.scan_job_id, scan_page=p, stage="page_split")
+    for p in pages[::3]
+}
 Stage.objects.bulk_create(
-    [Stage(scan_job_id=p.scan_job_id, scan_page=p, stage="deskew") for p in pages]
+    [
+        Stage(
+            scan_job_id=p.scan_job_id,
+            scan_page=p,
+            stage="deskew",
+            input_stage_state=splits.get(p.id),
+        )
+        for p in pages
+    ]
 )
 """
 
@@ -161,6 +176,12 @@ def test_rehearse_migrations_script_passes_on_a_pre_0041_copy(tmp_path: Path) ->
         assert "RESULT: PASS" in output
         assert "0041_scanjob_string_pk" in output  # listed as pending
         assert "scan job IDs: 42 before, 42 after" in output
+        # 2 (base seed) + 120 Deskew + 40 Page Split rows; only the Page Split rows go.
+        assert "core_scantailorstagestate: 162 -> 122 (40 retired row(s) removed)" in output
+        assert (
+            "core_scantailorstagestate.scan_job_id: 162 -> 122 (40 retired row(s) removed)"
+            in output
+        )
         assert "sample scan-job URLs checked: 10" in output
         password = urlsplit(base_url).password
         assert password and password not in output
