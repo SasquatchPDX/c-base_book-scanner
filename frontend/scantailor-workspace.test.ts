@@ -12,6 +12,7 @@ import {
   stageErrorText,
   stageStatusLabel,
   stageStatusMessage,
+  stageWorkerWarnings,
   STAGE_ORDER,
 } from "./scantailor-workspace";
 
@@ -45,6 +46,20 @@ describe("ScanTailor geometry coordinates", () => {
 });
 
 describe("editable stage parameters", () => {
+  it("does not resubmit a legacy computed margin canvas as a fixed request", () => {
+    expect(editableParameters("margins", {
+      margin: 20, input_width: 100, input_height: 200,
+      margin_left: 20, margin_right: 20, margin_top: 20, margin_bottom: 20,
+      canvas_width: 140, canvas_height: 240,
+    })).toEqual({ margin: 20 });
+    // A larger fixed canvas, and new explicit requests, remain intentional settings.
+    expect(editableParameters("margins", {
+      input_width: 100, canvas_width: 300,
+    })).toEqual({ canvas_width: 300 });
+    expect(editableParameters("margins", {
+      input_width: 100, canvas_width: 100, resolved_canvas_width: 100,
+    })).toEqual({ canvas_width: 100 });
+  });
   it("keeps manual geometry while excluding worker-derived provenance", () => {
     expect(
       editableParameters("select_content", {
@@ -78,6 +93,16 @@ describe("editable stage parameters", () => {
       picture_algorithm: "window",
     });
     expect(parameters).not.toHaveProperty("worker_job_id");
+  });
+});
+
+describe("worker warnings", () => {
+  it("shows recorded fallback explanations and ignores absent or malformed values", () => {
+    expect(stageWorkerWarnings({ dewarp_warning: "No reliable page geometry found" }))
+      .toBe("No reliable page geometry found");
+    expect(stageWorkerWarnings({ output_warning: "Fell back to Otsu", dewarp_warning: null }))
+      .toBe("Fell back to Otsu");
+    expect(stageWorkerWarnings({ output_warning: [], dewarp_warning: " " })).toBe("");
   });
 });
 
