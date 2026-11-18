@@ -1340,6 +1340,26 @@ returns ScanJobs stuck in FINALIZING with no live finalization job to their
 prior state so Finish can be retried. It does not re-queue anything itself;
 re-request OCR/conversion/identification from the UI afterwards.
 
+Conversion deliveries claim the job under a short row lock and persist a unique
+`details.conversion_attempt` token. A duplicate delivery of a live attempt exits;
+a stale redelivery gets a new token. Conversion, hashing, and copying into the
+private `_conversion_staging/<job-id>/` namespace happen outside that lock. Only
+the current owner can promote those verified bytes to a final archive name,
+register the FileVariant and its provenance, and record success in one database
+transaction. Publication uses an exclusive hard link where available. On mounts
+without hard links, it keeps the existing exclusive-copy fallback under the job
+lock, so takeover waits for that publication to finish. Originals and occupied
+archive names are never replaced.
+
+An old attempt's late output or error cannot overwrite a newer result. Enqueue
+errors can fail only the unchanged, unclaimed QUEUED job; recovery similarly
+checks that its inspected conversion state has not changed. Unregistered output
+and private staging files are removed after a normal exit. A process killed
+before cleanup can leave an unreferenced staging file (or, if killed between
+promotion and database commit, an unreferenced final file). Reconcile those files
+against the database and running jobs before removing them; never infer that a
+file is safe to delete from its age alone.
+
 It also lists import jobs stuck in an active phase (HASHING through ARCHIVING)
 whose lease has expired, and import jobs without a lease (left by a worker from
 before leases existed) that have not changed for one lease duration. `--apply`

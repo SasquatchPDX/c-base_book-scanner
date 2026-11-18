@@ -374,13 +374,9 @@ def test_conversion_of_referenced_variant_writes_to_archive(
     variant = FileVariant.objects.get(pk=_import(location, book).file_variant_id)
     share_files_before = sorted(p for p in Path(location.root_path).rglob("*"))
 
-    output = conversion._execute_plan(
-        source_variant=variant,
-        target_format="epub",
-        route=(conversion.ConversionStep("txt", "epub", "pandoc"),),
-        request_options=None,
-        processing_job_id=uuid.uuid4(),
-    )
+    job = conversion.request_conversion(source_variant=variant, target_format="epub")
+    assert job.state == ProcessingJob.JobState.SUCCESS
+    output = FileVariant.objects.get(pk=job.details["output_variant_id"])
 
     assert output.storage_location == default_archive_location()
     archive = LocalFilesystemStorage(str(app_storage / "library-artifacts"))
@@ -388,14 +384,9 @@ def test_conversion_of_referenced_variant_writes_to_archive(
     assert sorted(p for p in Path(location.root_path).rglob("*")) == share_files_before
 
     book.write_text("replaced", encoding="utf-8")
-    with pytest.raises(conversion.ConversionError):
-        conversion._execute_plan(
-            source_variant=variant,
-            target_format="epub",
-            route=(conversion.ConversionStep("txt", "epub", "pandoc"),),
-            request_options=None,
-            processing_job_id=uuid.uuid4(),
-        )
+    job = conversion.request_conversion(source_variant=variant, target_format="epub")
+    assert job.state == ProcessingJob.JobState.FAILED
+    assert FileVariant.objects.filter(source_variant=variant).count() == 1
 
 
 @pytest.mark.django_db(transaction=True)

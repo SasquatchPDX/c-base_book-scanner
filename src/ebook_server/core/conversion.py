@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import signal
@@ -16,10 +17,11 @@ from typing import Any
 
 import structlog
 from django.conf import settings as django_settings
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from ebook_server.jobs import get_queue, is_stale_running, tunable_setting
+from ebook_server.storage import StorageBackend
 
 from . import archive_layout, intake
 from .models import Book, FileVariant, ProcessingJob
@@ -35,6 +37,17 @@ logger = structlog.get_logger(__name__)
 
 class ConversionError(RuntimeError):
     """Raised when conversion cannot complete."""
+
+
+@dataclass(frozen=True)
+class PreparedConversion:
+    """Private, verified bytes awaiting an ownership-checked archive publication."""
+
+    variant: FileVariant
+    storage: StorageBackend
+    staging_identifier: str
+    namespace: str
+    filename: str
 
 
 @dataclass(frozen=True)
@@ -321,32 +334,47 @@ def _dispatch_conversion_job(job: ProcessingJob) -> None:
         queue.enqueue(process_conversion_job, job_id)
     except Exception as exc:
         logger.exception("conversion_dispatch_failed", processing_job_id=job_id)
-        job.refresh_from_db()
-        if job.state in {ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING}:
-            _fail_conversion_job(job, f"conversion dispatch failed: {exc}")
+        _fail_conversion_job(job, f"conversion dispatch failed: {exc}")
+
+
+def _claim_conversion_job(job_id: str) -> tuple[ProcessingJob, str] | None:
+    """Claim one delivery, or replace a stale attempt, in a short transaction."""
+    with transaction.atomic():
+        job = (
+            ProcessingJob.objects.select_for_update()
+            .filter(job_id=job_id, job_type=ProcessingJob.JobType.CONVERSION)
+            .first()
+        )
+        if job is None or not (job.state == ProcessingJob.JobState.QUEUED or is_stale_running(job)):
+            return None
+        token = str(uuid.uuid4())
+        details = dict(job.details) if isinstance(job.details, dict) else {}
+        job.details = {**details, "conversion_attempt": token}
+        job.state = ProcessingJob.JobState.RUNNING
+        job.started_at = timezone.now()
+        job.finished_at = None
+        job.save(update_fields=["state", "started_at", "finished_at", "details"])
+        return job, token
+
+
+def _owns_conversion(job: ProcessingJob, token: str) -> bool:
+    return (
+        job.state == ProcessingJob.JobState.RUNNING
+        and isinstance(job.details, dict)
+        and job.details.get("conversion_attempt") == token
+    )
 
 
 def process_conversion_job(job_id: str) -> None:
-    try:
-        conversion_job = ProcessingJob.objects.select_related("file_variant").get(job_id=job_id)
-    except ProcessingJob.DoesNotExist:
+    claim = _claim_conversion_job(job_id)
+    if claim is None:
         return
-    if conversion_job.state in {ProcessingJob.JobState.SUCCESS, ProcessingJob.JobState.FAILED}:
-        return
-    if conversion_job.state == ProcessingJob.JobState.RUNNING and not is_stale_running(
-        conversion_job
-    ):
-        return
-
+    conversion_job, token = claim
     details = conversion_job.details if isinstance(conversion_job.details, dict) else {}
     source_variant = conversion_job.file_variant
     if source_variant is None:
-        _fail_conversion_job(conversion_job, "missing source variant")
+        _fail_conversion_job(conversion_job, "missing source variant", token=token)
         return
-
-    conversion_job.state = ProcessingJob.JobState.RUNNING
-    conversion_job.started_at = timezone.now()
-    conversion_job.save(update_fields=["state", "started_at"])
     logger.info(
         "conversion_started",
         processing_job_id=str(conversion_job.job_id),
@@ -354,28 +382,25 @@ def process_conversion_job(job_id: str) -> None:
         target_format=details.get("target_format"),
     )
 
+    prepared: PreparedConversion | None = None
+    registered = False
     try:
         route_payload = details.get("route")
         if not isinstance(route_payload, list) or not route_payload:
             raise ConversionError("conversion route missing")
         target_format = _normalize_format(details.get("target_format", ""))
         route = _deserialize_route(route_payload)
-        output_variant = _execute_plan(
+        prepared = _execute_plan(
             source_variant=source_variant,
             target_format=target_format,
             route=route,
             request_options=details.get("request_options"),
             processing_job_id=conversion_job.job_id,
         )
-        conversion_job.state = ProcessingJob.JobState.SUCCESS
-        conversion_job.finished_at = timezone.now()
-        conversion_job.details = {
-            **details,
-            "output_variant_id": output_variant.id,
-            "output_format": target_format,
-            "error": "",
-        }
-        conversion_job.save(update_fields=["state", "finished_at", "details"])
+        output_variant = _complete_conversion_job(conversion_job, token, prepared)
+        if output_variant is None:
+            return
+        registered = output_variant is prepared.variant
         logger.info(
             "conversion_succeeded",
             processing_job_id=str(conversion_job.job_id),
@@ -384,7 +409,85 @@ def process_conversion_job(job_id: str) -> None:
         )
     except Exception as exc:  # pragma: no cover - defensive path
         close_old_connections()
-        _fail_conversion_job(conversion_job, str(exc))
+        _fail_conversion_job(conversion_job, str(exc), token=token)
+    finally:
+        if prepared is not None:
+            _discard_unpublished_conversion(prepared, registered=registered)
+
+
+def _complete_conversion_job(
+    snapshot: ProcessingJob, token: str, prepared: PreparedConversion
+) -> FileVariant | None:
+    """Fence exclusive publication and metadata; prefer promotion without copying."""
+    variant = prepared.variant
+    with transaction.atomic():
+        job = ProcessingJob.objects.select_for_update().filter(pk=snapshot.pk).first()
+        if job is None or not _owns_conversion(job, token):
+            return None
+        # Serialize reuse across distinct conversions of the same source as well.
+        FileVariant.objects.select_for_update().get(pk=variant.source_variant_id)
+        output = FileVariant.objects.filter(
+            book_id=variant.book_id,
+            source_variant_id=variant.source_variant_id,
+            format=variant.format,
+            source_type=FileVariant.SourceType.CONVERTED,
+            sha256=variant.sha256,
+        ).first()
+        if output is None:
+            try:
+                variant.storage_identifier = prepared.storage.publish_unique(
+                    prepared.staging_identifier, prepared.namespace, prepared.filename, mode="link"
+                )
+            except OSError as exc:
+                if exc.errno not in {
+                    errno.EXDEV,
+                    errno.EPERM,
+                    errno.EACCES,
+                    errno.ENOSYS,
+                    errno.EOPNOTSUPP,
+                }:
+                    raise
+                # Some SMB mounts cannot hard-link. Preserve their existing safe
+                # exclusive-copy path, keeping ownership locked until it finishes.
+                variant.storage_identifier = prepared.storage.publish_unique(
+                    prepared.staging_identifier, prepared.namespace, prepared.filename, mode="copy"
+                )
+            variant.original_filename = Path(variant.storage_identifier).name
+            variant.save(force_insert=True)
+            output = variant
+        job.state = ProcessingJob.JobState.SUCCESS
+        job.finished_at = timezone.now()
+        job.details = {
+            **job.details,
+            "output_variant_id": output.pk,
+            "output_format": variant.format,
+            "error": "",
+        }
+        job.save(update_fields=["state", "finished_at", "details"])
+        return output
+
+
+def _discard_unpublished_conversion(prepared: PreparedConversion, *, registered: bool) -> None:
+    """Remove only this attempt's exclusive output, never an adopted artifact.
+
+    If the database cannot confirm that the file is unreferenced, leave it for
+    operator reconciliation instead of risking a committed variant's contents.
+    """
+    identifiers = {prepared.staging_identifier}
+    if not registered:
+        identifiers.add(prepared.variant.storage_identifier)
+    for identifier in identifiers:
+        try:
+            if FileVariant.objects.filter(
+                storage_location_id=prepared.variant.storage_location_id,
+                storage_identifier=identifier,
+            ).exists():
+                continue
+            prepared.storage.delete(identifier)
+        except Exception:
+            logger.warning(
+                "conversion_unpublished_cleanup_failed", job_id=str(prepared.variant.job_id)
+            )
 
 
 def _deserialize_route(raw: list[Any]) -> tuple[ConversionStep, ...]:
@@ -418,7 +521,7 @@ def _execute_plan(
     route: tuple[ConversionStep, ...],
     request_options: Any | None,
     processing_job_id: uuid.UUID,
-) -> FileVariant:
+) -> PreparedConversion:
     _validate_route(
         source_format=source_variant.format,
         target_format=target_format,
@@ -475,40 +578,37 @@ def _execute_plan(
 
         output_sha = intake.compute_sha256(str(current_path))
         output_size = current_path.stat().st_size
-        existing = (
-            FileVariant.objects.filter(
-                book=source_variant.book,
-                source_variant=source_variant,
-                format=target_format,
-                source_type=FileVariant.SourceType.CONVERTED,
-                sha256=output_sha,
-            )
-            .select_related("book")
-            .first()
+        namespace = (
+            f"books/{source_variant.book_id}/converted"
+            if archive_layout.configured_layout().job_scoped
+            else archive_layout.book_folder(source_variant.book, output_storage)
         )
-        if existing is not None:
-            return existing
-
-        storage_identifier = archive_layout.publish_derived(
-            output_storage,
-            source_variant.book,
-            str(current_path),
-            f"{archive_layout.book_file_stem(source_variant.book)}.{target_format}",
-            legacy_namespace=f"books/{source_variant.book_id}/converted",
-            legacy_filename=f"{uuid.uuid4()}.{target_format}",
+        filename = (
+            f"{uuid.uuid4()}.{target_format}"
+            if archive_layout.configured_layout().job_scoped
+            else f"{archive_layout.book_file_stem(source_variant.book)}.{target_format}"
         )
-
-        return FileVariant.objects.create(
+        staging_identifier = output_storage.generate_destination(
+            f"_conversion_staging/{processing_job_id}", f"{uuid.uuid4()}.{target_format}"
+        )
+        try:
+            output_storage.store_atomic(str(current_path), staging_identifier)
+            if output_storage.hash(staging_identifier) != output_sha:
+                raise ConversionError("staged conversion checksum mismatch")
+        except BaseException:
+            output_storage.delete(staging_identifier)
+            raise
+        variant = FileVariant(
             book=source_variant.book,
             format=target_format,
             mime_type=FORMAT_TO_MIME.get(target_format, "application/octet-stream"),
-            original_filename=Path(storage_identifier).name,
+            original_filename=filename,
             storage_location=output_location,
-            storage_identifier=storage_identifier,
+            storage_identifier=staging_identifier,
             size_bytes=output_size,
             sha256=output_sha,
             source_type=FileVariant.SourceType.CONVERTED,
-            uploader=source_variant.uploader,
+            uploader_id=source_variant.uploader_id,
             source_variant=source_variant,
             imported_at=timezone.now(),
             converter_tool=" -> ".join(converter_chain),
@@ -527,6 +627,7 @@ def _execute_plan(
             job_id=processing_job_id,
             processing_state=FileVariant.ProcessingState.COMPLETE,
         )
+        return PreparedConversion(variant, output_storage, staging_identifier, namespace, filename)
 
 
 def _validate_route(
@@ -556,20 +657,54 @@ def _validate_route(
         raise ConversionError("conversion route does not reach requested target")
 
 
-def _fail_conversion_job(job: ProcessingJob, message: str) -> None:
-    details = job.details if isinstance(job.details, dict) else {}
-    if not isinstance(details, dict):
-        details = {}
-    details = {**details, "error": message}
-    job.state = ProcessingJob.JobState.FAILED
-    job.finished_at = timezone.now()
-    job.details = details
-    job.save(update_fields=["state", "finished_at", "details"])
+def _fail_conversion_job(job: ProcessingJob, message: str, *, token: str | None = None) -> bool:
+    """An enqueue error owns only QUEUED; worker errors own only their attempt."""
+    with transaction.atomic():
+        current = ProcessingJob.objects.select_for_update().filter(pk=job.pk).first()
+        if current is None or current.job_type != ProcessingJob.JobType.CONVERSION:
+            return False
+        if token is None:
+            if (
+                current.state != ProcessingJob.JobState.QUEUED
+                or current.started_at != job.started_at
+                or current.details != job.details
+            ):
+                return False
+        elif not _owns_conversion(current, token):
+            return False
+        details = dict(current.details) if isinstance(current.details, dict) else {}
+        current.state = ProcessingJob.JobState.FAILED
+        current.finished_at = timezone.now()
+        current.details = {**details, "error": message}
+        current.save(update_fields=["state", "finished_at", "details"])
     logger.error(
         "conversion_failed",
         processing_job_id=str(job.job_id),
         error_recorded=bool(message),
     )
+    return True
+
+
+def recover_stale_conversion_job(snapshot: ProcessingJob, message: str) -> bool:
+    """Recover only the exact state inspected by the operator, not a newer attempt."""
+    with transaction.atomic():
+        current = ProcessingJob.objects.select_for_update().filter(pk=snapshot.pk).first()
+        if (
+            current is None
+            or current.job_type != ProcessingJob.JobType.CONVERSION
+            or current.state != snapshot.state
+            or current.started_at != snapshot.started_at
+            or current.details != snapshot.details
+            or current.state not in {ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING}
+            or (current.state == ProcessingJob.JobState.RUNNING and not is_stale_running(current))
+        ):
+            return False
+        current.state = ProcessingJob.JobState.FAILED
+        current.finished_at = timezone.now()
+        details = dict(current.details) if isinstance(current.details, dict) else {}
+        current.details = {**details, "error": message}
+        current.save(update_fields=["state", "finished_at", "details"])
+        return True
 
 
 STDERR_TAIL_BYTES = 2000
