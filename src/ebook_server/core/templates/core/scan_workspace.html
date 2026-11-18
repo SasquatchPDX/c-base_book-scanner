@@ -1,9 +1,6 @@
 {% extends "core/base.html" %}
 {% load static %}
 {% block title %}{{ job.provisional_title|default:"Scan workspace" }} · Hackerspace Library{% endblock %}
-{% block head %}
-  <script type="module" src="{% static 'core/dist/scantailor-workspace.js' %}"></script>
-{% endblock %}
 {% block content %}
   <div class="section-heading">
     <div>
@@ -18,7 +15,10 @@
         {% endif %}
       </p>
     </div>
-    <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
+    <div class="editor-actions">
+      <a class="button" data-open-editor href="{% url 'scan-job-editor' job.id %}">Open ScanTailor editor</a>
+      <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
+    </div>
   </div>
 
   {% if opf_metadata %}
@@ -87,68 +87,6 @@
     </section>
   {% endif %}
 
-  {{ pages|json_script:"scantailor-workspace-data" }}
-  <div
-    class="scantailor-shell"
-    data-scantailor-workspace
-    data-editable="{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}true{% else %}false{% endif %}"
-    data-events-url="{% url 'scan-job-workspace-events' job.id %}"
-    data-workspace-url="{% url 'scan-job-workspace' job.id %}"
-    data-workspace-state-url="{% url 'scan-job-workspace-state' job.id %}"
-  >
-    <aside class="scantailor-sidebar" aria-label="Processing stages">
-      <h2>Stages</h2>
-      <nav class="stage-nav">
-        {% for stage in stage_navigation %}
-          <button type="button" data-stage-select="{{ stage.name }}">{{ forloop.counter }}. {{ stage.label }}</button>
-          <span hidden data-stage="{{ stage.name }}" data-batch-url="{% url 'scan-job-stage-batch' job.id stage.name %}"></span>
-        {% endfor %}
-      </nav>
-      <p class="muted">Select a page below, then edit its stage here.</p>
-      <span class="live-status" data-live-status>Connecting live updates…</span>
-    </aside>
-
-    <section class="scantailor-editor" aria-labelledby="workspace-editor-title">
-      <div class="editor-toolbar">
-        <div>
-          <p class="eyebrow">Interactive preview</p>
-          <h2 id="workspace-editor-title" data-editor-title>Choose a page and stage</h2>
-        </div>
-        <div class="editor-actions">
-          <button type="button" data-save-stage>Save and run</button>
-        </div>
-      </div>
-      <div class="editor-stage-controls" data-stage-controls></div>
-      <div class="editor-actions" role="group" aria-label="Stage preview">
-        <button type="button" data-preview-input aria-pressed="true">Input</button>
-        <button type="button" data-preview-result aria-pressed="false" disabled>Result</button>
-        <small>Use Input to edit page geometry; Result shows the completed stage.</small>
-      </div>
-      <p class="editor-message" data-stage-warnings role="status" hidden></p>
-      <div class="geometry-frame">
-        <img data-editor-image alt="Processing-stage input preview" hidden>
-        <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
-      </div>
-      <p class="editor-message" data-editor-message aria-live="polite">Select a page to begin.</p>
-      <div class="batch-toolbar">
-        <label>Batch scope
-          <select data-batch-scope>
-            <option value="selected">Selected pages</option>
-            <option value="all">All pages</option>
-          </select>
-        </label>
-        <label class="checkbox"><input type="checkbox" data-preserve-exceptions checked>Preserve manual exceptions</label>
-        <button type="button" class="secondary" data-batch-stage>Apply stage to batch</button>
-      </div>
-    </section>
-
-  <noscript><p class="status-card">JavaScript enables live previews and direct geometry editing. The individual Run forms below remain available.</p></noscript>
-
-  <div class="page-selection-toolbar">
-    <strong data-selection-count>0 page(s) selected</strong>
-    <button type="button" class="secondary small-button" data-select-all>Select all</button>
-    <button type="button" class="secondary small-button" data-clear-selection>Clear</button>
-  </div>
   <div class="scan-page-grid">
     {% for page in pages %}
       <article class="scan-page-card" id="page-{{ page.id }}">
@@ -166,16 +104,7 @@
                 <span class="status status-{{ stage.status }}" data-stage-status{% if stage.status == 'invalidated' and stage.invalidated_reason %} title="{{ stage.invalidated_reason }}"{% endif %}>{{ stage.status }}</span>
                 <small class="error" data-stage-error {% if stage.status != 'failed' or not stage.last_error %}hidden{% endif %}>{% if stage.status == 'failed' %}{{ stage.last_error }}{% endif %}</small>
               </div>
-              <button
-                type="button"
-                class="secondary small-button"
-                data-stage-open
-                data-page-id="{{ page.id }}"
-                data-stage="{{ stage.stage }}"
-                data-stage-url="{% url 'scan-job-page-stage' job.id page.id stage.stage %}"
-                data-input-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}?input=true"
-                data-output-preview-url="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}"
-              >Edit</button>
+              <a class="button secondary small-button" data-stage-edit href="{% url 'scan-job-editor' job.id %}?page={{ page.id }}&amp;stage={{ stage.stage }}">Edit</a>
               <a data-stage-preview-link {% if not stage.preview_storage_identifier and not stage.output_storage_identifier %}hidden{% endif %} href="{% url 'scan-job-page-stage-preview' job.id page.id stage.stage %}">Preview</a>
               {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}
                 <form method="post" action="{% url 'scan-job-page-stage' job.id page.id stage.stage %}">
@@ -199,7 +128,6 @@
     {% empty %}
       <p class="empty-state">Upload the first page to begin processing.</p>
     {% endfor %}
-  </div>
   </div>
 
   {% if pages and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}

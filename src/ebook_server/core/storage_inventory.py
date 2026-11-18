@@ -93,6 +93,12 @@ def artifact_references() -> Iterable[ArtifactReference]:
                 state.output_storage_location,
             ),
             ("stage_preview", state.preview_storage_identifier, "", state.preview_storage_location),
+            (
+                "stage_thumbnail",
+                _existing_stage_thumbnail(state),
+                "",
+                state.output_storage_location,
+            ),
             ("stage_input", state.input_storage_identifier, "", scan),
         ):
             if identifier:
@@ -113,6 +119,22 @@ def artifact_references() -> Iterable[ArtifactReference]:
             yield ArtifactReference(
                 "generated_book_opf", str(opf_state.pk), target.identifier, "", target.location
             )
+
+
+def _existing_stage_thumbnail(state: ScanTailorStageState) -> str:
+    """The stage's strip thumbnail (#195 step 3), if it was written.
+
+    Stages published before thumbnails existed have none; it is regenerable, so its
+    absence is not a missing artifact.
+    """
+    if not state.output_storage_identifier or state.output_storage_location is None:
+        return ""
+    identifier = f"{state.output_storage_identifier.rsplit('/', 1)[0]}/thumbnail.jpg"
+    try:
+        backend = filesystem_backend_for_location(state.output_storage_location)
+        return identifier if backend.exists(identifier) else ""
+    except (OSError, ValueError, StorageConfigurationError):
+        return ""
 
 
 def physical_key(location: StorageLocation, identifier: str) -> str:
@@ -169,7 +191,7 @@ def reference_index() -> tuple[dict[str, list[ArtifactReference]], list[str]]:
 STAGE_FILE = re.compile(
     r"^scan-jobs/(?P<job>[^/]+)/(?P<page>[0-9a-f-]{36})/(?P<stage>[a-z_]+)/"
     # work.png / preview.jpg: working-resolution artifacts of stages 1-4 (#195 step 2).
-    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png|work\.png|preview\.jpg)$"
+    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png|work\.png|preview\.jpg|thumbnail\.jpg)$"
 )
 
 

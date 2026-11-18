@@ -2247,7 +2247,11 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
 
 
 def _write_stage_artifacts(
-    result: StageResult, stage_input: StageInput, output: Path, preview: Path
+    result: StageResult,
+    stage_input: StageInput,
+    output: Path,
+    preview: Path,
+    thumbnail: Path | None = None,
 ) -> None:
     if result.full_resolution:
         _save_png(result.image, output, stage_input.dpi)
@@ -2256,10 +2260,28 @@ def _write_stage_artifacts(
             max(1, round(result.image.width * sx)),
             max(1, round(result.image.height * sy)),
         )
-        scan_images.save_work_png(scan_images.downscale(result.image, preview_size), preview)
-        return
-    scan_images.save_work_png(result.image, output)
-    scan_images.save_preview_jpeg(result.image, preview)
+        preview_image = scan_images.downscale(result.image, preview_size)
+        scan_images.save_work_png(preview_image, preview)
+    else:
+        preview_image = result.image
+        scan_images.save_work_png(result.image, output)
+        scan_images.save_preview_jpeg(result.image, preview)
+    if thumbnail is not None:
+        # Small image for the workspace page strip (#195 step 3).
+        scan_images.save_preview_jpeg(
+            _thumbnail(preview_image, scan_images.THUMBNAIL_EDGE), thumbnail
+        )
+
+
+STAGE_THUMBNAIL_NAME: Final[str] = "thumbnail.jpg"
+
+
+def stage_thumbnail_identifier(state: ScanTailorStageState) -> str:
+    """The strip thumbnail of a published stage: next to its output, same revision."""
+    if not state.output_storage_identifier:
+        return ""
+    parent = state.output_storage_identifier.rsplit("/", 1)[0]
+    return f"{parent}/{STAGE_THUMBNAIL_NAME}"
 
 
 def process_stage_job(job_id: str) -> None:
@@ -2345,7 +2367,10 @@ def process_stage_job(job_id: str) -> None:
         with tempfile.TemporaryDirectory(prefix="stages-") as tempdir:
             staged_output = Path(tempdir) / _build_output_name(state)
             staged_preview = Path(tempdir) / _build_output_name(state, preview=True)
-            _write_stage_artifacts(result, stage_input, staged_output, staged_preview)
+            staged_thumbnail = Path(tempdir) / STAGE_THUMBNAIL_NAME
+            _write_stage_artifacts(
+                result, stage_input, staged_output, staged_preview, staged_thumbnail
+            )
             encode_done = time.perf_counter()
             merged = dict(state.parameters or {})
             merged.update(result.parameters)
@@ -2372,6 +2397,7 @@ def process_stage_job(job_id: str) -> None:
                 preview_identifier,
                 output_size,
                 output_sha,
+                thumbnail=staged_thumbnail,
             ):
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
@@ -2421,6 +2447,7 @@ def _publish_stage_artifacts(
     preview_identifier: str,
     output_size: int,
     output_sha: str,
+    thumbnail: Path | None = None,
 ) -> bool:
     """Copy privately, then promote under the same row lock used by retirement.
 
@@ -2430,9 +2457,15 @@ def _publish_stage_artifacts(
     token = uuid.uuid4().hex
     private_output = f"{_output_namespace(state)}/.{token}.output.partial"
     private_preview = f"{_output_namespace(state)}/.{token}.preview.partial"
+    private_thumbnail = f"{_output_namespace(state)}/.{token}.thumbnail.partial"
+    thumbnail_identifier = (
+        f"{output_identifier.rsplit('/', 1)[0]}/{STAGE_THUMBNAIL_NAME}" if thumbnail else ""
+    )
     try:
         storage.store_atomic(str(output), private_output)
         storage.store_atomic(str(preview), private_preview)
+        if thumbnail is not None:
+            storage.store_atomic(str(thumbnail), private_thumbnail)
         if storage.hash(private_output) != output_sha or storage.hash(
             private_preview
         ) != _compute_sha256(preview):
@@ -2442,6 +2475,8 @@ def _publish_stage_artifacts(
                 return False
             storage.commit_staged(private_output, output_identifier)
             storage.commit_staged(private_preview, preview_identifier)
+            if thumbnail is not None:
+                storage.commit_staged(private_thumbnail, thumbnail_identifier)
             state.output_storage_location = location
             state.preview_storage_location = location
             state.output_storage_identifier = output_identifier
@@ -2470,7 +2505,7 @@ def _publish_stage_artifacts(
             )
         return True
     finally:
-        for identifier in (private_output, private_preview):
+        for identifier in (private_output, private_preview, private_thumbnail):
             try:
                 storage.discard_staged(identifier)
             except OSError:

@@ -27,6 +27,8 @@ for (const transport of ["events", "polling"] as const) {
     await page.getByLabel("Sequence").fill("1");
     await page.getByRole("button", { name: "Upload page" }).click();
     await expect(page.locator(".scan-page-card")).toHaveCount(1);
+    await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+    await expect(page.locator("[data-scantailor-editor]")).toBeVisible();
 
     const input = page.getByRole("button", { name: "Input", exact: true });
     const result = page.getByRole("button", { name: "Result", exact: true });

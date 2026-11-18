@@ -1,0 +1,107 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ job.provisional_title|default:"Untitled scan" }} · ScanTailor editor</title>
+    <link rel="stylesheet" href="{% static 'core/app.css' %}">
+    <script type="module" src="{% static 'core/dist/scantailor-workspace.js' %}"></script>
+  </head>
+  <body class="st-editor-body">
+    {{ pages|json_script:"scantailor-workspace-data" }}
+    <div
+      class="st-editor"
+      data-scantailor-editor
+      data-editable="{% if editable %}true{% else %}false{% endif %}"
+      data-events-url="{% url 'scan-job-workspace-events' job.id %}"
+      data-workspace-url="{% url 'scan-job-workspace' job.id %}"
+      data-workspace-state-url="{% url 'scan-job-workspace-state' job.id %}"
+      data-stage-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/"
+      data-preview-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/preview/"
+      data-stage-thumbnail-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/thumbnail/"
+      data-page-thumbnail-template="/scan/pages/__PAGE__/thumbnail/"
+      data-batch-url-template="/scan/jobs/{{ job.id }}/stages/__STAGE__/batch/"
+    >
+      {% csrf_token %}
+      <aside class="st-left" aria-label="Stages and options">
+        <header class="st-left-header">
+          <a class="st-back" href="{% url 'scan-job-workspace' job.id %}?view=html">← Job overview</a>
+          <h1 title="{{ job.provisional_title }}">{{ job.provisional_title|default:"Untitled scan" }}</h1>
+        </header>
+        <ol class="st-stages" aria-label="Processing stages">
+          {% for stage in stage_navigation %}
+            <li>
+              <button type="button" class="st-stage" data-stage-select="{{ stage.name }}" data-hint="{{ stage.hint }}">
+                <span class="st-stage-number">{{ forloop.counter }}</span> {{ stage.label }}
+              </button>
+              <button type="button" class="st-run-all" data-stage-run-all="{{ stage.name }}" title="Launch batch processing: run {{ stage.label }} for every page" aria-label="Run {{ stage.label }} for all pages" {% if not editable %}disabled{% endif %}>▶</button>
+            </li>
+          {% endfor %}
+        </ol>
+        <section class="st-options" aria-labelledby="workspace-editor-title">
+          <h2 id="workspace-editor-title" data-editor-title>Choose a page and stage</h2>
+          <div class="editor-stage-controls" data-stage-controls></div>
+          <div class="st-option-actions">
+            <button type="button" data-save-stage>Save and run</button>
+          </div>
+          <fieldset class="st-apply">
+            <legend>Apply to…</legend>
+            <label>Pages
+              <select data-batch-scope>
+                <option value="selected">Selected pages</option>
+                <option value="all">All pages</option>
+              </select>
+            </label>
+            <label class="checkbox"><input type="checkbox" data-preserve-exceptions checked>Keep pages with manual settings</label>
+            <small data-selection-count></small>
+            <button type="button" class="secondary" data-batch-stage>Apply</button>
+          </fieldset>
+          <p class="editor-message" data-stage-warnings role="status" hidden></p>
+          <p class="editor-message" data-editor-message aria-live="polite">Select a page to begin.</p>
+        </section>
+        <footer class="st-statusbar">
+          <span data-status-hint></span>
+          <span class="live-status" data-live-status>Connecting live updates…</span>
+        </footer>
+      </aside>
+
+      <main class="st-canvas" aria-label="Page preview">
+        <div class="st-canvas-toolbar" role="toolbar" aria-label="Preview">
+          <div class="st-segmented" role="group" aria-label="Stage preview">
+            <button type="button" data-preview-input aria-pressed="true">Input</button>
+            <button type="button" data-preview-result aria-pressed="false" disabled>Result</button>
+          </div>
+          <div class="st-zoom" role="group" aria-label="Zoom">
+            <button type="button" data-zoom-out aria-label="Zoom out">−</button>
+            <span data-zoom-level>100 %</span>
+            <button type="button" data-zoom-in aria-label="Zoom in">+</button>
+            <button type="button" data-zoom-fit>Fit</button>
+            <button type="button" data-zoom-actual>1:1</button>
+          </div>
+        </div>
+        <div class="st-viewport" data-viewport>
+          <div class="st-surface" data-surface>
+            <img data-editor-image alt="Processing-stage input preview" hidden>
+            <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="st-strip" aria-label="Pages">
+        <div class="st-strip-scroll" data-strip-scroll role="listbox" aria-multiselectable="true" aria-label="Pages" tabindex="0"></div>
+        <footer class="st-strip-footer">
+          <label>Sort
+            <select data-strip-sort>
+              <option value="natural">Natural order</option>
+              <option value="width">Order by increasing width</option>
+              <option value="height">Order by increasing height</option>
+            </select>
+          </label>
+          <label class="checkbox"><input type="checkbox" data-keep-in-view checked>Keep current page in view</label>
+          <small class="muted">Home, End, PgUp (or Q), PgDown (or W) navigate pages; Ctrl/Shift-click selects several.</small>
+        </footer>
+      </aside>
+    </div>
+    {% if not pages %}<p class="st-empty">Upload the first page on the <a href="{% url 'scan-job-workspace' job.id %}?view=html">job overview</a>.</p>{% endif %}
+  </body>
+</html>

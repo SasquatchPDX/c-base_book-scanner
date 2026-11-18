@@ -233,17 +233,47 @@ Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still acce
 
 ## Browser workspace
 
-The server-rendered page remains usable without JavaScript through individual Run
-forms. The focused TypeScript component adds:
+Two pages (#195 step 3):
 
-- a five-stage navigation surface and per-page editor selection;
+- **Job overview** (`/scan/jobs/{id}/workspace/`): metadata, identification,
+  uploads, rescans, finishing, and one card per page with server-rendered stage
+  statuses and Run forms, so it works without JavaScript. "Open ScanTailor editor"
+  and each stage's "Edit" link open the editor (`?page=<id>&stage=<stage>`).
+- **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. It
+  fills the browser viewport (no site header, no page scrolling) with three columns:
+  - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
+    that runs it for every page with each page's own settings (upstream "Launch
+    batch processing"), the options of the selected stage with "Save and run" and
+    "Apply to…" (selected or all pages, keeping pages with manual settings), and a
+    status bar with the stage's hint (upstream strings where they exist) and the
+    live-update state;
+  - *middle*: the preview canvas. The wheel zooms around the cursor, dragging the
+    background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
+    and pan only translates it, so overlays and their handles keep working at any
+    zoom; handles capture their own pointer events. Ctrl+Wheel is left for stage
+    gestures (deskew rotation, step 4). The image is the stage's working-resolution
+    preview (about 150 dpi); full-resolution tiles are not part of this step;
+  - *right*: the page strip. It is virtualised (only the rows in view exist in the
+    DOM) and its thumbnails load lazily from tokenised, immutable URLs: the current
+    stage's output (each stage run writes a 400 px `thumbnail.jpg`), else the last
+    completed stage before it, else the page's working-image thumbnail. Under each:
+    the page number and file name, and one small numbered icon per stage: grey (not
+    started or needs re-run), amber and pulsing (queued or running), green (done),
+    blue (done with manual settings), red (failed); the tooltip names the stage and
+    the error or invalidation reason. A sort selector offers "Natural order",
+    "Order by increasing width" and "Order by increasing height" (content box for
+    Select Content, output size otherwise). Click selects a page, Ctrl/Cmd-click
+    toggles, Shift-click selects a range; Home, End, PgUp (or Q), PgDown (or W) and
+    the arrow keys move between pages, and "Keep current page in view" scrolls the
+    strip along (upstream ThumbnailSequence and MainWindow behaviour).
+
+The editor also keeps:
+
 - direct content-box, dewarp-point, and output-zone manipulation;
 - typed controls for deskew, margins, output algorithms, and threshold settings;
-- selected-page or all-page batch application;
-- preservation of page-level manual exceptions by default;
 - revision-conflict detection that reloads current values instead of overwriting;
 - live stage status, error, revision, and preview availability updates over SSE,
-  with compatibility polling when `EventSource` is unavailable.
+  with delta polling when `EventSource` is unavailable.
 
 Interact.js supplies drag/resize behavior. TypeScript, Vite, Vitest, and jsdom
 provide strict compilation, production bundling, and coordinate/parameter tests.
