@@ -11,6 +11,8 @@ class Migration(migrations.Migration):
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
+    # Recovery histories cannot fit the old two-source review constraint. Refuse
+    # rollback explicitly instead of deleting human decisions or failing midway.
     operations = [
         migrations.RemoveConstraint(
             model_name="reviewtask",
@@ -98,4 +100,5 @@ class Migration(migrations.Migration):
                 name="review_has_exactly_one_source",
             ),
         ),
+        migrations.RunPython(migrations.RunPython.noop),
     ]

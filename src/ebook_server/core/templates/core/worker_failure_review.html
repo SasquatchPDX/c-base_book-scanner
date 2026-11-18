@@ -3,7 +3,7 @@
 {% block content %}
 <div class="narrow">
   <p class="eyebrow">Worker recovery</p>
-  <h1>{{ task.inferred_title }} needs attention</h1>
+  <h1>{{ task.inferred_title }}</h1>
   <p>{{ task.source_filename }}</p>
   <p>Original files are retained. A retry creates a new background job using the same request settings. This task records every attempt and closes when a retry succeeds.</p>
   <span class="status status-{{ task.state }}">{{ task.get_state_display }}</span>

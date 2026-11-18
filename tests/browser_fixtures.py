@@ -16,6 +16,47 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 
+def seed_worker_failure_review() -> None:
+    """A real terminal conversion failure on an owned fixture, for browser recovery UI."""
+    from ebook_server.core import conversion, intake
+    from ebook_server.core.models import Book, FileVariant, ProcessingJob, get_or_create_profile
+
+    owner = get_or_create_profile("leela").user
+    book = Book.objects.create(title="Browser Worker Recovery")
+    source = b"%PDF-1.4\nBrowser recovery original\n"
+    identifier = "browser-fixtures/worker-recovery-original.pdf"
+    intake._default_storage().write_atomic(identifier, source)
+    variant = FileVariant.objects.create(
+        book=book,
+        format="pdf",
+        mime_type="application/pdf",
+        uploader=owner,
+        original_filename="worker-recovery-original.pdf",
+        storage_location=intake._default_storage_location(),
+        storage_identifier=identifier,
+        size_bytes=len(source),
+        sha256=hashlib.sha256(source).hexdigest(),
+        source_type=FileVariant.SourceType.UPLOAD,
+        processing_state=FileVariant.ProcessingState.COMPLETE,
+    )
+    job = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.CONVERSION,
+        file_variant=variant,
+        details={
+            "requested_by_user_id": owner.pk,
+            "target_format": "txt",
+            "route": [
+                {
+                    "source_format": "pdf",
+                    "target_format": "txt",
+                    "converter": "unavailable-browser-fixture",
+                }
+            ],
+        },
+    )
+    conversion.process_conversion_job(str(job.job_id))
+
+
 class BrowserMetadataProvider:
     """Stable provider boundary for the full physical-book browser scenario."""
 

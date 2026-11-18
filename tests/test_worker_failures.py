@@ -352,3 +352,37 @@ def test_normal_rq_worker_keeps_configurable_kill_handler(monkeypatch: pytest.Mo
     monkeypatch.setattr(Worker, "__init__", initialize)
     RecoveryWorker([])
     assert captured["work_horse_killed_handler"] is worker_failures.work_horse_killed
+
+
+def test_historical_reconciliation_is_bounded_and_preserves_acknowledgments() -> None:
+    from io import StringIO
+
+    from django.core.management import call_command
+
+    jobs = [
+        ProcessingJob.objects.create(job_type=ProcessingJob.JobType.CONVERSION) for _ in range(2)
+    ]
+    ProcessingJob.objects.filter(pk__in=[job.pk for job in jobs]).update(
+        state=ProcessingJob.JobState.FAILED, finished_at=timezone.now()
+    )
+    call_command("reconcile_worker_failures", limit=1, stdout=StringIO())
+    assert ReviewTask.objects.count() == 0
+    call_command("reconcile_worker_failures", apply=True, limit=1, stdout=StringIO())
+    task = ReviewTask.objects.get(processing_job=jobs[0])
+    task.state = ReviewTask.State.RESOLVED
+    task.decision = ReviewTask.Decision.ACKNOWLEDGE_FAILURE
+    task.save()
+    call_command("reconcile_worker_failures", apply=True, limit=1, stdout=StringIO())
+    call_command("reconcile_worker_failures", apply=True, limit=1, stdout=StringIO())
+    assert ReviewTask.objects.count() == 2
+    task.refresh_from_db()
+    assert task.state == ReviewTask.State.RESOLVED
+    assert task.decision == ReviewTask.Decision.ACKNOWLEDGE_FAILURE
+    assert ProcessingJob.objects.count() == 2
+
+
+def test_recovery_schema_rollback_is_explicitly_irreversible() -> None:
+    from importlib import import_module
+
+    migration = import_module("ebook_server.core.migrations.0048_worker_failure_reviews")
+    assert not migration.Migration.operations[-1].reversible
