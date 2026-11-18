@@ -4,6 +4,12 @@ Two CSV files listing the intake-relevant files of two real-world ebook collecti
 captured 2026-11-17 and trimmed for publication (see **Trimming** below). **Metadata
 only** — no file content and no hashes, just path/name/extension/size.
 
+> **Production data:** `c-base/` holds a sampled listing of the c-base ebook share, the
+> actual environment this software will run against (all of it must be ingested). It is
+> raw research data that still needs analysis before changes are derived from it. The two
+> files below come from a personal NAS and are only representative. See `c-base/README.md`
+> and `docs/c-base-ebook-share-analysis.md`.
+
 ## Columns
 
 | Column | Meaning |
