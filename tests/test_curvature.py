@@ -149,6 +149,18 @@ def test_unsafe_manual_geometry_is_rejected(curves: Any) -> None:
         curvature.normalize_curves(curves, (100, 100))
 
 
+def test_isolated_crossing_auto_trace_does_not_discard_ordered_text_rows() -> None:
+    good = [[[0.0, y], [500.0, y], [999.0, y]] for y in (100.0, 200.0, 300.0)]
+    bad = [[0.0, 250.0], [500.0, 180.0], [999.0, 250.0]]
+    candidates = [(0.9, curve) for curve in good] + [(0.2, bad)]
+    selected = curvature._ordered_candidates(candidates)
+    assert selected == good
+    assert curvature.normalize_curves(selected, (1000, 500)) == good
+    # The automatic filter must not make the same contradictory manual edit valid.
+    with pytest.raises(ValueError, match="cross"):
+        curvature.normalize_curves([*good, bad], (1000, 500))
+
+
 @pytest.mark.django_db(transaction=True)
 def test_opt_in_worker_provenance_manual_replay_and_switch_back() -> None:
     client, job = _create_scan_job("curvature-worker")

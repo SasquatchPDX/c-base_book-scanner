@@ -1,7 +1,9 @@
 # Opt-in baseline curvature acceptance (#171)
 
 These pages are **synthetic**, not scanned books. No physical-book quality corpus
-or site-connected scans were available. This does not close the real-page
+or site-connected scans were supplied. Two public book photographs are being
+evaluated separately; their acceptance measurements are not yet established.
+This does not close the real-page
 acceptance gate or enable curvature by default.
 
 ## Reproducible geometry and OCR
@@ -32,6 +34,12 @@ BOOK_SCANNER_RUN_INFRASTRUCTURE_TESTS=true \
 The second command needs `tesseract-ocr` and English traineddata. Tests also cover
 flat-page passthrough, unsafe-geometry fallback, four-corner retention, manual
 replay, model switching and worker provenance.
+
+Automatic traces must preserve text-row order across their entire width. A bounded
+longest-chain filter discards isolated crossing tracks, using observation coverage
+and fit residual only to break ties. The retained geometry still passes the same
+strict crossing/displacement checks as manual edits; invalid manual curves are
+never silently filtered.
 
 ## Full-resolution memory
 

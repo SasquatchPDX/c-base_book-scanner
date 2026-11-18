@@ -70,6 +70,33 @@ def normalize_curves(value: Any, size: tuple[int, int]) -> list[list[list[float]
     return curves
 
 
+def _ordered_candidates(
+    candidates: list[tuple[float, list[list[float]]]],
+) -> list[list[list[float]]]:
+    """Discard isolated bad automatic tracks, without relaxing geometry validation.
+
+    Text rows preserve their vertical order across the page. Find the longest
+    such chain; coverage and fit residual only break equal-length ties. Manual
+    geometry never passes through this filter and remains strictly validated.
+    """
+    candidates.sort(key=lambda item: float(np.median(np.asarray(item[1])[:, 1])))
+    profiles = [np.asarray(curve)[:, 1] for _confidence, curve in candidates]
+    chains: list[tuple[list[int], float]] = []
+    for index, (confidence, _curve) in enumerate(candidates):
+        options = [([index], confidence)]
+        for previous in range(index):
+            if bool(np.all(profiles[index] - profiles[previous] >= 2)):
+                chain, score = chains[previous]
+                options.append((chain + [index], score + confidence))
+        chains.append(max(options, key=lambda item: (len(item[0]), item[1])))
+    if not chains:
+        return []
+    selected = max(chains, key=lambda item: (len(item[0]), item[1]))[0]
+    if len(selected) > MAX_CURVES:
+        selected = [selected[i] for i in np.linspace(0, len(selected) - 1, MAX_CURVES).astype(int)]
+    return [candidates[index][1] for index in selected]
+
+
 def detect_curves(source: Image.Image) -> list[list[list[float]]]:
     scale = min(1.0, DETECTION_EDGE / max(source.size))
     reduced = reduced_image(source, DETECTION_EDGE)
@@ -97,7 +124,7 @@ def detect_curves(source: Image.Image) -> list[list[list[float]]]:
         raise ValueError("no reliable text baselines found")
     spacing = float(np.median(np.diff(bands[seed])))
     tolerance = min(height * 0.035, spacing * 0.45)
-    curves: list[list[list[float]]] = []
+    candidates: list[tuple[float, list[list[float]]]] = []
     for y in bands[seed][: MAX_CURVES * 3]:
         observations = [(float(xs[seed]), y)]
         for direction in (-1, 1):
@@ -134,12 +161,13 @@ def detect_curves(source: Image.Image) -> list[list[list[float]]]:
         if any(
             float(np.median(np.abs(np.asarray(existing)[:, 1] - controls_y)))
             < max(3, source.height * 0.008)
-            for existing in curves
+            for _confidence, existing in candidates
         ):
             continue
-        curves.append(np.column_stack((controls_x, controls_y)).tolist())
-        if len(curves) >= MAX_CURVES:
-            break
+        coverage = float(np.ptp(points[keep, 0])) / width
+        confidence = coverage / (1 + float(np.median(residual[keep])))
+        candidates.append((confidence, np.column_stack((controls_x, controls_y)).tolist()))
+    curves = _ordered_candidates(candidates)
     if len(curves) < 3:
         raise ValueError("too few reliable curved baselines")
     return normalize_curves(curves, source.size)
