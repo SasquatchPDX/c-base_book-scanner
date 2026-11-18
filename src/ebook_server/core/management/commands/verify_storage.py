@@ -2,72 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
-
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 
-from ebook_server.storage import StorageBackend
-
-from ...models import CoverImage, FileVariant, ScanPageVersion, ScanTailorStageState
-from ...storage_registry import StorageConfigurationError, backend_for_location
-
-
-@dataclass(frozen=True)
-class ArtifactReference:
-    kind: str
-    record_id: str
-    storage_identifier: str
-    expected_sha256: str
-    backend: StorageBackend
-
-
-def artifact_references() -> Iterable[ArtifactReference]:
-    for variant in FileVariant.objects.select_related("storage_location").iterator():
-        yield ArtifactReference(
-            "file_variant",
-            str(variant.pk),
-            variant.storage_identifier,
-            variant.sha256,
-            backend_for_location(variant.storage_location),
-        )
-    for cover in CoverImage.objects.select_related("storage_location").iterator():
-        yield ArtifactReference(
-            "cover_image",
-            str(cover.pk),
-            cover.storage_identifier,
-            cover.sha256,
-            backend_for_location(cover.storage_location),
-        )
-    for version in ScanPageVersion.objects.select_related("storage_location").iterator():
-        yield ArtifactReference(
-            "scan_page_version",
-            str(version.pk),
-            version.storage_identifier,
-            version.checksum_sha256,
-            backend_for_location(version.storage_location),
-        )
-    states = ScanTailorStageState.objects.select_related(
-        "output_storage_location",
-        "preview_storage_location",
-    ).iterator()
-    for state in states:
-        if state.output_storage_location and state.output_storage_identifier:
-            yield ArtifactReference(
-                "stage_output",
-                str(state.pk),
-                state.output_storage_identifier,
-                state.output_sha256,
-                backend_for_location(state.output_storage_location),
-            )
-        if state.preview_storage_location and state.preview_storage_identifier:
-            yield ArtifactReference(
-                "stage_preview",
-                str(state.pk),
-                state.preview_storage_identifier,
-                "",
-                backend_for_location(state.preview_storage_location),
-            )
+from ...storage_inventory import artifact_references
+from ...storage_registry import StorageConfigurationError
 
 
 class Command(BaseCommand):

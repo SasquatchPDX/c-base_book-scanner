@@ -7,6 +7,7 @@ import os
 import shutil
 import struct
 import tempfile
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import ceil, hypot
@@ -3015,48 +3016,22 @@ def process_stage_job(job_id: str) -> None:
                 merged = dict(state.parameters or {})
                 merged.update(output_params)
                 state.parameters = merged
-            if _locked_if_current(state.id, started_revision) is None:
+            output_size = staged_output.stat().st_size
+            output_sha = _compute_sha256(staged_output)
+            if not _publish_stage_artifacts(
+                state,
+                started_revision,
+                storage,
+                storage_location,
+                staged_output,
+                staged_preview,
+                artifact_identifier,
+                preview_identifier,
+                output_size,
+                output_sha,
+            ):
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
-            storage.store(str(staged_output), artifact_identifier)
-            storage.store(str(staged_preview), preview_identifier)
-
-        artifact_path = storage.resolve_location(artifact_identifier)
-        output_size = artifact_path.stat().st_size
-        output_sha = _compute_sha256(artifact_path)
-
-        with transaction.atomic():
-            if _locked_if_current(state.id, started_revision) is None:
-                _supersede_stage_job(job, details, "stage edited while job was running")
-                return
-            state.output_storage_location = storage_location
-            state.preview_storage_location = storage_location
-            state.output_storage_identifier = artifact_identifier
-            state.preview_storage_identifier = preview_identifier
-            state.output_size_bytes = output_size
-            state.output_sha256 = output_sha
-            state.status = ScanTailorStageState.StageStatus.SUCCESS
-            state.finished_at = timezone.now()
-            state.last_error = ""
-            # Provenance: record the version of the implementation that actually ran,
-            # not whatever version was current when this state row was first created.
-            state.algorithm_version = _default_algorithm_version(state.stage, state.algorithm)
-            state.save(
-                update_fields=[
-                    "algorithm_version",
-                    "output_storage_location",
-                    "preview_storage_location",
-                    "output_storage_identifier",
-                    "preview_storage_identifier",
-                    "output_size_bytes",
-                    "output_sha256",
-                    "status",
-                    "finished_at",
-                    "last_error",
-                    "parameters",
-                    "updated_at",
-                ],
-            )
 
         job.state = ProcessingJob.JobState.SUCCESS
         job.finished_at = timezone.now()
@@ -3083,6 +3058,73 @@ def process_stage_job(job_id: str) -> None:
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc))
+
+
+def _publish_stage_artifacts(
+    state: ScanTailorStageState,
+    revision: int,
+    storage: LocalFilesystemStorage,
+    location: StorageLocation,
+    output: Path,
+    preview: Path,
+    output_identifier: str,
+    preview_identifier: str,
+    output_size: int,
+    output_sha: str,
+) -> bool:
+    """Copy privately, then promote under the same row lock used by retirement.
+
+    Slow I/O and hash verification stay outside the lock. A late worker never
+    recreates a final path after its revision was superseded or quarantined.
+    """
+    token = uuid.uuid4().hex
+    private_output = f"{_output_namespace(state)}/.{token}.output.partial"
+    private_preview = f"{_output_namespace(state)}/.{token}.preview.partial"
+    try:
+        storage.store_atomic(str(output), private_output)
+        storage.store_atomic(str(preview), private_preview)
+        if storage.hash(private_output) != output_sha or storage.hash(
+            private_preview
+        ) != _compute_sha256(preview):
+            raise RuntimeError("staged processing artifact checksum mismatch")
+        with transaction.atomic():
+            if _locked_if_current(state.id, revision) is None:
+                return False
+            storage.commit_staged(private_output, output_identifier)
+            storage.commit_staged(private_preview, preview_identifier)
+            state.output_storage_location = location
+            state.preview_storage_location = location
+            state.output_storage_identifier = output_identifier
+            state.preview_storage_identifier = preview_identifier
+            state.output_size_bytes = output_size
+            state.output_sha256 = output_sha
+            state.status = ScanTailorStageState.StageStatus.SUCCESS
+            state.finished_at = timezone.now()
+            state.last_error = ""
+            state.algorithm_version = _default_algorithm_version(state.stage, state.algorithm)
+            state.save(
+                update_fields=[
+                    "algorithm_version",
+                    "output_storage_location",
+                    "preview_storage_location",
+                    "output_storage_identifier",
+                    "preview_storage_identifier",
+                    "output_size_bytes",
+                    "output_sha256",
+                    "status",
+                    "finished_at",
+                    "last_error",
+                    "parameters",
+                    "updated_at",
+                ]
+            )
+        return True
+    finally:
+        for identifier in (private_output, private_preview):
+            try:
+                storage.discard_staged(identifier)
+            except OSError:
+                logger.warning("scantailor_private_cleanup_failed", stage_state_id=state.pk)
 
 
 def _locked_if_current(state_id: int, revision: int) -> ScanTailorStageState | None:
