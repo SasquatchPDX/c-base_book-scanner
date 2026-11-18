@@ -1471,16 +1471,18 @@ def write_upload_to_staging(uploaded_file: Any, staging_root: Path) -> tuple[str
         suffix=UPLOAD_STAGING_SUFFIX,
     ) as upload_temp:
         total = 0
-        for chunk in uploaded_file.chunks():
-            payload = chunk
-            if not isinstance(payload, bytes):
-                payload = payload.encode()
-            total += len(payload)
-            if total > MAX_UPLOAD_BYTES:
-                upload_temp.close()
-                Path(upload_temp.name).unlink(missing_ok=True)
-                raise ValidationError("upload exceeds configured size limit")
-            upload_temp.write(payload)
+        try:
+            for chunk in uploaded_file.chunks():
+                payload = chunk if isinstance(chunk, bytes) else chunk.encode()
+                total += len(payload)
+                if total > MAX_UPLOAD_BYTES:
+                    raise ValidationError("upload exceeds configured size limit")
+                upload_temp.write(payload)
+            upload_temp.flush()
+        except BaseException:
+            upload_temp.close()
+            Path(upload_temp.name).unlink(missing_ok=True)
+            raise
         staged_path = upload_temp.name
     return staged_path, total
 
