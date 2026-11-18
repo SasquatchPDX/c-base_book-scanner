@@ -90,7 +90,11 @@ def test_preview_with_current_token_is_immutable_and_others_revalidate() -> None
     # The first stage's input is the page's working image, tokenised by version.
     version = page.active_version()
     assert version is not None
-    first_input = client.get(f"{url}?input=true&v=page-{version.id}")
+    # The editor gets this token from the workspace payload; it names the generator.
+    workspace = client.get(f"/scan/jobs/{job.id}/workspace/").json()
+    work_token = workspace["pages"][0]["work_image_token"]
+    assert work_token.startswith(f"page-{version.id}-w")
+    first_input = client.get(f"{url}?input=true&v={work_token}")
     assert first_input["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
     # The next stage's input preview is this stage's preview, with its token.
     content_input = client.get(

@@ -1,14 +1,20 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   artifactToken,
   displayBoxToSource,
   editableParameters,
   curvatureCurvesForEditing,
+  INITIAL_PREVIEW_RETRY,
   initializeScanTailorWorkspace,
+  nextPreviewRetry,
   outputZonesForEditing,
   normalizeBox,
+  PREVIEW_RETRY_EXHAUSTED_MESSAGE,
+  PREVIEW_RETRY_MAX_ATTEMPTS,
   previewErrorMessage,
+  previewIsBeingPrepared,
+  previewRetryUrl,
   previousStageName,
   sourceBoxToDisplay,
   stageErrorText,
@@ -385,5 +391,173 @@ describe("artifact tokens (#195)", () => {
     expect(artifactToken({ status: "queued", revision: 4, output_sha256: sha })).toBe("");
     expect(artifactToken({ status: "success", revision: 4, output_sha256: "" })).toBe("");
     expect(artifactToken(undefined)).toBe("");
+  });
+});
+
+describe("preview retries while the page image is prepared (#195)", () => {
+  const pending = { status: 503, body: "input preview not ready" };
+
+  it("recognises only the server's being-prepared answer as retryable", () => {
+    expect(previewIsBeingPrepared(pending)).toBe(true);
+    expect(previewIsBeingPrepared({ status: 503, body: "storage unavailable" })).toBe(false);
+    expect(previewIsBeingPrepared({ status: 404, body: "input preview not ready" })).toBe(false);
+    expect(previewErrorMessage("deskew", pending)).toMatch(/appear automatically/);
+  });
+
+  it("backs off exponentially and gives up after about a minute", () => {
+    let state = INITIAL_PREVIEW_RETRY;
+    const delays: number[] = [];
+    for (;;) {
+      const retry = nextPreviewRetry(pending, state);
+      if (!retry) break;
+      delays.push(retry.delay);
+      state = retry.state;
+    }
+    expect(delays).toHaveLength(PREVIEW_RETRY_MAX_ATTEMPTS);
+    expect(delays.slice(0, 5)).toEqual([1000, 2000, 4000, 8000, 8000]);
+    const total = delays.reduce((sum, delay) => sum + delay, 0);
+    expect(total).toBeGreaterThanOrEqual(55_000);
+    expect(total).toBeLessThanOrEqual(70_000);
+  });
+
+  it("reloads at once, but only once, when the diagnostic request succeeds", () => {
+    const first = nextPreviewRetry({ status: 200, body: "" }, INITIAL_PREVIEW_RETRY);
+    expect(first).toEqual({ delay: 0, state: { attempts: 0, reloadedAfterOk: true } });
+    expect(nextPreviewRetry({ status: 200, body: "" }, first!.state)).toBeNull();
+  });
+
+  it("does not retry failures that will not fix themselves", () => {
+    for (const failure of [
+      { status: 404, body: "input preview not ready" },
+      { status: 404, body: "preview artifact missing" },
+      { status: 403, body: "" },
+      { status: null, body: "" },
+    ]) {
+      expect(nextPreviewRetry(failure, INITIAL_PREVIEW_RETRY)).toBeNull();
+    }
+  });
+
+  it("adds a cache-busting retry marker", () => {
+    expect(previewRetryUrl("/p/?input=true&revision=1-unknown", 2)).toBe(
+      "/p/?input=true&revision=1-unknown&retry=2",
+    );
+    expect(previewRetryUrl("/p/", 1)).toBe("/p/?retry=1");
+  });
+});
+
+describe("editor preview recovery (#195)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
+
+  const response = (status: number, body = "") => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
+  });
+
+  async function flush(): Promise<void> {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  }
+
+  function mountDeskew(): { host: HTMLElement; image: HTMLImageElement; message: HTMLElement } {
+    const state = {
+      id: 1,
+      stage: "deskew",
+      stage_label: "Deskew",
+      revision: 1,
+      status: "unknown",
+      parameters: {},
+    };
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button><button data-stage-open data-page-id="page" data-stage="deskew" data-input-preview-url="/preview/?input=true"></button></div>`;
+    const host = document.querySelector<HTMLElement>("#retry-host")!;
+    initializeScanTailorWorkspace(host);
+    return {
+      host,
+      image: host.querySelector<HTMLImageElement>("[data-editor-image]")!,
+      message: host.querySelector<HTMLElement>("[data-editor-message]")!,
+    };
+  }
+
+  it("keeps retrying a page image that is still queued and shows it when ready", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(response(503, "input preview not ready"))
+      .mockResolvedValueOnce(response(503, "input preview not ready"))
+      .mockResolvedValue(response(200));
+    vi.stubGlobal("fetch", fetcher);
+    const { image, message } = mountDeskew();
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+
+    image.dispatchEvent(new Event("error"));
+    await flush();
+    expect(message.textContent).toMatch(/still being prepared/);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+
+    image.dispatchEvent(new Event("error"));
+    await flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=2");
+
+    // Generation finished: this load succeeds and the stage status returns.
+    image.dispatchEvent(new Event("load"));
+    expect(message.textContent).toBe("Revision 1 · unknown");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads the image when the diagnostic request already succeeds", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200)));
+    const { image } = mountDeskew();
+
+    // The first GET raced the generation job; by the diagnostic GET it was done.
+    image.dispatchEvent(new Event("error"));
+    await flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+
+    // A response that is fine but undecodable is not reloaded forever.
+    image.dispatchEvent(new Event("error"));
+    await flush();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+  });
+
+  it("gives up after the retry budget with an explanation", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn().mockResolvedValue(response(503, "input preview not ready"));
+    vi.stubGlobal("fetch", fetcher);
+    const { image, message } = mountDeskew();
+
+    for (let attempt = 0; attempt <= PREVIEW_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      image.dispatchEvent(new Event("error"));
+      await flush();
+      await vi.advanceTimersByTimeAsync(8000);
+    }
+    expect(message.textContent).toBe(PREVIEW_RETRY_EXHAUSTED_MESSAGE);
+    expect(fetcher).toHaveBeenCalledTimes(PREVIEW_RETRY_MAX_ATTEMPTS + 1);
+    expect(image.getAttribute("src")).toContain(`retry=${PREVIEW_RETRY_MAX_ATTEMPTS}`);
+  });
+
+  it("stops retrying when the member opens another stage", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(503, "input preview not ready")));
+    const { host, image } = mountDeskew();
+    image.dispatchEvent(new Event("error"));
+    await flush();
+    // Showing the result mode (no result yet) keeps the same URL; switching the
+    // source clears the pending retry.
+    const trigger = host.querySelector<HTMLElement>("[data-stage-open]")!;
+    trigger.dataset.inputPreviewUrl = "/other/?input=true";
+    host.querySelector<HTMLButtonElement>("[data-preview-input]")!.click();
+    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
   });
 });

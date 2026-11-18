@@ -5,6 +5,15 @@ Stages now record a transform op and keep working-resolution artifacts instead o
 full-resolution images. Stages processed before this change have no op, so every
 stage that has been queued, run or failed is invalidated with a new revision (which
 also supersedes queued jobs) and re-runs once. Raw page versions are untouched.
+
+Only jobs that can still be processed are invalidated (``PROCESSING_STATES`` in
+``scan_lifecycle``). Finalizing, complete and cancelled jobs reject stage re-runs, so
+invalidating them would leave results that can never be produced again; their
+historical results stay as they are.
+
+No ``ScanPageImage`` rows are made here (that would decode every scan inside the
+migration). Existing pages get theirs on first use, or ahead of time with
+``manage.py backfill_scan_page_images``.
 """
 
 import django.db.models.deletion
@@ -13,13 +22,17 @@ from django.db.models import F
 from django.utils import timezone
 
 REASON = "pipeline redesign: stages now record transforms (#195 step 2); re-run"
+# scan_lifecycle.PROCESSING_STATES when this migration was written (frozen on purpose).
+PROCESSING_JOB_STATES = ("open", "capturing", "paused", "captured")
 
 
 def invalidate_processed_stages(apps, schema_editor):
     states = apps.get_model("core", "ScanTailorStageState").objects.using(
         schema_editor.connection.alias
     )
-    states.exclude(status__in=["unknown", "invalidated"]).update(
+    states.filter(scan_job__state__in=PROCESSING_JOB_STATES).exclude(
+        status__in=["unknown", "invalidated"]
+    ).update(
         status="invalidated",
         invalidated_reason=REASON,
         last_error="",

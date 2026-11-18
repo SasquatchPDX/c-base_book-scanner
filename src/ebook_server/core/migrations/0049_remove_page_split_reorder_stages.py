@@ -11,9 +11,17 @@ Data step, before the schema change:
 2. Relink every remaining stage state to its new predecessor. Deskew now reads the
    page's active version directly; Dewarping now reads Select Content and Margins
    reads Dewarping.
-3. Every stage that has been queued, run or failed is marked invalidated with a new
-   revision, because its input changed. Bumping the revision also supersedes any
-   worker job that is still queued for the old chain.
+3. On jobs that can still be processed, every stage that has been queued, run or
+   failed is marked invalidated with a new revision, because its input changed.
+   Bumping the revision also supersedes any worker job that is still queued for the
+   old chain.
+
+   Jobs in ``finalizing``, ``complete`` or ``cancelled`` keep their stage statuses,
+   revisions and outputs. The lifecycle refuses processing changes in those states,
+   so invalidating them would leave a finished job with results nobody can re-run;
+   their outputs are the history behind the published book. A later replacement page
+   reopens a complete job (``captured``, re-finish needed) and invalidates that page
+   as usual, and a re-finish keeps the other pages' recorded outputs.
 
 The reverse direction restores the ``capture_layout`` column (as ``single_page``)
 but cannot bring back deleted Page Split rows; stage rows are recreated on demand.
@@ -24,6 +32,8 @@ from django.db.models import F
 from django.utils import timezone
 
 STAGE_ORDER = ("deskew", "select_content", "dewarping", "margins", "output")
+# Scan job states whose stage results are kept as they are (see the module docstring).
+FINISHED_JOB_STATES = ("finalizing", "complete", "cancelled")
 REASON = "pipeline reordered: Page Split removed, Dewarping now before Margins (#195)"
 
 
@@ -78,7 +88,8 @@ def remove_page_split_and_relink(apps, schema_editor):
         batch_size=1000,
     )
 
-    states.exclude(status__in=["unknown", "invalidated"]).update(
+    reprocessable = states.exclude(scan_job__state__in=FINISHED_JOB_STATES)
+    reprocessable.exclude(status__in=["unknown", "invalidated"]).update(
         status="invalidated",
         invalidated_reason=REASON,
         last_error="",
@@ -87,7 +98,7 @@ def remove_page_split_and_relink(apps, schema_editor):
         updated_at=timezone.now(),
     )
     # Already-invalidated rows also get a new revision so no stale job can publish.
-    states.filter(status="invalidated").exclude(invalidated_reason=REASON).update(
+    reprocessable.filter(status="invalidated").exclude(invalidated_reason=REASON).update(
         revision=F("revision") + 1,
         updated_at=timezone.now(),
     )

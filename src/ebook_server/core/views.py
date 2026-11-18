@@ -37,7 +37,6 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
-from ebook_server.jobs import enqueue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -876,16 +875,35 @@ def _version_page_image(version: ScanPageVersion | None) -> ScanPageImage | None
         return None
 
 
-def _page_work_identifier(page: ScanPage) -> tuple[str, str]:
-    """Working image of the active version and its token; queues it when missing."""
+def _work_image_token(version: ScanPageVersion, page_image: ScanPageImage) -> str:
+    """Token of a version's working image; it changes if the image is regenerated."""
+    generator = _THUMBNAIL_TOKEN_UNSAFE.sub("_", page_image.generator_version)
+    return f"page-{version.id}-w{generator}"
+
+
+# Seconds the editor should wait before asking again for a working image being generated.
+PAGE_IMAGE_RETRY_AFTER_SECONDS = 2
+
+
+def _page_work_identifier(page: ScanPage) -> tuple[str, str] | None:
+    """Working image of the page's active version and its token.
+
+    Returns ``("", "")`` when the page has no version, and ``None`` while the
+    working image is still being generated: pages uploaded before migration 0050, or
+    a new upload whose generation job has not run yet. The request never decodes the
+    scan itself; it queues the (deduplicated) background job and looks again,
+    because an inline queue, or a fast worker, may already have finished it.
+    """
     version = page.active_version()
     if version is None:
         return "", ""
     page_image = ScanPageImage.objects.filter(version=version).first()
     if page_image is None:
-        enqueue(scan_images.generate_page_image_job, version.pk)
-        return "", ""
-    return page_image.work_storage_identifier, f"page-{version.id}"
+        scan_images.request_page_image(version.pk)
+        page_image = ScanPageImage.objects.filter(version=version).first()
+    if page_image is None:
+        return None
+    return page_image.work_storage_identifier, _work_image_token(version, page_image)
 
 
 def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
@@ -1077,12 +1095,14 @@ def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
         page_states = states_by_page.get(page.id, {})
         active_version = _prefetched_active_version(versions)
         if active_version is not None:
+            page_image = _version_page_image(active_version)
             # Tokenised from rows already loaded: no extra queries per page.
             payload["thumbnail"] = _scan_page_thumbnail_url(
-                page,
-                _page_thumbnail_token(
-                    page_states, active_version, _version_page_image(active_version)
-                ),
+                page, _page_thumbnail_token(page_states, active_version, page_image)
+            )
+            # The first stage's input preview token; empty while it is being generated.
+            payload["work_image_token"] = (
+                _work_image_token(active_version, page_image) if page_image is not None else ""
             )
         payload["stages"] = [
             _serialize_stage_state(page_states[stage])
@@ -1666,7 +1686,14 @@ def scan_page_stage_preview(
         token = _stage_artifact_token(state.input_stage_state)
     elif wants_input:
         # The first stage edits the page's working image (#195), never the raw scan.
-        identifier, token = _page_work_identifier(state.scan_page)
+        work = _page_work_identifier(state.scan_page)
+        if work is None:
+            # Being generated: a distinct, retryable answer the editor polls on.
+            pending = HttpResponse("input preview not ready", status=503, content_type="text/plain")
+            pending["Retry-After"] = str(PAGE_IMAGE_RETRY_AFTER_SECONDS)
+            pending["Cache-Control"] = "no-store"
+            return pending
+        identifier, token = work
     else:
         identifier = state.preview_storage_identifier or state.output_storage_identifier
         token = _stage_artifact_token(state)
