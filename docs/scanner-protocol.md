@@ -202,6 +202,21 @@ keyed by scan job, because the job may still be unidentified and stages are re-r
 
 ## Storage and resilience
 
+The infrastructure browser suite exercises a simulated device against the running
+scanner API, then signs in as a member through the portal. It drops an upload
+acknowledgement after the server commits, retries the upload, sends a cover,
+OPF and events, and checks the completion manifest. After the member finishes
+the raw scan, the test claims a rescan, uploads the replacement twice, checks
+both immutable version checksums and downloads the re-finished PDF.
+Run `scripts/run_infrastructure_tests.sh` for this scenario.
+
+The physical scanner acceptance run for #169 remains outstanding. Use a
+disposable scan on the approved staging deployment. Record the scanner firmware,
+server commit, opaque job ID, first and replacement checksums, completion response
+and downloaded PDF checksum. Keep the local captures until the scanner receives
+a successful completion response with `verified: true`. A successful page
+upload alone cannot authorize local deletion.
+
 - Scanner sends raw image artifacts; server stores immutable upload.
 - Replacements create new page version and mark previous version inactive.
 - Source deletion by scanner is decoupled; pipeline policy handles source cleanup.
