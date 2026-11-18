@@ -1805,6 +1805,7 @@ For terminal conversion, OCR and scan-finalization jobs that predate migration
 add `--apply` to create missing reviews. Each invocation examines at most 100
 jobs (`--limit 1..1000`); `--after-pk` accepts the printed continuation cursor.
 Repeating a batch does not reopen acknowledged tasks or create duplicate tasks,
-and does not rerun jobs or alter archives. Migration 0048 is explicitly
-irreversible because the prior schema cannot retain processing-job reviews;
-restore a pre-migration database snapshot if a schema rollback is required.
+and does not rerun jobs or alter archives. Migration 0048 can roll back before any recovery history exists. Once reviews
+exist, it refuses rollback before changing the schema because the old schema
+cannot retain processing-job reviews; restore a pre-migration database snapshot
+if a schema rollback is required.
