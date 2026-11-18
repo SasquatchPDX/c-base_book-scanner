@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import dj_database_url
 import django_stubs_ext
 import structlog
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -155,6 +155,12 @@ class Settings(BaseSettings):
     ocr_submit_timeout: float | None = None
     ocr_job_timeout_seconds: int | None = None
     converter_timeout_seconds: int | None = None
+    converter_max_diagnostic_bytes: int = Field(default=1024 * 1024, gt=0)
+    converter_max_output_bytes: int = Field(default=1024**3, gt=0)
+    converter_max_scratch_bytes: int = Field(default=4 * 1024**3, gt=0)
+    converter_address_space_bytes: int | None = Field(default=None, gt=0)
+    # Optional quota-backed local scratch filesystem; must already exist.
+    converter_scratch_root: str = ""
     # Local LLM as an identification signal (#26). Off by default; see
     # docs/metadata-providers.md.
     # The service must be a loopback/private address or listed in llm_allowed_hosts.
@@ -470,6 +476,11 @@ BOOK_SCANNER_OCR_POLL_INTERVAL_MAX_SECONDS = settings.ocr_poll_interval_max_seco
 BOOK_SCANNER_OCR_SUBMIT_TIMEOUT = settings.ocr_submit_timeout
 BOOK_SCANNER_OCR_JOB_TIMEOUT_SECONDS = settings.ocr_job_timeout_seconds
 BOOK_SCANNER_CONVERTER_TIMEOUT_SECONDS = settings.converter_timeout_seconds
+BOOK_SCANNER_CONVERTER_MAX_DIAGNOSTIC_BYTES = settings.converter_max_diagnostic_bytes
+BOOK_SCANNER_CONVERTER_MAX_OUTPUT_BYTES = settings.converter_max_output_bytes
+BOOK_SCANNER_CONVERTER_MAX_SCRATCH_BYTES = settings.converter_max_scratch_bytes
+BOOK_SCANNER_CONVERTER_ADDRESS_SPACE_BYTES = settings.converter_address_space_bytes
+BOOK_SCANNER_CONVERTER_SCRATCH_ROOT = settings.converter_scratch_root
 BOOK_SCANNER_LLM_ENABLED = settings.llm_enabled
 BOOK_SCANNER_LLM_SERVICE_URL = settings.llm_service_url
 BOOK_SCANNER_LLM_MODEL = settings.llm_model

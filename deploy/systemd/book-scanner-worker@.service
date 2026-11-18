@@ -30,6 +30,12 @@ TimeoutStopSec=120
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# Per-worker cgroup ceilings, including the RQ work horse and tool descendants.
+# Size for the site's largest accepted books; see docs/operations.md.
+MemoryHigh=4G
+MemoryMax=6G
+TasksMax=128
+CPUQuota=200%
 
 [Install]
 WantedBy=multi-user.target

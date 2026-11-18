@@ -24,6 +24,15 @@ section so they never start against an unmounted path. Adjust or remove the
 `postgresql.service` / `redis-server.service` ordering when those services run
 on other hosts.
 
+The worker template also bounds its whole cgroup: memory pressure begins at 4 GiB,
+the hard memory ceiling is 6 GiB, at most 128 tasks may run, and CPU is limited to
+two cores' worth of time. These ceilings include all RQ work horses and converter
+descendants, and affect other jobs assigned to the instance too. Tune them with a
+systemd override for the site's accepted workload. Converter-specific byte limits
+and an optional existing quota-backed local scratch root are configured in `.env`;
+see "Workers and external tools" in `docs/operations.md`. The application samples
+aggregate scratch growth; a filesystem quota supplies the strict disk boundary.
+
 Install and start:
 
 ```bash
