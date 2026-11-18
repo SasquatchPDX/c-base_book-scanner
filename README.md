@@ -139,15 +139,13 @@ authoritative feature requirements.
 
 ## Current maturity
 
-The repository has broad automated coverage of the API and processing services,
-but the sprint-completion table should not be treated as a production-readiness
-certificate. Remaining requirement gaps and verification evidence are tracked in
-[docs/requirements-audit.md](docs/requirements-audit.md).
+The digital library has CI coverage for LDAP login, upload, bibliographic review,
+search, conversion and authenticated download. Release acceptance on the hackerspace
+mount and services is tracked in [#162](https://github.com/SasquatchPDX/c-base_book-scanner/issues/162).
+The physical-book workflow has a separate milestone. The browser pipeline uses
+synthetic scans and an OCR fixture. A device-to-download run on the scanner and
+an accuracy run on the AI server remain open.
 
-[Sprint019](Sprint019.md) is the active correction sprint;
-[Sprint020](Sprint020.md) is planned development. Current corrections cover strict
-metadata review, persisted intake phases, backend-aware duplicate verification,
-and streamed scan/OCR artifacts with preserved output versions. Provider/scoring,
-OCR provenance/polling, concurrency, converter limits, and unattended-import
-corrections remain open. The audit records the distinction between implemented
-behavior, deferred algorithms, and deployment acceptance.
+See the [release evidence table](docs/sprint_progress.md#release-evidence) for
+the tested revision, outstanding checks and links to the owning issues.
+[Sprint019](Sprint019.md) and [Sprint020](Sprint020.md) describe the requirements.

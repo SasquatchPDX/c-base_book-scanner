@@ -8,11 +8,24 @@ This file tracks execution status while advancing Sprint documents in order.
 > pipeline, observability, and integration gaps, are in
 > `docs/requirements-audit.md`.
 
-## Current snapshot
+## Release evidence
 
-Sprint019 is the active correction sprint and remains in progress. Sprint020 is
-planned work whose prerequisite corrections are not yet complete; its descriptions
-of Sprint019 outcomes are planning assumptions, not evidence of completion.
+As of 18 November 2026, both CI jobs passed at `c83bf73`. The digital-library
+and physical-book milestones have separate site acceptance checks. [CI run](https://github.com/SasquatchPDX/c-base_book-scanner/actions/runs/44278353270)
+
+| Capability | Evidence in the repository | Outstanding acceptance |
+| --- | --- | --- |
+| Digital intake and review | CI exercises LDAP login, member upload, review, search, conversion and download. [Browser journey](../tests/browser/digital-library.spec.ts) | Record site LDAP, COPY/MOVE, mount-failure recovery and alert delivery. [#162](https://github.com/SasquatchPDX/c-base_book-scanner/issues/162) |
+| Search and conversion workers | CI exercises PostgreSQL reassignment and rollback, concurrent conversion delivery and stale-worker takeover. [Search tests](../tests/integration/test_search_reassignment_postgres.py) · [Conversion tests](../tests/integration/test_conversion_concurrency.py) | Measure search latency during intake on 150,000 books. [#167](https://github.com/SasquatchPDX/c-base_book-scanner/issues/167) |
+| Scanner and portal | Single-key authentication, scanner-assigned job IDs, event logging and rescan support are implemented. CI exercises concurrent portal edits and a synthetic scan-to-library journey. [Device protocol](scanner-protocol.md) · [Browser tests](../tests/browser/scantailor-concurrency.spec.ts) | Run a device-originated job through re-finish and download on the actual scanner. [#169](https://github.com/SasquatchPDX/c-base_book-scanner/issues/169) |
+| ScanTailor and OCR | Workers process split, deskew, crop, margins, perspective and output. CI uses an OCR contract fixture. [Processing behavior](scantailor-web.md) · [OCR fixture](../tests/browser_fixtures.py) | Validate bound-page curvature, automatic picture zoning and recognition quality on representative pages. [#171](https://github.com/SasquatchPDX/c-base_book-scanner/issues/171) · [#172](https://github.com/SasquatchPDX/c-base_book-scanner/issues/172) · [#170](https://github.com/SasquatchPDX/c-base_book-scanner/issues/170) |
+
+## Historical sprint record
+
+The table below records the implementation passes. Later PRs also delivered individual
+Sprint020 requirements, including the [ranked search backend](https://github.com/SasquatchPDX/c-base_book-scanner/pull/116),
+[browse and thumbnail work](https://github.com/SasquatchPDX/c-base_book-scanner/pull/121) and [scanner authentication](https://github.com/SasquatchPDX/c-base_book-scanner/pull/135).
+Sprint-wide acceptance remains open.
 
 | Sprint | Status | Implementation evidence |
 | --- | --- | --- |
@@ -35,7 +48,7 @@ of Sprint019 outcomes are planning assumptions, not evidence of completion.
 | 017 | Partial | Output modes and manual zones exist; `fox` is Niblack, `wolf` is approximate, and automatic segmentation is outstanding |
 | 018 | Implemented | Added durable queued scan identification/review and finalization, processed-page safeguards, OCR + conversion chain coverage, pipeline status, downstream invalidation, and production-shaped Chromium acceptance for the synthetic physical-book flow |
 | 019 | In progress | A and F implemented; L covers backend-aware duplicate verification and streamed scan/OCR artifacts, including preservation of repeated OCR filenames; documentation reconciliation is partial. See the requirements audit for open work |
-| 020 | Planned | Deferred algorithms, taxonomy/search, artifact retention, device identity, abuse controls, and other explicitly scoped development |
+| 020 | Partially implemented | Deferred algorithms, taxonomy/search, artifact retention, device identity, abuse controls, and other explicitly scoped development |
 
 ## Sprint evidence checklist (as of 2026-08-10)
 
