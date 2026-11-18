@@ -315,6 +315,7 @@ def test_import_with_ambiguous_tie_goes_to_review(
 # --- Tie eligibility keeps the edition/identifier constraints (review of #94) -----
 
 CONFLICTING_ISBN13 = "9780451524935"
+CONFLICTING_ISBN13_2 = "9780140283297"
 # The reviewer's probe: the file's ISBN, title, author, language, publisher, description.
 RING_OF_FIRE_FILE = _evidence(
     isbns=[ISBN13], language="en", publisher="baen", description="An alternate history"
@@ -424,10 +425,53 @@ def test_same_title_and_authors_with_disjoint_isbns_are_different_editions() -> 
     assert not identification.candidates_describe_same_book(english, german)
 
 
-def test_tied_editions_with_disjoint_isbns_go_to_review_without_file_isbn() -> None:
+def test_tied_editions_without_file_isbn_accept_the_work_only() -> None:
+    # Two editions of one work fit a file that names no ISBN: the work is identified,
+    # its edition is not. It is accepted without either edition's ISBN.
     candidates = [
         _candidate("a", authors=["Eric Flint"], isbn13=ISBN13),
         _candidate("b", authors=["Eric Flint"], isbn13=CONFLICTING_ISBN13),
+    ]
+
+    decision = intake.decide_auto_accept(candidates, ["Eric Flint"], file_evidence=NO_FILE_EVIDENCE)
+
+    assert decision.candidate is not None
+    assert decision.candidate.title == "Ring of Fire"
+    assert decision.candidate.isbn13 is None
+    assert decision.blocked_reason is None
+    assert decision.tie_break is None  # the top record was picked, only stripped
+
+
+def test_tied_translations_without_file_language_drop_the_language() -> None:
+    candidates = [
+        dataclasses.replace(_candidate("a", authors=["Eric Flint"]), language="eng"),
+        dataclasses.replace(_candidate("b", authors=["Eric Flint"]), language="ger"),
+    ]
+
+    decision = intake.decide_auto_accept(candidates, ["Eric Flint"], file_evidence=NO_FILE_EVIDENCE)
+
+    assert decision.candidate is not None
+    assert decision.candidate.language is None
+
+
+def test_tied_editions_with_a_file_isbn_still_go_to_review() -> None:
+    # With a file ISBN the edition is knowable; the existing edition checks decide.
+    candidates = [
+        _candidate("a", authors=["Eric Flint"], isbn13=CONFLICTING_ISBN13),
+        _candidate("b", authors=["Eric Flint"], isbn13=CONFLICTING_ISBN13_2),
+    ]
+
+    decision = intake.decide_auto_accept(
+        candidates, ["Eric Flint"], file_evidence=_evidence(isbns=[ISBN13])
+    )
+
+    assert decision.candidate is None
+
+
+def test_tied_different_books_without_file_isbn_still_go_to_review() -> None:
+    candidates = [
+        _candidate("a", authors=["Eric Flint"], title="Ring of Fire", isbn13=ISBN13),
+        _candidate("b", authors=["Eric Flint"], title="Ring of Fire II", isbn13=CONFLICTING_ISBN13),
     ]
 
     decision = intake.decide_auto_accept(candidates, ["Eric Flint"], file_evidence=NO_FILE_EVIDENCE)
@@ -491,3 +535,65 @@ def test_probe_import_does_not_accept_tied_conflicting_isbn(
         MetadataCandidate.CandidateState.REVIEW
     }
     assert not Book.objects.exists()
+
+
+# --- Same work: volumes, subtitles and surname-only credits (review of #150) -------
+
+
+def _with_subtitle(
+    candidate: identification.IdentificationCandidate, subtitle: str
+) -> identification.IdentificationCandidate:
+    return dataclasses.replace(candidate, description=subtitle, raw={"subtitle": subtitle})
+
+
+def test_tied_volumes_of_one_title_go_to_review_without_file_isbn() -> None:
+    candidates = [
+        _with_subtitle(
+            _candidate("a", authors=["Ralph Waldo Emerson"], title="Essays"), "First Series"
+        ),
+        _with_subtitle(
+            _candidate("b", authors=["Ralph Waldo Emerson"], title="Essays"), "Second Series"
+        ),
+    ]
+
+    assert not identification.candidates_describe_same_work(*candidates)
+    assert not identification.candidates_describe_same_book(*candidates)
+    decision = intake.decide_auto_accept(
+        candidates, ["Ralph Waldo Emerson"], file_evidence=NO_FILE_EVIDENCE
+    )
+
+    assert decision.candidate is None
+    assert decision.blocked_reason == intake.BLOCK_AMBIGUOUS_TIE
+
+
+def test_tied_editions_drop_the_subtitle_from_the_work() -> None:
+    # One edition's subtitle is not the work's: the accepted work carries none.
+    candidates = [
+        _with_subtitle(_candidate("a", authors=["Eric Flint"], isbn13=ISBN13), "Assiti Shards"),
+        _with_subtitle(
+            _candidate("b", authors=["Eric Flint"], isbn13=CONFLICTING_ISBN13), "Assiti Shards"
+        ),
+    ]
+
+    decision = intake.decide_auto_accept(candidates, ["Eric Flint"], file_evidence=NO_FILE_EVIDENCE)
+
+    assert decision.candidate is not None
+    assert decision.candidate.isbn13 is None
+    assert decision.candidate.description is None
+
+
+def test_surname_only_credit_does_not_link_two_people() -> None:
+    herbert = _candidate("a", authors=["Herbert"], title="Dune")
+    brian = _candidate("b", authors=["Brian Herbert"], title="Dune")
+    frank = _candidate("c", authors=["Frank Herbert"], title="Dune")
+    frank_variant = _candidate("d", authors=["Herbert, Frank"], title="Dune")
+
+    assert not identification.candidates_describe_same_work(herbert, brian)
+    assert not identification.candidates_describe_same_work(frank, brian)
+    assert identification.candidates_describe_same_work(frank, frank_variant)
+    decision = intake.decide_auto_accept(
+        [herbert, brian], ["Herbert"], file_evidence=NO_FILE_EVIDENCE
+    )
+
+    assert decision.candidate is None
+    assert decision.blocked_reason == intake.BLOCK_AMBIGUOUS_TIE
