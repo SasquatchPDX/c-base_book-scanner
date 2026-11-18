@@ -705,9 +705,12 @@ def _on_book_child_changed(sender: type[Any], instance: Any, **kwargs: Any) -> N
     schedule_reindex([instance.book_id])
 
 
-def _on_scan_job_saved(sender: type[ScanJob], instance: ScanJob, **kwargs: Any) -> None:
-    # A scan job's state decides whether its book is in the library (#127).
-    schedule_reindex([instance.book_id])
+def _on_book_child_saved(sender: type[Any], instance: Any, **kwargs: Any) -> None:
+    # BookLinkedRecord.save reads this under the same row lock as the UPDATE.
+    previous = instance.__dict__.pop("_search_previous_book_id", None)
+    # Schedule only after the write, so autocommit indexing sees the new owner.
+    # on_commit also keeps rolled-back moves out of the search index.
+    schedule_reindex([previous, instance.book_id])
 
 
 def connect_signals() -> None:
@@ -735,11 +738,10 @@ def connect_signals() -> None:
         )
     # `BookGenre` is the explicit genre link model (#50): `genres.assign_*` and the
     # admin inline create, re-source and delete its rows directly, without m2m_changed.
-    post_save.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-save-ScanJob")
-    post_delete.connect(_on_scan_job_saved, sender=ScanJob, dispatch_uid=f"{uid}-delete-ScanJob")
-    for child in (FileVariant, Identifier, CoverImage, BookGenre):
+    # ScanJob's nullable book link controls library visibility as well (#127).
+    for child in (FileVariant, Identifier, CoverImage, BookGenre, ScanJob):
         post_save.connect(
-            _on_book_child_changed, sender=child, dispatch_uid=f"{uid}-save-{child.__name__}"
+            _on_book_child_saved, sender=child, dispatch_uid=f"{uid}-save-{child.__name__}"
         )
         post_delete.connect(
             _on_book_child_changed, sender=child, dispatch_uid=f"{uid}-delete-{child.__name__}"

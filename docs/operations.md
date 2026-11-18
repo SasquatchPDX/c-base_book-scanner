@@ -1540,7 +1540,15 @@ uv run python manage.py verify_search_index --fix
 
 Queryset `.update()` and `bulk_*` writes send no model signals; code that changes
 indexed data that way calls `search.schedule_reindex` *after* the write. The
-verifier rebuilds a sample of rows in memory and compares every column, the
+normal ORM save path remembers the previous book of an identifier, variant, cover,
+genre link or scan job before saving, then reindexes both the former and current
+books after commit. Parent-changing saves lock the child row until the save
+commits, so overlapping moves also refresh any intermediate book. Explicit saves
+of unrelated fields avoid the parent lookup. Repeated moves within a transaction
+coalesce; rolling back a move leaves the committed search rows unchanged.
+Bulk reassignment callers must
+likewise include both former and new book IDs when scheduling a refresh.
+The verifier rebuilds a sample of rows in memory and compares every column, the
 facets and a SHA-256 digest of the weighted full-text input (so a changed
 description or publisher is caught), and on PostgreSQL also the stored
 `tsvector` itself; use `--sample` larger than the library to check every row.
