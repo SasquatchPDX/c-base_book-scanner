@@ -25,6 +25,7 @@ from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
+from . import curvature
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -215,7 +216,9 @@ def _default_algorithm(stage: str) -> str:
     return DEFAULT_STAGE_ALGORITHM.get(stage, "copy")
 
 
-def _default_algorithm_version(stage: str) -> str:
+def _default_algorithm_version(stage: str, algorithm: str | None = None) -> str:
+    if stage == "dewarping" and algorithm == "baseline_curvature":
+        return curvature.VERSION
     return DEFAULT_STAGE_ALGORITHM_VERSION.get(stage, "placeholder-v1")
 
 
@@ -2037,6 +2040,10 @@ DEWARP_RESULT_KEYS: Final[tuple[str, ...]] = (
     "dewarp_correction",
     "dewarp_warning",
     "dewarp_error",
+    "curvature_curves",
+    "curvature_padding",
+    "curvature_max_displacement",
+    "curvature_model_version",
 )
 
 
@@ -2051,7 +2058,9 @@ def _dewarp_result(applied: str, **fields: Any) -> dict[str, Any]:
     result: dict[str, Any] = dict.fromkeys(DEWARP_RESULT_KEYS)
     result.update(fields)
     result["dewarp_applied"] = applied
-    result["algorithm"] = "copy" if applied == "passthrough" else "projective_dewarp"
+    result["algorithm"] = {"passthrough": "copy", "curvature": "baseline_curvature"}.get(
+        applied, "projective_dewarp"
+    )
     return result
 
 
@@ -2183,12 +2192,64 @@ def _run_perspective_dewarp(
         )
 
 
+def _run_curvature_dewarp(
+    state: ScanTailorStageState,
+    source_path: Path,
+    output_path: Path,
+    preview_path: Path,
+) -> dict[str, Any]:
+    parameters = dict(state.parameters or {})
+    mode = str(parameters.get("dewarp_mode", "auto")).strip().lower()
+    if mode not in {"auto", "manual", "bypass"}:
+        mode = "auto"
+    if mode == "bypass":
+        return _dewarp_passthrough(
+            source_path, output_path, preview_path, dewarp_mode="bypass", dewarp_model="curvature"
+        )
+    source = _load_image(source_path)
+    try:
+        if cv2 is None or np is None:
+            raise RuntimeError("curvature library unavailable")
+        curves = (
+            curvature.normalize_curves(parameters.get("dewarp_curves"), source.size)
+            if mode == "manual"
+            else curvature.detect_curves(source)
+        )
+        output, geometry = curvature.render(source, curves, _paper_fill(source))
+        metadata = dict(
+            dewarp_mode=mode,
+            dewarp_model="curvature",
+            curvature_curves=curves,
+            curvature_model_version=curvature.VERSION,
+            dewarp_warning="",
+            **geometry,
+        )
+        if geometry["dewarp_correction"] == "none_needed":
+            return _dewarp_passthrough(source_path, output_path, preview_path, **metadata)
+        _save_png(output, output_path, _dpi_of(source))
+        _save_preview(output, preview_path)
+        return _dewarp_result("curvature", **metadata)
+    except Exception as exc:
+        return _dewarp_passthrough(
+            source_path,
+            output_path,
+            preview_path,
+            dewarp_model="curvature",
+            dewarp_mode=mode,
+            dewarp_warning=f"Curvature correction was not applied: {exc}",
+            dewarp_correction="curvature_fallback",
+            curvature_model_version=curvature.VERSION,
+        )
+
+
 def _run_dewarping(
     state: ScanTailorStageState,
     source_path: Path,
     output_path: Path,
     preview_path: Path,
 ) -> dict[str, Any]:
+    if (state.parameters or {}).get("dewarp_model") == "curvature":
+        return _run_curvature_dewarp(state, source_path, output_path, preview_path)
     return _run_perspective_dewarp(
         state,
         source_path,
@@ -2536,6 +2597,7 @@ _STAGE_RUNNERS: dict[
         "copy_detect": _run_margins,
     },
     ScanTailorStageState.Stage.DEWARPING.value: {
+        "baseline_curvature": _run_curvature_dewarp,
         "projective_dewarp": _run_dewarping,
         "copy": _run_dewarping,
         "copy_detect": _run_dewarping,
@@ -2610,7 +2672,16 @@ def request_stage_job(
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
-    algorithm_version = state.algorithm_version or _default_algorithm_version(state.stage)
+    if state.stage == "dewarping" and str((state.parameters or {}).get("dewarp_model")) in {
+        "curvature",
+        "perspective",
+    }:
+        algorithm = (
+            "baseline_curvature"
+            if state.parameters["dewarp_model"] == "curvature"
+            else "projective_dewarp"
+        )
+    algorithm_version = _default_algorithm_version(state.stage, algorithm)
     now = timezone.now()
     claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(
         worker_job_id=str(job.job_id),
@@ -2916,7 +2987,7 @@ def process_stage_job(job_id: str) -> None:
             state.last_error = ""
             # Provenance: record the version of the implementation that actually ran,
             # not whatever version was current when this state row was first created.
-            state.algorithm_version = _default_algorithm_version(state.stage)
+            state.algorithm_version = _default_algorithm_version(state.stage, state.algorithm)
             state.save(
                 update_fields=[
                     "algorithm_version",
