@@ -461,6 +461,7 @@ def finalization_job_payload(job: ProcessingJob) -> dict[str, Any]:
         "state": job.state,
         "scan_job_id": details.get("scan_job_id"),
         "cleaned_variant_id": details.get("cleaned_variant_id"),
+        "allow_raw_pages": details.get("allow_raw_pages"),
         "ocr_job_id": details.get("ocr_job_id"),
         "attempt_count": details.get("attempt_count", 0),
         "error": details.get("error", ""),

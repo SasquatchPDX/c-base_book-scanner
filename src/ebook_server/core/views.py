@@ -15,7 +15,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Final, cast
 from urllib.parse import urlencode
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import redis
 import structlog
@@ -49,7 +49,6 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 
-from ebook_server.jobs import enqueue
 from ebook_server.storage import (
     LocalFilesystemStorage,
     StorageBackend,
@@ -66,7 +65,6 @@ from . import (
     conversion,
     genres,
     intake,
-    intake_progress,
     library_visibility,
     llm,
     llm_identification,
@@ -99,7 +97,6 @@ from .models import (
     CoverThumbnail,
     FileVariant,
     Genre,
-    ImportJob,
     LLMSuggestion,
     MetadataCandidate,
     MetadataSearch,
@@ -117,6 +114,20 @@ from .models import (
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .scan_job_ids import normalize_scan_job_id
 from .storage_registry import StorageConfigurationError, backend_for_location
+from .view_helpers import (
+    _active_library_profile,
+    _as_positive_int,
+    _cleanup_staged_upload,
+    _coerce_bool,
+    _coerce_int,
+    _coerce_optional_bool,
+    _coerce_uuid,
+    _json_body,
+    _limited_response,
+    _profile_for_request,
+    _request_payload,
+    _wants_html,
+)
 from .workspace_events import WorkspaceEventPoller
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
@@ -158,17 +169,6 @@ def library_login(request: HttpRequest) -> HttpResponseBase:
         {"next": next_url, "error": error},
         status=401 if error else 200,
     )
-
-
-def _limited_response(kind: str, error: request_limits.RequestLimited) -> HttpResponse:
-    request_limits.record_rejection(kind)
-    response = HttpResponse(
-        f"Too many requests. Try again in {error.retry_after} seconds.",
-        status=429,
-        content_type="text/plain; charset=utf-8",
-    )
-    response["Retry-After"] = str(error.retry_after)
-    return response
 
 
 @require_POST
@@ -476,53 +476,6 @@ def _coerce_str_or_none(value: Any) -> str | None:
     return str(value).strip() or None
 
 
-def _coerce_int(value: Any, *, minimum: int = 0) -> int | None:
-    try:
-        parsed = int(str(value))
-    except (TypeError, ValueError):
-        return None
-    if parsed < minimum:
-        return None
-    return parsed
-
-
-def _coerce_uuid(value: Any) -> UUID | None:
-    if isinstance(value, UUID):
-        return value
-    if value is None:
-        return None
-    if isinstance(value, str):
-        candidate = value.strip()
-    else:
-        candidate = str(value)
-    try:
-        return UUID(candidate)
-    except (TypeError, ValueError, AttributeError):
-        return None
-
-
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    text = str(value).strip().lower()
-    return text in {"1", "true", "t", "yes", "y", "on"}
-
-
-def _coerce_optional_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    return default
-
-
 def _coerce_optional_int_list(value: Any) -> list[int] | None:
     if value is None:
         return None
@@ -596,10 +549,6 @@ def _scan_todos_for_query(request: HttpRequest) -> tuple[Any, str]:
             return None, "invalid scan_page_id"
         queryset = queryset.filter(scan_page_id=page_id)
     return queryset, ""
-
-
-def _cleanup_staged_upload(path: str) -> None:
-    Path(path).unlink(missing_ok=True)
 
 
 _SCAN_IMAGE_FORMATS: Final[dict[str, tuple[str, str]]] = {
@@ -994,13 +943,6 @@ def _stage_scan_page_from_existing_version(page: ScanPage) -> tuple[str, int]:
     return staged_path, size_bytes
 
 
-def _active_library_profile(request: HttpRequest) -> AppUserProfile | None:
-    profile = _profile_for_request(request)
-    if profile is None or profile.is_disabled:
-        return None
-    return profile
-
-
 @dataclass(frozen=True)
 class DependencyResult:
     name: str
@@ -1069,40 +1011,6 @@ def _check_queue() -> DependencyResult:
         return DependencyResult(name="queue", status="ok")
     except Exception as exc:  # pragma: no cover - infrastructure-specific failures
         return DependencyResult(name="queue", status="down", details={"error": str(exc)})
-
-
-def _profile_for_request(request: HttpRequest) -> AppUserProfile | None:
-    if not request.user.is_authenticated:
-        return None
-    try:
-        return request.user.library_profile
-    except AppUserProfile.DoesNotExist:
-        return None
-
-
-def _json_body(request: HttpRequest) -> dict[str, Any]:
-    if not request.body:
-        return {}
-    try:
-        payload = json.loads(request.body.decode("utf-8"))
-    except (TypeError, json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-    if isinstance(payload, dict):
-        return payload
-    return {}
-
-
-def _request_payload(request: HttpRequest) -> dict[str, Any]:
-    payload = _json_body(request)
-    if payload:
-        return payload
-    return {key: value for key, value in request.POST.items()}
-
-
-def _wants_html(request: HttpRequest) -> bool:
-    if request.GET.get("view") == "html":
-        return True
-    return "text/html" in request.headers.get("Accept", "").lower()
 
 
 def scan_api_login_required(view: Callable[..., Any]) -> Callable[..., Any]:
@@ -1981,16 +1889,6 @@ def _serialize_cover(cover: Any) -> dict[str, Any]:
         "extractor_version": cover.extractor_version,
         "url": f"/library/books/{cover.book_id}/covers/{cover.position}/",
     }
-
-
-def _as_positive_int(raw: str | None, default: int, minimum: int = 1) -> int:
-    try:
-        value = int(raw or 0)
-    except (TypeError, ValueError):
-        return default
-    if value < minimum:
-        return default
-    return value
 
 
 _LIBRARY_FILTER_PARAMS: Final = (
@@ -4224,147 +4122,6 @@ def scan_job_cancel(
 @_require_role("admin")
 def admin_only(request: HttpRequest) -> JsonResponse:
     return JsonResponse({"status": "admin"})
-
-
-@require_http_methods(["GET", "POST"])
-@login_required
-def upload_file(request: HttpRequest) -> HttpResponseBase:
-    profile = _active_library_profile(request)
-    if profile is None:
-        return HttpResponseForbidden()
-    if request.method == "GET":
-        return render(
-            request,
-            "core/upload.html",
-            {
-                "max_upload_bytes": django_settings.BOOK_SCANNER_MAX_UPLOAD_BYTES,
-                "accepted_extensions": ",".join(sorted(intake.SUPPORTED_FORMATS)),
-                "supported_formats": ", ".join(
-                    extension.removeprefix(".").upper()
-                    for extension in sorted(intake.SUPPORTED_FORMATS)
-                ),
-                "audiobook_service_url": intake.audiobook_service_url(),
-            },
-        )
-
-    uploaded_file = request.FILES.get("file")
-    if uploaded_file is None:
-        return HttpResponseBadRequest("missing_file")
-    original_name = uploaded_file.name
-    if not original_name:
-        return HttpResponseBadRequest("filename is required")
-
-    try:
-        normalized_filename = intake.normalize_filename(original_name)
-    except intake.ValidationError as exc:
-        return HttpResponseBadRequest(str(exc))
-    if intake.is_audio_filename(original_name, uploaded_file.content_type):
-        # Audiobooks live on a separate service (docs/design/32-audiobooks.md); the
-        # file is rejected before it is staged, so no ImportJob is ever created.
-        logger.info(
-            "upload_audio_rejected",
-            drm_protected=intake.is_drm_audio_filename(original_name),
-        )
-        return HttpResponse(
-            intake.audio_upload_rejection_message(original_name),
-            status=415,
-            content_type="text/plain; charset=utf-8",
-        )
-    try:
-        detected_format, detected_mime = intake.detect_format(
-            original_name,
-            uploaded_file.content_type,
-        )
-    except intake.ValidationError as exc:
-        return HttpResponseBadRequest(str(exc))
-
-    staging_root = Path(django_settings.APP_DATA_DIR) / "uploads"
-    try:
-        reservation = request_limits.reserve_upload(profile, uploaded_file.size or 0)
-    except request_limits.RequestLimited as exc:
-        return _limited_response("upload", exc)
-    source_path = ""
-    committed = False
-    try:
-        source_path, size_bytes = intake.write_upload_to_staging(uploaded_file, staging_root)
-        with transaction.atomic():
-            request_limits.finish_reservation(reservation, size_bytes)
-            job = ImportJob.objects.create(
-                source_type=ImportJob.SourceType.UPLOAD,
-                state=ImportJob.State.DISCOVERED,
-                uploader=profile.user,
-                source_path=source_path,
-                original_filename=original_name,
-                normalized_filename=normalized_filename,
-                detected_format=detected_format,
-                mime_type=detected_mime,
-                size_bytes=size_bytes,
-            )
-        committed = True
-    except request_limits.RequestLimited as exc:
-        return _limited_response("upload", exc)
-    except ValueError as exc:
-        return HttpResponseBadRequest(str(exc))
-    except OSError:
-        return HttpResponse("storage unavailable", status=503)
-    finally:
-        if not committed:
-            reservation.delete()
-            if source_path:
-                _cleanup_staged_upload(source_path)
-    try:
-        enqueue(intake.process_import_job, str(job.id))
-    except Exception as exc:  # pragma: no cover - transport/path specific
-        return HttpResponseBadRequest(str(exc))
-    if _wants_html(request):
-        return redirect("imports-status", job_id=job.id)
-    return JsonResponse({"job_id": str(job.id), "state": job.state}, status=201)
-
-
-@require_GET
-@login_required
-def intake_progress_view(request: HttpRequest) -> HttpResponseBase:
-    """Admin page: how much is still left to import, per source, uploads and scanner.
-
-    Database aggregates only (``core.intake_progress``); nothing is scanned or hashed.
-    """
-    profile = _active_library_profile(request)
-    if profile is None or not profile.is_admin():
-        return HttpResponseForbidden()
-    progress = intake_progress.intake_progress()
-    if _wants_html(request):
-        return render(request, "core/intake_progress.html", {"progress": progress})
-    return JsonResponse(progress)
-
-
-@require_GET
-@login_required
-def import_status(
-    request: HttpRequest,
-    job_id: str,
-) -> HttpResponseBase:
-    if _coerce_uuid(job_id) is None:
-        return HttpResponseBadRequest("invalid job id")
-    try:
-        job = ImportJob.objects.get(pk=job_id)
-    except ImportJob.DoesNotExist:
-        return HttpResponseNotFound()
-    payload = {
-        "job_id": str(job.id),
-        "state": job.state,
-        "filename": job.original_filename,
-        "normalized_filename": job.normalized_filename,
-        "sha256": job.sha256,
-        "error": job.last_error,
-        "book_id": str(job.book_id) if job.book_id else None,
-        "file_variant_id": str(job.file_variant_id) if job.file_variant_id else None,
-        "storage_identifier": job.storage_identifier,
-        "created_at": job.created_at.isoformat(),
-        "updated_at": job.updated_at.isoformat(),
-    }
-    if _wants_html(request):
-        return render(request, "core/import_status.html", {"job": job, "payload": payload})
-    return JsonResponse(payload)
 
 
 REVIEW_QUEUE_SORTS: Final = {

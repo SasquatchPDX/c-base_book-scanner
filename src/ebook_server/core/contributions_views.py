@@ -28,7 +28,7 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 
 from . import contributions
 from .models import AppUserProfile, ContributionEvent, ReviewTask
-from .views import _active_library_profile, _request_payload, _wants_html
+from .view_helpers import _active_library_profile, _request_payload, _wants_html
 
 ERASE_CONFIRMATION = "erase"
 
