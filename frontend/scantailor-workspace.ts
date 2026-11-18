@@ -98,6 +98,7 @@ const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
     "keep_color",
     "invert",
     "zone_mode",
+    "zones",
     "text_box",
     "picture_box",
     "text_algorithm",
@@ -137,7 +138,10 @@ export function displayBoxToSource(box: Box, source: Size, display: Size): Box {
 export function editableParameters(stage: StageName, parameters: JsonObject): JsonObject {
   const editable: JsonObject = {};
   for (const key of EDITABLE_KEYS[stage]) {
-    if (key in parameters) {
+    if (
+      key in parameters &&
+      !(stage === "output" && key === "zones" && parameters.zone_mode !== "manual")
+    ) {
       editable[key] = structuredClone(parameters[key]);
     }
   }
@@ -149,10 +153,14 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
       ["height", "top", "bottom"],
     ] as const) {
       const size = positiveNumber(parameters[`input_${axis}`] ?? parameters[`source_${axis}`]);
-      const padding = finiteNumber(parameters[`margin_${before}`], 0) +
+      const padding =
+        finiteNumber(parameters[`margin_${before}`], 0) +
         finiteNumber(parameters[`margin_${after}`], 0);
-      if (!(`resolved_canvas_${axis}` in parameters) && size &&
-          parameters[`canvas_${axis}`] === size + padding) {
+      if (
+        !(`resolved_canvas_${axis}` in parameters) &&
+        size &&
+        parameters[`canvas_${axis}`] === size + padding
+      ) {
         delete editable[`canvas_${axis}`];
       }
     }
@@ -160,12 +168,46 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
   return editable;
 }
 
+export interface OutputZone {
+  kind: "text" | "picture";
+  box: number[];
+}
+
+/** Copy editable geometry only: workers own detection/provenance fields. */
+export function outputZonesForEditing(parameters: JsonObject): OutputZone[] {
+  const raw =
+    parameters.zone_mode === "manual" && Array.isArray(parameters.zones)
+      ? parameters.zones
+      : parameters.resolved_zones;
+  if (Array.isArray(raw)) {
+    return raw.slice(0, 64).flatMap((zone): OutputZone[] => {
+      if (
+        !isObject(zone) ||
+        (zone.kind !== "text" && zone.kind !== "picture") ||
+        !Array.isArray(zone.box) ||
+        zone.box.length !== 4 ||
+        !zone.box.every((v) => typeof v === "number" && Number.isFinite(v))
+      )
+        return [];
+      return [{ kind: zone.kind, box: [...zone.box] as number[] }];
+    });
+  }
+  return (["text", "picture"] as const).flatMap((kind) => {
+    const box = parameters[`${kind}_box`];
+    if (!(Array.isArray(box) && box.length === 4) && !isObject(box)) return [];
+    const normalized = normalizeBox(box, { x1: 0, y1: 0, x2: 1, y2: 1 });
+    return [{ kind, box: [normalized.x1, normalized.y1, normalized.x2, normalized.y2] }];
+  });
+}
+
 export function stageWorkerWarnings(parameters: JsonObject): string {
   return [parameters.dewarp_warning, parameters.output_warning]
     .filter((warning): warning is string => typeof warning === "string" && warning.trim() !== "")
-    .map((warning) => warning === "auto_detection_found_no_text_lines_or_page_outline" ?
-      "Automatic dewarping found no reliable text lines or page outline; the input was kept unchanged." :
-      warning)
+    .map((warning) =>
+      warning === "auto_detection_found_no_text_lines_or_page_outline"
+        ? "Automatic dewarping found no reliable text lines or page outline; the input was kept unchanged."
+        : warning,
+    )
     .join(" · ");
 }
 
@@ -314,9 +356,7 @@ function stageFor(page: WorkspacePage, stage: StageName): StageState | undefined
 }
 
 function csrfToken(): string {
-  return (
-    document.querySelector<HTMLInputElement>("input[name='csrfmiddlewaretoken']")?.value ?? ""
-  );
+  return document.querySelector<HTMLInputElement>("input[name='csrfmiddlewaretoken']")?.value ?? "";
 }
 
 function element<T extends HTMLElement>(parent: ParentNode, selector: string): T {
@@ -484,17 +524,22 @@ class WorkspaceController {
     const context = this.activeContext();
     if (!context) return;
     const state = context.state;
-    const hasResult = state.status === "success" &&
+    const hasResult =
+      state.status === "success" &&
       Boolean(state.preview_storage_identifier || state.output_storage_identifier);
     this.resultButton.disabled = !hasResult;
     this.previewMode = mode === "result" && hasResult ? "result" : "input";
     this.inputButton.setAttribute("aria-pressed", String(this.previewMode === "input"));
     this.resultButton.setAttribute("aria-pressed", String(this.previewMode === "result"));
-    this.image.alt = this.previewMode === "input" ? "Processing-stage input preview" :
-      "Processing-stage result preview";
+    this.image.alt =
+      this.previewMode === "input"
+        ? "Processing-stage input preview"
+        : "Processing-stage result preview";
     const trigger = this.stageTrigger(context.page.id, state.stage);
-    const source = this.previewMode === "result" ? trigger?.dataset.outputPreviewUrl :
-      trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
+    const source =
+      this.previewMode === "result"
+        ? trigger?.dataset.outputPreviewUrl
+        : trigger?.dataset.inputPreviewUrl || context.page.thumbnail;
     this.image.hidden = !source;
     if (source) {
       const url = `${source}${source.includes("?") ? "&" : "?"}revision=${state.revision}-${state.status}`;
@@ -509,7 +554,8 @@ class WorkspaceController {
 
   private updateActivePreview(state: StageState, previous?: StageState): void {
     if (state.scan_page_id !== this.activePageId || state.stage !== this.activeStage) return;
-    const justCompleted = state.status === "success" &&
+    const justCompleted =
+      state.status === "success" &&
       (previous?.status !== "success" || previous.revision !== state.revision);
     this.showPreview(justCompleted ? "result" : this.previewMode);
     if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
@@ -622,11 +668,82 @@ class WorkspaceController {
     this.addNumber("Local window size", "window_size", 3, 501, 2, 35);
     this.addNumber("Threshold k", "k", -2, 2, 0.01, 0.33);
     this.addNumber("Threshold r", "r", 1, 512, 1, 128);
-    this.addSelect("Text / picture zones", "zone_mode", ["auto", "manual"], "auto", true);
-    if (this.draft.zone_mode === "manual") {
+    this.addSelect("Text / picture zones", "zone_mode", ["auto", "manual", "off"], "auto", true);
+    const detected = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
+    if (this.draft.zone_mode !== "off") {
       this.addSelect("Text algorithm", "text_algorithm", algorithms, "sauvola");
-      this.addSelect("Picture algorithm", "picture_algorithm", algorithms, "window");
+      this.addSelect(
+        "Picture algorithm (Keep color uses copy)",
+        "picture_algorithm",
+        algorithms,
+        "copy",
+      );
     }
+    if (this.draft.zone_mode === "manual") {
+      if (!("zones" in this.draft)) this.draft.zones = detected;
+      const zones = outputZonesForEditing(this.draft);
+      this.draft.zones = zones;
+      zones.forEach((zone, index) => {
+        this.addSelectValue(`Region ${index + 1} type`, zone.kind, ["text", "picture"], (kind) => {
+          zone.kind = kind as OutputZone["kind"];
+          this.renderGeometry();
+        });
+        for (const [coordinate, label] of ["Left", "Top", "Right", "Bottom"].entries()) {
+          const wrapper = document.createElement("label");
+          wrapper.textContent = `Region ${index + 1} ${label}`;
+          const input = document.createElement("input");
+          input.type = "number";
+          input.min = "0";
+          input.value = String(zone.box[coordinate]);
+          input.addEventListener("change", () => {
+            zone.box[coordinate] = Math.max(
+              0,
+              finiteNumber(input.value, zone.box[coordinate] ?? 0),
+            );
+            this.renderGeometry();
+          });
+          wrapper.append(input);
+          this.controls.append(wrapper);
+        }
+        this.addZoneButton(`Remove region ${index + 1}`, () => {
+          zones.splice(index, 1);
+          this.renderControls();
+          this.renderGeometry();
+        });
+      });
+      for (const kind of ["text", "picture"] as const)
+        this.addZoneButton(`Add ${kind} region`, () => {
+          if (zones.length >= 64) return;
+          const source = this.sourceSize();
+          zones.push({
+            kind,
+            box: [
+              Math.round(source.width * 0.1),
+              Math.round(source.height * 0.1),
+              Math.round(source.width * 0.5),
+              Math.round(source.height * 0.5),
+            ],
+          });
+          this.renderControls();
+          this.renderGeometry();
+        });
+    } else if (this.draft.zone_mode === "auto") {
+      this.addZoneButton(`Edit detected regions (${detected.length})`, () => {
+        this.draft.zone_mode = "manual";
+        this.draft.zones = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
+        this.showPreview("input");
+        this.renderControls();
+        this.renderGeometry();
+      });
+    }
+  }
+
+  private addZoneButton(label: string, action: () => void): void {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.addEventListener("click", action);
+    this.controls.append(button);
   }
 
   private addSelect(
@@ -764,12 +881,44 @@ class WorkspaceController {
       case "dewarping":
         if (this.draft.dewarp_mode === "manual") this.renderDewarpPoints(source, display);
         break;
-      case "output":
-        if (this.draft.zone_mode === "manual") {
-          this.renderRectangle("text_box", "Text", "text", source, display, 0.08, 0.52);
-          this.renderRectangle("picture_box", "Picture", "picture", source, display, 0.55, 0.92);
-        }
+      case "output": {
+        const manual = this.draft.zone_mode === "manual";
+        const zones = outputZonesForEditing(
+          manual ? this.draft : (this.activeContext()?.state.parameters ?? {}),
+        );
+        zones.forEach((zone, index) => {
+          const box = normalizeBox(zone.box, {
+            x1: 0,
+            y1: 0,
+            x2: source.width,
+            y2: source.height,
+          });
+          if (manual) {
+            this.renderRectangle(
+              "zones",
+              `${zone.kind} ${index + 1}`,
+              zone.kind,
+              source,
+              display,
+              0,
+              1,
+              box,
+              (next) => {
+                const authored = this.draft.zones as OutputZone[];
+                authored[index]!.box = [next.x1, next.y1, next.x2, next.y2];
+              },
+            );
+          } else if (this.draft.zone_mode === "auto") {
+            const overlay = document.createElement("div");
+            overlay.className = `geometry-rectangle geometry-${zone.kind}`;
+            overlay.style.pointerEvents = "none";
+            overlay.textContent = `Detected ${zone.kind} ${index + 1}`;
+            this.positionRectangle(overlay, sourceBoxToDisplay(box, source, display));
+            this.geometryLayer.append(overlay);
+          }
+        });
         break;
+      }
       default:
         break;
     }
@@ -806,13 +955,15 @@ class WorkspaceController {
   }
 
   private renderRectangle(
-    key: "content_box" | "text_box" | "picture_box",
+    key: string,
     label: string,
     className: string,
     source: Size,
     display: Size,
     startRatio: number,
     endRatio = 0.92,
+    explicitBox?: Box,
+    onChange?: (box: Box) => void,
   ): void {
     const fallback = {
       x1: source.width * startRatio,
@@ -820,8 +971,8 @@ class WorkspaceController {
       x2: source.width * endRatio,
       y2: source.height * 0.9,
     };
-    const sourceBox = normalizeBox(this.draft[key], fallback);
-    this.draft[key] = [sourceBox.x1, sourceBox.y1, sourceBox.x2, sourceBox.y2];
+    const sourceBox = explicitBox ?? normalizeBox(this.draft[key], fallback);
+    if (!onChange) this.draft[key] = [sourceBox.x1, sourceBox.y1, sourceBox.x2, sourceBox.y2];
     const box = sourceBoxToDisplay(sourceBox, source, display);
     const overlay = document.createElement("div");
     overlay.className = `geometry-rectangle geometry-${className}`;
@@ -835,9 +986,12 @@ class WorkspaceController {
     const commit = (): void => {
       const displayed = this.elementBox(overlay);
       const next = displayBoxToSource(displayed, source, display);
-      this.draft[key] = [next.x1, next.y1, next.x2, next.y2];
+      if (onChange) onChange(next);
+      else this.draft[key] = [next.x1, next.y1, next.x2, next.y2];
     };
-    const restriction = interact.modifiers.restrictRect({ restriction: "parent" });
+    const restriction = interact.modifiers.restrictRect({
+      restriction: "parent",
+    });
     const interaction = interact(overlay)
       .draggable({
         modifiers: [restriction],
@@ -979,7 +1133,10 @@ class WorkspaceController {
       const response = await fetch(url, {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken(),
+        },
         body: JSON.stringify({
           expected_revision: context.state.revision,
           algorithm: context.state.algorithm,
@@ -997,9 +1154,12 @@ class WorkspaceController {
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as { stage: StageState };
       this.mergeStage(payload.stage);
-      this.setMessage(payload.stage.status === "success" ?
-        "Saved. Result preview is ready." : "Saved. The worker is generating the new preview.",
-        "success");
+      this.setMessage(
+        payload.stage.status === "success"
+          ? "Saved. Result preview is ready."
+          : "Saved. The worker is generating the new preview.",
+        "success",
+      );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Stage update failed.", "error");
     } finally {
@@ -1009,9 +1169,9 @@ class WorkspaceController {
 
   private async applyBatch(): Promise<void> {
     if (!this.editable) return;
-    const batchUrl = this.root
-      .querySelector<HTMLElement>(`[data-batch-url][data-stage="${this.activeStage}"]`)
-      ?.dataset.batchUrl;
+    const batchUrl = this.root.querySelector<HTMLElement>(
+      `[data-batch-url][data-stage="${this.activeStage}"]`,
+    )?.dataset.batchUrl;
     if (!batchUrl) return;
     const selected = [...this.selectedPages];
     if (this.batchScope.value === "selected" && selected.length === 0) {
@@ -1029,7 +1189,10 @@ class WorkspaceController {
       const response = await fetch(batchUrl, {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken(),
+        },
         body: JSON.stringify(body),
       });
       if (!response.ok) throw new Error(await response.text());
@@ -1126,7 +1289,9 @@ class WorkspaceController {
 
   private async pollWorkspace(workspaceUrl: string): Promise<void> {
     try {
-      const response = await fetch(workspaceUrl, { credentials: "same-origin" });
+      const response = await fetch(workspaceUrl, {
+        credentials: "same-origin",
+      });
       if (!response.ok) return;
       const payload = (await response.json()) as { pages: WorkspacePage[] };
       for (const page of payload.pages) {
@@ -1145,8 +1310,7 @@ class WorkspaceController {
   private updateSelectionCount(): void {
     this.selectionCount.textContent = `${this.selectedPages.size} page(s) selected`;
     this.batchButton.disabled =
-      !this.editable ||
-      (this.batchScope.value === "selected" && this.selectedPages.size === 0);
+      !this.editable || (this.batchScope.value === "selected" && this.selectedPages.size === 0);
   }
 
   private setMessage(message: string, kind: "info" | "success" | "error" | "conflict"): void {
