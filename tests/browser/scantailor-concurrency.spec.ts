@@ -102,14 +102,14 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     const firstControls = firstEditor.locator("[data-stage-controls]");
     const secondControls = secondEditor.locator("[data-stage-controls]");
     // Deskew is the first stage (#195) and starts in auto mode for both editors.
-    await expect(firstControls.getByLabel("Mode")).toHaveValue("auto");
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("auto");
+    await expect(firstControls.getByRole("radio", { name: "Auto" })).toBeChecked();
+    await expect(secondControls.getByRole("radio", { name: "Auto" })).toBeChecked();
 
-    await firstControls.getByLabel("Mode").selectOption("manual");
+    // Switching to manual commits at once, as upstream does (#195 step 4).
     const saved = firstEditor.waitForResponse(
       (response) => response.request().method() === "POST" && /\/stages\/deskew\/$/.test(response.url()),
     );
-    await firstEditor.getByRole("button", { name: "Save and run" }).click();
+    await firstControls.getByRole("radio", { name: "Manual" }).check();
     await expect((await saved).status()).toBe(202);
     await expect(firstEditor.locator("[data-editor-message]")).toContainText("Saved.");
 
@@ -122,7 +122,7 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     await expect(secondEditor.locator("[data-editor-message]")).toContainText(
       "Conflict detected: another editor changed this stage",
     );
-    await expect(secondControls.getByLabel("Mode")).toHaveValue("manual");
+    await expect(secondControls.getByRole("radio", { name: "Manual" })).toBeChecked();
   } finally {
     await firstContext.close();
     await secondContext.close();

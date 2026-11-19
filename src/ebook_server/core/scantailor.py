@@ -23,7 +23,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import curvature, output_zones, scan_images, scan_transform
+from . import curvature, deskew, output_zones, scan_images, scan_transform
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -42,7 +42,7 @@ type Quad = tuple[Point, Point, Point, Point]
 type Box = tuple[int, int, int, int]
 
 DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
-    "deskew": "projection_deskew",
+    "deskew": "skew_finder",
     "select_content": "content_box_projection",
     "margins": "margin_pad",
     "dewarping": "projective_dewarp",
@@ -51,7 +51,8 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
 
 DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v2 (#195 step 2): parameters + transform op, detection at working resolution.
-    "deskew": "projection-v2",
+    # v3 (#195 step 4): port of upstream SkewFinder; positive angles turn clockwise.
+    "deskew": "skewfinder-v3",
     "select_content": "projection-v2",
     "margins": "padding-v2",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
@@ -619,19 +620,6 @@ def _run_copy(state: ScanTailorStageState, stage_input: StageInput) -> StageResu
     )
 
 
-def _candidate_angles(start: float, stop: float, step: float) -> list[float]:
-    if step <= 0:
-        step = 1.0
-    if start > stop:
-        start, stop = stop, start
-    values: list[float] = []
-    current = start
-    while current <= stop + 1e-6:
-        values.append(round(current, 3))
-        current += step
-    return values
-
-
 def _ink_mask(gray: np.ndarray) -> np.ndarray | None:
     """Boolean ink mask using a per-image Otsu threshold, or None for blank pages."""
     low, high = np.percentile(gray, [0.5, 99.5])
@@ -647,73 +635,43 @@ def _ink_mask(gray: np.ndarray) -> np.ndarray | None:
     return np.asarray(gray <= threshold)
 
 
-def _rotated_row_score(mask: np.ndarray, angle: float) -> float:
-    height, width = mask.shape
-    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), angle, 1.0)
-    rotated = cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_LINEAR, borderValue=0)
-    return float(np.var(rotated.sum(axis=1, dtype=np.float64)))
-
-
-def _estimate_deskew_angle(image: Image.Image, parameters: dict[str, Any]) -> float:
-    """Return the CCW rotation (degrees, PIL ``rotate`` convention) that straightens text.
-
-    The returned value is exactly what ``_run_deskew`` applies and what the UI seeds
-    ``manual_angle`` with, so auto and manual agree. 0.0 is returned for blank or
-    ambiguous pages (tie / negligible improvement).
-    """
-    min_angle = _coerce_float(parameters.get("angle_min", -7.0), -7.0)
-    max_angle = _coerce_float(parameters.get("angle_max", 7.0), 7.0)
-    step = _coerce_float(parameters.get("angle_step", 1.0), 1.0)
-    if step <= 0:
-        step = 1.0
-
-    gray = np.asarray(_thumbnail(image.convert("L"), size=900))
-    mask = _ink_mask(gray)
-    if mask is None:
-        return 0.0
-    mask_u8 = mask.astype(np.uint8)
-
-    def score(angle: float) -> float:
-        return _rotated_row_score(mask_u8, angle)
-
-    baseline = score(0.0)
-    best_angle = 0.0
-    best_score = baseline
-    for angle in _candidate_angles(min_angle, max_angle, step):
-        value = score(angle)
-        if value > best_score * 1.0001 and value > best_score:
-            best_score = value
-            best_angle = angle
-    # refine around the coarse optimum with a finer step
-    fine = step / 4.0
-    if best_angle != 0.0 or best_score > baseline:
-        for angle in _candidate_angles(best_angle - step, best_angle + step, fine):
-            if not (min_angle <= angle <= max_angle):
-                continue
-            value = score(angle)
-            if value > best_score:
-                best_score = value
-                best_angle = angle
-    if best_score < baseline * 1.02:
-        return 0.0
-    return float(round(best_angle, 3))
+def _working_dpi(stage_input: StageInput) -> tuple[float, float]:
+    """Resolution of the working-resolution input (the page's dpi times the work scale)."""
+    sx, sy = stage_input.scale
+    return max(1.0, stage_input.dpi[0] * sx), max(1.0, stage_input.dpi[1] * sy)
 
 
 def _run_deskew(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    """Deskew (#195 step 4): upstream ``deskew::Task`` with the ``SkewFinder`` port.
+
+    ``angle`` is the rotation applied, in degrees, positive = clockwise on screen (the
+    editor's convention and upstream's internal one). Manual mode applies
+    ``manual_angle``; auto mode applies what :func:`deskew.detect` finds, or 0 when its
+    confidence is below upstream's ``GOOD_CONFIDENCE``.
+    """
     parameters = dict(state.parameters or {})
+    for legacy in ("angle_min", "angle_max", "angle_step"):
+        parameters.pop(legacy, None)
     manual = parameters.get("manual_angle")
+    updates: dict[str, Any]
     if manual is not None:
-        angle = _coerce_float(manual, 0.0)
-        mode = "manual"
+        angle = deskew.clamp_manual(_coerce_float(manual, 0.0))
+        parameters["manual_angle"] = angle
+        updates = {"deskew_mode": "manual", "angle": angle}
+        for stale in ("detected_angle", "confidence", "confidence_good"):
+            parameters.pop(stale, None)
     else:
-        angle = _estimate_deskew_angle(stage_input.image, parameters)
-        mode = "auto"
-    return _transform_result(
-        parameters,
-        stage_input,
-        scan_transform.rotate(angle),
-        {"deskew_mode": mode, "angle": angle},
-    )
+        found = deskew.detect(np.asarray(stage_input.image.convert("L")), _working_dpi(stage_input))
+        angle = found.angle
+        updates = {
+            "deskew_mode": "auto",
+            "angle": angle,
+            "detected_angle": found.detected_angle,
+            "confidence": found.confidence,
+            "confidence_good": found.applied,
+        }
+    # The transform op rotates counter-clockwise (Pillow convention, scan_transform).
+    return _transform_result(parameters, stage_input, scan_transform.rotate(-angle), updates)
 
 
 def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
@@ -2008,6 +1966,8 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
 _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
     ScanTailorStageState.Stage.DESKEW.value: {
         "copy": _run_copy,
+        "skew_finder": _run_deskew,
+        # Names recorded before #195 step 4; same runner.
         "projection_deskew": _run_deskew,
         "manual_deskew": _run_deskew,
     },
@@ -2087,6 +2047,9 @@ def request_stage_job(
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
+    if state.stage == "deskew":
+        # The pre-port names ("projection_deskew", "manual_deskew") run the port now.
+        algorithm = _default_algorithm("deskew")
     if state.stage == "dewarping" and str((state.parameters or {}).get("dewarp_model")) in {
         "curvature",
         "perspective",
