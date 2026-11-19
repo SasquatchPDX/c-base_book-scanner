@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from math import ceil, floor, hypot
+from math import ceil, floor, isfinite
 from pathlib import Path
 from typing import Any, Final
 
@@ -23,7 +23,15 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import content_box, curvature, deskew, output_zones, scan_images, scan_transform
+from . import (
+    content_box,
+    curvature,
+    cylindrical,
+    deskew,
+    output_zones,
+    scan_images,
+    scan_transform,
+)
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -45,7 +53,7 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
     "deskew": "skew_finder",
     "select_content": "content_box_finder",
     "margins": "margin_pad",
-    "dewarping": "projective_dewarp",
+    "dewarping": "cylindrical_dewarp",
     "output": "binarization_otsu",
 }
 
@@ -59,7 +67,8 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
     # v3: auto mode derives the quad from the text lines.
     # v4: transform op, detection at working resolution (#195 step 2).
-    "dewarping": "opencv-v4",
+    # v5 (#195 step 6a): upstream's cylindrical-surface model (CylindricalSurfaceDewarper).
+    "dewarping": "cylindrical-v5",
     # v3: rendered once from the original through the composed transform.
     "output": "opencv-zones-v3",
 }
@@ -204,8 +213,7 @@ def _default_algorithm(stage: str) -> str:
 
 
 def _default_algorithm_version(stage: str, algorithm: str | None = None) -> str:
-    if stage == "dewarping" and algorithm == "baseline_curvature":
-        return curvature.VERSION
+    del algorithm  # every stage has one current version
     return DEFAULT_STAGE_ALGORITHM_VERSION.get(stage, "placeholder-v1")
 
 
@@ -909,728 +917,162 @@ def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageR
     )
 
 
-def _ordered_quad_points(points: list[Point]) -> Quad:
-    if len(points) != 4:
-        raise ValueError("need four points")
-    np_points = np.array(points, dtype=np.float32) if np is not None else []
-    if np is None or np_points.shape != (4, 2):
-        # Degrade gracefully to a stable deterministic ordering.
-        ordered = sorted(points)
-        return (
-            ordered[0],
-            ordered[1],
-            ordered[3],
-            ordered[2],
-        )
-
-    s = np_points.sum(axis=1)
-    diff = np_points[:, 1] - np_points[:, 0]
-    top_left = (
-        int(np_points[np.argmin(s)][0]),
-        int(np_points[np.argmin(s)][1]),
-    )
-    bottom_right = (
-        int(np_points[np.argmax(s)][0]),
-        int(np_points[np.argmax(s)][1]),
-    )
-    top_right = (
-        int(np_points[np.argmin(diff)][0]),
-        int(np_points[np.argmin(diff)][1]),
-    )
-    bottom_left = (
-        int(np_points[np.argmax(diff)][0]),
-        int(np_points[np.argmax(diff)][1]),
-    )
-    return (top_left, top_right, bottom_right, bottom_left)
+DEWARP_MODES: Final[tuple[str, ...]] = ("off", "auto", "manual")
+#: Upstream ``DewarpingView`` samples splines like this when drawing the model.
+type Points = list[tuple[float, float]]
 
 
-def _coerce_dewarp_points(
-    raw_points: Any,
-    image_size: tuple[int, int],
-) -> list[tuple[int, int]] | None:
-    width, height = image_size
-    values: list[Point] = []
-
-    if isinstance(raw_points, dict):
-        sequence: Sequence[Any] = (
-            raw_points.get("tl"),
-            raw_points.get("tr"),
-            raw_points.get("br"),
-            raw_points.get("bl"),
-        )
-    elif isinstance(raw_points, (list, tuple)):
-        sequence = raw_points
-    else:
+def _coerce_points(value: Any) -> Points | None:
+    """``[[x, y], ...]`` with at least two finite points, or None."""
+    if not isinstance(value, list | tuple) or len(value) < 2:
         return None
-
-    if len(sequence) != 4:
-        return None
-
-    for item in sequence:
-        if isinstance(item, dict):
-            x = item.get("x")
-            y = item.get("y")
-            if not isinstance(x, int | float) or not isinstance(y, int | float):
-                return None
-            values.append((_coerce_int(int(x), 0), _coerce_int(int(y), 0)))
-            continue
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
+    points: Points = []
+    for item in value:
+        if not isinstance(item, list | tuple) or len(item) < 2:
             return None
-        x = item[0]
-        y = item[1]
-        if not isinstance(x, int | float) or not isinstance(y, int | float):
+        try:
+            x, y = float(item[0]), float(item[1])
+        except (TypeError, ValueError):
             return None
-        values.append((_coerce_int(int(x), 0), _coerce_int(int(y), 0)))
-
-    values = [(max(0, min(x, width)), max(0, min(y, height))) for x, y in values]
-    return values
-
-
-# Text-line based auto detection (see _detect_text_line_quad).
-DEWARP_DETECTION_MAX_SIDE: Final[int] = 1200
-DEWARP_MIN_TEXT_LINES: Final[int] = 3
-# The left/right edge fits need more rows than the top/bottom lines: with only a
-# few row ends a robust fit can drop all but two points and report zero scatter,
-# letting noise (or ragged text) pass as an aligned edge.
-DEWARP_MIN_SIDE_ROWS: Final[int] = 6
-# A text line is "long" (usable for the left/right edges) relative to the longest one.
-DEWARP_LONG_LINE_RATIO: Final[float] = 0.6
-# Reject detections implying more than this tilt of any quad edge.
-DEWARP_MAX_EDGE_SLOPE: Final[float] = 0.27  # ~15 degrees
+        if not (isfinite(x) and isfinite(y)):
+            return None
+        points.append((x, y))
+    return points
 
 
-def _robust_line_fit(
-    along: Sequence[float] | Any,
-    across: Sequence[float] | Any,
-) -> tuple[float, float, float] | None:
-    """Fit ``across = slope * along + intercept``, iteratively dropping outliers.
+def _depth_perception(parameters: dict[str, Any]) -> float:
+    value = _coerce_float(
+        parameters.get("depth_perception", cylindrical.DEFAULT_DEPTH_PERCEPTION),
+        cylindrical.DEFAULT_DEPTH_PERCEPTION,
+    )
+    return min(cylindrical.MAX_DEPTH_PERCEPTION, max(cylindrical.MIN_DEPTH_PERCEPTION, value))
 
-    Returns ``(slope, intercept, spread)`` where ``spread`` is the robust (MAD)
-    standard deviation of all points around the fit, used to judge reliability.
+
+def _extend_to_edges(polyline: Points, width: float) -> Points:
+    """Extend a baseline straight along its end segments to x = 0 and x = width."""
+    points = sorted(polyline)
+    if len(points) < 2:
+        return points
+    (x0, y0), (x1, y1) = points[0], points[1]
+    (xa, ya), (xb, yb) = points[-2], points[-1]
+    left = y0 + (0.0 - x0) * (y1 - y0) / (x1 - x0) if x1 != x0 else y0
+    right = yb + (width - xb) * (yb - ya) / (xb - xa) if xb != xa else yb
+    inner = [p for p in points if 0.0 < p[0] < width]
+    return [(0.0, left), *inner, (width, right)]
+
+
+def _spline_through(polyline: Points) -> cylindrical.XSpline:
+    """Editor control points for a polyline: upstream's five-point spline (ends with
+    tension 0) placed on the polyline at equal x steps. Upstream then fits the spline
+    to the polyline (``spfit``, #195 step 6b)."""
+    xs = np.array([p[0] for p in polyline])
+    ys = np.array([p[1] for p in polyline])
+    targets = np.linspace(xs[0], xs[-1], 5)
+    points = [(float(x), float(np.interp(x, xs, ys))) for x in targets]
+    return cylindrical.XSpline(points, [0.0, 1.0, 1.0, 1.0, 0.0])
+
+
+def _auto_dewarp_curves(stage_input: StageInput) -> tuple[Points, Points] | None:
+    """Bridge until the upstream detection is ported (#195 step 6b): the topmost and
+    bottommost baselines found by the pre-port detector, extended to the page edges."""
+    sx, sy = stage_input.scale
+    try:
+        baselines = curvature.detect_curves(stage_input.image)
+    except ValueError:  # "no reliable text baselines found"
+        return None
+    if len(baselines) < 2:
+        return None
+    full = [[(float(x) / sx, float(y) / sy) for x, y in line] for line in baselines]
+    full.sort(key=lambda line: float(np.mean([p[1] for p in line])))
+    width = float(stage_input.full_size[0])
+    return _extend_to_edges(full[0], width), _extend_to_edges(full[-1], width)
+
+
+def _run_cylindrical_dewarp(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    """Dewarping (#195 step 6): upstream's cylindrical-surface model.
+
+    Modes are upstream ``DewarpingMode``: off, auto and manual. The model is a top and
+    a bottom X-spline (``top_curve`` / ``bottom_curve`` control points, stage input
+    coordinates); the dewarping keeps the input's size, as Output keeps the page
+    layout upstream. A model that upstream would reject (``DistortionModel::isValid``)
+    or that fails to build leaves the page unchanged with a warning.
     """
-    if np is None:
-        return None
-    a = np.asarray(along, dtype=np.float64)
-    b = np.asarray(across, dtype=np.float64)
-    if a.size < 2 or float(np.ptp(a)) == 0.0:
-        return None
-    keep = np.ones(a.size, dtype=bool)
-    slope, intercept = 0.0, float(np.median(b))
-    for _ in range(4):
-        slope, intercept = (float(v) for v in np.polyfit(a[keep], b[keep], 1))
-        residual = np.abs(b - (slope * a + intercept))
-        # 2.5 robust standard deviations (MAD), never tighter than one pixel.
-        limit = max(1.0, 2.5 * 1.4826 * float(np.median(residual[keep])))
-        new_keep = residual <= limit
-        if int(new_keep.sum()) < 2 or bool(np.array_equal(new_keep, keep)):
-            break
-        keep = new_keep
-    spread = 1.4826 * float(np.median(np.abs(b - (slope * a + intercept))))
-    return slope, intercept, spread
-
-
-def _text_rows(
-    lines: list[tuple[float, float, float, float, float, float]],
-    line_height: float,
-) -> list[tuple[float, float, float, float]]:
-    """Group line blobs at the same height (e.g. across columns) into rows.
-
-    Returns ``(left_x, left_y, right_x, right_y)`` per row: the outermost ends.
-    """
-    rows: list[list[tuple[float, float, float, float, float, float]]] = []
-    for line in sorted(lines, key=lambda item: (item[1] + item[3]) / 2):
-        center = (line[1] + line[3]) / 2
-        if rows:
-            last = rows[-1]
-            last_center = sum((item[1] + item[3]) / 2 for item in last) / len(last)
-            if abs(center - last_center) <= 0.6 * line_height:
-                last.append(line)
-                continue
-        rows.append([line])
-    result: list[tuple[float, float, float, float]] = []
-    for row in rows:
-        leftmost = min(row, key=lambda item: item[0])
-        rightmost = max(row, key=lambda item: item[2])
-        result.append((leftmost[0], leftmost[1], rightmost[2], rightmost[3]))
-    return result
-
-
-def _detect_text_line_quad(image: Image.Image) -> Quad | None:
-    """Derive the dewarp quad from the topmost/bottommost text lines and the text edges.
-
-    Characters are merged into line blobs with a horizontal closing whose width
-    follows the measured glyph height. The top and bottom long lines give the
-    upper/lower quad edges (their fitted direction, not just their bounding box);
-    robust fits through the outer left/right ends of each text row give the side
-    edges (a ragged side is replaced by the mirror of the aligned one). The quad
-    corners are the intersections of those four lines. This straightens keystone
-    and tilt only; it cannot follow curved (spine-bowed) lines. Returns None when
-    the page has too few text lines or the result is implausible.
-    """
-    if cv2 is None or np is None:
-        return None
-    gray = np.array(image.convert("L"))
-    full_height, full_width = gray.shape
-    scale = min(1.0, DEWARP_DETECTION_MAX_SIDE / max(full_width, full_height))
-    if scale < 1.0:
-        gray = cv2.resize(
-            gray,
-            (max(1, round(full_width * scale)), max(1, round(full_height * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    height, width = gray.shape
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, ink = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    count, _, glyph_stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-    glyph_heights = glyph_stats[1:, cv2.CC_STAT_HEIGHT][
-        (glyph_stats[1:, cv2.CC_STAT_AREA] >= 4)
-        & (glyph_stats[1:, cv2.CC_STAT_HEIGHT] <= 0.06 * height)
-    ]
-    if count < 2 or glyph_heights.size < 10:
-        return None
-    # Word gaps are well under ~1.5 glyph heights; column gutters are wider.
-    kernel_width = int(min(max(9.0, 3.0 * float(np.median(glyph_heights))), width / 10))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, kernel_width), 1))
-    merged = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel)
-
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
-    # Each line: (left_x, left_y, right_x, right_y, slope, intercept) with y = slope*x + b.
-    lines: list[tuple[float, float, float, float, float, float]] = []
-    line_heights: list[int] = []
-    for index in range(1, count):
-        x = int(stats[index, cv2.CC_STAT_LEFT])
-        y = int(stats[index, cv2.CC_STAT_TOP])
-        line_width = int(stats[index, cv2.CC_STAT_WIDTH])
-        line_height = int(stats[index, cv2.CC_STAT_HEIGHT])
-        if (
-            line_width < 0.2 * width
-            or line_height < 2
-            or line_height > 0.06 * height
-            or line_width < 4 * line_height
-        ):
-            continue
-        ys, xs = np.nonzero(labels[y : y + line_height, x : x + line_width] == index)
-        fit = _robust_line_fit(xs + x, ys + y)
-        if fit is None:
-            continue
-        slope, intercept, _ = fit
-        line_heights.append(line_height)
-        left_x, right_x = float(x), float(x + line_width - 1)
-        lines.append(
-            (
-                left_x,
-                slope * left_x + intercept,
-                right_x,
-                slope * right_x + intercept,
-                slope,
-                intercept,
-            )
-        )
-    if len(lines) < DEWARP_MIN_TEXT_LINES:
-        return None
-    longest = max(line[2] - line[0] for line in lines)
-    long_lines = [line for line in lines if line[2] - line[0] >= DEWARP_LONG_LINE_RATIO * longest]
-    if len(long_lines) < DEWARP_MIN_TEXT_LINES:
-        return None
-    long_lines.sort(key=lambda line: (line[1] + line[3]) / 2)
-    top, bottom = long_lines[0], long_lines[-1]
-
-    # Side edges (x = slope * y + intercept) through the outer ends of each row, so
-    # multi-column pages use the outer column edges rather than a mixture.
-    rows = _text_rows(lines, float(np.median(line_heights)))
-    widest = max(row[2] - row[0] for row in rows)
-    rows = [row for row in rows if row[2] - row[0] >= DEWARP_LONG_LINE_RATIO * widest]
-    if len(rows) < DEWARP_MIN_SIDE_ROWS:
-        return None
-    left_fit = _robust_line_fit([row[1] for row in rows], [row[0] for row in rows])
-    right_fit = _robust_line_fit([row[3] for row in rows], [row[2] for row in rows])
-    if left_fit is None or right_fit is None:
-        return None
-    # Justified/aligned text gives side ends within a pixel or two of a line;
-    # ragged text (e.g. ragged-right) scatters them and the fit is meaningless.
-    max_spread = max(2.0, 0.006 * width)
-    left_ok, right_ok = left_fit[2] <= max_spread, right_fit[2] <= max_spread
-    if not left_ok and not right_ok:
-        return None
-    left_slope, right_slope = left_fit[0], right_fit[0]
-    if not right_ok:
-        # Assume symmetric keystone (camera centred on the page): mirror the left
-        # edge and place the right edge at the outermost line end.
-        right_slope = -left_slope
-    if not left_ok:
-        left_slope = -right_slope
-    left_intercept = left_fit[1] if left_ok else min(row[0] - left_slope * row[1] for row in rows)
-    right_intercept = (
-        right_fit[1] if right_ok else max(row[2] - right_slope * row[3] for row in rows)
-    )
-    left_edge = (left_slope, left_intercept)
-    right_edge = (right_slope, right_intercept)
-    if any(
-        abs(slope) > DEWARP_MAX_EDGE_SLOPE for slope in (top[4], bottom[4], left_slope, right_slope)
-    ):
-        return None
-
-    def intersect(
-        line: tuple[float, float, float, float, float, float],
-        edge: tuple[float, float],
-    ) -> tuple[float, float]:
-        line_slope, line_intercept = line[4], line[5]
-        edge_slope, edge_intercept = edge
-        y = (line_slope * edge_intercept + line_intercept) / (1.0 - line_slope * edge_slope)
-        return edge_slope * y + edge_intercept, y
-
-    corners = [
-        intersect(top, left_edge),
-        intersect(top, right_edge),
-        intersect(bottom, right_edge),
-        intersect(bottom, left_edge),
-    ]
-    scaled = [(px / scale, py / scale) for px, py in corners]
-    slack_x, slack_y = 0.1 * full_width, 0.1 * full_height
-    if any(
-        not (-slack_x <= px <= full_width + slack_x and -slack_y <= py <= full_height + slack_y)
-        for px, py in scaled
-    ):
-        return None
-    contour = np.array(scaled, dtype=np.float32)
-    if not cv2.isContourConvex(contour):
-        return None
-    if cv2.contourArea(contour) < 0.05 * full_width * full_height:
-        return None
-    points = [(round(px), round(py)) for px, py in scaled]
-    return (points[0], points[1], points[2], points[3])
-
-
-def _dewarp_correction_is_negligible(quad: Quad, image_size: tuple[int, int]) -> bool:
-    """True when ``quad`` is already an upright rectangle to within a few pixels."""
-    top_left, top_right, bottom_right, bottom_left = quad
-    tolerance = max(2.0, 0.003 * max(image_size))
-    width_top = hypot(top_right[0] - top_left[0], top_right[1] - top_left[1])
-    width_bottom = hypot(bottom_right[0] - bottom_left[0], bottom_right[1] - bottom_left[1])
-    height_left = hypot(bottom_left[0] - top_left[0], bottom_left[1] - top_left[1])
-    height_right = hypot(bottom_right[0] - top_right[0], bottom_right[1] - top_right[1])
-    deviations = (
-        abs(top_left[1] - top_right[1]),
-        abs(bottom_left[1] - bottom_right[1]),
-        abs(top_left[0] - bottom_left[0]),
-        abs(top_right[0] - bottom_right[0]),
-        abs(width_top - width_bottom),
-        abs(height_left - height_right),
-    )
-    return max(deviations) <= tolerance
-
-
-def _auto_dewarp_points(image: Image.Image) -> tuple[Quad, str] | None:
-    """Auto-detect the dewarp quad: text lines first, then a page-outline contour."""
-    text_quad = _detect_text_line_quad(image)
-    if text_quad is not None:
-        return text_quad, "text_lines"
-    outline_quad = _detect_page_outline_quad(image)
-    if outline_quad is not None:
-        return outline_quad, "page_outline"
-    return None
-
-
-def _detect_page_outline_quad(
-    image: Image.Image,
-) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
-    """Find one large near-rectangular contour (a sheet photographed on a contrasting
-    background). Rarely matches an ordinary scanned text page."""
-    if cv2 is None or np is None:
-        return None
-    grayscale = np.array(image.convert("L"))
-    blurred = cv2.GaussianBlur(grayscale, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    width, height = image.size
-    min_area = (width * height) * 0.15
-    best: list[Point] | None = None
-
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-        area = cv2.contourArea(contour)
-        if area < min_area:
-            continue
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter <= 0:
-            continue
-        approximated = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-        if len(approximated) < 4:
-            continue
-        if len(approximated) > 4:
-            hull = cv2.convexHull(approximated)
-            approx = cv2.approxPolyDP(hull, 0.02 * perimeter, True)
-            if len(approx) != 4:
-                continue
-            candidates = [(int(point[0][0]), int(point[0][1])) for point in approx]
-            best = candidates
-            break
-        candidates = [(int(point[0][0]), int(point[0][1])) for point in approximated]
-        best = candidates
-        break
-
-    if best is None:
-        return None
-    ordered = _ordered_quad_points(best)
-    return ordered
-
-
-def _estimate_target_dimensions(
-    quad: Quad,
-) -> tuple[int, int]:
-    top_left, top_right, bottom_right, bottom_left = quad
-
-    width_bottom = hypot(bottom_right[0] - bottom_left[0], bottom_right[1] - bottom_left[1])
-    width_top = hypot(top_right[0] - top_left[0], top_right[1] - top_left[1])
-    width = max(1, int(round(max(width_top, width_bottom))))
-
-    height_right = hypot(top_right[0] - bottom_right[0], top_right[1] - bottom_right[1])
-    height_left = hypot(top_left[0] - bottom_left[0], top_left[1] - bottom_left[1])
-    height = max(1, int(round(max(height_left, height_right))))
-    return width, height
-
-
-# How far (as a multiple of the input's own width/height) the dewarped canvas may
-# extend beyond the rectified quad on each side. A quad that would need more than
-# this is treated as degenerate and not rendered (see DewarpGeometry.rejection).
-DEWARP_MAX_CANVAS_OVERHANG: Final[float] = 1.0
-# The dewarped canvas may hold at most this multiple of the input's pixel count.
-# Real keystone/tilt corrections stay well below it; anything larger comes from a
-# near-degenerate quad and would only allocate a huge, mostly empty image.
-DEWARP_MAX_CANVAS_AREA_RATIO: Final[float] = 2.0
-# Projective weights at or below this (relative to the largest one) mean an input
-# corner lies at or beyond the vanishing line: it would map to infinity or mirror.
-DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO: Final[float] = 1e-3
-
-
-@dataclass(frozen=True)
-class DewarpGeometry:
-    """Perspective transform from the input onto an output canvas holding all of it.
-
-    ``rejection`` is empty when the transform may be rendered. Otherwise it names
-    why not (the quad is near-degenerate) and the canvas dimensions are only the
-    clamped, bounded values -- callers must not render such a geometry.
-    """
-
-    matrix: Any
-    canvas_width: int
-    canvas_height: int
-    quad_width: int
-    quad_height: int
-    offset_x: int
-    offset_y: int
-    clipped: bool
-    rejection: str = ""
-
-
-def _ceil_tolerant(value: float, tolerance: float = 1e-3) -> int:
-    return int(ceil(value - tolerance))
-
-
-def _dewarp_output_geometry(quad: Quad, image_size: tuple[int, int]) -> DewarpGeometry:
-    """Map ``quad`` to an upright rectangle without discarding the rest of the image.
-
-    The quad only defines the correction (which four points should become a
-    rectangle). The output canvas is sized to the bounding box of the whole
-    transformed input, so content outside the quad -- page numbers, a line that
-    runs past a corner point, the margins added by the Margins stage -- is kept.
-
-    Near-degenerate quads are rejected (``rejection`` is set) when an input corner
-    lies at or beyond the vanishing line, when the transformed input would extend
-    more than ``DEWARP_MAX_CANVAS_OVERHANG`` input sizes past the quad, or when the
-    canvas would exceed ``DEWARP_MAX_CANVAS_AREA_RATIO`` times the input area. The
-    returned canvas dimensions are always bounded, so even a caller that ignored
-    the rejection could not allocate an unbounded image.
-    """
-    if cv2 is None or np is None:
-        raise RuntimeError("dewarping requires OpenCV and NumPy")
-    quad_width, quad_height = _estimate_target_dimensions(quad)
-    source_matrix = np.array(quad, dtype=np.float64)
-    # Corner distances are preserved (no "-1"), so an already-upright quad is a pure
-    # translation and the output equals the input.
-    destination_matrix = np.array(
-        [
-            [0, 0],
-            [quad_width, 0],
-            [quad_width, quad_height],
-            [0, quad_height],
-        ],
-        dtype=np.float64,
-    )
-    transform = cv2.getPerspectiveTransform(
-        source_matrix.astype(np.float32),
-        destination_matrix.astype(np.float32),
-    ).astype(np.float64)
-
-    width, height = image_size
-    corners = np.array(
-        [[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]],
-        dtype=np.float64,
-    ).T
-    projected = transform @ corners
-    weights = projected[2]
-    overhang_x = DEWARP_MAX_CANVAS_OVERHANG * width
-    overhang_y = DEWARP_MAX_CANVAS_OVERHANG * height
-    limit_left, limit_right = -overhang_x, quad_width + overhang_x
-    limit_top, limit_bottom = -overhang_y, quad_height + overhang_y
-
-    rejection = ""
-    clipped = False
-    max_weight = float(np.max(np.abs(weights))) if np.all(np.isfinite(weights)) else 0.0
-    if (
-        max_weight <= 0.0
-        or not np.all(np.isfinite(projected))
-        or not np.all(weights > DEWARP_MIN_PROJECTIVE_WEIGHT_RATIO * max_weight)
-    ):
-        # A corner lies at/beyond the vanishing line: the image has no finite (or
-        # unmirrored) bounds.
-        left, right, top, bottom = limit_left, limit_right, limit_top, limit_bottom
-        clipped = True
-        rejection = "degenerate_quad_beyond_vanishing_line"
-    else:
-        xs = projected[0] / weights
-        ys = projected[1] / weights
-        left, right = float(min(xs.min(), 0.0)), float(max(xs.max(), quad_width))
-        top, bottom = float(min(ys.min(), 0.0)), float(max(ys.max(), quad_height))
-    if left < limit_left or right > limit_right or top < limit_top or bottom > limit_bottom:
-        clipped = True
-        rejection = rejection or "extreme_quad_canvas_clipped"
-    left, right = max(left, limit_left), min(right, limit_right)
-    top, bottom = max(top, limit_top), min(bottom, limit_bottom)
-
-    # Round up, but tolerate the solver's float noise (520.0001 must not add a pixel).
-    offset_x = _ceil_tolerant(-left)
-    offset_y = _ceil_tolerant(-top)
-    canvas_width = max(1, _ceil_tolerant(right) + offset_x)
-    canvas_height = max(1, _ceil_tolerant(bottom) + offset_y)
-    max_area = DEWARP_MAX_CANVAS_AREA_RATIO * max(1, width) * max(1, height)
-    if canvas_width * canvas_height > max_area:
-        rejection = rejection or "extreme_quad_canvas_too_large"
-        # Keep the reported dimensions within the area budget as well.
-        shrink = (max_area / (canvas_width * canvas_height)) ** 0.5
-        canvas_width = max(1, int(canvas_width * shrink))
-        canvas_height = max(1, int(canvas_height * shrink))
-    translate = np.array(
-        [[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]],
-        dtype=np.float64,
-    )
-    return DewarpGeometry(
-        matrix=translate @ transform,
-        canvas_width=canvas_width,
-        canvas_height=canvas_height,
-        quad_width=quad_width,
-        quad_height=quad_height,
-        offset_x=offset_x,
-        offset_y=offset_y,
-        clipped=clipped,
-        rejection=rejection,
-    )
-
-
-# Every parameter the dewarping stage reports. Each run sets all of them (``None``
-# when not applicable): results are merged into the stored parameters, and a
-# passthrough must not leave a previous run's warp geometry looking current.
-DEWARP_RESULT_KEYS: Final[tuple[str, ...]] = (
-    "dewarp_source_points",
-    "dewarp_width",
-    "dewarp_height",
-    "dewarp_canvas_width",
-    "dewarp_canvas_height",
-    "dewarp_quad_offset",
-    "dewarp_canvas_clipped",
-    "dewarp_detection",
-    "dewarp_correction",
-    "dewarp_warning",
-    "dewarp_error",
-    "curvature_curves",
-    "curvature_padding",
-    "curvature_max_displacement",
-    "curvature_model_version",
-)
-
-
-def _dewarp_result(applied: str, **fields: Any) -> dict[str, Any]:
-    """Full dewarping result: every known key, cleared unless given in ``fields``.
-
-    ``dewarp_applied`` records what actually ran: ``"perspective"`` when the page
-    was warped, ``"passthrough"`` when the input was copied through unchanged
-    (bypass, nothing detected, no correction needed, a rejected quad, an error).
-    ``algorithm`` follows it, so a passthrough never claims a warp ran.
-    """
-    result: dict[str, Any] = dict.fromkeys(DEWARP_RESULT_KEYS)
-    result.update(fields)
-    result["dewarp_applied"] = applied
-    result["algorithm"] = {"passthrough": "copy", "curvature": "baseline_curvature"}.get(
-        applied, "projective_dewarp"
-    )
-    return result
-
-
-def _dewarp_passthrough(
-    parameters: dict[str, Any], stage_input: StageInput, **fields: Any
-) -> StageResult:
-    """Keep the page as it is (identity op) and say why in the dewarping result keys."""
-    return _transform_result(
-        parameters, stage_input, scan_transform.IDENTITY, _dewarp_result("passthrough", **fields)
-    )
-
-
-def _run_perspective_dewarp(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("dewarp_mode", "auto")).strip().lower()
-    if mode not in {"auto", "manual", "bypass"}:
-        mode = "auto"
     if mode == "bypass":
-        return _dewarp_passthrough(parameters, stage_input, dewarp_mode="bypass")
-
-    full_size = stage_input.full_size
-    manual_points = _coerce_dewarp_points(parameters.get("dewarp_points"), full_size)
-    source_quad: Quad
-    detection = "manual"
-    recorded_mode = "manual" if mode == "manual" else "auto"
-    if mode == "manual" and manual_points is not None:
-        source_quad = _ordered_quad_points(manual_points)
-    else:
-        detected = _auto_dewarp_points(stage_input.image)
-        if detected is None:
-            return _dewarp_passthrough(
-                parameters,
-                stage_input,
-                dewarp_mode="auto_fallback",
-                dewarp_detection="none",
-                dewarp_warning="auto_detection_found_no_text_lines_or_page_outline",
-            )
-        work_quad, detection = detected
-        sx, sy = stage_input.scale
-        source_quad = _ordered_quad_points([(round(x / sx), round(y / sy)) for x, y in work_quad])
-        if _dewarp_correction_is_negligible(source_quad, full_size):
-            # Already upright: don't resample (and soften) the page for nothing.
-            return _dewarp_passthrough(
-                parameters,
-                stage_input,
-                dewarp_mode="auto",
-                dewarp_detection=detection,
-                dewarp_source_points=source_quad,
-                dewarp_correction="none_needed",
-                dewarp_warning="",
-            )
-
-    try:
-        geometry = _dewarp_output_geometry(source_quad, full_size)
-    except Exception as exc:  # pragma: no cover - geometry failures
-        return _dewarp_passthrough(
-            parameters,
-            stage_input,
-            dewarp_mode="processing_error_fallback",
-            dewarp_source_points=source_quad,
-            dewarp_detection=detection,
-            dewarp_error=str(exc),
-        )
-    if geometry.rejection:
-        # Near-degenerate quad: rendering would allocate a huge canvas of mostly
-        # extrapolated (or mirrored) pixels. Keep the page as it is instead.
-        return _dewarp_passthrough(
-            parameters,
-            stage_input,
-            dewarp_mode=recorded_mode,
-            dewarp_detection=detection,
-            dewarp_source_points=source_quad,
-            dewarp_canvas_clipped=geometry.clipped,
-            dewarp_correction="rejected_degenerate_quad",
-            dewarp_warning=geometry.rejection,
-        )
-    return _transform_result(
-        parameters,
-        stage_input,
-        scan_transform.perspective(
-            geometry.matrix, (geometry.canvas_width, geometry.canvas_height)
-        ),
-        _dewarp_result(
-            "perspective",
-            dewarp_mode=recorded_mode,
-            dewarp_source_points=source_quad,
-            dewarp_width=geometry.quad_width,
-            dewarp_height=geometry.quad_height,
-            dewarp_canvas_width=geometry.canvas_width,
-            dewarp_canvas_height=geometry.canvas_height,
-            dewarp_quad_offset=[geometry.offset_x, geometry.offset_y],
-            dewarp_canvas_clipped=geometry.clipped,
-            dewarp_detection=detection,
-            dewarp_correction="applied",
-            dewarp_warning="",
-        ),
-    )
-
-
-def _scale_curves(curves: list[list[list[float]]], sx: float, sy: float) -> list[list[list[float]]]:
-    """Scale pixel-centre curve coordinates by ``sx``, ``sy`` (see scan_transform)."""
-    return [[[(x + 0.5) * sx - 0.5, (y + 0.5) * sy - 0.5] for x, y in curve] for curve in curves]
-
-
-def _run_curvature_dewarp(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
-    parameters = dict(state.parameters or {})
-    mode = str(parameters.get("dewarp_mode", "auto")).strip().lower()
-    if mode not in {"auto", "manual", "bypass"}:
+        mode = "off"
+    if mode not in DEWARP_MODES:
         mode = "auto"
-    if mode == "bypass":
-        return _dewarp_passthrough(
-            parameters, stage_input, dewarp_mode="bypass", dewarp_model="curvature"
-        )
-    full_size = stage_input.full_size
-    try:
-        if mode == "manual":
-            proposed = parameters.get("dewarp_curves")
-        else:
-            sx, sy = stage_input.scale
-            detected = curvature.detect_curves(stage_input.image)
-            proposed = _scale_curves(detected, 1.0 / sx, 1.0 / sy)
-            # Scaling back to full resolution may round a point onto the far edge.
-            proposed = [
-                [
-                    [min(max(x, 0.0), full_size[0] - 1.0), min(max(y, 0.0), full_size[1] - 1.0)]
-                    for x, y in curve
-                ]
-                for curve in proposed
-            ]
-        curves, padding, maximum = curvature.measure(proposed, full_size)
-    except Exception as exc:
-        return _dewarp_passthrough(
-            parameters,
-            stage_input,
-            dewarp_model="curvature",
-            dewarp_mode=mode,
-            dewarp_warning=f"Curvature correction was not applied: {exc}",
-            dewarp_correction="curvature_fallback",
-            curvature_model_version=curvature.VERSION,
-        )
-    metadata: dict[str, Any] = {
+    depth = _depth_perception(parameters)
+    width, height = stage_input.full_size
+    updates: dict[str, Any] = {
         "dewarp_mode": mode,
-        "dewarp_model": "curvature",
-        "curvature_curves": curves,
-        "curvature_model_version": curvature.VERSION,
-        "curvature_max_displacement": maximum,
-        "curvature_padding": padding,
+        "depth_perception": depth,
         "dewarp_warning": "",
+        "output_width": width,
+        "output_height": height,
     }
-    if padding == 0:
-        return _dewarp_passthrough(
-            parameters, stage_input, dewarp_correction="none_needed", **metadata
+    for legacy in ("dewarp_model", "dewarp_points", "dewarp_curves", "curvature_curves"):
+        parameters.pop(legacy, None)
+    if mode == "off":
+        for key in ("top_curve", "bottom_curve", "top_polyline", "bottom_polyline"):
+            parameters.pop(key, None)
+        return _transform_result(
+            parameters, stage_input, scan_transform.IDENTITY, {**updates, "dewarp_applied": False}
         )
-    return _transform_result(
-        parameters,
-        stage_input,
-        scan_transform.curvature_op(curves, padding),
-        _dewarp_result("curvature", dewarp_correction="applied", **metadata),
-    )
+
+    top_spline: cylindrical.XSpline | None = None
+    bottom_spline: cylindrical.XSpline | None = None
+    trivial = False
+    if mode == "manual":
+        top_points = _coerce_points(parameters.get("top_curve"))
+        bottom_points = _coerce_points(parameters.get("bottom_curve"))
+        if top_points is not None and bottom_points is not None:
+            top_spline = cylindrical.XSpline(top_points)
+            bottom_spline = cylindrical.XSpline(bottom_points)
+        else:
+            mode = updates["dewarp_mode"] = "auto"
+    if top_spline is None or bottom_spline is None:
+        found = _auto_dewarp_curves(stage_input)
+        trivial = found is None
+        if found is None:
+            top_line, bottom_line = cylindrical.trivial_curves(width, height)
+            updates["dewarp_warning"] = "No text lines were found; the page is unchanged."
+        else:
+            top_line, bottom_line = found
+        top_spline = _spline_through(top_line)
+        bottom_spline = _spline_through(bottom_line)
+
+    top = top_spline.to_polyline()
+    bottom = bottom_spline.to_polyline()
+    updates["top_curve"] = [[x, y] for x, y in top_spline.points]
+    updates["bottom_curve"] = [[x, y] for x, y in bottom_spline.points]
+    op: scan_transform.Op = scan_transform.IDENTITY
+    if trivial:
+        pass  # upstream's trivial model: the page stays as it is
+    elif not cylindrical.model_is_valid(top, bottom):
+        updates["dewarp_warning"] = (
+            "The curves do not form a valid model (their ends must make a convex shape); "
+            "the page is unchanged."
+        )
+    else:
+        op = scan_transform.cylindrical_op(top, bottom, depth, (width, height))
+        try:
+            result = _transform_result(
+                parameters, stage_input, op, {**updates, "dewarp_applied": True}
+            )
+        except scan_transform.TransformError as exc:
+            updates["dewarp_warning"] = (
+                f"The model could not be applied ({exc}); the page is unchanged."
+            )
+            op = scan_transform.IDENTITY
+        else:
+            return result
+    return _transform_result(parameters, stage_input, op, {**updates, "dewarp_applied": False})
 
 
 def _run_dewarping(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
-    if (state.parameters or {}).get("dewarp_model") == "curvature":
-        return _run_curvature_dewarp(state, stage_input)
-    return _run_perspective_dewarp(state, stage_input)
+    return _run_cylindrical_dewarp(state, stage_input)
 
 
 def _coerce_output_mode(value: object, default: str = "otsu") -> str:
@@ -1987,7 +1429,9 @@ _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
         "copy_detect": _run_margins,
     },
     ScanTailorStageState.Stage.DEWARPING.value: {
-        "baseline_curvature": _run_curvature_dewarp,
+        "cylindrical_dewarp": _run_dewarping,
+        # Names recorded before #195 step 6; same runner.
+        "baseline_curvature": _run_dewarping,
         "projective_dewarp": _run_dewarping,
         "copy": _run_dewarping,
         "copy_detect": _run_dewarping,
@@ -2051,18 +1495,9 @@ def request_stage_job(
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
-    if state.stage in {"deskew", "select_content"}:
-        # Pre-port algorithm names run the port now (#195 steps 4 and 5).
+    if state.stage in {"deskew", "select_content", "dewarping"}:
+        # Pre-port algorithm names run the port now (#195 steps 4 to 6).
         algorithm = _default_algorithm(state.stage)
-    if state.stage == "dewarping" and str((state.parameters or {}).get("dewarp_model")) in {
-        "curvature",
-        "perspective",
-    }:
-        algorithm = (
-            "baseline_curvature"
-            if state.parameters["dewarp_model"] == "curvature"
-            else "projective_dewarp"
-        )
     algorithm_version = _default_algorithm_version(state.stage, algorithm)
     now = timezone.now()
     claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(

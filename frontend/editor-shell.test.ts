@@ -15,6 +15,15 @@ import {
   TOP,
 } from "./content-box-view";
 import {
+  CylindricalDewarper,
+  DewarpOverlay,
+  describeDewarp,
+  insertionIndex,
+  modelIsValid,
+  type Pt,
+  XSpline,
+} from "./dewarp-view";
+import {
   angleFromHandle,
   applyScopePages,
   deskewMapPoint,
@@ -342,6 +351,106 @@ describe("select content (#195 step 5)", () => {
     fire("pointerup", 310, 999);
     expect(onCommit).toHaveBeenCalledWith({ ...start, x1: 120 });
     expect(overlay.element.style.left).toBe("60px");
+    host.remove();
+  });
+});
+
+describe("dewarping (#195 step 6a)", () => {
+  interface ModelCase {
+    top: Pt[];
+    bottom: Pt[];
+    depth: number;
+    crv: Pt[];
+    warped: Pt[];
+    arc_length: number;
+    straight_line_y: number;
+  }
+
+  it("draws the same model as the server (shared fixture)", () => {
+    // tests/test_cylindrical.py checks core/cylindrical.py against the same file.
+    const cases = JSON.parse(
+      readFileSync(resolve(process.cwd(), "tests/fixtures/dewarp_model_cases.json"), "utf-8"),
+    ) as ModelCase[];
+    expect(cases.length).toBeGreaterThanOrEqual(3);
+    for (const item of cases) {
+      const top = new XSpline(item.top).toPolyline();
+      const bottom = new XSpline(item.bottom).toPolyline();
+      const dewarper = new CylindricalDewarper(top, bottom, item.depth);
+      expect(dewarper.directrixArcLength).toBeCloseTo(item.arc_length, 9);
+      expect(dewarper.straightLineY).toBeCloseTo(item.straight_line_y, 9);
+      item.crv.forEach((crv, index) => {
+        const [x, y] = dewarper.mapToWarped(crv);
+        expect(x).toBeCloseTo(item.warped[index]![0], 6);
+        expect(y).toBeCloseTo(item.warped[index]![1], 6);
+      });
+    }
+  });
+
+  it("moves middle points alone and turns the whole curve about the far end", () => {
+    const spline = new XSpline([
+      [0, 0],
+      [50, 0],
+      [100, 0],
+    ]);
+    spline.moveControlPoint(1, [50, 10]);
+    expect(spline.points[1]).toEqual([50, 10]);
+    spline.moveControlPoint(2, [0, 100]); // rotate 90 degrees about (0, 0)
+    expect(spline.points[2]![0]).toBeCloseTo(0);
+    expect(spline.points[2]![1]).toBeCloseTo(100);
+    expect(spline.points[1]![0]).toBeCloseTo(-10);
+    expect(spline.points[1]![1]).toBeCloseTo(50);
+    expect(insertionIndex(spline, 0.3)).toBe(1);
+    expect(insertionIndex(spline, 0.7)).toBe(2);
+  });
+
+  it("checks validity like upstream and describes the result", () => {
+    const top: Pt[] = [
+      [0, 0],
+      [100, 0],
+    ];
+    const bottom: Pt[] = [
+      [0, 100],
+      [100, 100],
+    ];
+    expect(modelIsValid(top, bottom)).toBe(true);
+    expect(modelIsValid(top, [...bottom].reverse())).toBe(false);
+    expect(describeDewarp({ dewarp_mode: "off" })).toContain("off");
+    expect(describeDewarp({ dewarp_mode: "auto", dewarp_applied: true, depth_perception: 2 })).toBe(
+      "Dewarped (auto, depth perception 2.0).",
+    );
+  });
+
+  it("drags a point, inserts one by clicking a curve and deletes it with D", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const onCommit = vi.fn();
+    const line = (y: number): Pt[] =>
+      [0, 0.25, 0.5, 0.75, 1].map((f) => [f * 400, y] as Pt);
+    const overlay = new DewarpOverlay(host, new XSpline(line(50)), new XSpline(line(550)), true, {
+      onPreview: () => undefined,
+      onCommit,
+    });
+    overlay.layout({ width: 400, height: 600 }, { width: 400, height: 600 });
+    expect(host.querySelectorAll("[data-dewarp-point]")).toHaveLength(10);
+    const fire = (target: EventTarget, type: string, x: number, y: number): void => {
+      target.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y, button: 0, bubbles: true }));
+    };
+    const middle = host.querySelector('[data-dewarp-point="0:2"]')!;
+    fire(middle, "pointerdown", 200, 50);
+    fire(window, "pointermove", 200, 80);
+    fire(window, "pointerup", 200, 80);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(overlay.top.points[2]).toEqual([200, 80]);
+
+    // Clicking the bottom curve between two points inserts a point there.
+    fire(overlay.element, "pointerdown", 150, 550);
+    fire(window, "pointerup", 150, 550);
+    expect(overlay.bottom.points).toHaveLength(6);
+    const added = host.querySelector('[data-dewarp-point="1:2"]')!;
+    added.dispatchEvent(new MouseEvent("pointerenter"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "d" }));
+    expect(overlay.bottom.points).toHaveLength(5);
+    overlay.remove();
     host.remove();
   });
 });
