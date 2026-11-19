@@ -528,12 +528,3 @@ def store_replacement(
                 storage.delete(destination)
             except OSError:
                 logger.warning("scanner_upload_cleanup_failed", storage_identifier=destination)
-
-
-def after_replacement(result: ReplacementResult) -> None:
-    """Post-commit follow-up, as for a web replacement: re-run a "no split" Page Split."""
-    if not result.created:
-        return
-    page = ScanPage.objects.select_related("scan_job").filter(pk=result.page_id).first()
-    if page is not None:
-        scantailor.auto_complete_single_page_split(page)

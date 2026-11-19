@@ -16,11 +16,7 @@
         {% else %}
           not linked to a canonical book
         {% endif %}
-        · <span data-capture-layout="{{ job.capture_layout }}">{{ job.get_capture_layout_display }}</span>
       </p>
-      {% if job.capture_layout == 'single_page' %}
-        <p class="muted">Page split completes automatically as "no split" for each page. Switch a page's split mode to manual or auto to split it anyway.</p>
-      {% endif %}
     </div>
     <span class="status status-{{ job.state }}">{{ job.get_state_display }}</span>
   </div>
@@ -166,7 +162,7 @@
             <div class="stage-row" data-stage-row data-page-id="{{ page.id }}" data-stage="{{ stage.stage }}">
               <div>
                 <strong>{{ stage.stage_label }}</strong>
-                <span class="status status-{{ stage.status }}" data-stage-status{% if stage.status == 'invalidated' and stage.invalidated_reason %} title="{{ stage.invalidated_reason }}"{% elif stage.auto_skipped %} title="{{ stage.parameters.split_skipped_reason }}"{% endif %}>{% if stage.auto_skipped %}skipped · single page{% else %}{{ stage.status }}{% endif %}</span>
+                <span class="status status-{{ stage.status }}" data-stage-status{% if stage.status == 'invalidated' and stage.invalidated_reason %} title="{{ stage.invalidated_reason }}"{% endif %}>{{ stage.status }}</span>
                 <small class="error" data-stage-error {% if stage.status != 'failed' or not stage.last_error %}hidden{% endif %}>{% if stage.status == 'failed' %}{{ stage.last_error }}{% endif %}</small>
               </div>
               <button

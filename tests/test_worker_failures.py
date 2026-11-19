@@ -399,4 +399,6 @@ def test_recovery_schema_rollback_preserves_populated_history() -> None:
         assert ReviewTask.objects.filter(processing_job=job).exists()
         assert job.recovery_task_id is not None
     finally:
-        MigrationExecutor(connection).migrate(current)
+        # Back to the newest schema, not just 0048, so later tests see current models.
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())

@@ -7,6 +7,7 @@ import os
 import shutil
 import struct
 import tempfile
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -44,7 +45,6 @@ type Quad = tuple[Point, Point, Point, Point]
 type Box = tuple[int, int, int, int]
 
 DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
-    "page_split": "auto_split",
     "deskew": "projection_deskew",
     "select_content": "content_box_projection",
     "margins": "margin_pad",
@@ -53,8 +53,6 @@ DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
 }
 
 DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
-    # v2: a single-page capture layout records a "no split" passthrough (#55).
-    "page_split": "splitter-v2",
     "deskew": "projection-v1",
     "select_content": "projection-v1",
     "margins": "padding-v1",
@@ -78,14 +76,8 @@ def normalize_stage(value: str) -> str | None:
 
 
 def stage_order() -> tuple[str, ...]:
-    return (
-        ScanTailorStageState.Stage.PAGE_SPLIT.value,
-        ScanTailorStageState.Stage.DESKEW.value,
-        ScanTailorStageState.Stage.SELECT_CONTENT.value,
-        ScanTailorStageState.Stage.MARGINS.value,
-        ScanTailorStageState.Stage.DEWARPING.value,
-        ScanTailorStageState.Stage.OUTPUT.value,
-    )
+    """Pipeline order (#195): Deskew, Select Content, Dewarping, Margins, Output."""
+    return tuple(stage.value for stage in ScanTailorStageState.Stage)
 
 
 def stage_position(stage: str) -> int:
@@ -802,310 +794,6 @@ def _run_copy(
 ) -> dict[str, Any]:
     del state
     return _copy_fallback(source_path, output_path, preview_path)
-
-
-@dataclass(frozen=True)
-class SplitResult:
-    x: int
-    confidence: float
-    method: str
-
-
-MIN_SPLIT_CONFIDENCE: Final[float] = 0.08
-
-
-def _column_darkness_profile(gray: np.ndarray) -> np.ndarray:
-    """Per-column mean darkness in 0..1, normalised to the image's own paper/ink range."""
-    height = gray.shape[0]
-    rows = gray[int(height * 0.05) : max(int(height * 0.95), 1)]
-    paper = float(np.percentile(rows, 99))
-    ink = float(np.percentile(rows, 1))
-    span = paper - ink
-    if span < 20.0:
-        return np.zeros(gray.shape[1], dtype=np.float64)
-    darkness = np.clip((paper - rows.astype(np.float32)) / span, 0.0, 1.0)
-    return np.asarray(darkness.mean(axis=0), dtype=np.float64)
-
-
-def _find_gutter(image: Image.Image) -> SplitResult | None:
-    """Locate the page gutter in a spread.
-
-    Works on the per-column darkness profile of the central band (30-70% of the
-    width). A gutter shows up either as a narrow dark ridge (binding shadow) or as a
-    narrow bright valley between two text blocks (flat scan). Whichever contrasts
-    more with its surroundings wins; if neither does, no split is reported.
-    """
-    width, height = image.size
-    if width < 96 or width <= height:
-        return None
-    scale = min(1.0, 1000.0 / width)
-    gray = np.asarray(image.convert("L"))
-    if scale < 1.0:
-        gray = cv2.resize(
-            gray, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA
-        )
-    small_w = gray.shape[1]
-    profile = _column_darkness_profile(gray)
-    smooth_w = max(1, int(small_w * 0.006))
-    kernel = np.ones(smooth_w) / smooth_w
-    profile = np.convolve(np.pad(profile, smooth_w, mode="edge"), kernel, mode="same")[
-        smooth_w:-smooth_w
-    ]
-
-    inner = max(2, int(small_w * 0.04))
-    outer = max(inner + 2, int(small_w * 0.12))
-    lo = int(small_w * 0.30)
-    hi = int(small_w * 0.70)
-    best_strength = 0.0
-    best_kind = ""
-    candidates: list[tuple[float, str, int]] = []
-    ridge = np.full(small_w, -1.0)
-    valley = np.full(small_w, -1.0)
-    for x in range(max(lo, outer), min(hi, small_w - outer)):
-        neighbours = np.concatenate(
-            (profile[x - outer : x - inner], profile[x + inner : x + outer + 1])
-        )
-        level = float(neighbours.mean())
-        ridge[x] = float(profile[x]) - level
-        valley[x] = level - float(profile[x])
-    for kind, strength_map in (("ridge", ridge), ("valley", valley)):
-        peak = float(strength_map.max())
-        candidates.append((peak, kind, int(strength_map.argmax())))
-    best_strength, best_kind, _ = max(candidates)
-    if best_strength <= 0.0:
-        return None
-    strength_map = ridge if best_kind == "ridge" else valley
-    # centre of the plateau of near-maximal responses (flat gaps are wide, not 1px)
-    near = np.flatnonzero(strength_map >= best_strength * 0.9)
-    # keep the run of indexes that contains the argmax
-    peak_index = int(strength_map.argmax())
-    run = [int(i) for i in near if abs(int(i) - peak_index) <= int(small_w * 0.05)]
-    centre = (min(run) + max(run)) / 2.0 if run else float(peak_index)
-    x_full = int(round(centre / (gray.shape[1] / width)))
-    return SplitResult(x=x_full, confidence=round(best_strength, 4), method=best_kind)
-
-
-def _auto_split_position(
-    image: Image.Image,
-    *,
-    minimum_confidence: float = MIN_SPLIT_CONFIDENCE,
-) -> int | None:
-    result = _find_gutter(image)
-    if result is None or result.confidence < minimum_confidence:
-        return None
-    width = image.width
-    if not (width * 0.25 <= result.x <= width * 0.75):
-        return None
-    return result.x
-
-
-SPLIT_MODES: Final[frozenset[str]] = frozenset({"auto", "manual", "single", "none"})
-SINGLE_PAGE_SPLIT_ALGORITHM: Final[str] = "single_page_passthrough"
-SINGLE_PAGE_SPLIT_REASON: Final[str] = (
-    "single-page capture layout: the image already holds exactly one page, no split"
-)
-# Recorded by a split run; dropped when another mode runs so none of them goes stale.
-_SPLIT_RESULT_KEYS: Final[tuple[str, ...]] = (
-    "algorithm",
-    "split_skipped",
-    "split_skipped_reason",
-    "capture_layout",
-    "resolved_split_x",
-    "resolved_width",
-    "split_confidence",
-    "split_method",
-)
-
-
-def _capture_layout(state: ScanTailorStageState) -> str:
-    """The capture layout of the state's scan job (#55).
-
-    A state that is not attached to a saved job (direct unit-level runs) keeps the
-    gutter-detecting behaviour, i.e. it is treated as ``spread``.
-    """
-    if state.scan_job_id is None:
-        return str(ScanJob.CaptureLayout.SPREAD)
-    return str(state.scan_job.capture_layout)
-
-
-def default_split_mode(capture_layout: str) -> str:
-    """Page Split mode used when a page has no explicit ``split_mode`` (#55)."""
-    return "none" if capture_layout == ScanJob.CaptureLayout.SINGLE_PAGE else "auto"
-
-
-def _explicit_split_mode(parameters: dict[str, Any] | None) -> str | None:
-    raw = (parameters or {}).get("split_mode")
-    if raw is None:
-        return None
-    mode = str(raw).strip().lower()
-    return mode if mode in SPLIT_MODES else None
-
-
-def effective_split_mode(state: ScanTailorStageState) -> str:
-    """The split mode a Page Split run of ``state`` uses."""
-    return _explicit_split_mode(state.parameters) or default_split_mode(_capture_layout(state))
-
-
-def split_algorithm_for_mode(split_mode: str) -> str:
-    """Stage ``algorithm`` recorded for a Page Split mode."""
-    if split_mode == "none":
-        return SINGLE_PAGE_SPLIT_ALGORITHM
-    if split_mode == "manual":
-        return "manual_split"
-    return "auto_split"
-
-
-def is_auto_skipped_split(state: ScanTailorStageState) -> bool:
-    """True for a Page Split stage that completed as a recorded "no split" passthrough."""
-    return (
-        state.stage == ScanTailorStageState.Stage.PAGE_SPLIT.value
-        and state.status == ScanTailorStageState.StageStatus.SUCCESS
-        and (state.parameters or {}).get("resolved_split_mode") == "none"
-    )
-
-
-def _run_single_page_split(
-    state: ScanTailorStageState,
-    parameters: dict[str, Any],
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    """Record Page Split as "no split": the input is copied through unchanged.
-
-    Uses the shared passthrough helper (#54): a normalised PNG input is byte-copied,
-    anything else is normalised once, and no gutter detection runs. The stage still
-    gets its own output artifact, checksum and provenance, so downstream stages and
-    their invalidation behave exactly as after a real split.
-    """
-    image = _load_image(source_path)
-    _write_unchanged(image, source_path, output_path, preview_path)
-    recorded = {
-        key: value
-        for key, value in parameters.items()
-        if key not in _SPLIT_RESULT_KEYS and key != "split_x"
-    }
-    recorded.update(
-        {
-            "split_mode": "none",
-            "resolved_split_mode": "none",
-            "resolved_split_side": "single",
-            "algorithm": SINGLE_PAGE_SPLIT_ALGORITHM,
-            "split_skipped": True,
-            "split_skipped_reason": SINGLE_PAGE_SPLIT_REASON,
-            "capture_layout": _capture_layout(state),
-            "source_width": image.width,
-            "source_height": image.height,
-        },
-    )
-    return recorded
-
-
-def _run_page_split(
-    state: ScanTailorStageState,
-    source_path: Path,
-    output_path: Path,
-    preview_path: Path,
-) -> dict[str, Any]:
-    parameters = dict(state.parameters or {})
-    split_mode = effective_split_mode(state)
-    if split_mode == "none":
-        return _run_single_page_split(state, parameters, source_path, output_path, preview_path)
-    for key in _SPLIT_RESULT_KEYS:
-        parameters.pop(key, None)
-
-    source = _load_image(source_path)
-    side = state.scan_page.side
-
-    dpi = _dpi_of(source)
-    if source.width <= source.height:
-        _write_unchanged(source, source_path, output_path, preview_path)
-        return {
-            "resolved_split_mode": "single",
-            "source_width": source.width,
-            "source_height": source.height,
-        }
-
-    split_x = None
-    split_confidence: float | None = None
-    split_method = split_mode
-    if split_mode == "manual":
-        split_x = _coerce_int(parameters.get("split_x"), -1)
-        if split_x < 0:
-            split_x = None
-    elif split_mode == "single":
-        split_x = None
-    else:
-        gutter = _find_gutter(source)
-        if gutter is not None:
-            split_confidence = gutter.confidence
-            split_method = gutter.method
-            if (
-                gutter.confidence >= MIN_SPLIT_CONFIDENCE
-                and source.width * 0.25 <= gutter.x <= source.width * 0.75
-            ):
-                split_x = gutter.x
-        else:
-            split_confidence = 0.0
-        if split_x is None:
-            split_method = "center_fallback"
-
-    resolved = split_mode
-    output = source
-    output_side = "single"
-    split_detected = None
-
-    if split_x is None:
-        split_x = source.width // 2
-        if split_x <= 0 or split_x >= source.width:
-            split_x = None
-
-    if split_x is not None and side in {ScanPage.Side.LEFT, ScanPage.Side.RIGHT}:
-        split_x = max(1, min(source.width - 1, split_x))
-        if side == ScanPage.Side.LEFT:
-            output = source.crop((0, 0, split_x, source.height))
-            output_side = "left"
-        else:
-            output = source.crop((split_x, 0, source.width, source.height))
-            output_side = "right"
-            resolved = "auto" if split_mode == "auto" else split_mode
-        split_detected = split_x
-    elif side == ScanPage.Side.LEFT:
-        output = source.crop((0, 0, source.width // 2, source.height))
-        output_side = "left-heuristic"
-        split_detected = source.width // 2
-        resolved = "heuristic-left"
-    elif side == ScanPage.Side.RIGHT:
-        output = source.crop((source.width // 2, 0, source.width, source.height))
-        output_side = "right-heuristic"
-        split_detected = source.width // 2
-        resolved = "heuristic-right"
-    else:
-        split_detected = None
-
-    with output as out:
-        _save_png(out, output_path, dpi)
-        _save_preview(out, preview_path)
-
-    updates: dict[str, Any] = {
-        "split_mode": split_mode,
-        "resolved_split_side": output_side,
-        "source_width": source.width,
-        "source_height": source.height,
-    }
-    if split_confidence is not None:
-        updates["split_confidence"] = split_confidence
-        updates["split_method"] = split_method
-    if split_detected is not None:
-        updates["resolved_split_x"] = split_detected
-        updates["resolved_width"] = output.width
-    return _as_recorded_parameters(
-        parameters,
-        {
-            "resolved_split_mode": resolved,
-            **updates,
-        },
-    )
 
 
 def _candidate_angles(start: float, stop: float, step: float) -> list[float]:
@@ -2628,12 +2316,6 @@ _STAGE_RUNNERS: dict[
         ],
     ],
 ] = {
-    ScanTailorStageState.Stage.PAGE_SPLIT.value: {
-        "copy": _run_copy,
-        "auto_split": _run_page_split,
-        "manual_split": _run_page_split,
-        SINGLE_PAGE_SPLIT_ALGORITHM: _run_page_split,
-    },
     ScanTailorStageState.Stage.DESKEW.value: {
         "copy": _run_copy,
         "projection_deskew": _run_deskew,
@@ -2702,7 +2384,6 @@ def request_stage_job(
     *,
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
-    automatic: bool = False,
 ) -> ProcessingJob:
     """Create and dispatch the worker job for ``state`` at its current revision.
 
@@ -2722,7 +2403,6 @@ def request_stage_job(
             "requested_by_user_id": requested_by_user_id,
             "stage": state.stage,
             "stage_revision": revision,
-            "automatic": automatic,
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
@@ -2757,137 +2437,6 @@ def request_stage_job(
     state.algorithm_version = algorithm_version
     state.updated_at = now
     dispatch_stage_job(str(job.job_id))
-    return job
-
-
-def _claim_automatic_single_page_split(
-    state: ScanTailorStageState,
-    observed_revision: int,
-) -> ScanTailorStageState | None:
-    """Atomically move an auto-owned Page Split stage to a new "no split" revision.
-
-    The decision is taken on the row as it is *now*, under a row lock, and the write
-    is conditional on the revision observed before the lock. Any edit that landed in
-    between (a manual split, a batch apply, another passthrough) bumped the revision,
-    so automation loses the race and changes nothing: the concurrent edit wins.
-    Returns the updated state, or ``None`` when automation must stay out.
-    """
-    with transaction.atomic():
-        locked = (
-            ScanTailorStageState.objects.select_for_update()
-            .select_related("scan_job")
-            .filter(id=state.id)
-            .first()
-        )
-        if locked is None or locked.revision != observed_revision:
-            return None
-        if effective_split_mode(locked) != "none":
-            return None
-        parameters = dict(locked.parameters or {})
-        parameters["split_mode"] = "none"
-        algorithm = split_algorithm_for_mode("none")
-        new_revision = observed_revision + 1
-        now = timezone.now()
-        updated = ScanTailorStageState.objects.filter(
-            id=locked.id,
-            revision=observed_revision,
-        ).update(
-            parameters=parameters,
-            algorithm=algorithm,
-            revision=new_revision,
-            status=ScanTailorStageState.StageStatus.QUEUED,
-            last_error="",
-            updated_at=now,
-        )
-        if not updated:
-            return None
-        # A new page version has normally invalidated everything already ("source
-        # changed"); keep that reason and only catch stages that are still current.
-        ScanTailorStageState.objects.filter(
-            scan_job_id=locked.scan_job_id,
-            scan_page_id=locked.scan_page_id,
-            stage__in=downstream_stages(locked.stage),
-        ).exclude(status=ScanTailorStageState.StageStatus.INVALIDATED).update(
-            status=ScanTailorStageState.StageStatus.INVALIDATED,
-            invalidated_reason="page_split updated",
-            last_error="",
-            updated_at=now,
-        )
-    locked.parameters = parameters
-    locked.algorithm = algorithm
-    locked.revision = new_revision
-    locked.status = ScanTailorStageState.StageStatus.QUEUED
-    locked.last_error = ""
-    locked.updated_at = now
-    return locked
-
-
-def auto_complete_single_page_split(
-    page: ScanPage,
-    *,
-    requested_by_user_id: int | None = None,
-) -> ProcessingJob | None:
-    """Queue the recorded "no split" Page Split run for a page of a single-page job (#55).
-
-    Called when a new page version arrives. In a ``single_page`` job Page Split needs
-    no human input, so it completes on its own as a background passthrough job. A
-    page whose split was switched to another mode (manual/auto/single) is a per-page
-    override and is left for the user to re-run. Returns the queued job, or ``None``
-    when nothing was queued.
-
-    Concurrency: automation never wins against a user. The mode/revision decision is
-    a locked, revision-conditional update (:func:`_claim_automatic_single_page_split`),
-    and the dispatched job only runs while the stage is still at the revision it was
-    queued for, so a manual edit that interleaves at any point keeps its parameters,
-    its revision and its artifact.
-    """
-    if page.scan_job.capture_layout != ScanJob.CaptureLayout.SINGLE_PAGE:
-        return None
-    observed = get_or_create_stage_state(
-        scan_job_id=str(page.scan_job_id),
-        page_id=str(page.id),
-        stage=ScanTailorStageState.Stage.PAGE_SPLIT.value,
-    )
-    if effective_split_mode(observed) != "none":
-        return None
-    state = _claim_automatic_single_page_split(observed, observed.revision)
-    if state is None:
-        logger.info(
-            "scantailor_auto_split_skipped_concurrent_edit",
-            scan_job_id=str(page.scan_job_id),
-            scan_page_id=str(page.id),
-            observed_revision=observed.revision,
-        )
-        return None
-    try:
-        job = request_stage_job(
-            state=state,
-            requested_by_user_id=requested_by_user_id,
-            automatic=True,
-        )
-    except Exception as exc:  # the page upload itself must still succeed
-        logger.warning(
-            "scantailor_auto_split_dispatch_failed",
-            scan_job_id=str(page.scan_job_id),
-            scan_page_id=str(page.id),
-            error=str(exc),
-        )
-        now = timezone.now()
-        message = f"automatic page split could not be queued: {exc}"
-        if state.worker_job_id:
-            ProcessingJob.objects.filter(
-                job_id=state.worker_job_id,
-                state=ProcessingJob.JobState.QUEUED,
-            ).update(state=ProcessingJob.JobState.FAILED, finished_at=now)
-        ScanTailorStageState.objects.filter(id=state.id, revision=state.revision).update(
-            status=ScanTailorStageState.StageStatus.FAILED,
-            last_error=message,
-            updated_at=now,
-        )
-        return None
-    details = job.details if isinstance(job.details, dict) else {}
-    if details.get("superseded"):
-        return None
     return job
 
 
@@ -2941,13 +2490,10 @@ def process_stage_job(job_id: str) -> None:
         return
 
     # A job only ever produces the artifact of the revision it was queued for. A late
-    # job (e.g. an automatic passthrough overtaken by a manual edit) is a no-op.
+    # job (e.g. one overtaken by a manual edit) is a no-op.
     dispatched_revision = details.get("stage_revision")
     if isinstance(dispatched_revision, int) and dispatched_revision != state.revision:
         _supersede_stage_job(job, details, "stage revision changed after dispatch")
-        return
-    if details.get("automatic") is True and effective_split_mode(state) != "none":
-        _supersede_stage_job(job, details, "stage is no longer an automatic passthrough")
         return
 
     if state.input_stage_state is not None:
@@ -2995,6 +2541,8 @@ def process_stage_job(job_id: str) -> None:
         preview_identifier = output_identifier(state, preview=True)
 
         runner = _resolve_stage_algorithm(state)
+        # Per-phase timings for the structured log (#195 section 8.3).
+        timer_start = time.perf_counter()
         with tempfile.TemporaryDirectory(prefix="stages-") as tempdir:
             staged_output = Path(tempdir) / "output.png"
             staged_preview = Path(tempdir) / "preview.png"
@@ -3004,6 +2552,7 @@ def process_stage_job(job_id: str) -> None:
                 staged_output,
                 staged_preview,
             )
+            run_done = time.perf_counter()
             if not staged_output.exists() or not staged_preview.exists():
                 raise RuntimeError("processing did not produce expected outputs")
             output_params = output_updates if isinstance(output_updates, dict) else {}
@@ -3018,6 +2567,7 @@ def process_stage_job(job_id: str) -> None:
                 state.parameters = merged
             output_size = staged_output.stat().st_size
             output_sha = _compute_sha256(staged_output)
+            hash_done = time.perf_counter()
             if not _publish_stage_artifacts(
                 state,
                 started_revision,
@@ -3032,6 +2582,7 @@ def process_stage_job(job_id: str) -> None:
             ):
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
+            publish_done = time.perf_counter()
 
         job.state = ProcessingJob.JobState.SUCCESS
         job.finished_at = timezone.now()
@@ -3049,6 +2600,10 @@ def process_stage_job(job_id: str) -> None:
             scan_job_id=str(state.scan_job_id),
             stage=state.stage,
             output_size_bytes=output_size,
+            duration_ms=round((time.perf_counter() - timer_start) * 1000, 1),
+            run_ms=round((run_done - timer_start) * 1000, 1),
+            hash_ms=round((hash_done - run_done) * 1000, 1),
+            store_db_ms=round((publish_done - hash_done) * 1000, 1),
         )
     except Exception as exc:
         with transaction.atomic():

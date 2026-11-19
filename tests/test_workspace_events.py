@@ -24,6 +24,9 @@ from ebook_server.core.workspace_events import WorkspaceEventPoller
 pytestmark = pytest.mark.django_db(transaction=True)
 
 
+STAGES_PER_PAGE = len(scantailor.stage_order())
+
+
 def workspace(pages: int = 2) -> tuple[ScanJob, list[ScanTailorStageState]]:
     job = ScanJob.objects.create()
     page_rows = ScanPage.objects.bulk_create(
@@ -45,7 +48,7 @@ def test_idle_300_page_workspace_reads_tokens_without_deserializing_stage_json()
     poller = WorkspaceEventPoller(str(job.pk), serialize)
     initial = poller.poll()
     assert initial.exists and initial.payload is not None
-    assert len(initial.payload["stages"]) == 1800
+    assert len(initial.payload["stages"]) == 300 * STAGES_PER_PAGE
     serialize.reset_mock()
     with CaptureQueriesContext(connection) as queries:
         idle = poller.poll()
@@ -134,7 +137,8 @@ def test_creation_deletion_job_state_reconnect_and_job_isolation() -> None:
     paused = poller.poll()
     assert paused.payload is not None and paused.payload["state"] == ScanJob.State.PAUSED
     reconnected = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state).poll()
-    assert reconnected.payload is not None and len(reconnected.payload["stages"]) == 12
+    assert reconnected.payload is not None
+    assert len(reconnected.payload["stages"]) == 2 * STAGES_PER_PAGE
     job.delete()
     closed = poller.poll()
     assert not closed.exists and closed.payload is None
@@ -159,7 +163,7 @@ def test_stage_get_only_marks_real_input_binding_changes() -> None:
     job, states = workspace()
     client = Client()
     client.force_login(get_or_create_profile("input-binding-viewer").user)
-    url = f"/scan/jobs/{job.pk}/pages/{states[1].scan_page_id}/stages/deskew/"
+    url = f"/scan/jobs/{job.pk}/pages/{states[1].scan_page_id}/stages/select_content/"
     assert client.get(url).status_code == 200
     poller = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state)
     poller.poll()
@@ -176,8 +180,9 @@ def test_stage_get_only_marks_real_input_binding_changes() -> None:
     assert client.get(url).status_code == 200
     update = poller.poll()
     assert update.payload is not None
-    deskew = next(row for row in update.payload["stages"] if row["id"] == states[1].pk)
-    assert deskew["input_storage_identifier"] == "new-input.png"
+    content = next(row for row in update.payload["stages"] if row["id"] == states[1].pk)
+    assert content["stage"] == "select_content"
+    assert content["input_storage_identifier"] == "new-input.png"
 
 
 @pytest.mark.parametrize("viewers", [1, 5])
@@ -206,7 +211,7 @@ def test_connected_streams_start_immediately_idle_then_deliver_changes(
         initial = await asyncio.gather(*(anext(stream) for stream in streams))
         for frame in initial:
             payload = json.loads(frame.decode().split("data: ", 1)[1])
-            assert len(payload["stages"]) == 1800
+            assert len(payload["stages"]) == 300 * STAGES_PER_PAGE
         serialize.reset_mock()
         # Fifteen unchanged polls yield a heartbeat without fetching/serializing models.
         idle = await asyncio.gather(*(anext(stream) for stream in streams))

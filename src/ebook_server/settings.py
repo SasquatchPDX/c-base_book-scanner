@@ -200,9 +200,9 @@ class Settings(BaseSettings):
     contributions_daily_soft_cap: float = 50.0
     contributions_retention_months: int = 24
     contributions_season: Literal["month", "quarter"] = "month"
-    # How scanners deliver pages (#55): ``single_page`` (one page per image, the
-    # project's own scanner) or ``spread`` (one photo holds two facing pages).
-    scan_default_capture_layout: Literal["single_page", "spread"] = "single_page"
+    # Deprecated, ignored (#195): Page Split was removed, every image is one page.
+    # Kept only so existing .env files that still set them keep loading.
+    scan_default_capture_layout: str = ""
     scan_spread_scanner_ids: list[str] = []
     # Scanner device API v1 (/api/scanner/v1/, libreflip contract §7.2, #125). There is
     # one scanner with one key; this is the key's SHA-256 as lowercase hex (generate it
@@ -512,8 +512,6 @@ BOOK_SCANNER_CONTRIBUTIONS_HOLD_DAYS = settings.contributions_hold_days
 BOOK_SCANNER_CONTRIBUTIONS_DAILY_SOFT_CAP = settings.contributions_daily_soft_cap
 BOOK_SCANNER_CONTRIBUTIONS_RETENTION_MONTHS = settings.contributions_retention_months
 BOOK_SCANNER_CONTRIBUTIONS_SEASON = settings.contributions_season
-BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT = settings.scan_default_capture_layout
-BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS = list(settings.scan_spread_scanner_ids)
 # Normalised to end in "/" so links are built as PUBLIC_BASE_URL + "j/<job_id>".
 BOOK_SCANNER_PUBLIC_BASE_URL = (
     settings.public_base_url.strip().rstrip("/") + "/" if settings.public_base_url.strip() else ""

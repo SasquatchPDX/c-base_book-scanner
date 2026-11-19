@@ -33,6 +33,7 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 
 from . import (
+    capture_layout,
     scan_events,
     scan_lifecycle,
     scan_manifest,
@@ -216,7 +217,6 @@ def job_status_payload(request: HttpRequest, job: ScanJob) -> dict[str, Any]:
         "state": job.state,
         "portal_url": portal_url(request, job.pk),
         "scan_started_at": iso_utc(job.scan_started_at) if job.scan_started_at else None,
-        "capture_layout": job.capture_layout,
     }
     payload.update(scan_manifest.status_sections(job))
     payload["open_rescans"] = job.todos.filter(
@@ -245,15 +245,15 @@ def _parse_registration(request: HttpRequest) -> tuple[dict[str, Any] | None, Js
             "scan_started_at must be an ISO 8601 timestamp with a time zone.",
             {"field": "scan_started_at"},
         )
-    layout = payload.get("capture_layout", ScanJob.CaptureLayout.SINGLE_PAGE)
-    if layout not in ScanJob.CaptureLayout.values:
+    # Legacy field (#195): ``single_page`` is accepted and ignored, ``spread`` is refused.
+    if not capture_layout.is_accepted(payload.get("capture_layout")):
         return None, error_response(
             400,
             "invalid_request",
-            "capture_layout must be one of: " + ", ".join(ScanJob.CaptureLayout.values),
+            capture_layout.UNSUPPORTED_MESSAGE,
             {"field": "capture_layout"},
         )
-    return {"scan_started_at": started, "capture_layout": layout}, None
+    return {"scan_started_at": started}, None
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -318,8 +318,8 @@ def job(request: HttpRequest, job_id: str) -> JsonResponse:
 def _register_job(request: HttpRequest, job_id: str) -> JsonResponse:
     """Register a job (§6.3): 201 created, 200 identical repeat, 409 conflict.
 
-    Repeating the registration with the same ``scan_started_at`` (and
-    ``capture_layout``) gets ``200`` and changes nothing. Any other data for an existing
+    Repeating the registration with the same ``scan_started_at`` gets ``200`` and
+    changes nothing. Any other data for an existing
     scanner job, or an existing web-created job with that ID, is
     ``409 job_id_conflict``; nothing is overwritten.
     """
@@ -343,7 +343,6 @@ def _register_job(request: HttpRequest, job_id: str) -> JsonResponse:
                 same = (
                     current.source == ScanJob.Source.SCANNER
                     and current.scan_started_at == registration["scan_started_at"]
-                    and current.capture_layout == registration["capture_layout"]
                 )
                 if not same:
                     return _conflict(job_id)
@@ -888,7 +887,6 @@ def rescan_replacement(request: HttpRequest, job_id: str, todo_id: str) -> JsonR
             upload.discard()
     except scanner_uploads.UploadError as exc:
         return _upload_error(exc)
-    scanner_rescans.after_replacement(result)
     return JsonResponse(result.payload(), status=201 if result.created else 200)
 
 

@@ -190,7 +190,6 @@ def _first_async_stream_chunk(response: StreamingHttpResponse) -> bytes:
 @pytest.mark.parametrize(
     ("stage", "parameters"),
     [
-        ("page_split", {"split_mode": "manual", "split_x": 200}),
         ("deskew", {"manual_angle": 1.25}),
     ],
 )
@@ -226,12 +225,12 @@ def test_two_users_can_edit_different_scan_jobs() -> None:
     page_b = ScanPage.objects.get(scan_job=job_b, logical_sequence_number=1, side="single")
 
     response_a = client_a.post(
-        _stage_url(str(job_a.id), str(page_a.id), "page_split"),
+        _stage_url(str(job_a.id), str(page_a.id), "deskew"),
         data=json.dumps({"parameters": {"pass": "a"}}),
         content_type="application/json",
     )
     response_b = client_b.post(
-        _stage_url(str(job_b.id), str(page_b.id), "page_split"),
+        _stage_url(str(job_b.id), str(page_b.id), "deskew"),
         data=json.dumps({"parameters": {"pass": "b"}}),
         content_type="application/json",
     )
@@ -288,7 +287,7 @@ def test_stage_input_preview_and_dimensions_support_geometry_editor() -> None:
     client.get(_stages_url(str(job.id), str(page.id)))
 
     input_response = client.get(
-        f"/scan/jobs/{job.id}/pages/{page.id}/stages/page_split/preview/?input=true",
+        f"/scan/jobs/{job.id}/pages/{page.id}/stages/deskew/preview/?input=true",
     )
     assert input_response.status_code == 200
     input_stream = cast(StreamingHttpResponse, input_response)
@@ -299,12 +298,12 @@ def test_stage_input_preview_and_dimensions_support_geometry_editor() -> None:
         assert source.size == (1200, 1600)
 
     processed = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "single"}}),
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 0}}),
         content_type="application/json",
     )
     assert processed.status_code == 202
-    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
     assert state.parameters["input_width"] == 1200
     assert state.parameters["input_height"] == 1600
@@ -312,7 +311,7 @@ def test_stage_input_preview_and_dimensions_support_geometry_editor() -> None:
     assert state.parameters["output_height"] == 1600
 
     predecessor_preview = client.get(
-        f"/scan/jobs/{job.id}/pages/{page.id}/stages/deskew/preview/?input=true",
+        f"/scan/jobs/{job.id}/pages/{page.id}/stages/select_content/preview/?input=true",
     )
     assert predecessor_preview.status_code == 200
     preview_stream = cast(StreamingHttpResponse, predecessor_preview)
@@ -337,18 +336,18 @@ def test_concurrent_edit_conflict_is_reported() -> None:
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
 
     initial = client.get(_stages_url(str(job.id), str(page.id))).json()
-    page_split_state = next(item for item in initial["stages"] if item["stage"] == "page_split")
-    expected_revision = page_split_state["revision"]
+    deskew_state = next(item for item in initial["stages"] if item["stage"] == "deskew")
+    expected_revision = deskew_state["revision"]
 
     first = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
+        _stage_url(str(job.id), str(page.id), "deskew"),
         data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "first"}}),
         content_type="application/json",
     )
     assert first.status_code == 202
 
     second = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
+        _stage_url(str(job.id), str(page.id), "deskew"),
         data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "second"}}),
         content_type="application/json",
     )
@@ -376,7 +375,7 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
     assert len(workspace["stages"]) == len(list(scantailor.stage_order()))
 
     update = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
+        _stage_url(str(job.id), str(page.id), "deskew"),
         data=json.dumps({"parameters": {"pass": "changed"}}),
         content_type="application/json",
     )
@@ -385,21 +384,21 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
     latest = client.get(_stages_url(str(job.id), str(page.id))).json()["stages"]
     status_by_stage = {entry["stage"]: entry["status"] for entry in latest}
     by_stage = {entry["stage"]: entry for entry in latest}
-    for stage_name in ("deskew", "select_content", "margins", "dewarping", "output"):
+    for stage_name in ("select_content", "dewarping", "margins", "output"):
         assert status_by_stage[stage_name] == ScanTailorStageState.StageStatus.INVALIDATED
         # Routine invalidation is not an error (#53).
         assert by_stage[stage_name]["last_error"] == ""
-        assert by_stage[stage_name]["invalidated_reason"] == "page_split updated"
+        assert by_stage[stage_name]["invalidated_reason"] == "deskew updated"
 
     # Re-running a stage clears its invalidation note.
     rerun = client.post(
-        _stage_url(str(job.id), str(page.id), "deskew"),
+        _stage_url(str(job.id), str(page.id), "select_content"),
         data=json.dumps({"parameters": {}}),
         content_type="application/json",
     )
     assert rerun.status_code == 202
-    deskew = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
-    assert deskew.invalidated_reason == ""
+    content = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="select_content")
+    assert content.invalidated_reason == ""
 
 
 @pytest.mark.django_db(transaction=True)
@@ -441,7 +440,7 @@ def test_stage_worker_failure_preserves_previous_outputs() -> None:
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
 
-    stage_url = _stage_url(str(job.id), str(page.id), "page_split")
+    stage_url = _stage_url(str(job.id), str(page.id), "deskew")
     first_run = client.post(
         stage_url,
         data=json.dumps({"parameters": {"mode": "first"}}),
@@ -449,7 +448,7 @@ def test_stage_worker_failure_preserves_previous_outputs() -> None:
     )
     assert first_run.status_code == 202
 
-    stage = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
+    stage = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     assert stage.output_storage_identifier
     previous_output = stage.output_storage_identifier
     previous_size = stage.output_size_bytes
@@ -487,70 +486,6 @@ def test_stage_worker_failure_preserves_previous_outputs() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_page_split_auto_detects_facing_gutter() -> None:
-    client, job = _create_scan_job("scan-user-auto-split")
-    _upload_scan_page(
-        client,
-        str(job.id),
-        sequence=1,
-        side="left",
-        payload=_facing_page_bytes(),
-        filename="facing-left.png",
-        content_type="image/png",
-    )
-    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="left")
-
-    response = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "auto"}}),
-        content_type="application/json",
-    )
-    assert response.status_code == 202
-
-    stage = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
-    assert stage.output_storage_identifier
-    assert stage.parameters["resolved_split_mode"] in {"auto", "heuristic-left"}
-    assert stage.parameters["resolved_split_side"] in {"left", "left-heuristic"}
-    preview_width, preview_height = _stage_preview_size(
-        client,
-        str(job.id),
-        str(page.id),
-        "page_split",
-    )
-    assert preview_width < 240
-    assert preview_height == 280
-
-
-@pytest.mark.django_db(transaction=True)
-def test_page_split_manual_x_override() -> None:
-    client, job = _create_scan_job("scan-user-manual-split")
-    _upload_scan_page(
-        client,
-        str(job.id),
-        sequence=1,
-        side="right",
-        payload=_facing_page_bytes(split=230),
-        filename="facing-right.png",
-        content_type="image/png",
-    )
-    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="right")
-
-    response = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "manual", "split_x": 140}}),
-        content_type="application/json",
-    )
-    assert response.status_code == 202
-
-    preview_width, _ = _stage_preview_size(client, str(job.id), str(page.id), "page_split")
-    assert 270 <= preview_width <= 290
-
-    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
-    assert state.parameters["resolved_split_x"] == 140
-    assert state.parameters["resolved_split_side"] == "right"
-
-
-@pytest.mark.django_db(transaction=True)
 def test_deskew_reproducible_with_manual_angle() -> None:
     client, job = _create_scan_job("scan-user-deskew-manual")
     _upload_scan_page(
@@ -563,14 +498,6 @@ def test_deskew_reproducible_with_manual_angle() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
-
-    split_payload = {"parameters": {"split_mode": "single"}}
-    split_response = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps(split_payload),
-        content_type="application/json",
-    )
-    assert split_response.status_code == 202
 
     deskew_url = _stage_url(str(job.id), str(page.id), "deskew")
     first = client.post(
@@ -1234,87 +1161,6 @@ def test_loader_applies_exif_orientation(tmp_path: Path) -> None:
     assert loaded.size == (200, 300)
 
 
-def test_exif_rotated_page_is_not_split_as_spread(tmp_path: Path) -> None:
-    portrait = _text_page(800, 1100)
-    sideways = portrait.rotate(90, expand=True, fillcolor=235)  # stored landscape
-    exif = Image.Exif()
-    exif[0x0112] = 8  # orientation 8 undoes a 90 degree CCW rotation
-    source = _save(sideways, tmp_path / "s.jpg", exif=exif)
-    output = tmp_path / "out.png"
-    state = ScanTailorStageState(parameters={})
-    state.scan_page = ScanPage(side=ScanPage.Side.SINGLE)
-    result = scantailor._run_page_split(state, source, output, tmp_path / "p.png")
-    assert result["resolved_split_mode"] == "single"
-    with Image.open(output) as out:
-        assert out.size == (800, 1100)
-
-
-def _spread(
-    width: int = 1500,
-    height: int = 1000,
-    *,
-    gutter_x: int,
-    shadow: bool = True,
-    paper: int = 225,
-) -> Image.Image:
-    rng = np.random.default_rng(3)
-    array = np.full((height, width), paper, dtype=np.float32)
-    for y in range(int(height * 0.1), int(height * 0.9), 26):
-        x = int(width * 0.06)
-        while x < width * 0.94:
-            word = int(rng.integers(20, 60))
-            if abs((x + word / 2) - gutter_x) > width * 0.02:
-                array[y : y + 8, x : x + word] = paper * 0.15
-            x += word + 12
-    if shadow:
-        columns = np.arange(width)
-        ridge = np.clip(1 - np.abs(columns - gutter_x) / (width * 0.03), 0, 1)
-        array *= (1 - 0.55 * ridge)[None, :]
-    array += rng.normal(0, 3, array.shape)
-    return Image.fromarray(np.clip(array, 0, 255).astype(np.uint8))
-
-
-@pytest.mark.parametrize("gutter_ratio", [0.5, 0.44, 0.56])
-def test_auto_split_finds_dark_gutter(gutter_ratio: float) -> None:
-    spread = _spread(gutter_x=int(1500 * gutter_ratio))
-    found = scantailor._find_gutter(spread)
-    assert found is not None
-    assert abs(found.x - 1500 * gutter_ratio) <= 1500 * 0.015
-    assert found.confidence >= scantailor.MIN_SPLIT_CONFIDENCE
-
-
-def test_auto_split_works_on_dim_exposure() -> None:
-    dim = _spread(gutter_x=700, paper=60)
-    found = scantailor._find_gutter(dim)
-    assert found is not None
-    assert abs(found.x - 700) <= 1500 * 0.015
-
-
-def test_auto_split_finds_bright_gap_between_text_blocks() -> None:
-    payload = _facing_page_bytes(width=900, height=600, split=430, gutter=24)
-    with Image.open(io.BytesIO(payload)) as image:
-        found = scantailor._find_gutter(image.copy())
-    assert found is not None
-    assert abs(found.x - 430) <= 900 * 0.015
-
-
-def test_auto_split_rejects_featureless_spread() -> None:
-    blank = Image.new("L", (1500, 1000), 230)
-    assert scantailor._auto_split_position(blank) is None
-    noise_pixels = np.random.default_rng(5).integers(200, 240, (1000, 1500), dtype=np.uint8)
-    assert scantailor._auto_split_position(Image.fromarray(noise_pixels)) is None
-
-
-def test_auto_split_does_not_pick_brightest_paper() -> None:
-    # A bright paper patch off-centre must not beat the real (shadow) gutter.
-    spread = _spread(gutter_x=760)
-    array = np.asarray(spread).copy()
-    array[:, 600:640] = 255
-    found = scantailor._find_gutter(Image.fromarray(array))
-    assert found is not None
-    assert abs(found.x - 760) <= 1500 * 0.02
-
-
 def test_content_box_ignores_dust_speck_and_scales_with_dim_images() -> None:
     page = _text_page(900, 1200, paper=235)
     ImageDraw.Draw(page).rectangle((860, 1170, 863, 1173), fill=15)
@@ -1415,23 +1261,22 @@ def test_stage_outputs_are_named_for_the_png_they_contain() -> None:
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
     response = client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "single"}}),
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 0}}),
         content_type="application/json",
     )
     assert response.status_code == 202
-    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     assert state.status == ScanTailorStageState.StageStatus.SUCCESS
     assert state.output_storage_identifier.endswith(".png")
     assert state.preview_storage_identifier.endswith(".png")
-    preview = client.get(_stage_url(str(job.id), str(page.id), "page_split") + "preview/")
+    preview = client.get(_stage_url(str(job.id), str(page.id), "deskew") + "preview/")
     assert preview["Content-Type"] == "image/png"
 
 
 @pytest.mark.django_db(transaction=True)
 def test_unreadable_input_fails_the_stage_with_message() -> None:
-    # spread: no automatic Page Split output exists before the failing run
-    client, job = _create_scan_job("scan-user-unreadable", capture_layout="spread")
+    client, job = _create_scan_job("scan-user-unreadable")
     good = _facing_page_bytes()
     _upload_scan_page(
         client,
@@ -1450,11 +1295,11 @@ def test_unreadable_input_fails_the_stage_with_message() -> None:
     stored = backend.resolve_location(version.storage_identifier)
     Path(stored).write_bytes(good[: len(good) // 2])
     client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "single"}}),
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 0}}),
         content_type="application/json",
     )
-    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     assert state.status == ScanTailorStageState.StageStatus.FAILED
     assert "cannot read image" in state.last_error
     assert not state.output_storage_identifier
@@ -1464,8 +1309,7 @@ def test_unreadable_input_fails_the_stage_with_message() -> None:
 
 @pytest.mark.django_db(transaction=True)
 def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> None:
-    # spread: no automatic Page Split output exists before the raced run
-    client, job = _create_scan_job("scan-user-race", capture_layout="spread")
+    client, job = _create_scan_job("scan-user-race")
     _upload_scan_page(
         client,
         str(job.id),
@@ -1475,7 +1319,7 @@ def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> 
         filename="scan.png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
-    original = scantailor._STAGE_RUNNERS["page_split"]["auto_split"]
+    original = scantailor._STAGE_RUNNERS["deskew"]["projection_deskew"]
 
     def racing_runner(
         state: ScanTailorStageState,
@@ -1485,20 +1329,20 @@ def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> 
     ) -> dict[str, object]:
         # a user saves new parameters (revision bump, re-queued) while the job runs
         ScanTailorStageState.objects.filter(id=state.id).update(
-            parameters={"split_mode": "manual", "split_x": 77},
+            parameters={"manual_angle": 1.5},
             revision=state.revision + 1,
             status=ScanTailorStageState.StageStatus.QUEUED,
         )
         return original(state, source, output, preview)
 
-    monkeypatch.setitem(scantailor._STAGE_RUNNERS["page_split"], "auto_split", racing_runner)
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "projection_deskew", racing_runner)
     client.post(
-        _stage_url(str(job.id), str(page.id), "page_split"),
-        data=json.dumps({"parameters": {"split_mode": "single"}}),
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 0}}),
         content_type="application/json",
     )
-    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="page_split")
-    assert state.parameters == {"split_mode": "manual", "split_x": 77}
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
+    assert state.parameters == {"manual_angle": 1.5}
     assert state.status == ScanTailorStageState.StageStatus.QUEUED
     assert not state.output_storage_identifier
 
@@ -1935,16 +1779,12 @@ def test_page_thumbnail_follows_latest_completed_stage() -> None:
     assert raw_size == (300, 400)
 
     client.get(_stages_url(str(job.id), str(page.id)))
-    for stage, parameters in (
-        ("page_split", {"split_mode": "single"}),
-        ("deskew", {"manual_angle": 90}),
-    ):
-        response = client.post(
-            _stage_url(str(job.id), str(page.id), stage),
-            data=json.dumps({"parameters": parameters}),
-            content_type="application/json",
-        )
-        assert response.status_code == 202
+    response = client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 90}}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
 
@@ -1956,19 +1796,23 @@ def test_page_thumbnail_follows_latest_completed_stage() -> None:
     assert revalidated.status_code == 304
     assert "max-age=0" in revalidated["Cache-Control"]
 
-    # A stale (invalidated) stage is never shown; fall back to the last good one.
+    # A stale (invalidated) stage is never shown; fall back to the raw page.
     ScanTailorStageState.objects.filter(pk=deskew.pk).update(
         status=ScanTailorStageState.StageStatus.INVALIDATED,
     )
     fallback_size, fallback_etag = _thumbnail_size(client, str(page.id))
     assert fallback_size == (300, 400)
-    assert fallback_etag not in {raw_etag, stage_etag}
+    assert fallback_etag == raw_etag
 
     # Downstream success after an upstream that is not complete does not count either.
-    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
+    ScanTailorStageState.objects.filter(scan_page=page, stage="select_content").update(
         status=ScanTailorStageState.StageStatus.SUCCESS,
+        output_storage_identifier=deskew.output_storage_identifier,
+        preview_storage_identifier=deskew.preview_storage_identifier,
+        preview_storage_location=deskew.preview_storage_location,
+        output_storage_location=deskew.output_storage_location,
     )
-    ScanTailorStageState.objects.filter(scan_page=page, stage="page_split").update(
+    ScanTailorStageState.objects.filter(pk=deskew.pk).update(
         status=ScanTailorStageState.StageStatus.QUEUED,
     )
     assert _thumbnail_size(client, str(page.id))[1] == raw_etag
@@ -2054,29 +1898,27 @@ def test_noop_stage_still_persists_own_output_artifact_with_provenance() -> None
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
     client.get(_stages_url(str(job.id), str(page.id)))
-    for stage, parameters in (
-        ("page_split", {"split_mode": "single"}),
-        ("deskew", {"manual_angle": 0}),
-    ):
-        response = client.post(
-            _stage_url(str(job.id), str(page.id), stage),
-            data=json.dumps({"parameters": parameters}),
-            content_type="application/json",
-        )
-        assert response.status_code == 202
+    response = client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        data=json.dumps({"parameters": {"manual_angle": 0}}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202
 
-    split = ScanTailorStageState.objects.get(scan_page=page, stage="page_split")
+    active = page.active_version()
+    assert active is not None
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
-    # The no-op stage has its own artifact (and preview) with full provenance ...
+    # The no-op stage has its own artifact (and preview) with full provenance, separate
+    # from the raw page version it read (byte copying is covered by the passthrough tests).
     assert deskew.output_storage_identifier
-    assert deskew.output_storage_identifier != split.output_storage_identifier
+    assert deskew.output_storage_identifier != active.storage_identifier
     assert deskew.preview_storage_identifier
-    assert deskew.input_stage_state_id == split.id
+    assert deskew.input_stage_state_id is None
+    assert deskew.input_scan_page_version_id == active.id
     assert deskew.algorithm and deskew.algorithm_version
-    # ... byte-identical to its input, so the hashes match.
-    assert deskew.output_sha256 == split.output_sha256
-    assert deskew.output_size_bytes == split.output_size_bytes
+    assert deskew.output_sha256 and deskew.output_size_bytes
+    assert deskew.parameters["angle"] == 0
     assert deskew.parameters["output_width"] == deskew.parameters["input_width"]
 
 
@@ -2294,9 +2136,9 @@ def test_workspace_bulk_stage_creation_links_inputs_like_single_path() -> None:
     states = {state.stage: state for state in ScanTailorStageState.objects.filter(scan_page=page)}
     active = page.active_version()
     assert active is not None
-    assert states["page_split"].input_stage_state_id is None
-    assert states["page_split"].input_scan_page_version_id == active.id
-    assert states["page_split"].input_storage_identifier == active.storage_identifier
+    assert states["deskew"].input_stage_state_id is None
+    assert states["deskew"].input_scan_page_version_id == active.id
+    assert states["deskew"].input_storage_identifier == active.storage_identifier
     for stage in scantailor.stage_order()[1:]:
         predecessor = scantailor.previous_stage(stage)
         assert predecessor is not None
@@ -2317,14 +2159,14 @@ def test_get_or_create_stage_state_skips_noop_save() -> None:
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
     first = scantailor.get_or_create_stage_state(
-        scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+        scan_job_id=str(job.id), page_id=str(page.id), stage="deskew"
     )
     from django.db import connection
     from django.test.utils import CaptureQueriesContext
 
     with CaptureQueriesContext(connection) as captured:
         again = scantailor.get_or_create_stage_state(
-            scan_job_id=str(job.id), page_id=str(page.id), stage="page_split"
+            scan_job_id=str(job.id), page_id=str(page.id), stage="deskew"
         )
     assert again.id == first.id
     assert not [

@@ -145,19 +145,14 @@ def _page_sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _create_scan_job(
-    profile_user: str,
-    *,
-    capture_layout: str | None = None,
-) -> tuple[Client, ScanJob]:
-    return _create_scan_job_with_book(profile_user, book_id=None, capture_layout=capture_layout)
+def _create_scan_job(profile_user: str) -> tuple[Client, ScanJob]:
+    return _create_scan_job_with_book(profile_user, book_id=None)
 
 
 def _create_scan_job_with_book(
     profile_user: str,
     *,
     book_id: int | None = None,
-    capture_layout: str | None = None,
 ) -> tuple[Client, ScanJob]:
     from ebook_server.core.models import get_or_create_profile
 
@@ -170,8 +165,6 @@ def _create_scan_job_with_book(
     }
     if book_id is not None:
         payload["book_id"] = str(book_id)
-    if capture_layout is not None:
-        payload["capture_layout"] = capture_layout
     response = client.post(
         "/scan/jobs/",
         data=payload,
@@ -266,6 +259,29 @@ def test_scan_job_create_and_list() -> None:
     payload = response.json()
     assert payload["count"] >= 1
     assert any(item["id"] == str(job.id) for item in payload["items"])
+    assert "capture_layout" not in payload["items"][0]
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("layout", "status"),
+    [("single_page", 201), ("single", 201), ("", 201), ("spread", 400), ("spreads", 400)],
+)
+def test_scan_job_create_accepts_only_single_page_layout(layout: str, status: int) -> None:
+    """#195: Page Split is gone, so the legacy field may only say single_page."""
+    from ebook_server.core.models import get_or_create_profile
+
+    profile = get_or_create_profile(f"scanner-layout-{layout or 'empty'}")
+    client = Client()
+    client.force_login(profile.user)
+    response = client.post(
+        "/scan/jobs/",
+        data={"provisional_title": "Layout", "capture_layout": layout},
+    )
+    assert response.status_code == status
+    if status == 400:
+        assert b"single_page" in response.content
+        assert not ScanJob.objects.filter(provisional_title="Layout").exists()
 
 
 @pytest.mark.django_db(transaction=True)

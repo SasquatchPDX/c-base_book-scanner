@@ -149,3 +149,14 @@ an accuracy run on the AI server remain open.
 See the [release evidence table](docs/sprint_progress.md#release-evidence) for
 the tested revision, outstanding checks and links to the owning issues.
 [Sprint019](Sprint019.md) and [Sprint020](Sprint020.md) describe the requirements.
+
+## Licence
+
+This project is licensed under the GNU General Public License, version 3 or (at
+your option) any later version (`GPL-3.0-or-later`); see [LICENSE](LICENSE).
+
+ScanTailor-Web ports algorithms from [Scan Tailor](https://github.com/scantailor/scantailor)
+(GPL-3.0-or-later, copyright Joseph Artsimovich and contributors). Ported or derived
+modules carry a header naming their upstream files, and
+[docs/third-party/scantailor-port.md](docs/third-party/scantailor-port.md) tracks every
+upstream file, its counterpart here and any divergence.

@@ -2,6 +2,8 @@
 name = "ebook-server"
 version = "0.1.0"
 description = "Hackerspace e-book server: shared library, ingestion, metadata identification, and ScanTailor-Web scanning pipeline"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
   { name = "SasquatchPDX", email = "sasquatchpdx@gmail.com" },
 ]

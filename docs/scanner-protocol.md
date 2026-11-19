@@ -149,14 +149,10 @@ book queues bibliographic identification instead (202, `requires_bibliographic_r
    `401 {"error": "authentication required"}` when the session is missing or expired
    (browsers still get the login redirect). On a 401, log in again (step 1) and retry.
 4. **Create a job:** `POST /scan/jobs/` (form or JSON: `provisional_title`, `scanner_id`,
-   `book_id`, `expected_page_count`, `capture_layout`...). The response (201) contains
-   the job `id`. `capture_layout` is `single_page` (every image is one page; the
-   default and what the project's scanner produces) or `spread` (an image may hold two
-   facing pages). If it is left out, scanner ids listed in
-   `BOOK_SCANNER_SCAN_SPREAD_SCANNER_IDS` get `spread` and every other scanner gets
-   `BOOK_SCANNER_SCAN_DEFAULT_CAPTURE_LAYOUT`. Any other value is a 400. In a
-   `single_page` job, ScanTailor's Page Split completes automatically as "no split"
-   (see `docs/scantailor-web.md`).
+   `book_id`, `expected_page_count`...). The response (201) contains the job `id`.
+   Every image must hold one upright page; ScanTailor-Web has no Page Split stage
+   (#195). The legacy `capture_layout` field is still accepted when it is absent,
+   empty or `single_page`, and ignored; `spread` or any other value is a 400.
 5. **Upload pages** one at a time with `POST /scan/jobs/{id}/pages/` as multipart, always
    sending `checksum_sha256` of the exact bytes. Retries are safe: re-sending the same
    `(sequence, side, checksum)` returns 200 without creating a version, so retry on network
@@ -255,22 +251,23 @@ see `docs/operations.md`).
   keep a server-generated UUID in canonical form (`str(uuid4())`). Jobs registered by a
   scanner use the scanner's ID, which must match `^[0-9]{8}T[0-9]{6}Z(-[1-9][0-9]{0,3})?$`.
 - Every `/scan/jobs/{job_id}/...` route accepts both forms (path converter `scan_job_id`).
-- `PUT /api/scanner/v1/jobs/{job_id}` with `{"scan_started_at": "<ISO 8601>",
-  "capture_layout": "single_page"}` (layout optional) registers a job:
+- `PUT /api/scanner/v1/jobs/{job_id}` with `{"scan_started_at": "<ISO 8601>"}` registers
+  a job. The legacy `"capture_layout": "single_page"` is still accepted and ignored
+  (#195); any other layout is a 400, because every image must hold one page.
   - `201`: created in state `open` with `source=scanner` (`operator` is empty).
-  - `200`: the same `scan_started_at` and layout are registered again; nothing changes.
-  - `409 job_id_conflict`: the ID exists with another `scan_started_at` or layout, or
-    as a web-created job. Nothing is overwritten.
+  - `200`: the same `scan_started_at` is registered again; nothing changes.
+  - `409 job_id_conflict`: the ID exists with another `scan_started_at`, or as a
+    web-created job. Nothing is overwritten.
   - `400 invalid_job_id`: the ID does not match the format above (UUIDs included).
   - `400 invalid_json` / `invalid_request`: the body is not a JSON object, or
     `scan_started_at` is not a valid ISO 8601 timestamp with a time zone (including
-    well-formed but impossible dates such as `2026-02-30T00:00:00Z`), or the layout
-    is unknown.
+    well-formed but impossible dates such as `2026-02-30T00:00:00Z`), or
+    `capture_layout` is anything other than `single_page`.
 
   The response body is the job status (see `GET` below). `portal_url` is built from
   `BOOK_SCANNER_PUBLIC_BASE_URL` as `<base>j/<job_id>`.
 - `GET /api/scanner/v1/jobs/{job_id}` (§6.4) returns the job status: `job_id`, `state`,
-  `portal_url`, `scan_started_at`, `capture_layout`, `events.sans_last_line_no`, `pages`
+  `portal_url`, `scan_started_at`, `events.sans_last_line_no`, `pages`
   (`sequence_number`, `sha256`, `version` of each active version), `covers` (`position`,
   `sha256`, `version` of each active cover), `open_rescans`, and
   `note: "re-finish needed"` while a complete job waits for a re-finish.
