@@ -259,5 +259,110 @@ def test_recover_stale_jobs_returns_finalizing_scan_without_any_job() -> None:
     assert scan.state == ScanJob.State.PAUSED
 
 
+class _ChunkJob:
+    def __init__(self, job_id: str, func_name: str, args: tuple[Any, ...]) -> None:
+        self.id = job_id
+        self.func_name = func_name
+        self.args = args
+
+
+class _ChunkRegistry:
+    def __init__(self, members: list[str]) -> None:
+        self.members = members
+
+    def get_job_ids(self, cleanup: bool = True) -> list[str]:
+        del cleanup
+        return list(self.members)
+
+
+class _ChunkConnection:
+    def exists(self, key: str) -> int:
+        del key
+        return 1
+
+
+class _ChunkRQQueue:
+    """Just enough of an rq.Queue for ``rq_pending_job_args``."""
+
+    name = "default"
+
+    def __init__(self, queued: list[_ChunkJob], started: list[_ChunkJob]) -> None:
+        self.queued = queued
+        self.jobs = {job.id: job for job in [*queued, *started]}
+        self.started = _ChunkRegistry([f"{job.id}:exec-1" for job in started])
+        self.connection = _ChunkConnection()
+
+    def get_jobs(self) -> list[_ChunkJob]:
+        return list(self.queued)
+
+    def fetch_job(self, job_id: str) -> _ChunkJob | None:
+        return self.jobs.get(job_id)
+
+
+def _stage_job(age: timedelta) -> ProcessingJob:
+    job = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.STAGE,
+        state=ProcessingJob.JobState.QUEUED,
+    )
+    ProcessingJob.objects.filter(pk=job.pk).update(scheduled_at=timezone.now() - age)
+    return job
+
+
+@pytest.mark.django_db
+def test_recover_stale_jobs_keeps_every_member_of_a_queued_stage_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#195: a batch chunk queues ``process_stage_jobs([id, id, ...])`` as one RQ job."""
+    from ebook_server import jobs
+
+    old = timedelta(days=2)
+    queued_a, queued_b = _stage_job(old), _stage_job(old)
+    running_a, running_b = _stage_job(old), _stage_job(old)
+    lost = _stage_job(old)
+    func = "ebook_server.core.scantailor.process_stage_jobs"
+    rq_queue = _ChunkRQQueue(
+        queued=[_ChunkJob("chunk-1", func, ([str(queued_a.job_id), str(queued_b.job_id)],))],
+        started=[_ChunkJob("chunk-2", func, ([str(running_a.job_id), str(running_b.job_id)],))],
+    )
+
+    class _Configured:
+        queue = rq_queue
+
+    monkeypatch.setattr(jobs, "get_queue", lambda name=None: _Configured())
+    monkeypatch.setattr(
+        jobs,
+        "_live_registries",
+        lambda inspected: [inspected.started, _ChunkRegistry([]), _ChunkRegistry([])],
+    )
+
+    ids, scheduler = jobs.rq_pending_job_args()
+    assert ids == {
+        str(queued_a.job_id),
+        str(queued_b.job_id),
+        str(running_a.job_id),
+        str(running_b.job_id),
+    }
+    assert scheduler is True
+
+    out = StringIO()
+    call_command("recover_stale_jobs", "--apply", stdout=out)
+    for job in (queued_a, queued_b, running_a, running_b, lost):
+        job.refresh_from_db()
+    assert [job.state for job in (queued_a, queued_b, running_a, running_b)] == [
+        ProcessingJob.JobState.QUEUED
+    ] * 4
+    assert lost.state == ProcessingJob.JobState.FAILED
+    assert "recovered 1 stale job(s)" in out.getvalue()
+
+
+def test_rq_job_row_ids_expands_batch_arguments() -> None:
+    from ebook_server.jobs import rq_job_row_ids
+
+    assert rq_job_row_ids(_ChunkJob("a", "f", ("row-1",))) == ["row-1"]
+    assert rq_job_row_ids(_ChunkJob("b", "f", (["row-1", "row-2"],))) == ["row-1", "row-2"]
+    assert rq_job_row_ids(_ChunkJob("c", "f", (("row-3",), "extra"))) == ["row-3"]
+    assert rq_job_row_ids(_ChunkJob("d", "f", ())) == []
+
+
 # Silence unused-import linting for names kept for readability in fixtures.
 _ = (Book, FileVariant, StorageLocation)

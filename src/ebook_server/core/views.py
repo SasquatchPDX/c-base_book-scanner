@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from typing import Any, Final
@@ -34,6 +34,7 @@ from django.http.response import HttpResponseBase
 from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from ebook_server.storage import (
@@ -525,8 +526,84 @@ def _serialize_scan_page_with_thumbnail(page: ScanPage) -> dict[str, Any]:
     return payload
 
 
-def _scan_page_thumbnail_url(page: ScanPage) -> str:
-    return f"/scan/pages/{page.id}/image/"
+SCAN_ARTIFACT_IMMUTABLE: Final[str] = "private, max-age=31536000, immutable"
+SCAN_ARTIFACT_REVALIDATE: Final[str] = "private, max-age=0, must-revalidate"
+
+
+def _stage_artifact_token(state: ScanTailorStageState) -> str:
+    """Identity of a stage's current artifacts: changes whenever they are replaced."""
+    if state.status != ScanTailorStageState.StageStatus.SUCCESS or not state.output_sha256:
+        return ""
+    return f"{state.revision}-{state.output_sha256[:16]}"
+
+
+def _page_thumbnail_token(
+    states: dict[str, ScanTailorStageState],
+    version: ScanPageVersion | None,
+    page_image: ScanPageImage | None,
+) -> str:
+    """Token of what ``scan_page_thumbnail`` shows, from rows the caller already has."""
+    source = _select_page_thumbnail(states, version, page_image)
+    return source.token if source is not None else ""
+
+
+def _guess_image_type(identifier: str) -> str:
+    suffix = Path(identifier).suffix.lower()
+    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}.get(
+        suffix, "application/octet-stream"
+    )
+
+
+def _serve_scan_artifact(
+    request: HttpRequest,
+    *,
+    storage: StorageBackend,
+    identifier: str,
+    token: str,
+    content_type: str | None = None,
+    accel_identifier: str | None = None,
+) -> HttpResponseBase:
+    """Serve a scan artifact; immutable when the URL names its current token (#195).
+
+    The workspace links ``?v=<token>``, and a new artifact always gets a new token,
+    so such a URL never shows two different images and is cached for good. A request
+    without the token, or with an outdated one, gets the current file and must
+    revalidate (ETag). With ``BOOK_SCANNER_SCAN_ARTIFACT_ACCEL_PREFIX`` set, Django
+    only checks the session and nginx sends the bytes.
+    """
+    immutable = bool(token) and request.GET.get("v") == token
+    headers = {
+        "Cache-Control": SCAN_ARTIFACT_IMMUTABLE if immutable else SCAN_ARTIFACT_REVALIDATE,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if token:
+        headers["ETag"] = f'"{token}"'
+        if headers["ETag"] in request.headers.get("If-None-Match", ""):
+            return HttpResponse(status=304, headers=headers)
+    accel_prefix = str(getattr(django_settings, "BOOK_SCANNER_SCAN_ARTIFACT_ACCEL_PREFIX", ""))
+    response: HttpResponseBase
+    if accel_prefix:
+        response = HttpResponse(content_type=content_type or _guess_image_type(identifier))
+        target = (accel_identifier or identifier).lstrip("/")
+        response["X-Accel-Redirect"] = f"{accel_prefix.rstrip('/')}/{target}"
+    else:
+        try:
+            stream = storage.open(identifier)
+        except FileNotFoundError:
+            return HttpResponseNotFound("preview artifact missing")
+        except OSError:
+            return HttpResponse("storage unavailable", status=503)
+        response = FileResponse(stream, as_attachment=False, filename=Path(identifier).name)
+        if content_type:
+            response["Content-Type"] = content_type
+    for name, value in headers.items():
+        response[name] = value
+    return response
+
+
+def _scan_page_thumbnail_url(page: ScanPage, token: str = "") -> str:
+    url = f"/scan/pages/{page.id}/image/"
+    return f"{url}?v={token}" if token else url
 
 
 def _serialize_scan_job_with_pages(
@@ -709,27 +786,44 @@ SCAN_THUMBNAIL_MAX_EDGE: Final[int] = 1600
 
 @dataclass(frozen=True)
 class _ThumbnailSource:
-    """The artifact a page thumbnail is rendered from, plus its cache identity."""
+    """The one artifact a page thumbnail is rendered from, and its identity.
 
-    storage: StorageBackend
-    identifier: str
-    cache_key: str
-
-
-def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None:
-    """Last stage of the page's unbroken run of successful stages that has an artifact.
-
-    Walks ``stage_order()`` from the first stage and stops at the first stage that
-    is not SUCCESS, so an output whose upstream was edited/invalidated or is
-    re-running is never shown as current (#58).
+    ``token`` names exactly this artifact *and* which representation of it is used
+    (stage preview/output, the page's working image, or the raw scan), so the bytes
+    rendered from ``identifier`` and the ETag/``?v=`` validator can never disagree.
+    It is also the render-cache key. ``location`` is resolved lazily, so computing
+    only the token (the workspace) never loads a storage location.
     """
-    states = {
-        state.stage: state
-        for state in ScanTailorStageState.objects.filter(
-            scan_job_id=page.scan_job_id,
-            scan_page=page,
-        ).select_related("preview_storage_location", "output_storage_location")
-    }
+
+    location: Callable[[], StorageLocation | None]
+    identifier: str
+    token: str
+
+    @property
+    def storage(self) -> StorageBackend:
+        location = self.location()
+        if location is None:
+            return _default_scan_storage()
+        return backend_for_location(location)
+
+
+_THUMBNAIL_TOKEN_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _select_page_thumbnail(
+    states: dict[str, ScanTailorStageState],
+    version: ScanPageVersion | None,
+    page_image: ScanPageImage | None,
+) -> _ThumbnailSource | None:
+    """Pick the page thumbnail's artifact from rows the caller already loaded.
+
+    The latest stage of the page's unbroken run of successful stages that has an
+    artifact wins; a stage that is not SUCCESS ends the run, so an output whose
+    upstream was edited/invalidated or is re-running is never shown (#58). Without
+    one, the active version's working image (#195) or, until it exists, the raw scan.
+    The workspace and ``scan_page_thumbnail`` both go through this function, so the
+    URL token and the served bytes come from one selection.
+    """
     latest: ScanTailorStageState | None = None
     for stage_name in scantailor.stage_order():
         state = states.get(stage_name)
@@ -737,73 +831,79 @@ def _latest_completed_stage_state(page: ScanPage) -> ScanTailorStageState | None
             break
         if state.preview_storage_identifier or state.output_storage_identifier:
             latest = state
-    return latest
-
-
-def _scan_thumbnail_source(page: ScanPage) -> _ThumbnailSource | None:
-    """Thumbnail source: latest completed stage output, else the raw active version."""
-    state = _latest_completed_stage_state(page)
-    if state is not None:
-        if state.preview_storage_identifier:
-            identifier = state.preview_storage_identifier
-            location = state.preview_storage_location
-        else:
-            identifier = state.output_storage_identifier
-            location = state.output_storage_location
+    if latest is not None:
+        chosen: ScanTailorStageState = latest
+        stage_token = f"s{chosen.id}-{_stage_artifact_token(chosen)}"
+        if chosen.preview_storage_identifier:
+            return _ThumbnailSource(
+                location=lambda: chosen.preview_storage_location,
+                identifier=chosen.preview_storage_identifier,
+                token=f"{stage_token}-p",
+            )
         return _ThumbnailSource(
-            storage=(
-                backend_for_location(location) if location is not None else _default_scan_storage()
-            ),
-            identifier=identifier,
-            cache_key=(
-                f"stage-{state.id}-{state.stage}-r{state.revision}-{state.output_sha256[:16]}"
-            ),
+            location=lambda: chosen.output_storage_location,
+            identifier=chosen.output_storage_identifier,
+            token=f"{stage_token}-o",
         )
-    version = page.active_version()
     if version is None:
         return None
-    page_image = ScanPageImage.objects.filter(version=version).first()
-    if page_image is not None:
+    version_token = f"v{version.id}-{version.checksum_sha256[:16]}"
+    if page_image is not None and page_image.version_id == version.id:
         # Rendering from the working image avoids decoding the full scan (#195).
+        generator = _THUMBNAIL_TOKEN_UNSAFE.sub("_", page_image.generator_version)
         return _ThumbnailSource(
-            storage=backend_for_location(page_image.storage_location),
+            location=lambda: page_image.storage_location,
             identifier=page_image.work_storage_identifier,
-            cache_key=f"{version.id}-{version.checksum_sha256[:32]}-{page_image.generator_version}",
+            token=f"{version_token}-w{generator}",
         )
     return _ThumbnailSource(
-        storage=(
-            backend_for_location(version.storage_location)
-            if version.storage_location_id is not None
-            else _default_scan_storage()
+        location=lambda: (
+            version.storage_location if version.storage_location_id is not None else None
         ),
         identifier=version.storage_identifier,
-        cache_key=f"{version.id}-{version.checksum_sha256[:32]}",
+        token=f"{version_token}-r",
     )
+
+
+def _version_page_image(version: ScanPageVersion | None) -> ScanPageImage | None:
+    """The version's working image; uses a ``page_image`` prefetch when there is one."""
+    if version is None:
+        return None
+    try:
+        return version.page_image
+    except ScanPageImage.DoesNotExist:
+        return None
+
+
+def _work_image_token(version: ScanPageVersion, page_image: ScanPageImage) -> str:
+    """Token of a version's working image; it changes if the image is regenerated."""
+    generator = _THUMBNAIL_TOKEN_UNSAFE.sub("_", page_image.generator_version)
+    return f"page-{version.id}-w{generator}"
 
 
 # Seconds the editor should wait before asking again for a working image being generated.
 PAGE_IMAGE_RETRY_AFTER_SECONDS = 2
 
 
-def _page_work_identifier(page: ScanPage) -> str | None:
-    """Working image of the page's active version.
+def _page_work_identifier(page: ScanPage) -> tuple[str, str] | None:
+    """Working image of the page's active version and its token.
 
-    Returns ``""`` when the page has no version, and ``None`` while the working
-    image is still being generated: pages uploaded before migration 0050, or a new
-    upload whose generation job has not run yet. The request never decodes the
+    Returns ``("", "")`` when the page has no version, and ``None`` while the
+    working image is still being generated: pages uploaded before migration 0050, or
+    a new upload whose generation job has not run yet. The request never decodes the
     scan itself; it queues the (deduplicated) background job and looks again,
     because an inline queue, or a fast worker, may already have finished it.
     """
     version = page.active_version()
     if version is None:
-        return ""
+        return "", ""
     page_image = ScanPageImage.objects.filter(version=version).first()
     if page_image is None:
         scan_images.request_page_image(version.pk)
         page_image = ScanPageImage.objects.filter(version=version).first()
     if page_image is None:
         return None
-    return page_image.work_storage_identifier
+    return page_image.work_storage_identifier, _work_image_token(version, page_image)
 
 
 def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
@@ -811,7 +911,7 @@ def _scan_thumbnail_cache_path(source: _ThumbnailSource) -> Path:
         Path(django_settings.APP_DATA_DIR)
         / SCANNING_STORAGE_ROOT
         / "thumbnails"
-        / f"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
+        / f"{source.token}-{SCAN_THUMBNAIL_MAX_EDGE}.jpg"
     )
 
 
@@ -972,7 +1072,7 @@ def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
         job.pages.annotate(
             open_todo_count=Count("todos", filter=Q(todos__state=ScanTodo.State.OPEN)),
         )
-        .prefetch_related("versions")
+        .prefetch_related("versions", "versions__page_image")
         .order_by("logical_sequence_number", "side"),
     )
     versions_by_page = {page.id: list(page.versions.all()) for page in page_list}
@@ -992,9 +1092,18 @@ def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
             versions=versions,
             open_todo_count=getattr(page, "open_todo_count", 0),
         )
-        if _prefetched_active_version(versions) is not None:
-            payload["thumbnail"] = _scan_page_thumbnail_url(page)
         page_states = states_by_page.get(page.id, {})
+        active_version = _prefetched_active_version(versions)
+        if active_version is not None:
+            page_image = _version_page_image(active_version)
+            # Tokenised from rows already loaded: no extra queries per page.
+            payload["thumbnail"] = _scan_page_thumbnail_url(
+                page, _page_thumbnail_token(page_states, active_version, page_image)
+            )
+            # The first stage's input preview token; empty while it is being generated.
+            payload["work_image_token"] = (
+                _work_image_token(active_version, page_image) if page_image is not None else ""
+            )
         payload["stages"] = [
             _serialize_stage_state(page_states[stage])
             for stage in scantailor.stage_order()
@@ -1238,6 +1347,45 @@ def scan_job_workspace(
     return JsonResponse(payload)
 
 
+# Rows changed this long before the client's cursor are sent again, so a transaction
+# that committed late with an older updated_at is still delivered (idempotent merge).
+WORKSPACE_STATE_OVERLAP: Final[timedelta] = timedelta(seconds=30)
+
+
+@require_GET
+@scan_api_login_required
+def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    """Stage rows changed since ``?since=<cursor>`` (#195 §8.2 item 8).
+
+    The compatibility-polling client used to re-download the whole workspace every
+    few seconds. This answers with two indexed queries and never writes: the job row,
+    then only the stage rows updated since the cursor (all of them without one). The
+    response's ``cursor`` is the server time before the read.
+    """
+    if normalize_scan_job_id(job_id) is None:
+        return HttpResponseBadRequest("invalid job id")
+    job = ScanJob.objects.filter(pk=job_id).only("id", "state", "updated_at").first()
+    if job is None:
+        return HttpResponseNotFound()
+    cursor = timezone.now()
+    states = ScanTailorStageState.objects.filter(scan_job_id=job.pk)
+    raw_since = request.GET.get("since")
+    if raw_since:
+        since = parse_datetime(raw_since)
+        if since is None or since.tzinfo is None:
+            return HttpResponseBadRequest("since must be an ISO 8601 time with a time zone")
+        states = states.filter(updated_at__gte=since - WORKSPACE_STATE_OVERLAP)
+    return JsonResponse(
+        {
+            "job_id": str(job.pk),
+            "state": job.state,
+            "updated_at": job.updated_at.isoformat(),
+            "cursor": cursor.isoformat(),
+            "stages": [_serialize_stage_state(state) for state in states.order_by("pk")],
+        }
+    )
+
+
 @require_GET
 @login_required
 async def scan_job_workspace_events(
@@ -1453,6 +1601,7 @@ def scan_job_stage_batch(
     applied: list[dict[str, Any]] = []
     skipped: list[str] = []
     jobs: list[dict[str, Any]] = []
+    batch_job_ids: list[str] = []
 
     for page in pages:
         state = scantailor.get_or_create_stage_state(
@@ -1474,7 +1623,10 @@ def scan_job_stage_batch(
         processing_job = scantailor.request_stage_job(
             state=state,
             requested_by_user_id=profile.user_id,
+            dispatch=False,
         )
+        if not (processing_job.details or {}).get("superseded"):
+            batch_job_ids.append(str(processing_job.job_id))
         applied.append(
             {
                 "page_id": str(page.id),
@@ -1482,6 +1634,10 @@ def scan_job_stage_batch(
             },
         )
         jobs.append(scantailor.stage_job_payload(processing_job))
+
+    # One queued job per chunk of pages instead of one per page (#195 §8.2 item 5);
+    # an interactive single-page edit still runs first.
+    scantailor.dispatch_stage_batch(batch_job_ids)
 
     return JsonResponse(
         {
@@ -1521,34 +1677,32 @@ def scan_page_stage_preview(
         return HttpResponseNotFound()
 
     wants_input = _coerce_bool(request.GET.get("input"))
+    token = ""
     if wants_input and state.input_stage_state is not None:
         identifier = (
             state.input_stage_state.preview_storage_identifier
             or state.input_stage_state.output_storage_identifier
         )
+        token = _stage_artifact_token(state.input_stage_state)
     elif wants_input:
         # The first stage edits the page's working image (#195), never the raw scan.
-        work_identifier = _page_work_identifier(state.scan_page)
-        if work_identifier is None:
+        work = _page_work_identifier(state.scan_page)
+        if work is None:
             # Being generated: a distinct, retryable answer the editor polls on.
             pending = HttpResponse("input preview not ready", status=503, content_type="text/plain")
             pending["Retry-After"] = str(PAGE_IMAGE_RETRY_AFTER_SECONDS)
             pending["Cache-Control"] = "no-store"
             return pending
-        identifier = work_identifier
+        identifier, token = work
     else:
         identifier = state.preview_storage_identifier or state.output_storage_identifier
+        token = _stage_artifact_token(state)
     if not identifier:
         message = "input preview not ready" if wants_input else "preview not ready"
         return HttpResponseNotFound(message)
-    storage = _default_scan_storage()
-    try:
-        stream = storage.open(identifier)
-    except FileNotFoundError:
-        return HttpResponseNotFound("preview artifact missing")
-    except OSError:
-        return HttpResponse("storage unavailable", status=503)
-    return FileResponse(stream, as_attachment=False, filename=Path(identifier).name)
+    return _serve_scan_artifact(
+        request, storage=_default_scan_storage(), identifier=identifier, token=token
+    )
 
 
 @require_http_methods(["GET", "POST"])
@@ -2170,16 +2324,30 @@ def scan_page_thumbnail(
         page = ScanPage.objects.get(pk=page_id)
     except (ScanPage.DoesNotExist, ValueError):
         return HttpResponseNotFound()
-    source = _scan_thumbnail_source(page)
+    # One read of the stage rows and of the active version selects ONE artifact; the
+    # bytes and the token/ETag both derive from that selection, so an invalidation
+    # racing this request can never pair new bytes with an old immutable token.
+    states = {
+        state.stage: state
+        for state in ScanTailorStageState.objects.filter(
+            scan_job_id=page.scan_job_id, scan_page=page
+        ).select_related("preview_storage_location", "output_storage_location")
+    }
+    version = page.active_version()
+    page_image = (
+        ScanPageImage.objects.select_related("storage_location").filter(version=version).first()
+        if version is not None
+        else None
+    )
+    source = _select_page_thumbnail(states, version, page_image)
     if source is None:
         return HttpResponseNotFound("no page version")
-
-    etag = f'"{source.cache_key}-{SCAN_THUMBNAIL_MAX_EDGE}"'
-    # The thumbnail URL is stable while its content follows stage processing, so
-    # browsers must revalidate (cheap: ETag -> 304) instead of caching for an hour.
-    headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
-    if request.headers.get("If-None-Match") == etag:
-        return HttpResponse(status=304, headers=headers)
+    token = source.token
+    etag = f'"{token}"'
+    if etag in request.headers.get("If-None-Match", ""):
+        return HttpResponse(
+            status=304, headers={"ETag": etag, "Cache-Control": SCAN_ARTIFACT_REVALIDATE}
+        )
 
     cache_path = _scan_thumbnail_cache_path(source)
     if not cache_path.exists():
@@ -2190,11 +2358,15 @@ def scan_page_thumbnail(
         except Exception:  # undecodable image data
             return HttpResponse("unsupported image", status=415)
 
-    response = FileResponse(cache_path.open("rb"), as_attachment=False)
-    response["Content-Type"] = "image/jpeg"
-    for key, value in headers.items():
-        response[key] = value
-    return response
+    scan_root = Path(django_settings.APP_DATA_DIR) / SCANNING_STORAGE_ROOT
+    return _serve_scan_artifact(
+        request,
+        storage=LocalFilesystemStorage(str(cache_path.parent)),
+        identifier=cache_path.name,
+        token=token,
+        content_type="image/jpeg",
+        accel_identifier=cache_path.relative_to(scan_root).as_posix(),
+    )
 
 
 @require_GET

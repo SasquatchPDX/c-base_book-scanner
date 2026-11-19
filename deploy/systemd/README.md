@@ -10,6 +10,26 @@ Example units for running the web and worker processes on a single host:
   application job state and the human recovery queue; retain its `--worker-class`
   option when adapting the command.
 
+### Sizing the worker pool (#195)
+
+Image work (ScanTailor stages, page images) is CPU-bound and single-threaded per
+worker: `ebook_server.rq_settings` pins OpenCV and NumPy/BLAS to one thread
+(`BOOK_SCANNER_WORKER_THREADS`, default 1), so N workers use N cores and never
+oversubscribe them. Run one worker instance per core, bounded by memory:
+
+```sh
+cores=$(nproc)
+for i in $(seq 1 "$cores"); do sudo systemctl enable --now "book-scanner-worker@$i"; done
+```
+
+On the 2-vCPU / 3 GB reference VM that is two workers. A ScanTailor Output job on
+a 300 dpi page needs a few hundred MB; conversions and OCR need more, so lower the
+count (or `MemoryMax=` per unit) if the host also runs Calibre conversions.
+
+A single-page ScanTailor edit is queued at the front of the queue, so it runs before
+queued batch work ("Apply to all pages" is split into jobs of eight pages). No
+separate queue or worker configuration is needed for that.
+
 They assume:
 
 - a dedicated unprivileged `book-scanner` user and group;

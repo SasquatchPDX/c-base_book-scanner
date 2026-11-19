@@ -206,6 +206,34 @@ get them on first open, or ahead of time with
 `manage.py backfill_scan_page_images` (see `docs/operations.md`). `scripts/benchmark_scanning.py`
 times the `page_image` step and each stage on this pipeline.
 
+## Serving and scheduling (#195 step 2b)
+
+- **Immutable artifact URLs.** Page thumbnails and stage previews carry a content
+  token (`?v=`): the stage revision and output checksum, or `page-<version>` for the
+  working image. A URL with the current token is answered with
+  `Cache-Control: private, max-age=31536000, immutable`; any other request
+  revalidates by ETag (`private, max-age=0, must-revalidate`). The workspace computes thumbnail tokens from rows it already
+  loads. With `BOOK_SCANNER_SCAN_ARTIFACT_ACCEL_PREFIX` set, Django only checks the
+  session and nginx sends the file (`deploy/nginx/book-scanner.conf`).
+- **Delta state for polling.** Without `EventSource` the workspace polls
+  `GET /scan/jobs/{id}/workspace/state/?since=<cursor>` every 5 s instead of the whole
+  workspace. It returns only stage rows updated since the cursor (minus a 30 s
+  overlap, so a late commit is not missed), never writes, and uses the
+  `(scan_job, updated_at)` index. The SSE stream was already incremental.
+- **Lazy thumbnails.** Page thumbnails load lazily; the virtualised strip follows in
+  the workspace redesign (step 3).
+- **Invalidation** is one `UPDATE` per edit instead of one save per stage row.
+- **Priority.** A single-page edit is queued at the front of the RQ queue; "apply to
+  pages" is dispatched as jobs of eight pages at the back, so the page being edited
+  never waits behind a batch (upstream `ProcessingTaskQueue`). Every page keeps its
+  own `ProcessingJob` and revision check.
+- **Worker pool.** Workers keep OpenCV and BLAS single-threaded; run one per core
+  (`deploy/systemd/README.md`).
+- **No in-worker image cache.** RQ forks a fresh work horse per job, so an
+  in-process LRU (upstream `ThumbnailPixmapCache`) would always be empty. The
+  working images make a stage's decode cheap instead (about 10 ms in
+  `scripts/benchmark_scanning.py`).
+
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049

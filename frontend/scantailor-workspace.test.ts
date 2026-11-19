@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  artifactToken,
   displayBoxToSource,
   editableParameters,
   curvatureCurvesForEditing,
@@ -378,6 +379,18 @@ describe("pipeline stages (#195)", () => {
   it("shows the plain status in the page list", () => {
     expect(stageStatusLabel({ status: "success" })).toBe("success");
     expect(stageStatusLabel({ status: "queued" })).toBe("queued");
+  });
+});
+
+describe("artifact tokens (#195)", () => {
+  it("match the server's revision-and-checksum token and skip unfinished stages", () => {
+    const sha = "0123456789abcdef0123456789abcdef";
+    expect(artifactToken({ status: "success", revision: 4, output_sha256: sha })).toBe(
+      "4-0123456789abcdef",
+    );
+    expect(artifactToken({ status: "queued", revision: 4, output_sha256: sha })).toBe("");
+    expect(artifactToken({ status: "success", revision: 4, output_sha256: "" })).toBe("");
+    expect(artifactToken(undefined)).toBe("");
   });
 });
 

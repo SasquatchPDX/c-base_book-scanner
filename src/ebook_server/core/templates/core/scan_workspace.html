@@ -94,6 +94,7 @@
     data-editable="{% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' or job.state == 'captured' %}true{% else %}false{% endif %}"
     data-events-url="{% url 'scan-job-workspace-events' job.id %}"
     data-workspace-url="{% url 'scan-job-workspace' job.id %}"
+    data-workspace-state-url="{% url 'scan-job-workspace-state' job.id %}"
   >
     <aside class="scantailor-sidebar" aria-label="Processing stages">
       <h2>Stages</h2>
@@ -156,7 +157,7 @@
           {% if page.page_number_verified is False %}<span class="status status-failed" data-page-number-unverified title="The scanner could not confirm the printed page number of this rescan; the operator kept the image anyway.">Page number not verified</span>{% elif page.page_number_verified %}<span class="status status-success" data-page-number-verified>Page number verified</span>{% endif %}
           {% if page.open_rescan_todos %}<span class="status status-failed">Rescan requested</span>{% endif %}
         </header>
-        {% if page.thumbnail %}<img src="{{ page.thumbnail }}" alt="Captured page {{ page.logical_sequence_number }}">{% endif %}
+        {% if page.thumbnail %}<img src="{{ page.thumbnail }}" alt="Captured page {{ page.logical_sequence_number }}" loading="lazy" decoding="async">{% endif %}
         <div class="stage-list">
           {% for stage in page.stages %}
             <div class="stage-row" data-stage-row data-page-id="{{ page.id }}" data-stage="{{ stage.stage }}">

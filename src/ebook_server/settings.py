@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     # nginx with X-Accel-Redirect; see deploy/nginx/book-scanner.conf.
     cover_thumbnail_root: str = ""
     cover_thumbnail_accel_prefix: str = ""
+    # ScanTailor previews, working images and page thumbnails (#195). With an accel
+    # prefix (for example `/_protected/scan-artifacts/`) Django checks the session and
+    # nginx sends the file from `<APP_DATA_DIR>/scan-artifacts`; see
+    # deploy/nginx/book-scanner.conf.
+    scan_artifact_accel_prefix: str = ""
     # Unreferenced thumbnail files are deleted by `collect_cover_thumbnails` only after
     # this grace period, so a worker that just saw a shared file can still publish it.
     cover_thumbnail_gc_grace_seconds: int = 24 * 60 * 60
@@ -413,6 +418,7 @@ BOOK_SCANNER_INGEST_LEASE_SECONDS = settings.ingest_lease_seconds
 BOOK_SCANNER_SIDECAR_COVERS_ENABLED = settings.sidecar_covers_enabled
 BOOK_SCANNER_COVER_THUMBNAIL_ROOT = settings.cover_thumbnail_root
 BOOK_SCANNER_COVER_THUMBNAIL_ACCEL_PREFIX = settings.cover_thumbnail_accel_prefix
+BOOK_SCANNER_SCAN_ARTIFACT_ACCEL_PREFIX = settings.scan_artifact_accel_prefix
 BOOK_SCANNER_COVER_THUMBNAIL_GC_GRACE_SECONDS = max(settings.cover_thumbnail_gc_grace_seconds, 0)
 BOOK_SCANNER_MULTIPART_DETECTION = settings.multipart_detection
 BOOK_SCANNER_SIDECAR_METADATA_ENABLED = settings.sidecar_metadata_enabled
