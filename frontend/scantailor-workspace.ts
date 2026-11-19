@@ -1213,7 +1213,8 @@ class WorkspaceController {
     const existing = this.contentOverlay;
     if (existing && (box || existing.isDragging())) {
       if (box) existing.setBox(box); // ignored while dragging
-      this.geometryLayer.append(existing.element);
+      if (existing.element.parentElement !== this.geometryLayer)
+        this.geometryLayer.append(existing.element);
       existing.layout(source, display);
       return;
     }
@@ -1621,7 +1622,9 @@ class WorkspaceController {
         ? this.contentOverlay
         : null;
     if (!keep) this.removeContentOverlay();
-    this.geometryLayer.replaceChildren(...(keep ? [keep.element] : []));
+    for (const child of [...this.geometryLayer.children]) {
+      if (child !== keep?.element) child.remove();
+    }
   }
 
   private removeContentOverlay(): void {

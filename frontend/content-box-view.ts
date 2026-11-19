@@ -170,9 +170,6 @@ export class ContentBoxOverlay {
         handle.addEventListener("pointerdown", (event) =>
           this.start(mask, event),
         );
-        handle.addEventListener("pointermove", (event) => this.move(event));
-        handle.addEventListener("pointerup", (event) => this.end(event));
-        handle.addEventListener("pointercancel", (event) => this.end(event));
         this.element.append(handle);
       }
     }
@@ -218,7 +215,6 @@ export class ContentBoxOverlay {
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
     this.drag = {
       mask,
       pointer: event.pointerId,
@@ -227,7 +223,20 @@ export class ContentBoxOverlay {
       start: this.current(),
     };
     this.element.classList.add("dragging");
+    // Follow the pointer on the window: a drag keeps working even if the handle is
+    // re-rendered or loses pointer capture meanwhile.
+    window.addEventListener("pointermove", this.onMove);
+    window.addEventListener("pointerup", this.onEnd);
+    window.addEventListener("pointercancel", this.onEnd);
+    try {
+      (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
+    } catch {
+      // Capture is a convenience only.
+    }
   }
+
+  private readonly onMove = (event: PointerEvent): void => this.move(event);
+  private readonly onEnd = (event: PointerEvent): void => this.end(event);
 
   private move(event: PointerEvent): void {
     const drag = this.drag;
@@ -248,6 +257,9 @@ export class ContentBoxOverlay {
     const drag = this.drag;
     if (!drag || drag.pointer !== event.pointerId) return;
     this.drag = null;
+    window.removeEventListener("pointermove", this.onMove);
+    window.removeEventListener("pointerup", this.onEnd);
+    window.removeEventListener("pointercancel", this.onEnd);
     this.element.classList.remove("dragging");
     this.box = roundBox(this.box, this.source);
     this.place();
@@ -255,6 +267,9 @@ export class ContentBoxOverlay {
   }
 
   remove(): void {
+    window.removeEventListener("pointermove", this.onMove);
+    window.removeEventListener("pointerup", this.onEnd);
+    window.removeEventListener("pointercancel", this.onEnd);
     this.element.remove();
   }
 }

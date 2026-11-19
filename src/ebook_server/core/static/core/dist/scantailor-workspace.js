@@ -4338,7 +4338,7 @@ var b = [
 	constructor(e, t, n, r) {
 		if (this.editable = n, this.callbacks = r, this.box = t, this.element = document.createElement("div"), this.element.className = "st-content-box", this.element.dataset.contentBox = "", n) for (let [e, t] of b) {
 			let n = document.createElement("div");
-			n.className = `st-content-handle st-content-${e}`, n.dataset.contentHandle = e, n.dataset.capturesPointer = "true", n.title = "Drag lines or corners to resize the content box.", n.addEventListener("pointerdown", (e) => this.start(t, e)), n.addEventListener("pointermove", (e) => this.move(e)), n.addEventListener("pointerup", (e) => this.end(e)), n.addEventListener("pointercancel", (e) => this.end(e)), this.element.append(n);
+			n.className = `st-content-handle st-content-${e}`, n.dataset.contentHandle = e, n.dataset.capturesPointer = "true", n.title = "Drag lines or corners to resize the content box.", n.addEventListener("pointerdown", (e) => this.start(t, e)), this.element.append(n);
 		}
 		e.append(this.element);
 	}
@@ -4365,14 +4365,21 @@ var b = [
 		this.element.style.left = `${this.box.x1 * e}px`, this.element.style.top = `${this.box.y1 * t}px`, this.element.style.width = `${Math.max(1, (this.box.x2 - this.box.x1) * e)}px`, this.element.style.height = `${Math.max(1, (this.box.y2 - this.box.y1) * t)}px`;
 	}
 	start(e, t) {
-		t.button === 0 && (t.preventDefault(), t.stopPropagation(), t.currentTarget.setPointerCapture?.(t.pointerId), this.drag = {
-			mask: e,
-			pointer: t.pointerId,
-			x: t.clientX,
-			y: t.clientY,
-			start: this.current()
-		}, this.element.classList.add("dragging"));
+		if (t.button === 0) {
+			t.preventDefault(), t.stopPropagation(), this.drag = {
+				mask: e,
+				pointer: t.pointerId,
+				x: t.clientX,
+				y: t.clientY,
+				start: this.current()
+			}, this.element.classList.add("dragging"), window.addEventListener("pointermove", this.onMove), window.addEventListener("pointerup", this.onEnd), window.addEventListener("pointercancel", this.onEnd);
+			try {
+				t.currentTarget?.setPointerCapture?.(t.pointerId);
+			} catch {}
+		}
 	}
+	onMove = (e) => this.move(e);
+	onEnd = (e) => this.end(e);
 	move(e) {
 		let t = this.drag;
 		if (!t || t.pointer !== e.pointerId) return;
@@ -4385,10 +4392,10 @@ var b = [
 	}
 	end(e) {
 		let t = this.drag;
-		t && t.pointer === e.pointerId && (this.drag = null, this.element.classList.remove("dragging"), this.box = _(this.box, this.source), this.place(), this.callbacks.onCommit(this.current()));
+		t && t.pointer === e.pointerId && (this.drag = null, window.removeEventListener("pointermove", this.onMove), window.removeEventListener("pointerup", this.onEnd), window.removeEventListener("pointercancel", this.onEnd), this.element.classList.remove("dragging"), this.box = _(this.box, this.source), this.place(), this.callbacks.onCommit(this.current()));
 	}
 	remove() {
-		this.element.remove();
+		window.removeEventListener("pointermove", this.onMove), window.removeEventListener("pointerup", this.onEnd), window.removeEventListener("pointercancel", this.onEnd), this.element.remove();
 	}
 }, S = .1, ee = .05, C = Math.PI / 180;
 function w(e) {
@@ -5223,7 +5230,7 @@ var Le = class {
 	}
 	renderContentBox(e, t) {
 		let n = this.contentBox(), r = this.contentOverlay;
-		r && (n || r.isDragging()) ? (n && r.setBox(n), this.geometryLayer.append(r.element), r.layout(e, t)) : (this.removeContentOverlay(), n && (this.contentOverlay = new x(this.geometryLayer, n, this.editable, {
+		r && (n || r.isDragging()) ? (n && r.setBox(n), r.element.parentElement !== this.geometryLayer && this.geometryLayer.append(r.element), r.layout(e, t)) : (this.removeContentOverlay(), n && (this.contentOverlay = new x(this.geometryLayer, n, this.editable, {
 			onPreview: (e) => this.updateContentText(e),
 			onCommit: (e) => {
 				this.draft.content_mode = "manual", this.draft.content_box = [
@@ -5465,7 +5472,8 @@ var Le = class {
 		for (let e of this.interactions) e.unset();
 		this.interactions = [];
 		let e = this.activeStage === "select_content" && this.previewMode === "input" ? this.contentOverlay : null;
-		e || this.removeContentOverlay(), this.geometryLayer.replaceChildren(...e ? [e.element] : []);
+		e || this.removeContentOverlay();
+		for (let t of [...this.geometryLayer.children]) t !== e?.element && t.remove();
 	}
 	removeContentOverlay() {
 		this.contentOverlay?.remove(), this.contentOverlay = null;

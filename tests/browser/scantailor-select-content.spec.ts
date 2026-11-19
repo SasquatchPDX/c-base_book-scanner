@@ -79,6 +79,11 @@ test("auto draws the detected content box and dragging an edge makes it manual",
     "true",
   );
   const before = (await box.boundingBox())!;
+  // The box sits on the detected text: x 90..512 of the 600 px wide page.
+  const shown = (await page.locator("[data-editor-image]").boundingBox())!;
+  const scale = shown.width / 600;
+  expect(Math.abs(before.x - (shown.x + 90 * scale))).toBeLessThan(4);
+  expect(Math.abs(before.y - (shown.y + 120 * scale))).toBeLessThan(4);
 
   // Drag the right edge 30 px to the left: only that edge moves, no request until release.
   const posts: string[] = [];
