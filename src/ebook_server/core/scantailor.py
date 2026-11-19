@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from math import ceil, hypot
+from math import ceil, floor, hypot
 from pathlib import Path
 from typing import Any, Final
 
@@ -23,7 +23,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from ebook_server.jobs import get_queue
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import curvature, deskew, output_zones, scan_images, scan_transform
+from . import content_box, curvature, deskew, output_zones, scan_images, scan_transform
 from .models import (
     ProcessingJob,
     ScanJob,
@@ -43,7 +43,7 @@ type Box = tuple[int, int, int, int]
 
 DEFAULT_STAGE_ALGORITHM: Final[dict[str, str]] = {
     "deskew": "skew_finder",
-    "select_content": "content_box_projection",
+    "select_content": "content_box_finder",
     "margins": "margin_pad",
     "dewarping": "projective_dewarp",
     "output": "binarization_otsu",
@@ -53,7 +53,8 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v2 (#195 step 2): parameters + transform op, detection at working resolution.
     # v3 (#195 step 4): port of upstream SkewFinder; positive angles turn clockwise.
     "deskew": "skewfinder-v3",
-    "select_content": "projection-v2",
+    # v3 (#195 step 5): port of upstream ContentBoxFinder.
+    "select_content": "contentboxfinder-v3",
     "margins": "padding-v2",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
     # v3: auto mode derives the quad from the text lines.
@@ -568,6 +569,10 @@ class StageInput:
     full_size: tuple[int, int]
     render_full: Callable[[], Image.Image]
     dpi: tuple[int, int] = (DEFAULT_DPI, DEFAULT_DPI)
+    #: Upstream transform ops and the original page size (#195 step 5: the page
+    #: outline inside the stage input, which Select Content needs).
+    ops: tuple[scan_transform.Op, ...] = ()
+    original_size: tuple[int, int] | None = None
 
     @property
     def scale(self) -> tuple[float, float]:
@@ -620,21 +625,6 @@ def _run_copy(state: ScanTailorStageState, stage_input: StageInput) -> StageResu
     )
 
 
-def _ink_mask(gray: np.ndarray) -> np.ndarray | None:
-    """Boolean ink mask using a per-image Otsu threshold, or None for blank pages."""
-    low, high = np.percentile(gray, [0.5, 99.5])
-    if high - low < max(6.0, 0.12 * float(high)):
-        return None
-    threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    dark = gray[gray <= threshold]
-    light = gray[gray > threshold]
-    if dark.size == 0 or light.size == 0:
-        return None
-    if float(light.mean()) - float(dark.mean()) < max(6.0, 0.2 * float(light.mean())):
-        return None
-    return np.asarray(gray <= threshold)
-
-
 def _working_dpi(stage_input: StageInput) -> tuple[float, float]:
     """Resolution of the working-resolution input (the page's dpi times the work scale)."""
     sx, sy = stage_input.scale
@@ -674,16 +664,90 @@ def _run_deskew(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
     return _transform_result(parameters, stage_input, scan_transform.rotate(-angle), updates)
 
 
+CONTENT_MODES: Final[tuple[str, ...]] = ("auto", "manual", "disabled")
+MM_PER_INCH: Final[float] = 25.4
+
+
+def _page_outline(stage_input: StageInput) -> list[tuple[float, float]] | None:
+    """The original page's corners inside the stage input (full-resolution coordinates).
+
+    Upstream passes the page's ``preCropArea`` along with its transformation; here the
+    original rectangle is mapped through the recorded upstream ops. None when unknown.
+    """
+    if stage_input.original_size is None:
+        return None
+    width, height = stage_input.original_size
+    corners = [(0.0, 0.0), (float(width), 0.0), (float(width), float(height)), (0.0, float(height))]
+    size = (width, height)
+    try:
+        for op in stage_input.ops:
+            # map_point works on pixel indices (pixel centres); corners are continuous.
+            corners = [
+                (mapped[0] + 0.5, mapped[1] + 0.5)
+                for mapped in (
+                    scan_transform.map_point(op, (x - 0.5, y - 0.5), size) for x, y in corners
+                )
+            ]
+            size = scan_transform.output_size(op, size)
+    except (scan_transform.TransformError, KeyError, TypeError, ValueError):
+        return None
+    if tuple(size) != tuple(stage_input.full_size):
+        return None
+    return corners
+
+
+def _detect_content(stage_input: StageInput) -> tuple[int, int, int, int] | None:
+    """Upstream ``ContentBoxFinder`` on the stage input; a full-resolution box or None."""
+    gray = np.asarray(stage_input.image.convert("L"))
+    gray150, _, _ = content_box.to_working(gray, _working_dpi(stage_input))
+    full_w, full_h = stage_input.full_size
+    to150_x = gray150.shape[1] / full_w
+    to150_y = gray150.shape[0] / full_h
+    page_mask = None
+    outline = _page_outline(stage_input)
+    if outline is not None:
+        polygon = np.array([[x * to150_x, y * to150_y] for x, y in outline], dtype=np.float64)
+        mask = np.zeros(gray150.shape, dtype=np.uint8)
+        cv2.fillPoly(mask, [np.round(polygon * 16).astype(np.int32)], 1, shift=4)
+        page_mask = mask.astype(bool)
+    found = content_box.find_content_box(gray150, page_mask)
+    if found is None:
+        return None
+    left, top, right, bottom = found
+    # QRect -> QRectF: the right/bottom edge of the last pixel, then back to full size.
+    box = (
+        int(floor(left / to150_x)),
+        int(floor(top / to150_y)),
+        int(ceil((right + 1) / to150_x - 1e-6)),
+        int(ceil((bottom + 1) / to150_y - 1e-6)),
+    )
+    return (
+        max(0, min(full_w - 1, box[0])),
+        max(0, min(full_h - 1, box[1])),
+        max(1, min(full_w, box[2])),
+        max(1, min(full_h, box[3])),
+    )
+
+
 def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    """Select Content (#195 step 5): upstream ``select_content::Task`` with the
+    ``ContentBoxFinder`` port.
+
+    Modes: ``auto`` finds the box; ``manual`` uses ``content_box``; ``disabled`` keeps
+    the whole page (Scan Tailor Advanced's "content detection disabled"). When auto
+    finds no content the whole page is kept too and ``content_found`` is false
+    (upstream records an empty content box; Margins handles it in step 7).
+    """
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("content_mode", "auto")).strip().lower()
-    if mode not in {"auto", "manual"}:
+    if mode not in CONTENT_MODES:
         mode = "auto"
-    explicit_box = parameters.get("content_box")
     full_width, full_height = stage_input.full_size
-    detected_box: tuple[int, int, int, int] | None = None
+    whole = (0, 0, full_width, full_height)
+    box: tuple[int, int, int, int] | None = None
+    found = True
     if mode == "manual":
-        detected_box = _coerce_box(
+        box = _coerce_box(
             {
                 key: parameters.get(key)
                 for key in (
@@ -699,20 +763,28 @@ def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) ->
                     "height",
                 )
             },
-            explicit_box,
+            parameters.get("content_box"),
             stage_input.full_size,
         )
-    if detected_box is None:
-        detected_box = _box_to_full(_detect_content_box(stage_input.image), stage_input)
-        mode = "auto"
-
-    left, top, right, bottom = detected_box
+        if box is None:
+            mode = "auto"
+    if mode == "disabled":
+        box = whole
+    elif mode == "auto":
+        box = _detect_content(stage_input)
+        if box is None:
+            found = False
+            box = whole
+    assert box is not None
+    left, top, right, bottom = box
+    dpi_x, dpi_y = (max(1, value) for value in stage_input.dpi)
     return _transform_result(
         parameters,
         stage_input,
-        scan_transform.crop(detected_box, stage_input.full_size),
+        scan_transform.crop(box, stage_input.full_size),
         {
             "content_mode": mode,
+            "content_found": found,
             "content_box": {
                 "x1": left,
                 "y1": top,
@@ -723,8 +795,14 @@ def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) ->
             },
             "content_area_width": right - left,
             "content_area_height": bottom - top,
+            # PhysSizeCalc: stage coordinates are original pixels (rotation keeps lengths).
+            "content_size_mm": {
+                "width": round((right - left) * MM_PER_INCH / dpi_x, 1),
+                "height": round((bottom - top) * MM_PER_INCH / dpi_y, 1),
+            },
             "source_width": full_width,
             "source_height": full_height,
+            "dpi": [dpi_x, dpi_y],
         },
     )
 
@@ -782,82 +860,6 @@ def _coerce_box(
         right = left + min(width_px - left, 1)
     if bottom <= top:
         bottom = top + min(height_px - top, 1)
-    return (left, top, right, bottom)
-
-
-def _detect_content_box(image: Image.Image) -> tuple[int, int, int, int]:
-    """Bounding box of real content: per-image Otsu threshold, specks filtered out."""
-    width, height = image.size
-    full = (0, 0, width, height)
-    scale = min(1.0, 1600.0 / max(width, height))
-    gray = np.asarray(image.convert("L"))
-    if scale < 1.0:
-        gray = cv2.resize(
-            gray,
-            (max(1, int(width * scale)), max(1, int(height * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    mask = _ink_mask(gray)
-    if mask is None:
-        return full
-    offset_x = offset_y = 0
-    small_h, small_w = mask.shape
-    ring = max(2, int(min(small_h, small_w) * 0.02))
-    ring_mask = np.ones_like(mask)
-    ring_mask[ring:-ring, ring:-ring] = False
-    if float(mask[ring_mask].mean()) > 0.6:
-        # Dark surroundings (table, scanner lid): ink is only meaningful on the page,
-        # so restrict the search to the largest light region first.
-        light = cv2.morphologyEx(
-            (~mask).astype(np.uint8),
-            cv2.MORPH_OPEN,
-            np.ones((5, 5), np.uint8),
-        )
-        count, _, stats, _ = cv2.connectedComponentsWithStats(light, connectivity=4)
-        if count <= 1:
-            return full
-        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        px, py, pw, ph = (int(stats[biggest, i]) for i in range(4))
-        inset_x, inset_y = max(1, int(pw * 0.01)), max(1, int(ph * 0.01))
-        offset_x, offset_y = px + inset_x, py + inset_y
-        region = gray[offset_y : py + ph - inset_y, offset_x : px + pw - inset_x]
-        if region.size == 0:
-            return full
-        mask = _ink_mask(region)
-        if mask is None:
-            return full
-    mask_u8 = mask.astype(np.uint8)
-    small_h, small_w = mask_u8.shape
-    # Group neighbouring glyphs, then drop groups with too little ink (dust specks).
-    grow = max(3, small_w // 150) | 1
-    grouped = cv2.dilate(mask_u8, np.ones((grow, grow), np.uint8))
-    count, labels = cv2.connectedComponents(grouped, connectivity=8)
-    if count <= 1:
-        return full
-    ink_per_label = np.bincount(labels[mask], minlength=count)
-    min_ink = max(12, int(small_w * small_h * 2e-5))
-    keep = ink_per_label >= min_ink
-    keep[0] = False
-    kept = keep[labels] & mask
-    ys, xs = np.nonzero(kept)
-    if ys.size == 0:
-        return full
-    inv = 1.0 / scale
-    left = int((xs.min() + offset_x) * inv)
-    right = int(min(width, (xs.max() + offset_x + 1) * inv + 1))
-    top = int((ys.min() + offset_y) * inv)
-    bottom = int(min(height, (ys.max() + offset_y + 1) * inv + 1))
-
-    pad_x = max(1, (right - left) // 120)
-    pad_y = max(1, (bottom - top) // 120)
-    left = max(0, left - pad_x)
-    top = max(0, top - pad_y)
-    right = min(width, right + pad_x)
-    bottom = min(height, bottom + pad_y)
-    if right <= left:
-        right = min(width, left + 1)
-    if bottom <= top:
-        bottom = min(height, top + 1)
     return (left, top, right, bottom)
 
 
@@ -1972,6 +1974,8 @@ _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
         "manual_deskew": _run_deskew,
     },
     ScanTailorStageState.Stage.SELECT_CONTENT.value: {
+        "content_box_finder": _run_select_content,
+        # Name recorded before #195 step 5; same runner.
         "content_box_projection": _run_select_content,
         "content_projection": _run_select_content,
         "copy": _run_select_content,
@@ -2047,9 +2051,9 @@ def request_stage_job(
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
-    if state.stage == "deskew":
-        # The pre-port names ("projection_deskew", "manual_deskew") run the port now.
-        algorithm = _default_algorithm("deskew")
+    if state.stage in {"deskew", "select_content"}:
+        # Pre-port algorithm names run the port now (#195 steps 4 and 5).
+        algorithm = _default_algorithm(state.stage)
     if state.stage == "dewarping" and str((state.parameters or {}).get("dewarp_model")) in {
         "curvature",
         "perspective",
@@ -2206,6 +2210,8 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
         full_size=full_size,
         render_full=render_full,
         dpi=(page_image.dpi_x, page_image.dpi_y),
+        ops=tuple(ops),
+        original_size=(page_image.full_width, page_image.full_height),
     )
 
 

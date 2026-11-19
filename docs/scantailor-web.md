@@ -18,8 +18,13 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    page is left unrotated and the editor says so. Manual mode sets the angle
    directly (±45°). Angles are degrees, **positive = clockwise**. It reads the
    page's active raw version directly.
-2. Select Content — automatic content detection or a draggable/resizable content
-   rectangle.
+2. Select Content — a port of upstream `ContentBoxFinder` (#195 step 5,
+   `core/content_box.py`): at 150 dpi, Wolf binarisation, removal of page-edge
+   shadows, despeckling, content blocks from the largest whitespace rectangles, a
+   text mask, and side-by-side trimming of strips that lie closer to the shadows than
+   to the text. Modes: auto, manual (the box as drawn) and disabled (the whole page).
+   A page without content keeps the whole page and says so. The content size is also
+   recorded in millimetres (upstream `PhysSizeCalc`).
 3. Dewarping — OpenCV projective correction using detected or draggable control
    points, with an explicit bypass and deterministic failure behavior.
 4. Margins — per-side/canvas padding and horizontal/vertical alignment.
@@ -307,6 +312,16 @@ did, for example "Angle 1.30° clockwise (auto, confidence 12.4)" or "Angle 0.00
 no change: detection confidence 1.3 is below 2.0". The server applies the same
 rotation the browser previews (`scan_transform.rotate(-angle)`); a fixture shared
 by `tests/test_deskew.py` and `frontend/editor-shell.test.ts` checks both.
+
+**Select Content** (upstream `select_content::ImageView`): the content box is drawn in
+auto and manual mode alike, as a translucent blue rectangle over the stage input.
+Dragging an edge moves only that edge and dragging a corner its two edges, by exactly
+the pointer movement in page coordinates, whatever the zoom or pan; the box keeps a
+minimum of 10 screen pixels and stays on the page. Dragging inside the box pans the
+page. Releasing a handle makes the box manual and saves it, as upstream commits on
+release. Auto, Manual and Disabled are radio buttons; the options show the content
+size, e.g. "Content 151.0 × 233.2 mm (892 × 1377 px, auto)". The page strip can be
+sorted by content width or height.
 
 The editor also keeps:
 

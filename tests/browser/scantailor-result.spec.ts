@@ -46,8 +46,13 @@ for (const transport of ["events", "polling"] as const) {
     });
     await expect(input).toHaveAttribute("aria-pressed", "true");
 
+    // Select Content also keeps the input view, with its box; this blank page has none.
     await page.locator('[data-stage-select="select_content"]').click();
-    await save();
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("No content found", {
+      timeout: 30_000,
+    });
+    await expect(input).toHaveAttribute("aria-pressed", "true");
 
     // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
     await page.locator('[data-stage-select="dewarping"]').click();

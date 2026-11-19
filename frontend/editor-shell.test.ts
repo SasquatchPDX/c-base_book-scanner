@@ -4,6 +4,17 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  BOTTOM,
+  ContentBoxOverlay,
+  describeContent,
+  LEFT,
+  moveEdges,
+  RIGHT,
+  roundBox,
+  sizeInMillimetres,
+  TOP,
+} from "./content-box-view";
+import {
   angleFromHandle,
   applyScopePages,
   deskewMapPoint,
@@ -268,5 +279,69 @@ describe("deskew (#195 step 4)", () => {
     expect(applyScopePages("every_other", order, "c", selected)).toEqual(["a", "c", "e"]);
     expect(applyScopePages("every_other", order, "b", selected)).toEqual(["b", "d"]);
     expect(applyScopePages("this", order, null, selected)).toEqual([]);
+  });
+});
+
+describe("select content (#195 step 5)", () => {
+  const image = { width: 1000, height: 1400 };
+  const min = { width: 10, height: 10 };
+  const start = { x1: 100, y1: 200, x2: 900, y2: 1200 };
+
+  it("moves only the dragged edge, by exactly the pointer movement", () => {
+    expect(moveEdges(start, LEFT, 30, 500, image, min)).toEqual({ ...start, x1: 130 });
+    expect(moveEdges(start, BOTTOM, 0, -100, image, min)).toEqual({ ...start, y2: 1100 });
+    expect(moveEdges(start, TOP | RIGHT, 50, -50, image, min)).toEqual({
+      x1: 100,
+      y1: 150,
+      x2: 950,
+      y2: 1200,
+    });
+  });
+
+  it("keeps the minimum size and stays inside the image", () => {
+    expect(moveEdges(start, LEFT, 5000, 0, image, min).x1).toBe(890);
+    expect(moveEdges(start, TOP, 0, -5000, image, min).y1).toBe(0);
+    expect(moveEdges(start, RIGHT, 5000, 0, image, min).x2).toBe(1000);
+    expect(roundBox({ x1: 10.4, y1: 20.6, x2: 9, y2: 30 }, image)).toEqual({
+      x1: 9,
+      y1: 21,
+      x2: 10,
+      y2: 30,
+    });
+  });
+
+  it("shows the physical size like upstream PhysSizeCalc", () => {
+    const box = { x1: 0, y1: 0, x2: 1063, y2: 1654 };
+    expect(sizeInMillimetres(box, { x: 150, y: 150 }).width).toBeCloseTo(180.0, 0);
+    expect(describeContent({ content_mode: "auto" }, box, { x: 150, y: 150 })).toBe(
+      "Content 180.0 × 280.1 mm (1063 × 1654 px, auto).",
+    );
+    expect(describeContent({ content_mode: "auto", content_found: false }, null, null)).toBe(
+      "No content found: the whole page is kept.",
+    );
+    expect(describeContent({ content_mode: "disabled" }, null, null)).toContain("disabled");
+  });
+
+  it("drags an edge without jumping, whatever the zoom, and commits on release", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const onPreview = vi.fn();
+    const onCommit = vi.fn();
+    const overlay = new ContentBoxOverlay(host, start, true, { onPreview, onCommit });
+    // Shown at half size: 500 x 700 screen pixels for a 1000 x 1400 page.
+    overlay.layout(image, { width: 500, height: 700 });
+    expect(overlay.element.style.left).toBe("50px");
+    const handle = host.querySelector<HTMLElement>('[data-content-handle="left"]')!;
+    expect(handle.dataset.capturesPointer).toBe("true");
+    const fire = (type: string, x: number, y: number): void => {
+      handle.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y, button: 0, bubbles: true }));
+    };
+    fire("pointerdown", 300, 300); // grabbed anywhere along the edge: no jump
+    fire("pointermove", 310, 999);
+    expect(onPreview).toHaveBeenLastCalledWith({ ...start, x1: 120 });
+    fire("pointerup", 310, 999);
+    expect(onCommit).toHaveBeenCalledWith({ ...start, x1: 120 });
+    expect(overlay.element.style.left).toBe("60px");
+    host.remove();
   });
 });

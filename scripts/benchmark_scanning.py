@@ -50,6 +50,7 @@ PHASES = ("decode", "encode", "hash", "compute")
 #: encoding the working image, so the check is stricter than the detection alone.
 STAGE_BUDGETS_MS: dict[str, float] = {
     "deskew": 300.0,  # #195 step 4: SkewFinder port
+    "select_content": 300.0,  # #195 step 5: ContentBoxFinder port
 }
 
 
