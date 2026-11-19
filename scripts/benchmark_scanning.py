@@ -20,7 +20,9 @@ Usage::
 
 ``--baseline`` compares the mean per-page time of each stage with an earlier ``--json``
 result and exits with status 1 if any stage is more than ``--tolerance`` (default 20 %)
-slower. Record numbers on the 2-vCPU / 3 GB test VM; numbers from a developer machine
+slower. ``--check-budgets`` also fails when a stage's mean exceeds its absolute budget
+from #195 section 8.1 (:data:`STAGE_BUDGETS_MS`; a stage is added there by the PR that
+ports it). Record numbers on the 2-vCPU / 3 GB test VM; numbers from a developer machine
 are only useful as relative comparisons.
 """
 
@@ -42,6 +44,13 @@ from pathlib import Path
 from typing import Any
 
 PHASES = ("decode", "encode", "hash", "compute")
+
+#: Per-page budgets (#195 section 8.1, "auto-detection for one page in one stage"),
+#: checked against the mean of the whole stage step, which includes decoding and
+#: encoding the working image, so the check is stricter than the detection alone.
+STAGE_BUDGETS_MS: dict[str, float] = {
+    "deskew": 300.0,  # #195 step 4: SkewFinder port
+}
 
 
 def _setup_django() -> None:
@@ -241,6 +250,14 @@ def compare(summary: dict[str, Any], baseline_path: Path, tolerance: float) -> l
     return regressions
 
 
+def over_budget(summary: dict[str, Any]) -> list[str]:
+    return [
+        f"{stage}: {summary[stage]['mean_ms']:.0f} ms > budget {budget:.0f} ms"
+        for stage, budget in STAGE_BUDGETS_MS.items()
+        if stage in summary and summary[stage]["mean_ms"] > budget
+    ]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     source = parser.add_mutually_exclusive_group(required=True)
@@ -250,6 +267,9 @@ def main() -> int:
     parser.add_argument("--json", type=Path, help="write raw samples and summary here")
     parser.add_argument("--baseline", type=Path, help="earlier --json result to compare with")
     parser.add_argument("--tolerance", type=float, default=0.20)
+    parser.add_argument(
+        "--check-budgets", action="store_true", help="fail when a stage exceeds its budget"
+    )
     args = parser.parse_args()
 
     _setup_django()
@@ -282,6 +302,12 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
+    if args.check_budgets:
+        failures = over_budget(summary)
+        for failure in failures:
+            print(f"OVER BUDGET {failure}", file=sys.stderr)
+        if failures:
+            return 1
     if args.baseline:
         regressions = compare(summary, args.baseline, args.tolerance)
         for regression in regressions:

@@ -8,6 +8,16 @@ import {
   type SortMode,
   type StripItem,
 } from "./page-strip";
+import {
+  type ApplyScope,
+  applyScopePages,
+  clampAngle,
+  DeskewOverlay,
+  deskewResultText,
+  describeAngle,
+  roundAngle,
+  wheelAngle,
+} from "./deskew-view";
 import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
 
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
@@ -96,7 +106,7 @@ const STAGE_LABELS: Record<StageName, string> = {
 };
 
 const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
-  deskew: ["manual_angle", "angle_min", "angle_max", "angle_step"],
+  deskew: ["manual_angle"],
   select_content: ["content_mode", "content_box"],
   margins: [
     "margins_mode",
@@ -501,6 +511,25 @@ function element<T extends HTMLElement>(parent: ParentNode, selector: string): T
   return found;
 }
 
+const KEEP_GRID_KEY = "scantailor.deskew.keepGrid";
+
+/** Per-viewer preference; storage may be unavailable (private windows). */
+function readKeepGrid(): boolean {
+  try {
+    return window.localStorage.getItem(KEEP_GRID_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function writeKeepGrid(keep: boolean): void {
+  try {
+    window.localStorage.setItem(KEEP_GRID_KEY, String(keep));
+  } catch {
+    // The preference is a convenience only.
+  }
+}
+
 class WorkspaceController {
   private readonly root: HTMLElement;
   private readonly pages = new Map<string, WorkspacePage>();
@@ -544,6 +573,10 @@ class WorkspaceController {
   private previewUrl = "";
   private previewRetry: PreviewRetryState = INITIAL_PREVIEW_RETRY;
   private previewRetryTimer: number | null = null;
+  private deskewOverlay: DeskewOverlay | null = null;
+  private deskewSaveTimer: number | null = null;
+  private saving = false;
+  private saveQueued = false;
 
   constructor(root: HTMLElement, pages: WorkspacePage[]) {
     this.root = root;
@@ -794,6 +827,7 @@ class WorkspaceController {
     this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
     this.warnings.hidden = !warning;
     this.geometryLayer.hidden = this.previewMode === "result";
+    this.applyDeskewPreview();
     this.renderGeometry();
   }
 
@@ -802,6 +836,13 @@ class WorkspaceController {
     const justCompleted =
       state.status === "success" &&
       (previous?.status !== "success" || previous.revision !== state.revision);
+    if (state.stage === "deskew") {
+      // The input view already shows the rotation live; stay there and show the result.
+      this.showPreview(this.previewMode);
+      this.syncDeskewControls();
+      if (justCompleted) this.setMessage(deskewResultText(state.parameters), "success");
+      return;
+    }
     this.showPreview(justCompleted ? "result" : this.previewMode);
     if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
   }
@@ -841,24 +882,217 @@ class WorkspaceController {
   }
 
   private renderDeskewControls(): void {
-    const mode = "manual_angle" in this.draft ? "manual" : "auto";
-    this.addSelectValue("Mode", mode, ["auto", "manual"], (value) => {
-      if (value === "manual") {
-        const state = this.activeContext()?.state;
-        this.draft.manual_angle = finiteNumber(state?.parameters.angle, 0);
-      } else {
-        delete this.draft.manual_angle;
-      }
-      this.renderControls();
-      this.renderGeometry();
-    });
-    if ("manual_angle" in this.draft) {
-      this.addNumber("Angle (degrees)", "manual_angle", -15, 15, 0.05);
-    } else {
-      this.addNumber("Auto minimum", "angle_min", -15, 0, 0.25, -7);
-      this.addNumber("Auto maximum", "angle_max", 0, 15, 0.25, 7);
-      this.addNumber("Search step", "angle_step", 0.05, 5, 0.05, 1);
+    const state = this.activeContext()?.state;
+    const manual = "manual_angle" in this.draft;
+    const modes = document.createElement("fieldset");
+    modes.className = "st-radio-group";
+    const legend = document.createElement("legend");
+    legend.textContent = "Mode";
+    modes.append(legend);
+    for (const value of ["auto", "manual"] as const) {
+      const label = document.createElement("label");
+      label.className = "checkbox";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "deskew-mode";
+      radio.value = value;
+      radio.checked = (value === "manual") === manual;
+      radio.disabled = !this.editable;
+      radio.dataset.deskewMode = value;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        if (value === "manual") {
+          this.setDeskewAngle(this.deskewAngle(), false);
+        } else {
+          // Upstream clears the page's parameters and detects again.
+          delete this.draft.manual_angle;
+          this.applyDeskewPreview();
+        }
+        void this.commitDeskew();
+      });
+      label.append(radio, document.createTextNode(value === "auto" ? "Auto" : "Manual"));
+      modes.append(label);
     }
+    this.controls.append(modes);
+
+    const label = document.createElement("label");
+    label.textContent = "Angle (degrees, + = clockwise)";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "0.01";
+    input.min = "-45";
+    input.max = "45";
+    input.dataset.deskewAngle = "";
+    input.disabled = !this.editable;
+    input.value = this.deskewAngle().toFixed(2);
+    input.title =
+      "Mouse wheel: 0.1° per notch (Shift: 0.05°). Ctrl+wheel over the page also rotates.";
+    input.addEventListener("input", () => {
+      const value = Number(input.value);
+      if (input.value === "" || !Number.isFinite(value)) return;
+      this.deskewOverlay?.flashGrid();
+      this.setDeskewAngle(clampAngle(value), true, false);
+    });
+    input.addEventListener(
+      "wheel",
+      (event) => {
+        if (input.disabled) return;
+        event.preventDefault();
+        // A number field goes up when the wheel goes up.
+        const angle = wheelAngle(this.deskewAngle(), {
+          deltaY: -(event.deltaY || event.deltaX),
+          ctrlKey: true,
+          shiftKey: event.shiftKey,
+        });
+        if (angle === null) return;
+        this.deskewOverlay?.flashGrid();
+        this.setDeskewAngle(angle, true);
+      },
+      { passive: false },
+    );
+    label.append(input);
+    this.controls.append(label);
+
+    const grid = document.createElement("label");
+    grid.className = "checkbox";
+    const keep = document.createElement("input");
+    keep.type = "checkbox";
+    keep.dataset.deskewGrid = "";
+    keep.checked = readKeepGrid();
+    keep.addEventListener("change", () => {
+      writeKeepGrid(keep.checked);
+      this.deskewOverlay?.setKeepGrid(keep.checked);
+    });
+    grid.append(keep, document.createTextNode("Keep the grid visible"));
+    this.controls.append(grid);
+
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.deskewResult = "";
+    result.textContent = state?.status === "success" ? deskewResultText(state.parameters) : "";
+    this.controls.append(result);
+  }
+
+  /** The angle shown: the manual draft, else what auto mode applied last. */
+  private deskewAngle(): number {
+    if ("manual_angle" in this.draft) return roundAngle(finiteNumber(this.draft.manual_angle, 0));
+    const state = this.activeContext()?.state;
+    return state ? roundAngle(finiteNumber(state.parameters.angle, 0)) : 0;
+  }
+
+  private deskewEditing(): boolean {
+    return (
+      this.editable &&
+      this.activeStage === "deskew" &&
+      this.previewMode === "input" &&
+      !this.image.hidden
+    );
+  }
+
+  /**
+   * Change the angle: the page turns at once in the browser. ``commit`` saves it after
+   * a short pause (upstream commits when a drag ends or the spin box changes).
+   */
+  private setDeskewAngle(angle: number, commit: boolean, updateField = true): void {
+    const rounded = roundAngle(angle);
+    const wasManual = "manual_angle" in this.draft;
+    this.draft.manual_angle = rounded;
+    if (!wasManual) {
+      const radio = this.controls.querySelector<HTMLInputElement>('[data-deskew-mode="manual"]');
+      if (radio) radio.checked = true;
+    }
+    if (updateField) {
+      const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
+      if (field) field.value = rounded.toFixed(2);
+    }
+    const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
+    if (result) result.textContent = `${describeAngle(rounded)} (manual, not saved yet).`;
+    this.applyDeskewPreview();
+    if (commit) this.scheduleDeskewCommit();
+  }
+
+  private scheduleDeskewCommit(): void {
+    if (this.deskewSaveTimer !== null) window.clearTimeout(this.deskewSaveTimer);
+    this.deskewSaveTimer = window.setTimeout(() => {
+      this.deskewSaveTimer = null;
+      void this.commitDeskew();
+    }, 600);
+  }
+
+  /** Save the deskew draft; a change made while a save is running is saved after it. */
+  private async commitDeskew(): Promise<void> {
+    if (!this.editable) return;
+    if (this.deskewSaveTimer !== null) {
+      window.clearTimeout(this.deskewSaveTimer);
+      this.deskewSaveTimer = null;
+    }
+    if (this.saving) {
+      this.saveQueued = true;
+      return;
+    }
+    await this.saveActiveStage();
+    if (this.saveQueued) {
+      this.saveQueued = false;
+      await this.commitDeskew();
+    }
+  }
+
+  /** Field and result text after a run (unless the member is changing the angle). */
+  private syncDeskewControls(): void {
+    if (this.activeStage !== "deskew") return;
+    const state = this.activeContext()?.state;
+    if (!state) return;
+    const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
+    const editing =
+      this.deskewSaveTimer !== null ||
+      this.saving ||
+      this.deskewOverlay?.isDragging() === true ||
+      (field !== null && document.activeElement === field);
+    if (editing) return;
+    if (!("manual_angle" in this.draft) && field) field.value = this.deskewAngle().toFixed(2);
+    const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
+    if (result && state.status === "success") result.textContent = deskewResultText(state.parameters);
+    this.applyDeskewPreview();
+  }
+
+  /** Turn the input preview by the current angle and place the grid and handles. */
+  private applyDeskewPreview(): void {
+    const active =
+      this.activeStage === "deskew" && this.previewMode === "input" && !this.image.hidden;
+    if (!active || !this.viewport || !this.image.naturalWidth) {
+      this.image.style.transform = "";
+      if (this.deskewOverlay) this.deskewOverlay.element.style.display = "none";
+      return;
+    }
+    const angle = this.deskewAngle();
+    this.image.style.transformOrigin = "50% 50%";
+    this.image.style.transform = angle ? `rotate(${angle}deg)` : "";
+    if (!this.deskewOverlay) {
+      this.deskewOverlay = new DeskewOverlay(this.viewport, {
+        onPreview: (value) => this.setDeskewAngle(value, false),
+        onCommit: (value) => {
+          this.setDeskewAngle(value, false);
+          void this.commitDeskew();
+        },
+      });
+      this.deskewOverlay.setKeepGrid(readKeepGrid());
+    }
+    const overlay = this.deskewOverlay;
+    overlay.element.style.display = "";
+    overlay.element.classList.toggle("read-only", !this.editable);
+    const width = this.image.naturalWidth * this.view.zoom;
+    const height = this.image.naturalHeight * this.view.zoom;
+    const centre = { x: this.view.x + width / 2, y: this.view.y + height / 2 };
+    // Handles sit at the page edges, but stay inside the pane.
+    const radius = Math.max(
+      24,
+      Math.min(
+        width / 2,
+        this.viewport.clientWidth / 2 - 16,
+        this.viewport.clientHeight / 2 - 16,
+      ),
+    );
+    overlay.layout(centre, radius, angle);
   }
 
   private renderContentControls(): void {
@@ -1482,6 +1716,7 @@ class WorkspaceController {
     if (!context || !this.activePageId || !this.editable) return;
     const url = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
     if (!url) return;
+    this.saving = true;
     this.saveButton.disabled = true;
     this.setMessage("Saving revision and queueing a preview…", "info");
     try {
@@ -1509,16 +1744,21 @@ class WorkspaceController {
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as { stage: StageState };
       this.mergeStage(payload.stage);
+      const done = payload.stage.status === "success";
       this.setMessage(
-        payload.stage.status === "success"
-          ? "Saved. Result preview is ready."
-          : "Saved. The worker is generating the new preview.",
+        done && payload.stage.stage === "deskew"
+          ? `Saved. ${deskewResultText(payload.stage.parameters)}`
+          : done
+            ? "Saved. Result preview is ready."
+            : "Saved. The worker is generating the new preview.",
         "success",
       );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Stage update failed.", "error");
     } finally {
+      this.saving = false;
       this.saveButton.disabled = !this.editable;
+      if (!this.saveQueued) this.syncDeskewControls();
     }
   }
 
@@ -1526,8 +1766,10 @@ class WorkspaceController {
     if (!this.editable) return;
     const batchUrl = this.url("batchUrlTemplate", "", this.activeStage);
     if (!batchUrl) return;
-    const selected = [...this.selectedPages];
-    if (this.batchScope.value === "selected" && selected.length === 0) {
+    const scope = (this.batchScope.value || "selected") as ApplyScope;
+    const order = this.strip?.displayOrder() ?? this.naturalOrder;
+    const pageIds = applyScopePages(scope, order, this.activePageId, this.selectedPages);
+    if (pageIds !== null && pageIds.length === 0) {
       this.setMessage("Select at least one page before applying a batch.", "error");
       return;
     }
@@ -1537,7 +1779,7 @@ class WorkspaceController {
       parameters: this.draft,
       preserve_exceptions: this.preserveExceptions.checked,
     };
-    if (this.batchScope.value === "selected") body.page_ids = selected;
+    if (pageIds !== null) body.page_ids = pageIds;
     try {
       const response = await fetch(batchUrl, {
         method: "POST",
@@ -1702,7 +1944,18 @@ class WorkspaceController {
     viewport.addEventListener(
       "wheel",
       (event) => {
-        if (event.ctrlKey) return; // reserved for stage gestures (deskew rotation)
+        if (event.ctrlKey) {
+          // Upstream deskew: Ctrl+wheel rotates, Ctrl+Shift+wheel rotates finely.
+          if (this.deskewEditing()) {
+            event.preventDefault();
+            const angle = wheelAngle(this.deskewAngle(), event);
+            if (angle !== null) {
+              this.deskewOverlay?.flashGrid();
+              this.setDeskewAngle(angle, true);
+            }
+          }
+          return;
+        }
         event.preventDefault();
         const bounds = viewport.getBoundingClientRect();
         this.view = zoomAt(this.view, wheelFactor(event.deltaY, event.deltaMode), {
@@ -1717,7 +1970,11 @@ class WorkspaceController {
     viewport.addEventListener("pointerdown", (event) => {
       const target = event.target as HTMLElement | null;
       // Handles and boxes own their pointer events; only the background pans.
-      if (event.button !== 0 || target?.closest("[data-geometry-layer] > *")) return;
+      if (
+        event.button !== 0 ||
+        target?.closest("[data-geometry-layer] > *, [data-captures-pointer]")
+      )
+        return;
       drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
       viewport.setPointerCapture(event.pointerId);
       viewport.classList.add("panning");
@@ -1779,6 +2036,7 @@ class WorkspaceController {
     this.image.style.height = `${Math.round(this.image.naturalHeight * this.view.zoom)}px`;
     this.surface.style.transform = `translate(${Math.round(this.view.x)}px, ${Math.round(this.view.y)}px)`;
     if (this.zoomLevel) this.zoomLevel.textContent = `${Math.round(this.view.zoom * 100)} %`;
+    this.applyDeskewPreview();
     if (resized) this.renderGeometry();
   }
 

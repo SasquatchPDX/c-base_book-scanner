@@ -133,7 +133,7 @@ def test_workspace_thumbnail_urls_are_tokenised_and_change_with_the_artifact() -
     assert "?v=v" in raw_url
     response = client.get(raw_url)
     assert response["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
-    _run(client, str(job.id), page, "deskew", {"manual_angle": 90})
+    _run(client, str(job.id), page, "deskew", {"manual_angle": 45})
     stage_url = thumbnail_url()
     assert stage_url != raw_url and "?v=s" in stage_url
     assert client.get(stage_url)["Cache-Control"] == views.SCAN_ARTIFACT_IMMUTABLE
@@ -178,7 +178,7 @@ def test_thumbnail_bytes_and_token_come_from_one_selection_under_invalidation(
         client, str(job.id), sequence=1, side="single", payload=_landscape_png(), filename="p.png"
     )
     page = ScanPage.objects.get(scan_job_id=job.id, logical_sequence_number=1)
-    _run(client, str(job.id), page, "deskew", {"manual_angle": 90})
+    _run(client, str(job.id), page, "deskew", {"manual_angle": 45})
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     version = page.active_version()
     assert version is not None

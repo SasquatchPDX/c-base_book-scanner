@@ -1,4 +1,18 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
+
+import {
+  angleFromHandle,
+  applyScopePages,
+  deskewMapPoint,
+  deskewResultText,
+  describeAngle,
+  handlePositions,
+  roundAngle,
+  wheelAngle,
+} from "./deskew-view";
 
 import {
   applyClick,
@@ -172,5 +186,87 @@ describe("editor helpers", () => {
     expect(fillUrl("/j/pages/__PAGE__/stages/__STAGE__/", "p1", "deskew")).toBe(
       "/j/pages/p1/stages/deskew/",
     );
+  });
+});
+
+describe("deskew (#195 step 4)", () => {
+  interface RotationCase {
+    size: [number, number];
+    angle: number;
+    points: [number, number][];
+    expected: [number, number][];
+  }
+
+  it("previews exactly the rotation the server applies (shared fixture)", () => {
+    // tests/test_deskew.py checks scan_transform against the same file.
+    const cases = JSON.parse(
+      readFileSync(resolve(process.cwd(), "tests/fixtures/deskew_rotation_cases.json"), "utf-8"),
+    ) as RotationCase[];
+    expect(cases.length).toBeGreaterThanOrEqual(6);
+    for (const item of cases) {
+      const size = { width: item.size[0], height: item.size[1] };
+      item.points.forEach(([x, y], index) => {
+        const mapped = deskewMapPoint({ x, y }, size, item.angle);
+        const [ex, ey] = item.expected[index]!;
+        expect(mapped.x).toBeCloseTo(ex, 6);
+        expect(mapped.y).toBeCloseTo(ey, 6);
+      });
+    }
+  });
+
+  it("places the handles like upstream and turns clockwise when the right one goes down", () => {
+    const centre = { x: 100, y: 100 };
+    const [left, right] = handlePositions(centre, 50, 0);
+    expect(left).toEqual({ x: 50, y: 100 });
+    expect(right).toEqual({ x: 150, y: 100 });
+    const down = angleFromHandle(1, { x: 150, y: 125 }, centre, 50);
+    expect(down).toBeCloseTo(30);
+    // The left handle moving up is the same clockwise turn.
+    expect(angleFromHandle(0, { x: 50, y: 75 }, centre, 50)).toBeCloseTo(30);
+    // Clamped to +-45 degrees.
+    expect(angleFromHandle(1, { x: 0, y: 1000 }, centre, 50)).toBe(45);
+    const [, moved] = handlePositions(centre, 50, down);
+    expect(moved.y).toBeCloseTo(125);
+  });
+
+  it("rotates by 0.1 per wheel notch with Ctrl and 0.05 with Ctrl+Shift", () => {
+    expect(wheelAngle(1, { deltaY: -100, ctrlKey: true, shiftKey: false })).toBeCloseTo(0.9);
+    expect(wheelAngle(1, { deltaY: 100, ctrlKey: true, shiftKey: true })).toBeCloseTo(1.05);
+    expect(wheelAngle(1, { deltaY: 100, ctrlKey: false, shiftKey: false })).toBeNull();
+    expect(wheelAngle(44.98, { deltaY: 100, ctrlKey: true, shiftKey: false })).toBe(45);
+    expect(roundAngle(-0.001)).toBe(0);
+    expect(Object.is(roundAngle(-0.001), -0)).toBe(false);
+  });
+
+  it("says when a page is left unchanged", () => {
+    expect(describeAngle(0)).toBe("Angle 0.00°, no change");
+    expect(describeAngle(-1.234)).toBe("Angle 1.23° counter-clockwise");
+    expect(
+      deskewResultText({
+        deskew_mode: "auto",
+        angle: 0,
+        detected_angle: 0.4,
+        confidence: 1.25,
+        confidence_good: false,
+      }),
+    ).toBe("Angle 0.00°, no change: detection confidence 1.3 is below 2.0; best guess 0.40°.");
+    expect(deskewResultText({ deskew_mode: "auto", angle: 1.3, confidence: 12, confidence_good: true })).toBe(
+      "Angle 1.30° clockwise (auto, confidence 12.0).",
+    );
+    expect(deskewResultText({ deskew_mode: "manual", angle: -2 })).toBe(
+      "Angle 2.00° counter-clockwise (manual).",
+    );
+  });
+
+  it("resolves the Apply to… scopes in display order", () => {
+    const order = ["a", "b", "c", "d", "e"];
+    const selected = new Set(["d", "b"]);
+    expect(applyScopePages("all", order, "c", selected)).toBeNull();
+    expect(applyScopePages("this", order, "c", selected)).toEqual(["c"]);
+    expect(applyScopePages("following", order, "c", selected)).toEqual(["c", "d", "e"]);
+    expect(applyScopePages("selected", order, "c", selected)).toEqual(["b", "d"]);
+    expect(applyScopePages("every_other", order, "c", selected)).toEqual(["a", "c", "e"]);
+    expect(applyScopePages("every_other", order, "b", selected)).toEqual(["b", "d"]);
+    expect(applyScopePages("this", order, null, selected)).toEqual([]);
   });
 });
