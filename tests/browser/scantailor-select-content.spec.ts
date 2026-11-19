@@ -67,6 +67,9 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await page.getByRole("button", { name: "Save and run" }).click();
   await expect(message).toContainText("mm", { timeout: 30_000 });
   await expect(message).toContainText("auto");
+  await expect(
+    page.locator('[data-strip-page] .st-status-icon[data-stage="select_content"]').first(),
+  ).toHaveAttribute("data-status", "success");
 
   // The auto result is drawn and stays on the input view.
   const box = page.locator("[data-content-box]");

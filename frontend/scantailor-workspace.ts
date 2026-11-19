@@ -1204,8 +1204,20 @@ class WorkspaceController {
     result.textContent = known ? describeContent(parameters, box, this.contentDpi()) : "";
   }
 
+  /**
+   * Draw the content box. The overlay persists across re-renders (live updates,
+   * zoom, image reloads), like the Deskew overlay, so a drag in progress survives them.
+   */
   private renderContentBox(source: Size, display: Size): void {
     const box = this.contentBox();
+    const existing = this.contentOverlay;
+    if (existing && (box || existing.isDragging())) {
+      if (box) existing.setBox(box); // ignored while dragging
+      this.geometryLayer.append(existing.element);
+      existing.layout(source, display);
+      return;
+    }
+    this.removeContentOverlay();
     if (!box) return;
     this.contentOverlay = new ContentBoxOverlay(this.geometryLayer, box, this.editable, {
       onPreview: (next) => this.updateContentText(next),
@@ -1603,8 +1615,18 @@ class WorkspaceController {
   private clearGeometry(): void {
     for (const interaction of this.interactions) interaction.unset();
     this.interactions = [];
+    // Keep the content box element (and any drag on it); renderGeometry re-adds it.
+    const keep =
+      this.activeStage === "select_content" && this.previewMode === "input"
+        ? this.contentOverlay
+        : null;
+    if (!keep) this.removeContentOverlay();
+    this.geometryLayer.replaceChildren(...(keep ? [keep.element] : []));
+  }
+
+  private removeContentOverlay(): void {
+    this.contentOverlay?.remove();
     this.contentOverlay = null;
-    this.geometryLayer.replaceChildren();
   }
 
   private renderRectangle(

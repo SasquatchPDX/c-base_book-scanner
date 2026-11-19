@@ -5222,8 +5222,8 @@ var Le = class {
 		t.textContent = n?.status === "success" || this.draft.content_mode === "manual" ? y(r, e, this.contentDpi()) : "";
 	}
 	renderContentBox(e, t) {
-		let n = this.contentBox();
-		n && (this.contentOverlay = new x(this.geometryLayer, n, this.editable, {
+		let n = this.contentBox(), r = this.contentOverlay;
+		r && (n || r.isDragging()) ? (n && r.setBox(n), this.geometryLayer.append(r.element), r.layout(e, t)) : (this.removeContentOverlay(), n && (this.contentOverlay = new x(this.geometryLayer, n, this.editable, {
 			onPreview: (e) => this.updateContentText(e),
 			onCommit: (e) => {
 				this.draft.content_mode = "manual", this.draft.content_box = [
@@ -5235,7 +5235,7 @@ var Le = class {
 				let t = this.controls.querySelector("[data-content-mode=\"manual\"]");
 				t && (t.checked = !0), this.updateContentText(e), this.commitDraft();
 			}
-		}), this.contentOverlay.layout(e, t));
+		}), this.contentOverlay.layout(e, t)));
 	}
 	renderMarginControls() {
 		this.addNumber("All margins (pixels)", "margin", 0, 5e3, 1, 0), this.addSelect("Horizontal alignment", "align_x", [
@@ -5463,7 +5463,12 @@ var Le = class {
 	}
 	clearGeometry() {
 		for (let e of this.interactions) e.unset();
-		this.interactions = [], this.contentOverlay = null, this.geometryLayer.replaceChildren();
+		this.interactions = [];
+		let e = this.activeStage === "select_content" && this.previewMode === "input" ? this.contentOverlay : null;
+		e || this.removeContentOverlay(), this.geometryLayer.replaceChildren(...e ? [e.element] : []);
+	}
+	removeContentOverlay() {
+		this.contentOverlay?.remove(), this.contentOverlay = null;
 	}
 	renderRectangle(e, t, n, r, i, a, o = .92, s, l) {
 		let u = {
