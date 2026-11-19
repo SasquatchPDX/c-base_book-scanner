@@ -14,6 +14,7 @@ from PIL import Image
 from ebook_server.core import output_zones, scantailor, views
 from ebook_server.core.models import ScanPage, ScanTailorStageState
 from tests.output_zone_fixtures import PICTURE_BOXES, illustrated_page
+from tests.stage_helpers import run_stage
 from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
 
 
@@ -22,15 +23,14 @@ def run_output(tmp_path: Path, parameters: dict[str, Any]) -> tuple[Image.Image,
     if not source.exists():
         illustrated_page().save(source)
     before = source.read_bytes()
-    result = scantailor._run_output(
+    result = run_stage(
+        scantailor._run_output,
         cast(ScanTailorStageState, SimpleNamespace(parameters=parameters)),
         source,
-        tmp_path / "output.png",
-        tmp_path / "preview.png",
     )
     assert source.read_bytes() == before
-    with Image.open(tmp_path / "output.png") as image:
-        return image.copy(), result
+    assert result.full_resolution
+    return result.image, result.parameters
 
 
 def test_auto_finds_multiple_pictures_and_text_regions_and_preserves_detail(tmp_path: Path) -> None:
@@ -214,7 +214,7 @@ def test_list_zone_edit_survives_batch_and_only_replaces_output() -> None:
     assert replay.status_code == 202
     manual.refresh_from_db()
     assert manual.output_sha256 == original
-    assert manual.algorithm_version == "opencv-zones-v2"
+    assert manual.algorithm_version == "opencv-zones-v3"
     assert (
         list(
             ScanTailorStageState.objects.filter(scan_page=pages[0])

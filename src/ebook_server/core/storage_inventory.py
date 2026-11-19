@@ -27,6 +27,7 @@ from .models import (
     ScanCover,
     ScanJob,
     ScanLog,
+    ScanPageImage,
     ScanPageVersion,
     ScanTailorStageState,
     SourceLocation,
@@ -96,6 +97,15 @@ def artifact_references() -> Iterable[ArtifactReference]:
         ):
             if identifier:
                 yield ArtifactReference(kind, str(state.pk), identifier, digest, location)
+    for page_image in ScanPageImage.objects.select_related("storage_location").iterator():
+        for kind, identifier in (
+            ("page_work_image", page_image.work_storage_identifier),
+            ("page_thumbnail", page_image.thumbnail_storage_identifier),
+        ):
+            if identifier:
+                yield ArtifactReference(
+                    kind, str(page_image.pk), identifier, "", page_image.storage_location
+                )
     for opf_state in (
         BookOpfState.objects.filter(written_generation__gt=0).select_related("book").iterator()
     ):
@@ -158,7 +168,8 @@ def reference_index() -> tuple[dict[str, list[ArtifactReference]], list[str]]:
 
 STAGE_FILE = re.compile(
     r"^scan-jobs/(?P<job>[^/]+)/(?P<page>[0-9a-f-]{36})/(?P<stage>[a-z_]+)/"
-    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png)$"
+    # work.png / preview.jpg: working-resolution artifacts of stages 1-4 (#195 step 2).
+    r"v(?P<revision>[1-9][0-9]*)/(?P<name>output\.png|preview\.png|work\.png|preview\.jpg)$"
 )
 
 

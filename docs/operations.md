@@ -1734,6 +1734,28 @@ uv run python manage.py collect_cover_thumbnails
 uv run python manage.py collect_cover_thumbnails --grace-seconds 3600 --limit 5000
 ```
 
+### Scan page working images
+
+Every scan page version gets a working image and thumbnail (`ScanPageImage`,
+migration 0050) from a background job when it is uploaded. Pages uploaded before
+migration 0050 have none; the editor queues the job the first time a member opens
+such a page and shows the Deskew input as soon as it is ready (the preview answers
+`503 input preview not ready` with `Retry-After` meanwhile, and the editor retries
+for about a minute). To make them ahead of time after the upgrade:
+
+```bash
+uv run python manage.py backfill_scan_page_images --dry-run  # count only
+uv run python manage.py backfill_scan_page_images            # one RQ job per version
+uv run python manage.py backfill_scan_page_images --all-versions --limit 500
+```
+
+The command is idempotent and queues at most one job per version within two
+minutes (a marker in the queue's Redis, shared with the editor's requests).
+Without a configured queue it generates the images in the command's process.
+Migration 0050 also invalidates processed stages of jobs that can still be
+processed (open, capturing, paused, raw scan); finalizing, complete and cancelled
+jobs keep their stage results.
+
 ## Metrics and logs
 
 Set a long random `BOOK_SCANNER_METRICS_BEARER_TOKEN` in production and configure

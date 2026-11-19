@@ -26,7 +26,7 @@ def test_benchmark_runs_every_stage_in_pipeline_order(tmp_path: Path) -> None:
     raw = bench.run(pages, tmp_path)
     assert raw["failures"] == []
     summary = bench.summarise(raw)
-    assert list(summary) == list(scantailor.stage_order())
+    assert list(summary) == ["page_image", *scantailor.stage_order()]
     for row in summary.values():
         assert row["pages"] == 1
         assert set(row["phases_mean_ms"]) == set(bench.PHASES)

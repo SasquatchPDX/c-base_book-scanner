@@ -129,6 +129,7 @@ uv run python manage.py collectstatic --noinput --clear --verbosity 0
 "${book_scanner_compose[@]}" up --detach --wait --wait-timeout 120
 uv run python manage.py migrate --noinput
 uv run python manage.py shell -c 'from tests.browser_fixtures import seed_worker_failure_review; seed_worker_failure_review()'
+uv run python manage.py shell -c 'from tests.browser_fixtures import seed_migrated_scan_page; seed_migrated_scan_page()'
 uv run python manage.py check
 # tests/integration includes test_rehearse_migrations_postgres.py, which runs
 # scripts/rehearse_migrations.sh end to end against this PostgreSQL (pg_dump and friends

@@ -173,23 +173,42 @@ def detect_curves(source: Image.Image) -> list[list[list[float]]]:
     return normalize_curves(curves, source.size)
 
 
-def render(source: Image.Image, value: Any, paper: Any = 255) -> tuple[Image.Image, dict[str, Any]]:
-    curves = normalize_curves(value, source.size)
+def measure(value: Any, size: tuple[int, int]) -> tuple[list[list[list[float]]], int, float]:
+    """Validate curves for ``size``; return them with the padding and maximum shift.
+
+    A padding of 0 means the correction is negligible (subpixel glyph-band fitting
+    noise must not resample an already flat page).
+    """
+    curves = normalize_curves(value, size)
+    anchors, samples = _anchors(curves, size[0])
+    maximum = float(np.max(np.abs(samples - anchors[:, None])))
+    if maximum < 2.0:
+        return curves, 0, maximum
+    return curves, int(ceil(maximum)) + 2, maximum
+
+
+def _anchors(curves: list[list[list[float]]], width: int) -> tuple[Any, Any]:
     arrays = [np.asarray(curve) for curve in curves]
     # Uniform control positions make anchors independent of image dimensions and
     # reproduce precisely when detected geometry is used as a manual correction.
-    sample_x = np.linspace(0, source.width - 1, 65)
+    sample_x = np.linspace(0, width - 1, 65)
     samples = np.asarray([np.interp(sample_x, c[:, 0], c[:, 1]) for c in arrays])
-    anchors = np.median(samples, axis=1)
-    maximum = float(np.max(np.abs(samples - anchors[:, None])))
-    padding = int(ceil(maximum)) + 2
-    # Subpixel glyph-band fitting noise must not resample an already flat page.
-    if maximum < 2.0:
-        return source.copy(), {
-            "curvature_padding": 0,
-            "curvature_max_displacement": maximum,
-            "dewarp_correction": "none_needed",
-        }
+    return np.median(samples, axis=1), samples
+
+
+def warp(
+    source: Image.Image,
+    curves: list[list[list[float]]],
+    padding: int,
+    paper: Any = 255,
+) -> Image.Image:
+    """Flatten ``source`` along ``curves`` onto a canvas ``2 * padding`` taller.
+
+    ``curves`` are in ``source`` pixel coordinates and are not re-validated, so a
+    curve set validated at full resolution can be rendered at any scale.
+    """
+    arrays = [np.asarray(curve, dtype=np.float64) for curve in curves]
+    anchors, _ = _anchors(curves, source.width)
     result = Image.new(source.mode, (source.width, source.height + 2 * padding), paper)
     for top in range(0, result.height, TILE_EDGE):
         bottom = min(result.height, top + TILE_EDGE)
@@ -227,7 +246,18 @@ def render(source: Image.Image, value: Any, paper: Any = 255) -> tuple[Image.Ima
                 borderValue=paper,
             )
             result.paste(Image.fromarray(warped), (left, top))
-    return result, {
+    return result
+
+
+def render(source: Image.Image, value: Any, paper: Any = 255) -> tuple[Image.Image, dict[str, Any]]:
+    curves, padding, maximum = measure(value, source.size)
+    if padding == 0:
+        return source.copy(), {
+            "curvature_padding": 0,
+            "curvature_max_displacement": maximum,
+            "dewarp_correction": "none_needed",
+        }
+    return warp(source, curves, padding, paper), {
         "curvature_padding": padding,
         "curvature_max_displacement": maximum,
         "dewarp_correction": "applied",
