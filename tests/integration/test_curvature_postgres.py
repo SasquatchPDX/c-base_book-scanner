@@ -1,4 +1,4 @@
-"""Worker version and replay on PostgreSQL (#171)."""
+"""Dewarping worker version and replay on PostgreSQL (#171, #195 step 6)."""
 
 import os
 from pathlib import Path
@@ -7,8 +7,8 @@ from typing import Any
 import pytest
 from django.db import connection
 
-from tests.test_curvature import (
-    test_opt_in_worker_provenance_manual_replay_and_switch_back,  # noqa: F401
+from tests.test_cylindrical import (
+    test_manual_model_replays_through_the_worker_and_auto_returns,  # noqa: F401
 )
 
 pytestmark = [
