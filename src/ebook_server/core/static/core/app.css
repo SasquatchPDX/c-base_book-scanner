@@ -76,3 +76,13 @@
 .st-radio-group legend{float:left;margin-right:6px;font-weight:700}
 .st-radio-group input{width:auto}
 .st-stage-result{grid-column:1/-1;margin:0;color:var(--muted);font-size:.85rem}
+/* Select Content (#195 step 5): upstream's blue box; edges and corners resize, the inside pans. */
+.st-content-box{position:absolute;box-sizing:border-box;border:1px solid #0000ff;background:rgba(0,0,255,.2);pointer-events:none}
+.st-content-handle{position:absolute;pointer-events:auto;touch-action:none}
+.st-content-top,.st-content-bottom{left:6px;right:6px;height:12px;cursor:ns-resize}
+.st-content-top{top:-6px}.st-content-bottom{bottom:-6px}
+.st-content-left,.st-content-right{top:6px;bottom:6px;width:12px;cursor:ew-resize}
+.st-content-left{left:-6px}.st-content-right{right:-6px}
+.st-content-top-left,.st-content-top-right,.st-content-bottom-left,.st-content-bottom-right{width:14px;height:14px;background:#5ad1ff;border:2px solid #fff;border-radius:3px;box-sizing:border-box}
+.st-content-top-left{left:-7px;top:-7px;cursor:nwse-resize}.st-content-bottom-right{right:-7px;bottom:-7px;cursor:nwse-resize}
+.st-content-top-right{right:-7px;top:-7px;cursor:nesw-resize}.st-content-bottom-left{left:-7px;bottom:-7px;cursor:nesw-resize}

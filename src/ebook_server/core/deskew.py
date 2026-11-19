@@ -272,7 +272,7 @@ def remove_horizontal_shadows(image: Binary, dpi: tuple[float, float]) -> Binary
         first = False
         dpi_x, dpi_y = dpi_x / 2, dpi_y / 2
     brick = (_from_150dpi(200, dpi_x), _from_150dpi(14, dpi_y))
-    opened = open_brick(reduced, brick)
+    opened = open_brick(reduced, brick, black_surroundings=True)
     if not opened.any():
         return image
     seed = upscale_integer_times(opened, (image.shape[1], image.shape[0]))

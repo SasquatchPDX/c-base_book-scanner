@@ -1184,8 +1184,11 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
     if stage == "deskew":
         return "manual_angle" in parameters
     if stage == "select_content":
-        if str(parameters.get("content_mode", "")).strip().lower() == "manual":
-            return True
+        mode = str(parameters.get("content_mode", "")).strip().lower()
+        if mode:
+            # Auto results record the box they found; only the chosen mode counts
+            # (#195 step 5). Disabled is a deliberate per-page choice too.
+            return mode in {"manual", "disabled"}
         return "content_box" in parameters
     if stage == "margins":
         if str(parameters.get("margins_mode", "")).strip().lower() == "manual":
