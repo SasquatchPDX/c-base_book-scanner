@@ -41,7 +41,9 @@ for (const transport of ["events", "polling"] as const) {
     // Deskew keeps the live input view and says when it leaves a page unchanged.
     await page.locator('[data-stage-select="deskew"]').click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("Angle 0.00°, no change", {
+    // Each stage's own result line: the status line moves on to the stages that the
+    // run queues after it (#205 chaining).
+    await expect(page.locator("[data-deskew-result]")).toContainText("Angle 0.00°, no change", {
       timeout: 30_000,
     });
     await expect(input).toHaveAttribute("aria-pressed", "true");
@@ -49,7 +51,7 @@ for (const transport of ["events", "polling"] as const) {
     // Select Content also keeps the input view, with its box; this blank page has none.
     await page.locator('[data-stage-select="select_content"]').click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No content found", {
+    await expect(page.locator("[data-content-result]")).toContainText("No content found", {
       timeout: 30_000,
     });
     await expect(input).toHaveAttribute("aria-pressed", "true");
@@ -58,7 +60,7 @@ for (const transport of ["events", "polling"] as const) {
     // and stays on the input view with the model grid.
     await page.locator('[data-stage-select="dewarping"]').click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No text lines", {
+    await expect(page.locator("[data-dewarp-result]")).toContainText("No text lines", {
       timeout: 30_000,
     });
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");

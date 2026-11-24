@@ -56,18 +56,21 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
-  const message = page.locator("[data-editor-message]");
-  const runStage = async (stage: string, expected: string): Promise<void> => {
+  // Each stage's own result line: the status line moves on to the stages that the
+  // run queues after it (#205 chaining).
+  const runStage = async (stage: string, resultLine: string, expected: string): Promise<void> => {
     await page.locator(`[data-stage-select="${stage}"]`).click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(message).toContainText(expected, { timeout: 30_000 });
+    await expect(page.locator(`[data-stage-controls] ${resultLine}`)).toContainText(expected, {
+      timeout: 30_000,
+    });
     await expect(
       page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
     ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   };
-  await runStage("deskew", "Angle");
-  await runStage("select_content", "mm");
-  await runStage("dewarping", "");
+  await runStage("deskew", "[data-deskew-result]", "Angle");
+  await runStage("select_content", "[data-content-result]", "mm");
+  await runStage("dewarping", "[data-dewarp-result]", "");
 
   // Upstream's view: the model grid with red control points on the page.
   const overlay = page.locator("[data-dewarp-overlay]");
@@ -103,5 +106,7 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await expect(
     page.locator("[data-stage-controls]").getByRole("radio", { name: "Manual" }),
   ).toBeChecked();
-  await expect(message).toContainText("manual", { timeout: 30_000 });
+  await expect(page.locator("[data-dewarp-result]")).toContainText("manual", {
+    timeout: 30_000,
+  });
 });
