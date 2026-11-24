@@ -29,6 +29,7 @@ from . import (
     cylindrical,
     deskew,
     output_zones,
+    scan_artifact_pruning,
     scan_images,
     scan_transform,
 )
@@ -1806,6 +1807,8 @@ def process_stage_job(job_id: str) -> None:
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
             publish_done = time.perf_counter()
+        # The committed revision replaces the earlier ones on disk (#204).
+        _prune_quietly(scan_artifact_pruning.prune_superseded_revisions, state)
 
         job.state = ProcessingJob.JobState.SUCCESS
         job.finished_at = timezone.now()
@@ -1934,6 +1937,23 @@ def _locked_if_current(state_id: int, revision: int) -> ScanTailorStageState | N
         return fresh
 
 
+def _prune_quietly(prune: Callable[..., int], *args: object) -> None:
+    """Artifact cleanup (#204) never changes a stage job's outcome."""
+    try:
+        prune(*args)
+    except Exception:
+        logger.exception("scantailor_artifact_prune_failed", prune=prune.__name__)
+
+
+def _discard_job_artifacts(details: dict[str, Any]) -> None:
+    """A closed job's files of its own revision go, unless a stage row uses them (#204)."""
+    _prune_quietly(
+        scan_artifact_pruning.discard_revision_artifacts,
+        details.get("scan_tailor_stage_state_id"),
+        details.get("stage_revision"),
+    )
+
+
 def _supersede_stage_job(job: ProcessingJob, details: dict[str, Any], reason: str) -> None:
     """Close a job whose stage was edited meanwhile, leaving the stage row untouched."""
     job.state = ProcessingJob.JobState.SUCCESS
@@ -1946,6 +1966,7 @@ def _supersede_stage_job(job: ProcessingJob, details: dict[str, Any], reason: st
         stage=details.get("stage"),
         reason=reason,
     )
+    _discard_job_artifacts(details)
 
 
 def _fail_stage_job(job: ProcessingJob, message: str) -> None:
@@ -1959,3 +1980,4 @@ def _fail_stage_job(job: ProcessingJob, message: str) -> None:
         processing_job_id=str(job.job_id),
         stage=details.get("stage"),
     )
+    _discard_job_artifacts(details)

@@ -30,17 +30,20 @@ def _relaxed_storage_root_and_source_age() -> Iterator[None]:
         getattr(django_settings, "STORAGE_SENTINEL_FILE", ""),
         getattr(django_settings, "BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS", 60),
         getattr(django_settings, "BOOK_SCANNER_STORAGE_MIN_FREE_BYTES", 0),
+        getattr(django_settings, "BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES", 0),
     )
     django_settings.STORAGE_REQUIRE_EXISTING_ROOT = False
     django_settings.STORAGE_SENTINEL_FILE = ""
     django_settings.BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS = 0
     django_settings.BOOK_SCANNER_STORAGE_MIN_FREE_BYTES = 0
+    django_settings.BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES = 0
     yield
     (
         django_settings.STORAGE_REQUIRE_EXISTING_ROOT,
         django_settings.STORAGE_SENTINEL_FILE,
         django_settings.BOOK_SCANNER_SOURCE_MIN_AGE_SECONDS,
         django_settings.BOOK_SCANNER_STORAGE_MIN_FREE_BYTES,
+        django_settings.BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES,
     ) = original
 
 

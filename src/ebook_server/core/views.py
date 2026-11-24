@@ -48,6 +48,7 @@ from . import (
     capture_layout,
     intake,
     ocr,
+    scan_artifact_pruning,
     scan_identification,
     scan_images,
     scan_lifecycle,
@@ -1026,6 +1027,9 @@ def _apply_scan_job_transition(job: ScanJob, target_state: str) -> tuple[bool, s
         if target_state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
             locked.finished_at = timezone.now()
         locked.save(update_fields=["state", "finished_at", "updated_at"])
+        if target_state == ScanJob.State.CANCELLED:
+            # Derived stage files of a cancelled job are not needed any more (#204).
+            scan_artifact_pruning.schedule_scan_job_stage_cleanup(str(locked.pk))
     job.state = locked.state
     job.finished_at = locked.finished_at
     return True, ""
@@ -1569,6 +1573,8 @@ def scan_page_stage(
 
     if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
+    if low_space := _stage_low_space_response():
+        return low_space
 
     payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
@@ -1600,13 +1606,24 @@ def scan_page_stage(
     return JsonResponse(response_payload, status=202)
 
 
+def _stage_low_space_response() -> HttpResponse | None:
+    """Refuse a stage save on a nearly full scan volume, before anything is queued (#204).
+
+    Plain text, so the editor shows the sentence as it is; 507 Insufficient Storage.
+    """
+    message = scan_artifact_pruning.low_space_message()
+    if not message:
+        return None
+    return HttpResponse(message, status=507, content_type="text/plain; charset=utf-8")
+
+
 @require_POST
 @scan_api_login_required
 def scan_job_stage_batch(
     request: HttpRequest,
     job_id: str,
     stage: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponse:
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
@@ -1624,6 +1641,8 @@ def scan_job_stage_batch(
         return HttpResponseNotFound()
     if job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
+    if low_space := _stage_low_space_response():
+        return low_space
 
     payload = _json_body(request)
     preserve_exceptions = True

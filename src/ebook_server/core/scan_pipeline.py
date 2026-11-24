@@ -26,6 +26,7 @@ from . import (
     conversion,
     intake,
     ocr,
+    scan_artifact_pruning,
     scan_covers,
     scan_events,
     scan_lifecycle,
@@ -740,6 +741,13 @@ def process_scan_finalization_job(job_id: str, *, raise_on_error: bool = False) 
             scan_events.schedule_scan_jsonl_render([scan_job.pk])
         # Pending recognition for the members whose pages made the final set (#27).
         contributions.record_scan_completion(scan_job)
+        if cleaned_variant is not None:
+            # The cleaned PDF is in the library: the stage files are no longer needed
+            # (#204). A re-finish after a replacement page reruns the stages.
+            try:
+                scan_artifact_pruning.prune_scan_job_stage_artifacts(str(scan_job.pk))
+            except Exception:
+                logger.exception("scan_job_stage_cleanup_failed", scan_job_id=str(scan_job.id))
         logger.info(
             "scan_finalization_succeeded",
             processing_job_id=str(processing_job.job_id),
