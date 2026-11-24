@@ -1195,7 +1195,20 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
             return True
         return any(
             key in parameters
-            for key in {"top", "right", "bottom", "left", "margin", "canvas_width", "canvas_height"}
+            for key in {
+                "top_mm",
+                "right_mm",
+                "bottom_mm",
+                "left_mm",
+                # Pixel settings written before #208.
+                "top",
+                "right",
+                "bottom",
+                "left",
+                "margin",
+                "canvas_width",
+                "canvas_height",
+            }
         )
     if stage == "dewarping":
         mode = str(parameters.get("dewarp_mode", "")).strip().lower()
@@ -1689,6 +1702,10 @@ def scan_job_stage_batch(
     # One queued job per chunk of pages instead of one per page (#195 §8.2 item 5);
     # an interactive single-page edit still runs first.
     scantailor.dispatch_stage_batch(batch_job_ids)
+    if normalized_stage == ScanTailorStageState.Stage.MARGINS.value and applied:
+        # The new settings may change the common page size: re-queue the other pages'
+        # Margins results once for the whole batch, not once per page (#208).
+        scantailor.requeue_stale_margins(job)
 
     return JsonResponse(
         {

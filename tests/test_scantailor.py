@@ -58,13 +58,14 @@ def test_margin_results_do_not_become_fixed_canvas_requests() -> None:
     assert second.image.tobytes() == source.tobytes()
     assert second.parameters["resolved_canvas_width"] == 100
     assert second.parameters["resolved_canvas_height"] == 100
+    # Explicit pixel canvases (before #208) give way to the common page size.
     fixed = run_stage(
         scantailor._run_margins,
         ScanTailorStageState(parameters={"margin": 0, "canvas_width": 200}),
         source,
     )
-    assert fixed.parameters["canvas_width"] == fixed.parameters["resolved_canvas_width"] == 200
-    assert fixed.full_size == (200, 100)
+    assert "canvas_width" not in fixed.parameters
+    assert fixed.full_size == (100, 100)
 
 
 def _facing_page_bytes(

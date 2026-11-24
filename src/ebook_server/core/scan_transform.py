@@ -23,7 +23,9 @@ Ops are plain JSON objects, stored in the stage's ``parameters["transform"]``:
 ``{"op": "curvature", "curves": [...], "padding": p}``
     Baseline flattening (:mod:`.curvature`); the output is ``2 * p`` taller.
 ``{"op": "pad", "offset": [x, y], "canvas": [w, h]}``
-    Place the input at ``offset`` on a paper-coloured canvas.
+    Place the input at ``offset`` on a paper-coloured canvas (the Margins page). A
+    negative offset or a canvas smaller than the input cuts the input (#208: a page
+    without content is cut from around its centre).
 ``{"op": "cylindrical", "top": [[x, y], ...], "bottom": [...], "depth": d, "canvas": [w, h]}``
     Upstream's cylindrical-surface dewarping (#195 step 6, :mod:`.cylindrical`): the
     top and bottom curves are polylines in continuous input coordinates (pixel ``i``
@@ -308,9 +310,11 @@ def apply(
         return Image.fromarray(warped)
     if kind == "pad":
         offset = (round(op["offset"][0] * sx), round(op["offset"][1] * sy))
+        # The canvas is the page (#208): what lies outside it is cut, so every page
+        # with the same canvas has the same preview size too.
         canvas_size = (
-            max(image.width + offset[0], round(op["canvas"][0] * sx)),
-            max(image.height + offset[1], round(op["canvas"][1] * sy)),
+            max(1, round(op["canvas"][0] * sx)),
+            max(1, round(op["canvas"][1] * sy)),
         )
         canvas_image = Image.new(image.mode, canvas_size, fill)
         canvas_image.paste(image, offset)

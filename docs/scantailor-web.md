@@ -32,7 +32,16 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    manual. The output keeps the input's size. Auto detection is not ported yet
    (step 6b): until then it takes the top and bottom baselines found by the earlier
    baseline detector, and a page without text lines stays unchanged and says so.
-4. Margins — per-side/canvas padding and horizontal/vertical alignment.
+4. Margins — a port of upstream `page_layout` (#208, `core/page_layout.py`): one
+   common page size for the job. Each page's *hard size* is its content plus its
+   hard margins (millimetres, default 10/5/10/5 mm left/top/right/bottom); the
+   common size is the largest hard width and height over the pages aligned with the
+   others. Every aligned page is padded to it: the hard margin is a minimum and the
+   rest (*soft margins*) is split by the page's alignment (3 × 3, default top
+   centre). A page with "Align with other pages" off keeps its own size and does not
+   change the others. A page without content is a point in the middle of the page
+   (upstream `adaptContentRect`), so it gets the common size cut from around its
+   centre. Sizes are physical: pages of different dpi come out the same size in mm.
 5. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
 
@@ -167,11 +176,38 @@ handles hidden; switch to Input to adjust geometry. Worker fallback warnings app
 beside the preview even when the stage completes successfully. Updates work through
 both live events and compatibility polling.
 
-Margins record computed dimensions as `resolved_canvas_width` and
-`resolved_canvas_height`; `canvas_width` and `canvas_height` are reserved for explicit
-fixed-canvas requests. Reducing ordinary padding therefore shrinks the result again.
-The editor also recognizes legacy computed canvases equal to the input plus recorded
-padding, rather than silently resubmitting them as fixed dimensions.
+## Margins: the common page size (#208)
+
+The Margins stage is the pipeline's one cross-page dependency.
+
+- **Settings** (stage parameters): `left_mm`, `top_mm`, `right_mm`, `bottom_mm`,
+  `align_x` (`left`/`center`/`right`), `align_y` (`top`/`center`/`bottom`) and
+  `align_with_others`. Pixel settings written before #208 (`margin`, `left`, ...)
+  are converted with the page dpi; explicit pixel canvases (`canvas_width`,
+  `canvas_height`) are no longer supported and are dropped on the next run.
+- **Aggregate.** `scantailor.margins_aggregate(job)` computes the common size from
+  the job's Select Content results (content size in pixels and dpi, or an empty
+  box) and Margins settings in one query, and returns it with a stable fingerprint.
+  It is not stored on the job. A page counts once its Select Content has succeeded.
+- **Each run** records what it used: `aggregate_size_mm`, `aggregate_fingerprint`
+  (empty for a page not aligned with the others), `hard_margins_mm`/`_px`,
+  `soft_margins_mm`/`_px`, `hard_size_mm`, `content_size_mm`, `page_size_mm`,
+  `resolved_canvas_width/height` and the `pad` op. Hard margins are rounded to whole
+  pixels per side, so pages of one dpi have exactly the same pixel size.
+- **Re-queueing.** After every successful Select Content or Margins run (and once
+  after a Margins "Apply to…" batch), `scantailor.requeue_stale_margins(job)`
+  re-queues, as a batch at the back of the queue, every successful Margins result of
+  an aligned page whose fingerprint is no longer current, and invalidates its Output.
+  The re-run keeps the stage revision (it is not an edit) and its `ProcessingJob`
+  carries `details.trigger = "margins_aggregate_changed"`. If the page's own upstream
+  stage was edited before the re-run starts, the re-run is dropped and the stage is
+  left invalidated for that edit: a re-run for another page never leaves a stage
+  failed. Margins rows that are queued, running or invalidated take the current
+  aggregate when they run.
+
+The editor's Margins options show four millimetre fields with "Link top and bottom"
+and "Link left and right", "Align with other pages", the 3 × 3 alignment grid and,
+after a run, the page size, the common size and the page's soft margins.
 
 ## Pipeline architecture: transforms, not images (#195 step 2)
 

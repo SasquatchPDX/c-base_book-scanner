@@ -29,6 +29,7 @@ from . import (
     cylindrical,
     deskew,
     output_zones,
+    page_layout,
     scan_images,
     scan_transform,
 )
@@ -63,7 +64,8 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     "deskew": "skewfinder-v3",
     # v3 (#195 step 5): port of upstream ContentBoxFinder.
     "select_content": "contentboxfinder-v3",
-    "margins": "padding-v2",
+    # v3 (#208): port of upstream page_layout: one page size for all, margins in mm.
+    "margins": "pagelayout-v3",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
     # v3: auto mode derives the quad from the text lines.
     # v4: transform op, detection at working resolution (#195 step 2).
@@ -871,50 +873,238 @@ def _coerce_box(
     return (left, top, right, bottom)
 
 
-def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
-    source_width, source_height = stage_input.full_size
+def _select_content_result(state: ScanTailorStageState) -> dict[str, Any]:
+    """The recorded Select Content result upstream of ``state`` (empty when unknown)."""
+    current = state.input_stage_state
+    for _ in range(len(stage_order())):
+        if current is None:
+            return {}
+        if current.stage == ScanTailorStageState.Stage.SELECT_CONTENT.value:
+            return dict(current.parameters or {})
+        current = current.input_stage_state
+    return {}
 
+
+def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    """Margins (#208): upstream ``page_layout::Task`` with the ``Utils`` port.
+
+    Every page aligned with the others gets the job's aggregate hard size (the largest
+    content plus hard margins, :func:`margins_aggregate`); its own hard margins are a
+    minimum and the rest is split by its alignment. The aggregate and its fingerprint
+    are recorded with the result; :func:`requeue_stale_margins` re-runs pages whose
+    recorded fingerprint is no longer current.
+    """
     parameters = dict(state.parameters or {})
     mode = str(parameters.get("margins_mode", "auto")).strip().lower()
     if mode not in {"auto", "manual"}:
         mode = "auto"
+    dpi = (float(max(1, stage_input.dpi[0])), float(max(1, stage_input.dpi[1])))
+    settings = page_layout.settings_from_parameters(parameters, dpi)
+    content_found = _select_content_result(state).get("content_found") is not False
+    content_px = stage_input.full_size if content_found else (0, 0)
+    own_mm = page_layout.hard_size_mm(content_px, settings, dpi)
+    if state.scan_job_id is not None:
+        aggregate = margins_aggregate(state.scan_job_id)
+    else:
+        aggregate = page_layout.aggregate_hard_size(
+            [page_layout.PageEntry("", own_mm, settings.align_with_others)]
+        )
+    # Settings::getAggregateHardSizeMM(page_id, hard_size, alignment): this page's
+    # current hard size counts even if its recorded content size is older.
+    aggregate_mm = (
+        (max(aggregate.width_mm, own_mm[0]), max(aggregate.height_mm, own_mm[1]))
+        if settings.align_with_others
+        else aggregate.size_mm
+    )
+    rect = page_layout.page_rect(stage_input.full_size, content_found, settings, dpi, aggregate_mm)
 
-    default_margin = _coerce_int(parameters.get("margin"), 0, minimum=0)
-    top = _coerce_int(parameters.get("top"), default_margin, minimum=0)
-    right = _coerce_int(parameters.get("right"), default_margin, minimum=0)
-    bottom = _coerce_int(parameters.get("bottom"), default_margin, minimum=0)
-    left = _coerce_int(parameters.get("left"), default_margin, minimum=0)
+    def sides(values: tuple[int, int, int, int]) -> dict[str, int]:
+        return dict(zip(("left", "top", "right", "bottom"), values, strict=True))
 
-    requested_width = _coerce_int(parameters.get("canvas_width"), source_width + left + right)
-    requested_height = _coerce_int(parameters.get("canvas_height"), source_height + top + bottom)
-    target_w = max(requested_width, source_width + left + right)
-    target_h = max(requested_height, source_height + top + bottom)
+    def sides_mm(values: tuple[int, int, int, int]) -> dict[str, float]:
+        scale = (MM_PER_INCH / dpi[0], MM_PER_INCH / dpi[1])
+        return {
+            key: round(value * scale[index % 2], 2)
+            for index, (key, value) in enumerate(sides(values).items())
+        }
 
-    align_x = str(parameters.get("align_x", "center")).strip().lower()
-    align_y = str(parameters.get("align_y", "center")).strip().lower()
-    spare_x = max(0, target_w - (source_width + left + right))
-    spare_y = max(0, target_h - (source_height + top + bottom))
-    extra_x = 0 if align_x == "left" else spare_x if align_x == "right" else spare_x // 2
-    extra_y = 0 if align_y == "top" else spare_y if align_y == "bottom" else spare_y // 2
-
+    # Explicit pixel canvases and the pixel margins recorded before #208 are replaced
+    # by the common page size and the millimetre values below.
+    for legacy in (
+        "canvas_width",
+        "canvas_height",
+        "margin_top",
+        "margin_right",
+        "margin_bottom",
+        "margin_left",
+    ):
+        parameters.pop(legacy, None)
     return _transform_result(
         parameters,
         stage_input,
-        scan_transform.pad(
-            (left + extra_x, top + extra_y), (target_w, target_h), stage_input.full_size
-        ),
+        scan_transform.pad(rect.offset, rect.canvas, stage_input.full_size),
         {
             "margins_mode": mode,
-            "margin_top": top,
-            "margin_right": right,
-            "margin_bottom": bottom,
-            "margin_left": left,
-            "align_x": align_x,
-            "align_y": align_y,
-            "resolved_canvas_width": target_w,
-            "resolved_canvas_height": target_h,
+            "hard_margins_mm": settings.hard_margins_mm.as_dict(2),
+            "hard_margins_px": sides(rect.hard_px),
+            "soft_margins_px": sides(rect.soft_px),
+            "soft_margins_mm": sides_mm(rect.soft_px),
+            "align_x": settings.align_x,
+            "align_y": settings.align_y,
+            "align_with_others": settings.align_with_others,
+            "content_found": content_found,
+            "content_size_mm": {
+                "width": round(content_px[0] * MM_PER_INCH / dpi[0], 2),
+                "height": round(content_px[1] * MM_PER_INCH / dpi[1], 2),
+            },
+            "hard_size_mm": {"width": round(own_mm[0], 2), "height": round(own_mm[1], 2)},
+            "aggregate_size_mm": {
+                "width": round(aggregate_mm[0], 3),
+                "height": round(aggregate_mm[1], 3),
+            },
+            # Only aligned pages depend on the aggregate (input of #205's fingerprint).
+            "aggregate_fingerprint": aggregate.fingerprint if settings.align_with_others else "",
+            "page_size_mm": {
+                "width": round(rect.canvas[0] * MM_PER_INCH / dpi[0], 2),
+                "height": round(rect.canvas[1] * MM_PER_INCH / dpi[1], 2),
+            },
+            "dpi": [dpi[0], dpi[1]],
+            "resolved_canvas_width": rect.canvas[0],
+            "resolved_canvas_height": rect.canvas[1],
         },
     )
+
+
+type _MarginsRow = tuple[int, int, str, dict[str, Any]]
+
+
+def _margins_page_entries(
+    scan_job_id: Any,
+) -> tuple[list[page_layout.PageEntry], list[_MarginsRow]]:
+    """Every page's contribution to the aggregate, plus the job's Margins rows.
+
+    One query over the job's Select Content and Margins rows. A page contributes once
+    its Select Content result is recorded (status success): its content size in
+    pixels, the page dpi and whether content was found, with the hard margins and
+    alignment of its Margins settings. As upstream invalidates a page's content size
+    while it is re-processed (``invalidateContentSize``), a page whose Select Content
+    is not done does not count. Returns the entries and ``(id, revision, status,
+    parameters)`` of each Margins row.
+    """
+    content: dict[Any, dict[str, Any]] = {}
+    margins: dict[Any, _MarginsRow] = {}
+    rows = ScanTailorStageState.objects.filter(
+        scan_job_id=scan_job_id,
+        stage__in=(
+            ScanTailorStageState.Stage.SELECT_CONTENT.value,
+            ScanTailorStageState.Stage.MARGINS.value,
+        ),
+    ).values_list("id", "scan_page_id", "stage", "status", "revision", "parameters")
+    for state_id, page_id, stage, status, revision, parameters in rows:
+        values = parameters if isinstance(parameters, dict) else {}
+        if stage == ScanTailorStageState.Stage.MARGINS.value:
+            margins[page_id] = (state_id, revision, status, values)
+        elif status == ScanTailorStageState.StageStatus.SUCCESS:
+            content[page_id] = values
+    entries: list[page_layout.PageEntry] = []
+    for page_id, values in content.items():
+        try:
+            width = int(values["output_width"])
+            height = int(values["output_height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        raw_dpi = values.get("dpi")
+        dpi = (float(DEFAULT_DPI), float(DEFAULT_DPI))
+        if isinstance(raw_dpi, list | tuple) and len(raw_dpi) >= 2:
+            dpi = (
+                max(1.0, _coerce_float(raw_dpi[0], DEFAULT_DPI)),
+                max(1.0, _coerce_float(raw_dpi[1], DEFAULT_DPI)),
+            )
+        found = values.get("content_found") is not False
+        margin_parameters = margins[page_id][3] if page_id in margins else {}
+        settings = page_layout.settings_from_parameters(margin_parameters, dpi)
+        entries.append(
+            page_layout.PageEntry(
+                str(page_id),
+                page_layout.hard_size_mm((width, height) if found else (0, 0), settings, dpi),
+                settings.align_with_others,
+            )
+        )
+    return entries, list(margins.values())
+
+
+def margins_aggregate(job: ScanJob | Any) -> page_layout.Aggregate:
+    """The job's aggregate hard size in mm and its fingerprint (#208).
+
+    ``Settings::getAggregateHardSizeMM``: the largest content-plus-hard-margins width
+    and height over the pages aligned with the others. ``job`` is a ScanJob or its
+    id. Every Margins run records the fingerprint it used
+    (``parameters["aggregate_fingerprint"]``); when the current one differs, the
+    aligned pages' results are stale (:func:`requeue_stale_margins`).
+    """
+    scan_job_id = job.pk if isinstance(job, ScanJob) else job
+    entries, _ = _margins_page_entries(scan_job_id)
+    return page_layout.aggregate_hard_size(entries)
+
+
+#: ``ProcessingJob.details["trigger"]`` of a Margins re-run caused by another page.
+AGGREGATE_TRIGGER: Final[str] = "margins_aggregate_changed"
+
+
+def requeue_stale_margins(job: ScanJob | Any) -> int:
+    """Re-run the Margins results that used another aggregate size (#208).
+
+    Upstream reports ``AGGREGATE_SIZE_CHANGED`` and invalidates every page. Here the
+    successful Margins results of aligned pages whose recorded fingerprint differs
+    from the current one are re-queued (at the back of the queue, in batch chunks)
+    and their Output is invalidated. Rows that are queued, running or invalidated get
+    the current aggregate when they run. Returns the number of pages re-queued.
+    """
+    scan_job_id = job.pk if isinstance(job, ScanJob) else job
+    entries, rows = _margins_page_entries(scan_job_id)
+    aggregate = page_layout.aggregate_hard_size(entries)
+    stale = [
+        (state_id, revision)
+        for state_id, revision, status, parameters in rows
+        if status == ScanTailorStageState.StageStatus.SUCCESS
+        and _coerce_bool(parameters.get("align_with_others"), True)
+        and parameters.get("aggregate_fingerprint") != aggregate.fingerprint
+    ]
+    if not stale:
+        return 0
+    reason = "page size changed (another page's content or margins)"
+    job_ids: list[str] = []
+    for state_id, revision in stale:
+        with transaction.atomic():
+            state = (
+                ScanTailorStageState.objects.select_for_update()
+                .select_related("scan_page")
+                .filter(
+                    id=state_id,
+                    revision=revision,
+                    status=ScanTailorStageState.StageStatus.SUCCESS,
+                )
+                .first()
+            )
+            if state is None:
+                continue  # edited, invalidated or re-queued meanwhile
+            invalidate_downstream_states(state.scan_page, from_stage=state.stage, reason=reason)
+        processing_job = request_stage_job(
+            state=state,
+            dispatch=False,
+            details={"trigger": AGGREGATE_TRIGGER, "aggregate_fingerprint": aggregate.fingerprint},
+        )
+        if not (processing_job.details or {}).get("superseded"):
+            job_ids.append(str(processing_job.job_id))
+    logger.info(
+        "scantailor_margins_requeued",
+        scan_job_id=str(scan_job_id),
+        pages=len(job_ids),
+        aggregate_width_mm=round(aggregate.width_mm, 2),
+        aggregate_height_mm=round(aggregate.height_mm, 2),
+    )
+    dispatch_stage_batch(job_ids)
+    return len(job_ids)
 
 
 DEWARP_MODES: Final[tuple[str, ...]] = ("off", "auto", "manual")
@@ -1473,6 +1663,7 @@ def request_stage_job(
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
     dispatch: bool = True,
+    details: dict[str, Any] | None = None,
 ) -> ProcessingJob:
     """Create and dispatch the worker job for ``state`` at its current revision.
 
@@ -1492,6 +1683,7 @@ def request_stage_job(
             "requested_by_user_id": requested_by_user_id,
             "stage": state.stage,
             "stage_revision": revision,
+            **(details or {}),
         },
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
@@ -1727,6 +1919,19 @@ def process_stage_job(job_id: str) -> None:
     if state.input_stage_state is not None:
         input_state = state.input_stage_state
         if input_state.status != ScanTailorStageState.StageStatus.SUCCESS:
+            if details.get("trigger") == AGGREGATE_TRIGGER:
+                # A re-run for another page's change found its own page being edited:
+                # leave the stage to that edit (invalidated), never failed (#208).
+                _invalidate(
+                    ScanTailorStageState.objects.filter(
+                        id=state.id,
+                        revision=state.revision,
+                        status=ScanTailorStageState.StageStatus.QUEUED,
+                    ),
+                    f"upstream stage {input_state.stage} changed",
+                )
+                _supersede_stage_job(job, details, "upstream stage changed before re-run")
+                return
             _fail_stage_job(job, f"upstream stage {input_state.stage} not complete")
             return
 
@@ -1838,6 +2043,31 @@ def process_stage_job(job_id: str) -> None:
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc))
+        return
+    if state.stage in _AGGREGATE_INPUT_STAGES:
+        _requeue_after_layout_change(state)
+
+
+#: Stages whose results feed the Margins aggregate: content size and margin settings.
+_AGGREGATE_INPUT_STAGES: Final[frozenset[str]] = frozenset(
+    {ScanTailorStageState.Stage.SELECT_CONTENT.value, ScanTailorStageState.Stage.MARGINS.value}
+)
+
+
+def _requeue_after_layout_change(state: ScanTailorStageState) -> None:
+    """After a Select Content or Margins result: re-run Margins results now stale (#208).
+
+    The one cross-page dependency of the pipeline. A failure here is logged and never
+    fails the stage that just succeeded.
+    """
+    try:
+        requeue_stale_margins(state.scan_job_id)
+    except Exception:
+        logger.exception(
+            "scantailor_margins_requeue_failed",
+            scan_job_id=str(state.scan_job_id),
+            stage=state.stage,
+        )
 
 
 def _publish_stage_artifacts(

@@ -65,7 +65,8 @@ for (const transport of ["events", "polling"] as const) {
     await expect(input).toHaveAttribute("aria-pressed", "true");
 
     await page.locator('[data-stage-select="margins"]').click();
-    await page.getByLabel("All margins (pixels)").fill("20");
+    // Margins are millimetres (#208): 1.7 mm is 20 px at 300 dpi; right follows (linked).
+    await page.getByLabel("Left", { exact: true }).fill("1.7");
     await save();
     await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))
       .toBe(140);
@@ -79,7 +80,7 @@ for (const transport of ["events", "polling"] as const) {
     // Reopen the stage, as a user does when adjusting an already completed result.
     await page.reload();
     await page.locator('[data-stage-select="margins"]').click();
-    await page.getByLabel("All margins (pixels)").fill("0");
+    await page.getByLabel("Left", { exact: true }).fill("0");
     await save();
     await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))
       .toBe(100);
