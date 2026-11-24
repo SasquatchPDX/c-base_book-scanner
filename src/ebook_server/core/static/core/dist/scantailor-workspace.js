@@ -5463,7 +5463,7 @@ var tt = class {
 	}
 	async explainPreviewFailure(e, t) {
 		if (!e) return;
-		this.previewRetry === G && this.setMessage("Loading the preview failed; checking why…", "error");
+		this.previewRetry === G && !this.settingsNotApplied() && this.setMessage("Loading the preview failed; checking why…", "error");
 		let n;
 		try {
 			let t = await fetch(e, { credentials: "same-origin" });
@@ -5481,7 +5481,18 @@ var tt = class {
 		}
 		if (this.image.src !== e || this.activeStage !== t) return;
 		let r = Re(n, this.previewRetry);
-		r ? (this.previewRetry = r.state, r.delay > 0 && this.setMessage(Me(t, n), "info"), this.schedulePreviewReload(r.delay)) : this.setMessage(Le(n) ? Ie : Me(t, n), "error");
+		r ? (this.previewRetry = r.state, r.delay > 0 && this.showInputFailure(t, n, Me(t, n), "info"), this.schedulePreviewReload(r.delay)) : this.showInputFailure(t, n, Le(n) ? Ie : Me(t, n), "error");
+	}
+	showInputFailure(e, t, n, r) {
+		if (t.status === 404 && t.body.trim().toLowerCase() === "input preview not ready") {
+			if (this.settingsNotApplied()) return;
+			let t = this.activeContext()?.page, n = t ? Ge(t, e).waitingFor : null;
+			if (n) {
+				this.setMessage(`Waiting for ${V[n]}: its result is not ready yet.`, r);
+				return;
+			}
+		}
+		this.setMessage(n, r);
 	}
 	schedulePreviewReload(e) {
 		this.cancelPreviewReload();
