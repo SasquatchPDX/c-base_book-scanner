@@ -6392,7 +6392,7 @@ var wt = class {
 		if (!t) return;
 		let n = ft(this.draft);
 		if (n === this.appliedDraft) {
-			this.showStatus(), this.refreshResultPane();
+			this.syncDeskewControls(), this.showStatus(), this.refreshResultPane();
 			return;
 		}
 		let r = this.activePageId, i = this.activeStage, a = e.state.status === "queued" || e.state.status === "running";

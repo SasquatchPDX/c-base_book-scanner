@@ -2319,7 +2319,9 @@ class WorkspaceController {
     if (!url) return;
     const sent = stableJson(this.draft);
     if (sent === this.appliedDraft) {
-      // Nothing changed (or changed back): nothing to save or run.
+      // Nothing changed (or changed back): nothing to save or run. A run that finished
+      // while the previous save was in flight was not shown yet: show it now.
+      this.syncDeskewControls();
       this.showStatus();
       this.refreshResultPane();
       return;

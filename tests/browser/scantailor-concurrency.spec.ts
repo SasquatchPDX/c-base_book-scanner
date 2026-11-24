@@ -62,6 +62,8 @@ async function waitForTextAcrossReloads(
 test("two LDAP members receive a visible conflict instead of overwriting a stage", async ({
   browser,
 }) => {
+  // Two sign-ins, an upload and a stage run that waits up to 30 s for its result.
+  test.setTimeout(90_000);
   const firstContext = await browser.newContext();
   const secondContext = await browser.newContext();
 
