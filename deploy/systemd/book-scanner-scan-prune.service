@@ -1,0 +1,17 @@
+# Sweep of unreferenced ScanTailor-Web stage files (#204, docs/scantailor-web.md).
+# Started by book-scanner-scan-prune.timer. --enqueue hands the run to an RQ worker
+# (falls back to running here when no queue is configured).
+[Unit]
+Description=Book Scanner scan artifact sweep
+Wants=network-online.target
+After=network-online.target postgresql.service redis-server.service
+
+[Service]
+Type=oneshot
+User=book-scanner
+Group=book-scanner
+WorkingDirectory=/opt/book-scanner
+ExecStart=/opt/book-scanner/.venv/bin/python manage.py prune_scan_artifacts --enqueue
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

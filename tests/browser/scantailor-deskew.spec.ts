@@ -73,10 +73,17 @@ test("deskew turns the page live in the browser and saves when the handle is rel
   expect(posts).toHaveLength(1);
   await expect(controls.getByRole("radio", { name: "Manual" })).toBeChecked();
   const angle = Number(await controls.locator("[data-deskew-angle]").inputValue());
-  await expect(page.locator("[data-editor-message]")).toContainText(
+  // The stage's own result line: the status line moves on to the chained stages (#205).
+  await expect(controls.locator("[data-deskew-result]")).toContainText(
     `Angle ${angle.toFixed(2)}° clockwise (manual)`,
     { timeout: 30_000 },
   );
+  // The rotated result appears beside the input, which keeps its live rotation (#206).
+  const result = page.locator("[data-result-image]");
+  await expect(result).toBeVisible();
+  await expect(result).toHaveAttribute("src", /\/stages\/deskew\/preview\/\?v=/);
+  await expect(image).toHaveAttribute("src", /\/stages\/deskew\/preview\/\?input=true/);
+  await expect(page.locator(".st-deskew-grid")).toBeVisible();
 
   // Ctrl+wheel up turns counter-clockwise by 0.1 degree, again without a request
   // until the angle settles.

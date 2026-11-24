@@ -165,15 +165,58 @@ browser geometry can be mapped between full-resolution source coordinates and a
 scaled display. Stage previews are bounded to 960 pixels; the first stage still
 uses the preserved capture as its input because it has no predecessor preview.
 
-Changing a stage increments its optimistic-concurrency revision, clears its prior
-error, queues processing, and invalidates every downstream stage. A replacement
-scan page similarly invalidates dependent artifacts without deleting the old page
-version.
+### Editing in any order: input fingerprints (#205)
 
-The editor's **Input** and **Result** buttons distinguish the editable source from
-the processed image. A successful run selects Result automatically, with geometry
-handles hidden; switch to Input to adjust geometry. Worker fallback warnings appear
-beside the preview even when the stage completes successfully. Updates work through
+Settings can be edited on any stage in any order. A stage row keeps two things
+apart: `parameters` holds the settings the user wants; the result in the output
+fields carries the fingerprint of what produced it: `applied_input_sha256` (the
+predecessor's `output_sha256`, or the page version's checksum for Deskew),
+`applied_parameters` (the parameters as that run recorded them) and
+`applied_revision`. `status` holds only run states (unknown = not run, queued,
+running, success, failed); there is no stored "invalidated" state.
+
+- **Current** is derived (`scantailor.stage_result_is_current`): the last run
+  succeeded, its settings equal the current ones (compared on the stage's setting
+  keys, `scantailor.STAGE_SETTING_KEYS`, so values the worker records do not count),
+  its input fingerprint equals `scantailor.stage_input_fingerprint` now, and the
+  predecessor is current. A result that is not current is *stale*, with the reason
+  "settings changed, not applied", "input changed" or, for Margins, "common page
+  size changed" (#208: an aligned page's Margins input fingerprint also covers the
+  job's common page size, see below).
+- **Waiting** (`scantailor.stage_waiting_for`): the first earlier stage without a
+  current result. A stage cannot run before it.
+- **Saving stores settings only.** An edit stores the parameters, bumps the stage's
+  revision and clears its error. It queues a job only if every earlier stage is
+  current and this stage's result is not; otherwise the response has
+  `"job": null` and `"waiting_for": "<stage>"`. Editing settings back to the values
+  of the existing result makes it current again without a job (the result's
+  recorded parameters are restored). Other stages' settings and results are never
+  touched.
+- **Chaining.** When a stage succeeds, the next stage of the page is queued if its
+  result is stale, with its saved settings (defaults if it was never edited). So an
+  edit to Deskew re-runs the later stages that depended on it, and Margins edited
+  before Deskew ran runs once Deskew, Select Content and Dewarping are done. A job
+  whose predecessor changed after it was queued does not fail: it is closed as
+  superseded (`waiting_for` in its details) and the stage keeps its previous result.
+- **Batch apply** ("Apply to…", ▶) follows the same rules per page; each applied
+  page reports its `waiting_for`.
+- A replacement scan page rebinds Deskew to the new active version, which changes
+  its input fingerprint: every stage of the page becomes stale, and finishing never
+  uses a stale Output result. Old page versions and artifacts are kept.
+
+Workers read the upstream transform ops and sizes from the upstream results'
+`applied_parameters`, never from settings edited since. The editor derives the same
+state from a page's rows (`stageReadiness` in `frontend/scantailor-workspace.ts`), so
+live updates of one row update every stage of the page. Migration 0053 records the
+fingerprint of every existing successful result (nothing current re-runs) and turns
+the old `invalidated` rows into "not run".
+
+The editor shows the editable source (**Input**, with the geometry handles) and the
+stage's current result (**Result**) side by side (#206); below 900 px a toggle picks
+one and a successful run selects Result. The result pane never shows a stale result
+as current: without a current result it gives the same reason as the status line.
+Worker fallback warnings appear beside the preview when the stage has a current
+result. Updates work through
 both live events and compatibility polling.
 
 ## Margins: the common page size (#208)
@@ -188,26 +231,47 @@ The Margins stage is the pipeline's one cross-page dependency.
 - **Aggregate.** `scantailor.margins_aggregate(job)` computes the common size from
   the job's Select Content results (content size in pixels and dpi, or an empty
   box) and Margins settings in one query, and returns it with a stable fingerprint.
-  It is not stored on the job. A page counts once its Select Content has succeeded.
+  It is not stored on the job. A page counts once its Select Content has a result;
+  while that result is re-run, the previous one keeps counting until it is replaced,
+  so a re-run on one page does not make every other page stale meanwhile.
+- **Part of the input fingerprint (#205).** For a page aligned with the others,
+  `stage_input_fingerprint` of its Margins row is a sha256 of the predecessor's
+  `output_sha256` and the aggregate fingerprint
+  (`scantailor.margins_input_fingerprint`). A change of the common size therefore
+  makes every aligned page's Margins stale through the normal mechanism (reason
+  "common page size changed"), and its Output follows by itself. The aggregate costs
+  one query over the job's Select Content and Margins rows, so code deriving the
+  state of many pages computes it once per request and attaches it to the rows
+  (`link_page_states(..., aggregate)`, `attach_margins_aggregate`; the workspace
+  list, the live-update feeds and "Apply to…" do this); a single page's view or
+  thumbnail computes it only when its Margins row has an aligned result. The editor
+  cannot recompute the hash: Margins rows carry the server's `input_sha256`, the
+  `input_basis_sha256` (predecessor output) it was built from and
+  `common_size_changed`.
 - **Each run** records what it used: `aggregate_size_mm`, `aggregate_fingerprint`
   (empty for a page not aligned with the others), `hard_margins_mm`/`_px`,
   `soft_margins_mm`/`_px`, `hard_size_mm`, `content_size_mm`, `page_size_mm`,
   `resolved_canvas_width/height` and the `pad` op. Hard margins are rounded to whole
   pixels per side, so pages of one dpi have exactly the same pixel size.
-- **Re-queueing.** After every successful Select Content or Margins run (and once
-  after a Margins "Apply to…" batch), `scantailor.requeue_stale_margins(job)`
-  re-queues, as a batch at the back of the queue, every successful Margins result of
-  an aligned page whose fingerprint is no longer current, and invalidates its Output.
-  The re-run keeps the stage revision (it is not an edit) and its `ProcessingJob`
-  carries `details.trigger = "margins_aggregate_changed"`. If the page's own upstream
-  stage was edited before the re-run starts, the re-run is dropped and the stage is
-  left invalidated for that edit: a re-run for another page never leaves a stage
-  failed. Margins rows that are queued, running or invalidated take the current
-  aggregate when they run.
+- **Re-queueing.** #205's chaining only runs a page's own next stage, but a change
+  on page A must re-run Margins on pages B..N. After every successful Select Content
+  or Margins run, after a Margins edit and once after a Margins "Apply to…" batch,
+  `scantailor.requeue_stale_margins(job)` computes the aggregate once and queues, as
+  one batch at the back of the queue, the aligned pages' Margins results that are no
+  longer current, through `request_stage_job_if_ready`. The re-run keeps the stage
+  revision (it is not an edit) and its `ProcessingJob` carries
+  `details.trigger = "margins_aggregate_changed"`; chaining then re-runs Output. A
+  page whose earlier stages are not current is not queued (or, if edited after it
+  was queued, its job is closed as waiting): it runs when its chain reaches Margins.
+  Nothing is ever written as failed. Margins rows that are queued or running take
+  the current aggregate when they run.
 
 The editor's Margins options show four millimetre fields with "Link top and bottom"
 and "Link left and right", "Align with other pages", the 3 × 3 alignment grid and,
-after a run, the page size, the common size and the page's soft margins.
+after a run, the page size, the common size and the page's soft margins. They sit
+beside #206's input and result panes; the status line and the result pane give
+#205's readiness messages. Margins are set in the fields only: upstream's draggable
+margin lines are not ported, so the input pane has no Margins overlay.
 
 ## Pipeline architecture: transforms, not images (#195 step 2)
 
@@ -272,7 +336,9 @@ times the `page_image` step and each stage on this pipeline.
   `(scan_job, updated_at)` index. The SSE stream was already incremental.
 - **Lazy thumbnails.** Page thumbnails load lazily; the virtualised strip follows in
   the workspace redesign (step 3).
-- **Invalidation** is one `UPDATE` per edit instead of one save per stage row.
+- **No invalidation writes.** An edit writes only its own row; whether later stages
+  are stale is derived from fingerprints (#205). A replacement scan is two `UPDATE`s
+  for the page's rows.
 - **Priority.** A single-page edit is queued at the front of the RQ queue; "apply to
   pages" is dispatched as jobs of eight pages at the back, so the page being edited
   never waits behind a batch (upstream `ProcessingTaskQueue`). Every page keeps its
@@ -284,6 +350,43 @@ times the `page_image` step and each stage on this pipeline.
   working images make a stage's decode cheap instead (about 10 ms in
   `scripts/benchmark_scanning.py`).
 
+## Disk use: superseded revisions are deleted (#204)
+
+Every saved edit gives a stage a new revision, and each revision that runs writes its
+own `scan-jobs/<job>/<page>/<stage>/v<revision>/` folder (working image or
+full-resolution output, preview, strip thumbnail). These files are derived and
+regenerable, so only the revision a `ScanTailorStageState` row points at is kept
+(`core/scan_artifact_pruning.py`). That is the row's applied result (#205), which
+may be older than its current revision: a stale result (settings edited but not
+applied, or input changed) keeps its files while the row refers to them, so editing
+the settings back makes it current again without a job. A file stays whenever any stage row names it in
+`input_storage_identifier`, `output_storage_identifier` or
+`preview_storage_identifier` (a thumbnail stays with the output beside it). Only
+files in the stage layout are ever deleted: the raw scanner pages, covers and logs in
+the same `scan-jobs/<job>/` folder are originals and are never touched. Deletion goes
+through the storage backend; a failure is logged and never fails the job.
+
+- **Commit.** When a stage run commits, the files of the stage's earlier revisions
+  are deleted. A lower revision is never written again, so this needs no lock.
+- **Closed jobs.** A stage job closed as superseded or failed deletes the files of
+  its own revision folder, under the stage row's lock (the lock a commit takes),
+  unless a row refers to them.
+- **Sweep.** `manage.py prune_scan_artifacts` deletes every unreferenced stage file
+  under `scan-jobs/` older than an hour (`--min-age-seconds`), including crashed
+  workers' `.partial` copies and the folders of deleted jobs. `--dry-run` prints the
+  file and byte count and deletes nothing. `deploy/systemd/book-scanner-scan-prune.timer`
+  runs it hourly with `--enqueue`, so a worker does the work.
+- **Job end.** When a finish has put the cleaned PDF into the library, and when a
+  job is cancelled (in a worker), the job's stage rows lose their output and preview
+  references and their applied fingerprint (`applied_*`), and return to status
+  `unknown` (not run); then all its stage files are deleted. No result is current
+  any more (#205), so a job reopened for a re-finish reruns its stages.
+- **Free-space guard.** A stage save (single page or batch) is refused before
+  anything is saved or queued while the scan storage volume has less than
+  `BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES` free (default 1 GiB, `0` disables). The
+  response is `507` with a plain-text sentence starting "Disk almost full", which
+  the editor shows as its error message.
+
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
@@ -294,8 +397,10 @@ with a new revision, so those jobs re-run once. Finalizing, complete and
 cancelled jobs keep their stage statuses, revisions and outputs: the lifecycle
 refuses stage re-runs in those states, and the outputs are the history behind
 the published book. When a replacement page reopens a complete job (raw scan,
-re-finish needed), that page is invalidated as usual and the re-finish reuses
-the other pages' recorded outputs. Raw page versions are untouched. The
+re-finish needed), that page becomes stale as usual and the re-finish reuses
+the other pages' recorded outputs. (Since #204 a successful finish deletes the stage
+files and clears the results, so a job finished after that reruns its stages for a
+re-finish.) Raw page versions are untouched. The
 migration rehearsal's integrity check expects exactly the deleted `page_split`
 rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
@@ -318,21 +423,38 @@ Two pages (#195 step 3):
     following ones, or every other page counted from this one, optionally keeping
     pages with manual settings), and a
     status bar with the stage's hint (upstream strings where they exist) and the
-    live-update state;
-  - *middle*: the preview canvas. The wheel zooms around the cursor, dragging the
-    background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
+    live-update state. Edits in the options are a draft until saved: the status
+    line says "Settings not applied" and no result is shown for them. The status
+    line is derived from the stage's state (#205): "Waiting for Select Content",
+    "stale: input changed", "Failed: …";
+  - *middle*: the preview canvas, in two panes (#206): on the left the stage's
+    *input* with its editable overlay (deskew grid, content box, dewarp curves,
+    output zones), on the right this stage's *result*. After a run the result pane
+    updates in place without leaving the stage. Only a current result is shown
+    (#205); otherwise the pane gives the status line's reason: "Settings not
+    applied", "Queued"/"Running", "Waiting for Deskew", "Stale: input changed",
+    "Failed: …" or "Not run yet". While the stage is queued or running the result
+    the pane was showing stays, dimmed under a spinner, until the new one arrives;
+    a stale result that is not being recomputed is never shown. The input pane is
+    not reloaded while an overlay is being dragged. Both panes share zoom and pan,
+    the result centred where the input is. Below 900 px width only one pane fits:
+    an Input/Result toggle picks it, keeps the choice across pages and stages,
+    switches to the result when a run finishes and back to the input when the
+    deskew angle or another setting is edited. The wheel zooms around the cursor,
+    dragging the background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
     and pan only translates it, so overlays and their handles keep working at any
     zoom; handles capture their own pointer events. Ctrl+Wheel is reserved for
     stage gestures (deskew rotation). The image is the stage's working-resolution
     preview (about 150 dpi); full-resolution tiles are not part of this step;
   - *right*: the page strip. It is virtualised (only the rows in view exist in the
     DOM) and its thumbnails load lazily from tokenised, immutable URLs: the current
-    stage's output (each stage run writes a 400 px `thumbnail.jpg`), else the last
-    completed stage before it, else the page's working-image thumbnail. Under each:
-    the page number and file name, and one small numbered icon per stage: grey (not
-    started or needs re-run), amber and pulsing (queued or running), green (done),
-    blue (done with manual settings), red (failed); the tooltip names the stage and
-    the error or invalidation reason. A sort selector offers "Natural order",
+    stage's current output (each stage run writes a 400 px `thumbnail.jpg`), else the
+    last current stage before it, else the page's working-image thumbnail. Under
+    each: the page number and file name, and one small numbered icon per stage: grey
+    (not started), grey ring (waiting for an earlier stage), amber and pulsing
+    (queued or running), green (done), green ring (stale result), blue (done with
+    manual settings), red (failed); the tooltip names the stage and the error, the
+    stage it waits for or the stale reason. A sort selector offers "Natural order",
     "Order by increasing width" and "Order by increasing height" (content box for
     Select Content, output size otherwise). Click selects a page, Ctrl/Cmd-click
     toggles, Shift-click selects a range; Home, End, PgUp (or Q), PgDown (or W) and
@@ -400,9 +522,18 @@ parameters.
   fingerprint path, portable token fallback, and remaining database scan cost.
 - `GET /scan/jobs/<job_id>/pages/<page_id>/stages/` — ordered stage state.
 - `GET|POST /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/` — read/update one
-  stage; POST accepts `expected_revision` and returns `409` on a conflict.
+  stage; POST accepts `expected_revision` and returns `409` on a conflict. A `202`
+  answers `{"stage", "job", "waiting_for"}`; `job` is `null` when the stage waits
+  for an earlier stage or its result is already current (#205).
 - `POST /scan/jobs/<job_id>/stages/<stage>/batch/` — apply parameters to selected
-  page IDs or all pages, optionally preserving manual exceptions.
+  page IDs or all pages, optionally preserving manual exceptions; every applied page
+  reports its `waiting_for`, and `jobs` lists only the jobs actually queued.
+
+Every stage row carries `applied_input_sha256`, `applied_revision`,
+`settings_applied` and, for Deskew, `input_sha256` (the active version's checksum),
+from which clients derive current/waiting/stale. Page-level responses (workspace,
+stage list, single stage) also include the derived `current`, `waiting_for`,
+`waiting_for_label` and `stale_reason`.
 - `GET /scan/jobs/<job_id>/pages/<page_id>/stages/<stage>/preview/` — stage output
   preview; `?input=true` resolves the correct predecessor/input artifact.
 
@@ -435,6 +566,10 @@ them with:
 
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS`
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`
+
+Enable `book-scanner-scan-prune.timer` (see `deploy/systemd/README.md`) so stage files
+left behind by crashed workers or deleted jobs are swept; the free-space guard is
+`BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES`.
 
 The infrastructure suite verifies authentication, prompt initial and updated
 events, unbuffered Nginx proxying, and client disconnect recovery against a real

@@ -197,6 +197,9 @@ class Settings(BaseSettings):
     csrf_trusted_origins: list[str] = []
     scantailor_event_stream_interval_seconds: float = 1.0
     scantailor_event_stream_max_events: int = 45
+    # Free space the scan storage volume must keep before a ScanTailor stage save is
+    # accepted (#204); below it the editor says "disk almost full". 0 disables.
+    scantailor_min_free_bytes: int = 1024 * 1024 * 1024
     # Contribution recognition (#27, docs/contributions.md). Off by default; the
     # leaderboard additionally needs its own flag and each member's opt-in.
     contributions_enabled: bool = False
@@ -512,6 +515,7 @@ BOOK_SCANNER_METRICS_ENABLED = settings.metrics_enabled
 BOOK_SCANNER_METRICS_BEARER_TOKEN = settings.metrics_bearer_token.get_secret_value()
 SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS = settings.scantailor_event_stream_interval_seconds
 SCANTAILOR_EVENT_STREAM_MAX_EVENTS = settings.scantailor_event_stream_max_events
+BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES = settings.scantailor_min_free_bytes
 BOOK_SCANNER_CONTRIBUTIONS_ENABLED = settings.contributions_enabled
 BOOK_SCANNER_LEADERBOARD_ENABLED = settings.leaderboard_enabled
 BOOK_SCANNER_CONTRIBUTIONS_HOLD_DAYS = settings.contributions_hold_days

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -219,8 +220,29 @@ def test_page_not_aligned_with_others_keeps_its_own_size() -> None:
     _assert_nothing_failed(job)
 
 
+def _linked(page: ScanPage) -> dict[str, ScanTailorStageState]:
+    """The page's rows linked as the views link them (#205), read fresh."""
+    states = {state.stage: state for state in ScanTailorStageState.objects.filter(scan_page=page)}
+    scantailor.link_page_states(states, page.active_version())
+    return states
+
+
+def _hold_batches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Keep batch-dispatched jobs (the cross-page re-queue) queued until released."""
+    held: list[str] = []
+
+    def hold(job_ids: Sequence[str]) -> int:
+        held.extend(job_ids)
+        return 1 if job_ids else 0
+
+    monkeypatch.setattr(scantailor, "dispatch_stage_batch", hold)
+    return held
+
+
 @pytest.mark.django_db(transaction=True)
-def test_content_change_on_one_page_requeues_the_others() -> None:
+def test_content_change_on_one_page_requeues_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, job, pages = _job_with_pages("layout-requeue", 3)
     for page, box in zip(pages, BOXES, strict=True):
         _prepare(client, job, page, box)
@@ -228,9 +250,12 @@ def test_content_change_on_one_page_requeues_the_others() -> None:
         _post(client, job, page, "margins", _margins())
         _post(client, job, page, "output", {"output_mode": "otsu"})
     before = {page.id: _state(page, "margins") for page in pages}
+    for page in pages:
+        assert all(scantailor.stage_result_is_current(s) for s in _linked(page).values())
     requeued_before = _requeued()
+    held = _hold_batches(monkeypatch)
 
-    # Page 3 becomes the largest page: 160x220.
+    # Page 3 becomes the largest page: 160x220. Its own chain runs on (#205 chaining).
     _post(
         client,
         job,
@@ -240,8 +265,29 @@ def test_content_change_on_one_page_requeues_the_others() -> None:
     )
 
     bigger = (160 + 2 * MARGIN_PX, 220 + 2 * MARGIN_PX)
+    assert _size(pages[2]) == bigger
+    assert scantailor.stage_result_is_current(_linked(pages[2])["output"])
+    # The other pages' Margins are stale through their input fingerprint (#205, #208)
+    # and queued as one batch; their Output follows them.
+    assert _requeued() - requeued_before == 2
+    assert len(held) == 2
     for page in pages[:2]:
-        state = _state(page, "margins")
+        states = _linked(page)
+        margins = states["margins"]
+        assert margins.status == ScanTailorStageState.StageStatus.QUEUED
+        assert not scantailor.stage_result_is_current(states["output"])
+        # Its last result (kept while queued) is stale only by the common page size.
+        margins.status = SUCCESS  # in memory: how the row reads before the re-queue
+        assert not scantailor.stage_result_is_current(margins)
+        assert scantailor.stage_stale_reason(margins) == scantailor.COMMON_SIZE_CHANGED
+    _assert_nothing_failed(job)
+
+    for job_id in held:
+        scantailor.process_stage_job(job_id)
+
+    for page in pages[:2]:
+        states = _linked(page)
+        state = states["margins"]
         assert state.status == SUCCESS
         assert state.revision == before[page.id].revision  # a re-run, not an edit
         assert state.output_sha256 != before[page.id].output_sha256
@@ -250,22 +296,17 @@ def test_content_change_on_one_page_requeues_the_others() -> None:
             state.parameters["aggregate_fingerprint"]
             == scantailor.margins_aggregate(job).fingerprint
         )
-        # The Output built on the old page size is stale.
-        assert _state(page, "output").status == ScanTailorStageState.StageStatus.INVALIDATED
-    assert _requeued() - requeued_before == 2
-    assert _state(pages[2], "margins").status == ScanTailorStageState.StageStatus.INVALIDATED
-    _assert_nothing_failed(job)
-
-    _post(client, job, pages[2], "dewarping", {"dewarp_mode": "off"})
-    _post(client, job, pages[2], "margins", _margins())
+        # The Output was rebuilt on the new page size by chaining.
+        assert all(scantailor.stage_result_is_current(s) for s in states.values())
     assert [_size(page) for page in pages] == [bigger] * 3
     # Nothing else changed, so nothing more was re-queued.
     assert _requeued() - requeued_before == 2
+    assert not ProcessingJob.objects.filter(state=ProcessingJob.JobState.QUEUED).exists()
     _assert_nothing_failed(job)
 
 
 @pytest.mark.django_db(transaction=True)
-def test_requeued_page_edited_meanwhile_is_left_to_the_edit(
+def test_requeued_page_edited_meanwhile_waits_instead_of_failing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, job, pages = _job_with_pages("layout-requeue-race", 2)
@@ -274,29 +315,60 @@ def test_requeued_page_edited_meanwhile_is_left_to_the_edit(
     for page in pages:
         _post(client, job, page, "margins", _margins())
 
-    held: list[str] = []
-
-    def hold(job_ids: list[str]) -> int:
-        held.extend(job_ids)
-        return 1
-
-    monkeypatch.setattr(scantailor, "dispatch_stage_batch", hold)
-    margins = _state(pages[1], "margins")
-    margins.parameters = {**margins.parameters, "aggregate_fingerprint": "stale"}
-    margins.save(update_fields=["parameters"])
-    assert scantailor.requeue_stale_margins(job) == 1
-    # The member edits that page's Dewarping before the re-run starts.
+    held = _hold_batches(monkeypatch)
+    # Page 1's recorded content grows (as a finished Select Content run would record).
+    content = _state(pages[0], "select_content")
+    content.parameters = {**content.parameters, "output_width": 200}
+    content.save(update_fields=["parameters"])
+    assert scantailor.requeue_stale_margins(job) == 2
+    # The member edits page 2's Dewarping before its re-run starts.
     ScanTailorStageState.objects.filter(scan_page=pages[1], stage="dewarping").update(
         status=ScanTailorStageState.StageStatus.QUEUED
     )
     for job_id in held:
         scantailor.process_stage_job(job_id)
 
-    assert _state(pages[1], "margins").status == ScanTailorStageState.StageStatus.INVALIDATED
-    processing = ProcessingJob.objects.get(job_id=held[0])
-    assert processing.state == ProcessingJob.JobState.SUCCESS
-    assert processing.details["superseded"] is True
+    # Page 2's Margins waits for its Dewarping (#205) and keeps its stale result.
+    waiting = _linked(pages[1])["margins"]
+    assert waiting.status == SUCCESS
+    assert not scantailor.stage_result_is_current(waiting)
+    assert scantailor.stage_waiting_for(waiting) == "dewarping"
+    parked = ProcessingJob.objects.get(
+        job_id__in=held, details__scan_tailor_stage_state_id=waiting.pk
+    )
+    assert parked.state == ProcessingJob.JobState.SUCCESS
+    assert parked.details["superseded"] is True
+    assert parked.details["waiting_for"] == "dewarping"
+    assert scantailor.stage_result_is_current(_linked(pages[0])["margins"])
     _assert_nothing_failed(job)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_aggregate_is_computed_once_for_a_whole_job() -> None:
+    client, job, pages = _job_with_pages("layout-queries", 3)
+    for page, box in zip(pages, BOXES, strict=True):
+        _prepare(client, job, page, box)
+    for page in pages:
+        _post(client, job, page, "margins", _margins())
+
+    calls: list[object] = []
+    original = scantailor.margins_aggregate
+
+    def counting(job_or_id: object) -> page_layout.Aggregate:
+        calls.append(job_or_id)
+        return original(job_or_id)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(scantailor, "margins_aggregate", counting)
+    try:
+        response = client.get(f"/scan/jobs/{job.id}/workspace/state/")
+        assert response.status_code == 200, response.content
+        rows = [row for row in response.json()["stages"] if row["stage"] == "margins"]
+        assert len(rows) == 3
+        assert all(row["input_sha256"] == row["applied_input_sha256"] for row in rows)
+        assert len(calls) == 1
+    finally:
+        patch.undo()
 
 
 @pytest.mark.django_db(transaction=True)
@@ -369,3 +441,21 @@ def test_margins_batch_requeues_the_other_pages_once() -> None:
     assert [_size(page)[0] for page in pages] == [wider] * 3
     assert _requeued() - requeued_before == 2
     _assert_nothing_failed(job)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_result_from_before_the_page_layout_port_stays_current() -> None:
+    """A pre-#208 padding result did not read the aggregate; like other results of an
+    older algorithm (#205) it stays current, so finished jobs keep their Output."""
+    client, job, pages = _job_with_pages("layout-legacy", 1)
+    _prepare(client, job, pages[0], BOXES[0])
+    _post(client, job, pages[0], "margins", _margins())
+    states = _linked(pages[0])
+    dewarped = states["dewarping"].output_sha256
+    assert states["margins"].applied_input_sha256 != dewarped
+    ScanTailorStageState.objects.filter(pk=states["margins"].pk).update(
+        algorithm_version="padding-v2", applied_input_sha256=dewarped
+    )
+    states = _linked(pages[0])
+    assert scantailor.stage_input_fingerprint(states["margins"]) == dewarped
+    assert scantailor.stage_result_is_current(states["margins"])

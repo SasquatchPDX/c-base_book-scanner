@@ -15,8 +15,10 @@ import {
   previewIsBeingPrepared,
   previewRetryUrl,
   previousStageName,
+  resultPaneMessage,
   sourceBoxToDisplay,
   stageErrorText,
+  stageReadiness,
   stageStatusLabel,
   stageStatusMessage,
   stageWorkerWarnings,
@@ -250,7 +252,7 @@ describe("preview error messages", () => {
 
   it("names the actual predecessor when the input preview is missing", () => {
     expect(previewErrorMessage("margins", { status: 404, body: "input preview not ready" })).toBe(
-      "The input preview is not ready. Run the Dewarping stage first.",
+      "Waiting for Dewarping: its result is not ready yet.",
     );
     expect(previousStageName("deskew")).toBeNull();
     expect(previousStageName("dewarping")).toBe("select_content");
@@ -285,19 +287,24 @@ describe("preview error messages", () => {
 });
 
 describe("stage status presentation", () => {
-  it("treats routine invalidation as information, not an error", () => {
-    const invalidated = {
-      status: "invalidated",
-      revision: 3,
-      last_error: "deskew updated via batch",
-      invalidated_reason: "deskew updated via batch",
-    };
+  it("derives waiting and stale messages from the state, not a stored flag (#205)", () => {
+    const success = { status: "success", revision: 3, last_error: "" };
+    const unknown = { status: "unknown", revision: 2, last_error: "" };
 
-    expect(stageErrorText(invalidated)).toBe("");
-    expect(stageStatusMessage(invalidated)).toEqual({
-      text: "Revision 3 · invalidated (deskew updated via batch)",
-      tone: "info",
-    });
+    expect(
+      stageStatusMessage(unknown, { current: false, waitingFor: "deskew", staleReason: "" }),
+    ).toEqual({ text: "Waiting for Deskew.", tone: "info" });
+    expect(
+      stageStatusMessage(success, {
+        current: false,
+        waitingFor: null,
+        staleReason: "settings changed, not applied",
+      }),
+    ).toEqual({ text: "Revision 3 · stale: settings changed, not applied", tone: "info" });
+    expect(
+      stageStatusMessage(success, { current: true, waitingFor: null, staleReason: "" }, true),
+    ).toEqual({ text: "Settings not applied. Save them to run this stage.", tone: "info" });
+    expect(stageStatusMessage(unknown)).toEqual({ text: "Revision 2 · not run yet", tone: "info" });
   });
 
   it("shows the error only for failed stages", () => {
@@ -309,13 +316,174 @@ describe("stage status presentation", () => {
 
     expect(stageErrorText(failed)).toBe("cannot read image");
     expect(stageStatusMessage(failed)).toEqual({
-      text: "cannot read image",
+      text: "Failed: cannot read image",
       tone: "error",
     });
     expect(stageStatusMessage({ status: "success", revision: 1, last_error: "" })).toEqual({
       text: "Revision 1 · success",
       tone: "info",
     });
+  });
+});
+
+describe("stage readiness from input fingerprints (#205)", () => {
+  const row = (
+    stage: string,
+    status: string,
+    output: string,
+    appliedInput: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    stage,
+    status,
+    output_sha256: output,
+    applied_input_sha256: appliedInput,
+    settings_applied: true,
+    input_sha256: stage === "deskew" ? "v1" : "",
+    ...extra,
+  });
+
+  it("is current when every result matches its input and settings", () => {
+    const page = {
+      stages: [
+        row("deskew", "success", "d1", "v1"),
+        row("select_content", "success", "s1", "d1"),
+        row("dewarping", "success", "w1", "s1"),
+        row("margins", "success", "m1", "w1"),
+        row("output", "success", "o1", "m1"),
+      ],
+    } as never;
+    for (const stage of STAGE_ORDER) {
+      expect(stageReadiness(page, stage)).toEqual({
+        current: true,
+        waitingFor: null,
+        staleReason: "",
+      });
+    }
+  });
+
+  it("waits for the first earlier stage without a current result", () => {
+    const page = {
+      stages: [
+        row("deskew", "unknown", "", ""),
+        row("margins", "unknown", "", "", { settings_applied: false }),
+      ],
+    } as never;
+    expect(stageReadiness(page, "margins")).toEqual({
+      current: false,
+      waitingFor: "deskew",
+      staleReason: "",
+    });
+    expect(stageReadiness(page, "deskew").waitingFor).toBeNull();
+  });
+
+  it("marks a result stale when its input or its settings changed", () => {
+    const page = {
+      stages: [
+        row("deskew", "success", "d2", "v1"),
+        row("select_content", "success", "s1", "d1"),
+        row("dewarping", "success", "w1", "s1", { settings_applied: false }),
+      ],
+    } as never;
+    expect(stageReadiness(page, "deskew")).toEqual({
+      current: true,
+      waitingFor: null,
+      staleReason: "",
+    });
+    expect(stageReadiness(page, "select_content")).toEqual({
+      current: false,
+      waitingFor: null,
+      staleReason: "input changed",
+    });
+    expect(stageReadiness(page, "dewarping")).toEqual({
+      current: false,
+      waitingFor: "select_content",
+      staleReason: "settings changed, not applied",
+    });
+    // A replacement scan changes the first stage's input.
+    const rescanned = {
+      stages: [{ ...row("deskew", "success", "d1", "v1"), input_sha256: "v2" }],
+    } as never;
+    expect(stageReadiness(rescanned, "deskew").staleReason).toBe("input changed");
+  });
+
+  it("uses the server's Margins fingerprint, which includes the common page size (#208)", () => {
+    const upstream = [
+      row("deskew", "success", "d1", "v1"),
+      row("select_content", "success", "s1", "d1"),
+      row("dewarping", "success", "w1", "s1"),
+    ];
+    const margins = (extra: Record<string, unknown>) =>
+      ({ stages: [...upstream, row("margins", "success", "m1", "w1+a1", extra)] }) as never;
+    // Current: the fingerprint for the predecessor output on this page matches.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w1" }), "margins"),
+    ).toEqual({ current: true, waitingFor: null, staleReason: "" });
+    // Another page changed the common size.
+    expect(
+      stageReadiness(
+        margins({ input_sha256: "w1+a2", input_basis_sha256: "w1", common_size_changed: true }),
+        "margins",
+      ),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "common page size changed" });
+    // Dewarping produced a newer output than the one the server's fingerprint used.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w0" }), "margins"),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "input changed" });
+  });
+});
+
+describe("result pane message (#206, from #205's derived state)", () => {
+  const state = (status: string, extra: Record<string, string> = {}) => ({
+    status,
+    last_error: "",
+    preview_storage_identifier: "",
+    output_storage_identifier: "",
+    ...extra,
+  });
+  const current = { current: true, waitingFor: null, staleReason: "" };
+  const notCurrent = { current: false, waitingFor: null, staleReason: "" };
+
+  it("is empty when the stage has a current result", () => {
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), current),
+    ).toBe("");
+    expect(resultPaneMessage(state("success"), current)).toMatch(/no result preview/);
+  });
+
+  it("gives the status line's reason when there is no current result", () => {
+    expect(resultPaneMessage(state("unknown"), notCurrent)).toMatch(/^Not run yet/);
+    expect(resultPaneMessage(state("queued"), notCurrent)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("running"), notCurrent)).toMatch(/^Running/);
+    expect(
+      resultPaneMessage(state("failed", { last_error: "cannot read image" }), notCurrent),
+    ).toBe("Failed: cannot read image");
+    expect(
+      resultPaneMessage(state("unknown"), { ...notCurrent, waitingFor: "deskew" }),
+    ).toBe("Waiting for Deskew. This stage runs when it is done.");
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), {
+        ...notCurrent,
+        staleReason: "input changed",
+      }),
+    ).toBe("Stale: input changed. Save and run to update the result.");
+  });
+
+  it("never shows a result for settings that are not applied", () => {
+    const done = state("success", { preview_storage_identifier: "p.jpg" });
+    expect(resultPaneMessage(done, current, true)).toBe(
+      "Settings not applied. Save them to see this stage's result.",
+    );
+    // A failure is still reported first, as on the status line.
+    expect(resultPaneMessage(state("failed", { last_error: "boom" }), notCurrent, true)).toBe(
+      "Failed: boom",
+    );
+  });
+
+  it("puts a running job before waiting and stale", () => {
+    const stale = { current: false, waitingFor: "deskew" as const, staleReason: "input changed" };
+    expect(resultPaneMessage(state("queued"), stale)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("success"), stale)).toMatch(/^Waiting for Deskew/);
   });
 });
 
@@ -455,7 +623,7 @@ describe("editor preview recovery (#195)", () => {
 
     // Generation finished: this load succeeds and the stage status returns.
     image.dispatchEvent(new Event("load"));
-    expect(message.textContent).toBe("Revision 1 · unknown");
+    expect(message.textContent).toBe("Revision 1 · not run yet");
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 

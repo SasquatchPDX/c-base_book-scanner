@@ -70,9 +70,9 @@
 
       <main class="st-canvas" aria-label="Page preview">
         <div class="st-canvas-toolbar" role="toolbar" aria-label="Preview">
-          <div class="st-segmented" role="group" aria-label="Stage preview">
+          <div class="st-segmented st-pane-toggle" role="group" aria-label="Shown pane">
             <button type="button" data-preview-input aria-pressed="true">Input</button>
-            <button type="button" data-preview-result aria-pressed="false" disabled>Result</button>
+            <button type="button" data-preview-result aria-pressed="false">Result</button>
           </div>
           <div class="st-zoom" role="group" aria-label="Zoom">
             <button type="button" data-zoom-out aria-label="Zoom out">−</button>
@@ -82,11 +82,28 @@
             <button type="button" data-zoom-actual>1:1</button>
           </div>
         </div>
-        <div class="st-viewport" data-viewport>
-          <div class="st-surface" data-surface>
-            <img data-editor-image alt="Processing-stage input preview" hidden>
-            <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
-          </div>
+        <div class="st-panes" data-panes data-pane="input">
+          <section class="st-pane st-pane-input" data-input-pane aria-label="Stage input">
+            <span class="st-pane-label">Input</span>
+            <div class="st-viewport" data-viewport>
+              <div class="st-surface" data-surface>
+                <img data-editor-image alt="Processing-stage input preview" hidden>
+                <div class="geometry-layer" data-geometry-layer aria-label="Editable page geometry"></div>
+              </div>
+            </div>
+          </section>
+          <section class="st-pane st-pane-result" data-result-pane aria-label="Stage result">
+            <span class="st-pane-label">Result</span>
+            <div class="st-viewport" data-result-viewport>
+              <div class="st-surface" data-result-surface>
+                <img data-result-image alt="Processing-stage result preview" hidden>
+              </div>
+              <div class="st-result-status" data-result-status role="status" hidden>
+                <span class="st-spinner" data-result-spinner hidden></span>
+                <span data-result-message></span>
+              </div>
+            </div>
+          </section>
         </div>
       </main>
 

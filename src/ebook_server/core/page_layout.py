@@ -121,6 +121,11 @@ def _flag(value: object, fallback: bool) -> bool:
     return fallback
 
 
+def aligns_with_others(parameters: Mapping[str, Any]) -> bool:
+    """Whether a page's Margins settings take part in the common page size."""
+    return _flag(parameters.get("align_with_others"), True)
+
+
 def settings_from_parameters(
     parameters: Mapping[str, Any], dpi: tuple[float, float]
 ) -> LayoutSettings:
@@ -159,7 +164,7 @@ def settings_from_parameters(
         hard_margins_mm=margins,
         align_x=_alignment(parameters.get("align_x"), ALIGN_X, DEFAULT_ALIGN_X),
         align_y=_alignment(parameters.get("align_y"), ALIGN_Y, DEFAULT_ALIGN_Y),
-        align_with_others=_flag(parameters.get("align_with_others"), True),
+        align_with_others=aligns_with_others(parameters),
     )
 
 

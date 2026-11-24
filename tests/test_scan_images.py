@@ -93,6 +93,9 @@ def test_stages_work_on_the_working_image_and_output_renders_the_original_once(
         return real_load(path)
 
     monkeypatch.setattr(scantailor, "_load_image", recording_load)
+    # Run the stages one by one: chaining (#205) would also run Output, which renders
+    # the original.
+    monkeypatch.setattr(scantailor, "queue_ready_successor", lambda *args, **kwargs: None)
 
     for stage, parameters in (
         ("deskew", {}),

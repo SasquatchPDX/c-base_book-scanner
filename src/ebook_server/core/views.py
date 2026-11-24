@@ -48,6 +48,7 @@ from . import (
     capture_layout,
     intake,
     ocr,
+    scan_artifact_pruning,
     scan_identification,
     scan_images,
     scan_lifecycle,
@@ -169,6 +170,38 @@ def _serialize_scan_page(
     }
 
 
+def _serialize_margins_input(state: ScanTailorStageState) -> dict[str, Any]:
+    if (
+        state.stage != ScanTailorStageState.Stage.MARGINS.value
+        or state.status != ScanTailorStageState.StageStatus.SUCCESS
+    ):
+        return {}
+    predecessor = state.input_stage_state
+    if predecessor is None or not scantailor.margins_depends_on_aggregate(state):
+        return {}
+    fingerprint = scantailor.stage_input_fingerprint(state)
+    if not fingerprint:
+        return {}
+    recorded = (state.parameters or {}).get("aggregate_fingerprint")
+    return {
+        "input_sha256": fingerprint,
+        "input_basis_sha256": predecessor.output_sha256,
+        "common_size_changed": bool(
+            isinstance(recorded, str)
+            and recorded
+            and fingerprint != state.applied_input_sha256
+            and scantailor.margins_input_fingerprint(predecessor.output_sha256, recorded)
+            == state.applied_input_sha256
+        ),
+    }
+
+
+def _serialize_stage_states(states: list[ScanTailorStageState]) -> list[dict[str, Any]]:
+    """Several rows of one job: the common page size (#208) is computed once."""
+    scantailor.attach_margins_aggregate_if_needed(states)
+    return [_serialize_stage_state(state) for state in states]
+
+
 def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
     return {
         "id": state.id,
@@ -190,7 +223,23 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "output_size_bytes": state.output_size_bytes,
         "output_sha256": state.output_sha256,
         "last_error": state.last_error,
-        "invalidated_reason": state.invalidated_reason,
+        # Fingerprint of the result (#205). Row-local, so every client can derive
+        # "current", "waiting for" and "stale" from a page's rows as they change:
+        # current iff status is success, settings_applied, applied_input_sha256 equals
+        # input_sha256 (first stage) or the predecessor's output_sha256, and the
+        # predecessor is current.
+        "applied_input_sha256": state.applied_input_sha256,
+        "applied_revision": state.applied_revision,
+        "settings_applied": scantailor.stage_settings_applied(state),
+        "input_sha256": (
+            scantailor.stage_input_fingerprint(state)
+            if scantailor.previous_stage(state.stage) is None
+            else ""
+        ),
+        # An aligned page's Margins input includes the job's common page size (#208),
+        # which a client cannot recompute: the current fingerprint, the predecessor
+        # output it was built from, and whether only the common size differs.
+        **_serialize_margins_input(state),
         # Done with a manual override: a blue status icon in the page strip (#195).
         "manual": _is_manual_stage_state(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
@@ -624,6 +673,20 @@ def _serialize_scan_job_with_pages(
     return payload
 
 
+def _margins_rows_of(state: ScanTailorStageState) -> list[ScanTailorStageState]:
+    """``state`` and its predecessors, as the derived-state functions will follow them.
+
+    Loading the chain here costs the queries ``stage_waiting_for`` would make anyway;
+    Django caches each relation on the instance, so the attached aggregate is seen.
+    """
+    rows: list[ScanTailorStageState] = []
+    current: ScanTailorStageState | None = state
+    while current is not None and len(rows) < len(scantailor.stage_order()):
+        rows.append(current)
+        current = current.input_stage_state
+    return rows
+
+
 def _ordered_stages_for_page(page: ScanPage) -> list[ScanTailorStageState]:
     all_states = {
         state.stage: state
@@ -632,12 +695,29 @@ def _ordered_stages_for_page(page: ScanPage) -> list[ScanTailorStageState]:
             scan_job=page.scan_job,
         )
     }
+    scantailor.link_page_states(
+        all_states, page.active_version(), scantailor.page_margins_aggregate(all_states)
+    )
     ordered: list[ScanTailorStageState] = []
     for stage_name in scantailor.stage_order():
         state = all_states.get(stage_name)
         if state is not None:
             ordered.append(state)
     return ordered
+
+
+def _serialize_page_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
+    """A stage row plus its derived state (#205); the page's rows must be linked
+    (``scantailor.link_page_states``) so this costs no queries."""
+    payload = _serialize_stage_state(state)
+    waiting_for = scantailor.stage_waiting_for(state)
+    payload["current"] = scantailor.stage_result_is_current(state)
+    payload["waiting_for"] = waiting_for
+    payload["waiting_for_label"] = (
+        ScanTailorStageState.Stage(waiting_for).label if waiting_for else ""
+    )
+    payload["stale_reason"] = scantailor.stage_stale_reason(state)
+    return payload
 
 
 def _scan_page_request_payload(request: HttpRequest) -> dict[str, Any]:
@@ -822,9 +902,9 @@ def _select_page_thumbnail(
 ) -> _ThumbnailSource | None:
     """Pick the page thumbnail's artifact from rows the caller already loaded.
 
-    The latest stage of the page's unbroken run of successful stages that has an
-    artifact wins; a stage that is not SUCCESS ends the run, so an output whose
-    upstream was edited/invalidated or is re-running is never shown (#58). Without
+    The latest stage of the page's unbroken run of current stages that has an
+    artifact wins; a stage without a current result ends the run, so an output whose
+    upstream was edited or is re-running is never shown (#58, #205). Without
     one, the active version's working image (#195) or, until it exists, the raw scan.
     The workspace and ``scan_page_thumbnail`` both go through this function, so the
     URL token and the served bytes come from one selection.
@@ -832,7 +912,7 @@ def _select_page_thumbnail(
     latest: ScanTailorStageState | None = None
     for stage_name in scantailor.stage_order():
         state = states.get(stage_name)
-        if state is None or state.status != ScanTailorStageState.StageStatus.SUCCESS:
+        if state is None or not scantailor.stage_result_is_current(state):
             break
         if state.preview_storage_identifier or state.output_storage_identifier:
             latest = state
@@ -1026,6 +1106,9 @@ def _apply_scan_job_transition(job: ScanJob, target_state: str) -> tuple[bool, s
         if target_state in {ScanJob.State.COMPLETE, ScanJob.State.CANCELLED}:
             locked.finished_at = timezone.now()
         locked.save(update_fields=["state", "finished_at", "updated_at"])
+        if target_state == ScanJob.State.CANCELLED:
+            # Derived stage files of a cancelled job are not needed any more (#204).
+            scan_artifact_pruning.schedule_scan_job_stage_cleanup(str(locked.pk))
     job.state = locked.state
     job.finished_at = locked.finished_at
     return True, ""
@@ -1063,7 +1146,9 @@ def _ensure_workspace_stage_states(job: ScanJob, page: ScanPage) -> list[ScanTai
 
 def _serialize_workspace_page(page: ScanPage) -> dict[str, Any]:
     payload = _serialize_scan_page_with_thumbnail(page)
-    payload["stages"] = [_serialize_stage_state(state) for state in _ordered_stages_for_page(page)]
+    payload["stages"] = [
+        _serialize_page_stage_state(state) for state in _ordered_stages_for_page(page)
+    ]
     return payload
 
 
@@ -1110,7 +1195,7 @@ def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
                 _work_image_token(active_version, page_image) if page_image is not None else ""
             )
         payload["stages"] = [
-            _serialize_stage_state(page_states[stage])
+            _serialize_page_stage_state(page_states[stage])
             for stage in scantailor.stage_order()
             if stage in page_states
         ]
@@ -1281,12 +1366,20 @@ def _apply_stage_payload_to_state(
             output_mode = str(merged.get("output_mode", "")).strip().lower()
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
                 state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
+        if state.applied_revision is not None and scantailor.stage_settings(
+            stage, merged
+        ) == scantailor.stage_settings(stage, state.applied_parameters):
+            # The settings of the existing result (#205): keep what that run recorded
+            # (sizes, transform op, detection results) instead of dropping it.
+            merged = dict(state.applied_parameters)
         state.parameters = merged
 
     _bind_stage_inputs(state, page)
     state.revision += 1
     state.last_error = ""
-    state.status = ScanTailorStageState.StageStatus.QUEUED
+    # Saving stores settings only (#205). A job for an older revision is superseded,
+    # so the row returns to its idle status; the caller queues a job if it can run.
+    state.status = scantailor.stage_idle_status(state)
 
 
 def _lock_stage_state(state: ScanTailorStageState) -> ScanTailorStageState:
@@ -1385,7 +1478,9 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
     if job is None:
         return HttpResponseNotFound()
     cursor = timezone.now()
-    states = ScanTailorStageState.objects.filter(scan_job_id=job.pk)
+    states = ScanTailorStageState.objects.filter(scan_job_id=job.pk).select_related(
+        "input_scan_page_version", "input_stage_state"
+    )
     raw_since = request.GET.get("since")
     if raw_since:
         since = parse_datetime(raw_since)
@@ -1398,7 +1493,7 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
             "state": job.state,
             "updated_at": job.updated_at.isoformat(),
             "cursor": cursor.isoformat(),
-            "stages": [_serialize_stage_state(state) for state in states.order_by("pk")],
+            "stages": _serialize_stage_states(list(states.order_by("pk"))),
         }
     )
 
@@ -1445,7 +1540,7 @@ EDITOR_STAGE_HINTS: Final[dict[str, str]] = {
         "Drag the red points to bend the grid; click the top or bottom curve to add a "
         "point, press Del or D to remove one."
     ),
-    "margins": "Resize margins by dragging any of the solid lines.",
+    "margins": "Set the margins in millimetres; aligned pages share the size of the largest page.",
     "output": "Draw text and picture zones; choose how each kind is binarised.",
 }
 
@@ -1532,7 +1627,9 @@ def scan_page_stages(
         {
             "job_id": str(job.id),
             "page_id": str(page.id),
-            "stages": [_serialize_stage_state(state) for state in _ordered_stages_for_page(page)],
+            "stages": [
+                _serialize_page_stage_state(state) for state in _ordered_stages_for_page(page)
+            ],
             "count": page.stage_states.count(),
         },
     )
@@ -1582,6 +1679,8 @@ def scan_page_stage(
 
     if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
+    if low_space := _stage_low_space_response():
+        return low_space
 
     payload = _request_payload(request)
     expected_revision = _coerce_int(payload.get("expected_revision"), minimum=1)
@@ -1594,23 +1693,36 @@ def scan_page_stage(
         if expected_revision is not None and expected_revision != state.revision:
             return _conflict_response(state, expected_revision)
         _apply_and_save_stage_edit(state, page, normalized_stage, payload)
-        scantailor.invalidate_downstream_states(
-            page,
-            from_stage=state.stage,
-            reason=f"{state.stage} updated",
-        )
 
-    processing_job = scantailor.request_stage_job(
+    # Queue only when every earlier stage is current and this result is not (#205);
+    # otherwise the stage waits and its predecessor's successful run queues it.
+    processing_job, waiting_for = scantailor.request_stage_job_if_ready(
         state=state,
         requested_by_user_id=profile.user_id,
     )
+    if normalized_stage == ScanTailorStageState.Stage.MARGINS.value:
+        # Margins settings feed the common page size (#208): the other aligned pages'
+        # results may be stale now; queue them behind this page's run.
+        scantailor.requeue_stale_margins(page.scan_job)
     response_payload = {
-        "stage": _serialize_stage_state(state),
-        "job": scantailor.stage_job_payload(processing_job),
+        "stage": _serialize_page_stage_state(state),
+        "job": scantailor.stage_job_payload(processing_job) if processing_job else None,
+        "waiting_for": waiting_for,
     }
     if _wants_html(request):
         return redirect("scan-job-workspace", job_id=page.scan_job_id)
     return JsonResponse(response_payload, status=202)
+
+
+def _stage_low_space_response() -> HttpResponse | None:
+    """Refuse a stage save on a nearly full scan volume, before anything is queued (#204).
+
+    Plain text, so the editor shows the sentence as it is; 507 Insufficient Storage.
+    """
+    message = scan_artifact_pruning.low_space_message()
+    if not message:
+        return None
+    return HttpResponse(message, status=507, content_type="text/plain; charset=utf-8")
 
 
 @require_POST
@@ -1619,7 +1731,7 @@ def scan_job_stage_batch(
     request: HttpRequest,
     job_id: str,
     stage: str,
-) -> JsonResponse | HttpResponseBadRequest | HttpResponseNotFound | HttpResponseForbidden:
+) -> HttpResponse:
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid uuid")
 
@@ -1637,6 +1749,8 @@ def scan_job_stage_batch(
         return HttpResponseNotFound()
     if job.state not in scan_lifecycle.PROCESSING_STATES:
         return HttpResponseBadRequest("scan job is not accepting processing changes")
+    if low_space := _stage_low_space_response():
+        return low_space
 
     payload = _json_body(request)
     preserve_exceptions = True
@@ -1666,6 +1780,7 @@ def scan_job_stage_batch(
     skipped: list[str] = []
     jobs: list[dict[str, Any]] = []
     batch_job_ids: list[str] = []
+    saved: list[tuple[ScanPage, ScanTailorStageState]] = []
 
     for page in pages:
         state = scantailor.get_or_create_stage_state(
@@ -1679,32 +1794,38 @@ def scan_job_stage_batch(
                 skipped.append(str(page.id))
                 continue
             _apply_and_save_stage_edit(state, page, normalized_stage, payload)
-            scantailor.invalidate_downstream_states(
-                page,
-                from_stage=state.stage,
-                reason=f"{state.stage} updated via batch",
-            )
-        processing_job = scantailor.request_stage_job(
+        saved.append((page, state))
+
+    # The common page size (#208) follows from every page's Margins settings: compute
+    # it once, after all of the batch's edits are stored, not once per page.
+    aggregate = scantailor.margins_aggregate(job)
+    for page, state in saved:
+        scantailor.attach_margins_aggregate(_margins_rows_of(state), aggregate)
+        # Same rule per page as a single edit (#205): queue only what can run now.
+        processing_job, waiting_for = scantailor.request_stage_job_if_ready(
             state=state,
             requested_by_user_id=profile.user_id,
             dispatch=False,
+            batch=True,
         )
-        if not (processing_job.details or {}).get("superseded"):
+        if processing_job is not None and not (processing_job.details or {}).get("superseded"):
             batch_job_ids.append(str(processing_job.job_id))
         applied.append(
             {
                 "page_id": str(page.id),
-                "stage": _serialize_stage_state(state),
+                "stage": _serialize_page_stage_state(state),
+                "waiting_for": waiting_for,
             },
         )
-        jobs.append(scantailor.stage_job_payload(processing_job))
+        if processing_job is not None:
+            jobs.append(scantailor.stage_job_payload(processing_job))
 
     # One queued job per chunk of pages instead of one per page (#195 §8.2 item 5);
     # an interactive single-page edit still runs first.
     scantailor.dispatch_stage_batch(batch_job_ids)
     if normalized_stage == ScanTailorStageState.Stage.MARGINS.value and applied:
         # The new settings may change the common page size: re-queue the other pages'
-        # Margins results once for the whole batch, not once per page (#208).
+        # stale Margins results once for the whole batch, not once per page (#208).
         scantailor.requeue_stale_margins(job)
 
     return JsonResponse(
@@ -2475,6 +2596,7 @@ def scan_page_thumbnail(
         ).select_related("preview_storage_location", "output_storage_location")
     }
     version = page.active_version()
+    scantailor.link_page_states(states, version, scantailor.page_margins_aggregate(states))
     page_image = (
         ScanPageImage.objects.select_related("storage_location").filter(version=version).first()
         if version is not None

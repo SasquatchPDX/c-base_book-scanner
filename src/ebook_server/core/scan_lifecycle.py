@@ -29,6 +29,7 @@ from django.db import transaction
 from django.db.models import Count, Q, QuerySet
 from django.utils import timezone
 
+from . import scan_artifact_pruning
 from .models import Book, ScanJob, ScanTodo
 
 State = ScanJob.State
@@ -95,6 +96,8 @@ def abort(job_id: str) -> ScanJob:
         job.state = State.CANCELLED
         job.finished_at = timezone.now()
         job.save(update_fields=["state", "finished_at", "updated_at"])
+        # Raw pages stay; only the derived stage files go (#204).
+        scan_artifact_pruning.schedule_scan_job_stage_cleanup(str(job.pk))
         return job
 
 

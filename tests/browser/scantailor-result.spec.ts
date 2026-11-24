@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 // Pillow-generated 100×100 white page: automatic dewarping must explain its fallback.
 const PAGE = Buffer.from(
@@ -6,84 +6,120 @@ const PAGE = Buffer.from(
   "base64",
 );
 
+const naturalWidth = (image: Locator) =>
+  image.evaluate((node) => (node as HTMLImageElement).naturalWidth);
+
+async function openNewJob(page: Page, title: string): Promise<void> {
+  await page.goto("/accounts/login/");
+  await page.getByLabel("LDAP username").fill("fry");
+  await page.getByLabel("Password").fill("fry");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.goto("/scan/jobs/?view=html");
+  await page.getByLabel("Title hint").fill(title);
+  await page.getByRole("button", { name: "Create workspace" }).click();
+  await page.getByLabel("Page image").setInputFiles({
+    name: "blank.png", mimeType: "image/png", buffer: PAGE,
+  });
+  await page.getByLabel("Sequence").fill("1");
+  await page.getByRole("button", { name: "Upload page" }).click();
+  await expect(page.locator(".scan-page-card")).toHaveCount(1);
+  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  await expect(page.locator("[data-scantailor-editor]")).toBeVisible();
+}
+
 for (const transport of ["events", "polling"] as const) {
-  test(`stage results, reduced margins and fallback warnings (${transport})`, async ({ page }) => {
+  test(`each stage shows its result beside its input after a run (${transport})`, async ({
+    page,
+  }) => {
     test.setTimeout(90_000);
     if (transport === "polling") {
       await page.addInitScript(() => {
         Object.defineProperty(window, "EventSource", { value: undefined });
       });
     }
-    await page.goto("/accounts/login/");
-    await page.getByLabel("LDAP username").fill("fry");
-    await page.getByLabel("Password").fill("fry");
-    await page.getByRole("button", { name: "Sign in" }).click();
-    await page.goto("/scan/jobs/?view=html");
-    await page.getByLabel("Title hint").fill(`Result feedback ${transport}`);
-    await page.getByRole("button", { name: "Create workspace" }).click();
-    await page.getByLabel("Page image").setInputFiles({
-      name: "blank.png", mimeType: "image/png", buffer: PAGE,
-    });
-    await page.getByLabel("Sequence").fill("1");
-    await page.getByRole("button", { name: "Upload page" }).click();
-    await expect(page.locator(".scan-page-card")).toHaveCount(1);
-    await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
-    await expect(page.locator("[data-scantailor-editor]")).toBeVisible();
+    await openNewJob(page, `Result feedback ${transport}`);
 
-    const input = page.getByRole("button", { name: "Input", exact: true });
-    const result = page.getByRole("button", { name: "Result", exact: true });
-    const image = page.locator("[data-editor-image]");
-    const save = async () => {
-      await page.getByRole("button", { name: "Save and run" }).click();
-      await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
-      await expect(image).toHaveAttribute("alt", "Processing-stage result preview");
+    const input = page.locator("[data-editor-image]");
+    const result = page.locator("[data-result-image]");
+    const status = page.locator("[data-result-status]");
+    const message = page.locator("[data-editor-message]");
+    // Two panes side by side (#206): no Input/Result toggle on a wide screen.
+    await expect(page.locator("[data-input-pane]")).toBeVisible();
+    await expect(page.locator("[data-result-pane]")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Result", exact: true })).toBeHidden();
+
+    /** After a run the result pane shows this stage's result; the editor stays on it. */
+    const expectResult = async (stage: string): Promise<void> => {
+      await expect(result).toBeVisible({ timeout: 30_000 });
+      await expect(result).toHaveAttribute("src", new RegExp(`/stages/${stage}/preview/\\?v=`));
+      await expect.poll(() => naturalWidth(result)).toBeGreaterThan(0);
+      await expect(status).toBeHidden();
+      await expect(input).toBeVisible();
+      await expect(input).toHaveAttribute("src", new RegExp(`/stages/${stage}/preview/\\?input=true`));
+      await expect(page.locator(`[data-stage-select="${stage}"]`)).toHaveClass(/active/);
     };
-    // Deskew keeps the live input view and says when it leaves a page unchanged.
+
+    // Before a run the result pane says why it is empty.
+    await expect(status).toContainText("Not run yet");
+    await expect(result).toBeHidden();
+    // A later stage waits for Deskew; the pane gives the status line's reason (#205).
+    await page.locator('[data-stage-select="select_content"]').click();
+    await expect(message).toContainText("Waiting for Deskew");
+    await expect(status).toContainText("Waiting for Deskew");
+    await expect(result).toBeHidden();
+
+    // Deskew says when it leaves a page unchanged. Its run queues the later stages,
+    // which run with their defaults (#205 chaining).
     await page.locator('[data-stage-select="deskew"]').click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("Angle 0.00°, no change", {
-      timeout: 30_000,
-    });
-    await expect(input).toHaveAttribute("aria-pressed", "true");
+    await expectResult("deskew");
+    await expect(page.locator("[data-deskew-result]")).toContainText("Angle 0.00°, no change");
 
-    // Select Content also keeps the input view, with its box; this blank page has none.
+    // Select Content: this blank page has no content box.
     await page.locator('[data-stage-select="select_content"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No content found", {
-      timeout: 30_000,
-    });
-    await expect(input).toHaveAttribute("aria-pressed", "true");
+    await expectResult("select_content");
+    await expect(page.locator("[data-content-result]")).toContainText("No content found");
 
-    // Dewarping runs before Margins (#195); on a blank page it explains its fallback
-    // and stays on the input view with the model grid.
+    // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
     await page.locator('[data-stage-select="dewarping"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No text lines", {
-      timeout: 30_000,
-    });
+    await expectResult("dewarping");
+    await expect(page.locator("[data-dewarp-result]")).toContainText("No text lines");
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
-    await expect(input).toHaveAttribute("aria-pressed", "true");
 
+    // Margins: an edit is a draft, and no result is shown for it until it is saved.
     await page.locator('[data-stage-select="margins"]').click();
+    await expectResult("margins");
     // Margins are millimetres (#208): 1.7 mm is 20 px at 300 dpi; right follows (linked).
+    // The page is blank, so no content is found: the page is just its margins
+    // (adaptContentRect), 2 × 20 px wide.
     await page.getByLabel("Left", { exact: true }).fill("1.7");
-    await save();
-    await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))
-      .toBe(140);
-    await input.click();
-    await expect(image).toHaveAttribute("src", /input=true/);
-    await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))
-      .toBe(100);
-    await result.click();
-    await expect(image).not.toHaveAttribute("src", /input=true/);
+    await expect(message).toContainText("Settings not applied");
+    await expect(status).toContainText("Settings not applied");
+    await expect(result).toBeHidden();
+    // Saved, the result updates in place: the input stays the 100 px page, the
+    // result is the margins' page.
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
+    await expectResult("margins");
+    await expect.poll(() => naturalWidth(input)).toBe(100);
+
+    // Output re-ran on its own with the new margins.
+    await page.locator('[data-stage-select="output"]').click();
+    await expectResult("output");
 
     // Reopen the stage, as a user does when adjusting an already completed result.
     await page.reload();
     await page.locator('[data-stage-select="margins"]').click();
-    await page.getByLabel("Left", { exact: true }).fill("0");
-    await save();
-    await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))
-      .toBe(100);
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
+    // 3.4 mm is 40 px a side.
+    await page.getByLabel("Left", { exact: true }).fill("3.4");
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(80);
+    await expectResult("margins");
+
+    // Output follows again; its earlier (stale) result is never shown as current.
+    await page.locator('[data-stage-select="output"]').click();
+    await expectResult("output");
 
     await page.locator('[data-stage-select="dewarping"]').click();
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
@@ -91,3 +127,62 @@ for (const transport of ["events", "polling"] as const) {
     await expect(page.locator("[data-stage-warnings]")).toBeHidden();
   });
 }
+
+test("a narrow screen shows one pane and brings the result forward after a run", async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 820, height: 700 });
+  await openNewJob(page, "Result feedback narrow");
+
+  const inputButton = page.getByRole("button", { name: "Input", exact: true });
+  const resultButton = page.getByRole("button", { name: "Result", exact: true });
+  const inputPane = page.locator("[data-input-pane]");
+  const resultPane = page.locator("[data-result-pane]");
+  await expect(inputButton).toHaveAttribute("aria-pressed", "true");
+  await expect(inputPane).toBeVisible();
+  await expect(resultPane).toBeHidden();
+
+  await page.getByRole("button", { name: "Save and run" }).click();
+  await expect(resultButton).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  await expect(resultPane).toBeVisible();
+  await expect(inputPane).toBeHidden();
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/deskew\/preview\/\?v=/,
+  );
+
+  // The choice is remembered when another stage opens; Select Content ran on its own
+  // after Deskew (#205 chaining).
+  await page.locator('[data-stage-select="select_content"]').click();
+  await expect(resultButton).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/select_content\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
+
+  await inputButton.click();
+  await expect(inputPane).toBeVisible();
+  await expect(resultPane).toBeHidden();
+  await expect(page.locator("[data-editor-image]")).toBeVisible();
+
+  // Editing a setting brings the input forward; the result pane then says why it
+  // shows no result.
+  await page.locator('[data-stage-select="margins"]').click();
+  await resultButton.click();
+  await expect(resultPane).toBeVisible();
+  // Wait for the chained Margins run, which would bring the result forward again.
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/margins\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
+  await page.getByLabel("Left", { exact: true }).fill("1.7");
+  await expect(inputButton).toHaveAttribute("aria-pressed", "true");
+  await expect(inputPane).toBeVisible();
+  await expect(resultPane).toBeHidden();
+  await resultButton.click();
+  await expect(page.locator("[data-result-status]")).toContainText("Settings not applied");
+  await expect(page.locator("[data-result-image]")).toBeHidden();
+});
