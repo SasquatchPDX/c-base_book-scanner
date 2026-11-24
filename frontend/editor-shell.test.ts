@@ -126,14 +126,18 @@ describe("page strip (#195 step 3)", () => {
     expect(neighbour([], "a", 1)).toBeNull();
   });
 
-  it("maps stage states to the five icon colours with explanatory tooltips", () => {
+  it("maps stage states to icon colours with explanatory tooltips", () => {
     expect(statusKind({ status: "unknown" })).toBe("idle");
-    expect(statusKind({ status: "invalidated" })).toBe("idle");
     expect(statusKind({ status: "queued" })).toBe("working");
     expect(statusKind({ status: "running" })).toBe("working");
     expect(statusKind({ status: "success" })).toBe("done");
     expect(statusKind({ status: "success", manual: true })).toBe("manual");
     expect(statusKind({ status: "failed" })).toBe("failed");
+    // Derived from input fingerprints (#205).
+    expect(statusKind({ status: "unknown", waiting_for: "Deskew" })).toBe("waiting");
+    expect(statusKind({ status: "success", waiting_for: "Deskew" })).toBe("waiting");
+    expect(statusKind({ status: "success", stale_reason: "input changed" })).toBe("stale");
+    expect(statusKind({ status: "queued", waiting_for: "Deskew" })).toBe("working");
     expect(
       statusTooltip({ stage: "deskew", label: "Deskew", status: "failed", last_error: "bad" }),
     ).toBe("Deskew: failed: bad");
@@ -141,10 +145,13 @@ describe("page strip (#195 step 3)", () => {
       statusTooltip({
         stage: "margins",
         label: "Margins",
-        status: "invalidated",
-        invalidated_reason: "deskew updated",
+        status: "success",
+        stale_reason: "settings changed, not applied",
       }),
-    ).toBe("Margins: needs re-run (deskew updated)");
+    ).toBe("Margins: stale (settings changed, not applied)");
+    expect(
+      statusTooltip({ stage: "margins", label: "Margins", status: "unknown", waiting_for: "Deskew" }),
+    ).toBe("Margins: waiting for Deskew");
   });
 
   it("keeps a few hundred pages cheap: only visible rows exist in the DOM", () => {
@@ -178,16 +185,37 @@ describe("editor helpers", () => {
     parameters: extra,
   });
 
+  /** Rows whose results each record the previous row's output as their input (#205). */
+  const chain = (...entries: [string, string][]) => {
+    let input = "page-version";
+    return entries.map(([name, status], index) => {
+      const output = status === "success" ? `${sha}${index}` : "";
+      const row = {
+        ...stage(name, status),
+        output_sha256: output,
+        settings_applied: true,
+        applied_input_sha256: input,
+        input_sha256: index === 0 ? "page-version" : "",
+      };
+      input = output;
+      return row;
+    });
+  };
+
   it("shows the current stage's output, else the last completed stage before it", () => {
     const page = {
-      stages: [stage("deskew", "success"), stage("select_content", "success"), stage("dewarping", "queued")],
+      stages: chain(["deskew", "success"], ["select_content", "success"], ["dewarping", "queued"]),
     } as never;
     expect(stripSourceStage(page, "select_content")?.stage).toBe("select_content");
     expect(stripSourceStage(page, "margins")?.stage).toBe("select_content");
     expect(stripSourceStage(page, "deskew")?.stage).toBe("deskew");
-    expect(stripSourceStage({ stages: [stage("deskew", "failed")] } as never, "deskew")).toBe(
+    expect(stripSourceStage({ stages: chain(["deskew", "failed"]) } as never, "deskew")).toBe(
       undefined,
     );
+    // A stale result (#205) is not shown: Deskew's settings changed since it ran.
+    const stale = chain(["deskew", "success"], ["select_content", "success"]);
+    stale[0]!.settings_applied = false;
+    expect(stripSourceStage({ stages: stale } as never, "select_content")).toBe(undefined);
   });
 
   it("uses the content box for Select Content and the output size elsewhere", () => {

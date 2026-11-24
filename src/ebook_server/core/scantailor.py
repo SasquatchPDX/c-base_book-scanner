@@ -30,6 +30,7 @@ from . import (
     deskew,
     output_zones,
     scan_images,
+    scan_lifecycle,
     scan_transform,
 )
 from .models import (
@@ -396,40 +397,179 @@ def ensure_stage_states_for_pages(
                     page_id=str(page.id),
                     stage=stage,
                 )
+        # Derived state (#205) follows the input relations; resolve them in memory.
+        link_page_states(page_states, active_versions.get(page.id))
     return by_page
 
 
-def _invalidate(states: Any, reason: str) -> int:
-    """Mark ``states`` invalidated in one UPDATE (#195 §8.2 item 13).
+# Settings that determine a stage's result (#205): the editor's EDITABLE_KEYS plus
+# legacy inputs the runners still read. Everything else in ``parameters`` is recorded
+# by the worker (sizes, transform op, detection results). Edited settings are compared
+# on these keys only, so resubmitting what the editor shows after a run is no change.
+STAGE_SETTING_KEYS: Final[dict[str, tuple[str, ...]]] = {
+    "deskew": ("manual_angle",),
+    "select_content": (
+        "content_mode",
+        "content_box",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "left",
+        "top",
+        "right",
+        "bottom",
+        "width",
+        "height",
+    ),
+    "dewarping": ("dewarp_mode", "depth_perception", "top_curve", "bottom_curve"),
+    "margins": (
+        "margins_mode",
+        "margin",
+        "top",
+        "right",
+        "bottom",
+        "left",
+        "canvas_width",
+        "canvas_height",
+        "align_x",
+        "align_y",
+    ),
+    "output": (
+        "output_mode",
+        "keep_color",
+        "invert",
+        "zone_mode",
+        "zones",
+        "text_box",
+        "picture_box",
+        "text_algorithm",
+        "picture_algorithm",
+        "window_size",
+        "k",
+        "r",
+    ),
+}
 
-    ``updated_at`` is set explicitly: ``QuerySet.update`` skips ``auto_now``, and the
-    live workspace stream detects changes through it.
+
+def stage_settings(stage: str, parameters: object) -> dict[str, Any]:
+    """The settings part of ``parameters``: what decides the stage's result."""
+    if not isinstance(parameters, dict):
+        return {}
+    keys = STAGE_SETTING_KEYS.get(stage)
+    if keys is None:
+        return dict(parameters)
+    settings = {key: parameters[key] for key in keys if key in parameters}
+    if stage == "output" and str(parameters.get("zone_mode", "")).strip().lower() != "manual":
+        # Detected zones are a result; only a manual list is a setting.
+        settings.pop("zones", None)
+    return settings
+
+
+def stage_settings_applied(state: ScanTailorStageState) -> bool:
+    """Whether the stage's result was computed with its current settings (#205)."""
+    if state.applied_revision is None:
+        return False
+    if state.applied_revision == state.revision:
+        return True
+    return stage_settings(state.stage, state.parameters) == stage_settings(
+        state.stage, state.applied_parameters
+    )
+
+
+def stage_input_fingerprint(state: ScanTailorStageState) -> str:
+    """Fingerprint of the input ``state`` would be computed from now (#205).
+
+    The predecessor's ``output_sha256`` (its last result), or for the first stage the
+    checksum of the page version it reads. A successful run records this value as
+    ``applied_input_sha256``; a mismatch means "input changed". Anything else a stage's
+    result depends on (e.g. a job-wide aggregate) belongs in this function.
     """
-    return int(
-        states.update(
-            status=ScanTailorStageState.StageStatus.INVALIDATED,
-            invalidated_reason=reason,
-            last_error="",
-            updated_at=timezone.now(),
-        )
-    )
+    if previous_stage(state.stage) is None:
+        version = state.input_scan_page_version
+        if version is None:
+            version = state.scan_page.active_version()
+        return version.checksum_sha256 if version is not None else ""
+    predecessor = state.input_stage_state
+    if predecessor is None or predecessor.status != ScanTailorStageState.StageStatus.SUCCESS:
+        return ""
+    return predecessor.output_sha256
 
 
-def invalidate_downstream_states(
-    page: ScanPage,
-    *,
-    from_stage: str,
-    reason: str,
-) -> int:
-    stages = downstream_stages(from_stage)
-    if not stages:
-        return 0
-    return _invalidate(
-        ScanTailorStageState.objects.filter(
-            scan_job_id=page.scan_job_id, scan_page=page, stage__in=stages
-        ),
-        reason,
-    )
+def stage_result_is_current(state: ScanTailorStageState) -> bool:
+    """True iff ``state`` has a successful result matching its inputs and settings (#205).
+
+    Current means: the last run succeeded, it used the stage's current settings, its
+    recorded input fingerprint equals :func:`stage_input_fingerprint`, and the
+    predecessor is itself current (recursively up to the first stage).
+    """
+    if state.status != ScanTailorStageState.StageStatus.SUCCESS:
+        return False
+    if not stage_settings_applied(state):
+        return False
+    if previous_stage(state.stage) is not None:
+        predecessor = state.input_stage_state
+        if predecessor is None or not stage_result_is_current(predecessor):
+            return False
+    return stage_input_fingerprint(state) == state.applied_input_sha256
+
+
+def stage_waiting_for(state: ScanTailorStageState) -> str | None:
+    """The first predecessor (pipeline order) without a current result, else None."""
+    chain: list[ScanTailorStageState] = []
+    current = state
+    while (predecessor_name := previous_stage(current.stage)) is not None:
+        predecessor = current.input_stage_state
+        if predecessor is None:
+            # No linked row for an earlier stage: nothing before it can feed this one.
+            return predecessor_name
+        chain.append(predecessor)
+        current = predecessor
+    for upstream in reversed(chain):
+        if not stage_result_is_current(upstream):
+            return upstream.stage
+    return None
+
+
+def stage_stale_reason(state: ScanTailorStageState) -> str:
+    """Why a successful result is not current (#205), or "" when it is current or
+    there is no successful result: "settings changed, not applied" or "input changed".
+    """
+    if state.status != ScanTailorStageState.StageStatus.SUCCESS:
+        return ""
+    if not stage_settings_applied(state):
+        return "settings changed, not applied"
+    if not stage_result_is_current(state):
+        return "input changed"
+    return ""
+
+
+def stage_idle_status(state: ScanTailorStageState) -> str:
+    """Status of a stage without a job: SUCCESS if it holds a result, else UNKNOWN."""
+    if state.applied_revision is not None and state.output_storage_identifier:
+        return ScanTailorStageState.StageStatus.SUCCESS
+    return ScanTailorStageState.StageStatus.UNKNOWN
+
+
+def link_page_states(
+    states: dict[str, ScanTailorStageState],
+    active_version: ScanPageVersion | None = None,
+) -> None:
+    """Point each row's input relations at the given objects (no queries, no writes).
+
+    The derived-state functions above follow ``input_stage_state`` and
+    ``input_scan_page_version``; for one page's rows loaded together this avoids a
+    query per row. Only relations whose ids already match are set.
+    """
+    for stage, state in states.items():
+        predecessor_name = previous_stage(stage)
+        if predecessor_name is None:
+            if active_version is not None and state.input_scan_page_version_id == active_version.id:
+                state.input_scan_page_version = active_version
+            continue
+        predecessor = states.get(predecessor_name)
+        if predecessor is not None and state.input_stage_state_id == predecessor.id:
+            state.input_stage_state = predecessor
 
 
 def mark_state_stale(
@@ -438,10 +578,23 @@ def mark_state_stale(
     page_id: str,
     reason: str,
 ) -> int:
-    return _invalidate(
-        ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id),
-        reason,
-    )
+    """The page's source changed (a replacement scan): point the first stage at it.
+
+    Staleness is derived (#205): rebinding the first stage to the new active version
+    changes its input fingerprint, which makes it and every later stage stale. Every
+    row of the page is touched so live clients re-read it.
+    """
+    page = ScanPage.objects.get(pk=page_id)
+    active_version = page.active_version()
+    rows = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
+    now = timezone.now()
+    if active_version is not None:
+        rows.filter(stage=stage_order()[0]).update(
+            input_scan_page_version=active_version,
+            input_storage_identifier=active_version.storage_identifier,
+        )
+    logger.info("scantailor_page_source_changed", scan_page_id=page_id, reason=reason)
+    return int(rows.update(updated_at=now))
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -1473,6 +1626,7 @@ def request_stage_job(
     state: ScanTailorStageState,
     requested_by_user_id: int | None = None,
     dispatch: bool = True,
+    batch: bool = False,
 ) -> ProcessingJob:
     """Create and dispatch the worker job for ``state`` at its current revision.
 
@@ -1481,18 +1635,22 @@ def request_stage_job(
     revision. If an edit bumped the revision in between, the job is closed as
     superseded right away and never dispatched, so it cannot replace the newer
     edit's artifact; :func:`process_stage_job` repeats the check on execution.
+    ``batch`` marks work from "apply to pages"; stages it chains to queue at the back.
     """
     revision = state.revision
+    details: dict[str, Any] = {
+        "scan_job_id": str(state.scan_job_id),
+        "scan_tailor_stage_state_id": state.id,
+        "requested_by_user_id": requested_by_user_id,
+        "stage": state.stage,
+        "stage_revision": revision,
+    }
+    if batch:
+        details["batch"] = True
     job = ProcessingJob.objects.create(
         job_type=ProcessingJob.JobType.STAGE,
         state=ProcessingJob.JobState.QUEUED,
-        details={
-            "scan_job_id": str(state.scan_job_id),
-            "scan_tailor_stage_state_id": state.id,
-            "requested_by_user_id": requested_by_user_id,
-            "stage": state.stage,
-            "stage_revision": revision,
-        },
+        details=details,
     )
     algorithm = state.algorithm or _default_algorithm(state.stage)
     if state.stage in {"deskew", "select_content", "dewarping"}:
@@ -1506,7 +1664,6 @@ def request_stage_job(
         algorithm=algorithm,
         algorithm_version=algorithm_version,
         last_error="",
-        invalidated_reason="",
         updated_at=now,
     )
     if not claimed:
@@ -1515,12 +1672,75 @@ def request_stage_job(
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
-    state.invalidated_reason = ""
     state.algorithm = algorithm
     state.algorithm_version = algorithm_version
     state.updated_at = now
     if dispatch:
-        dispatch_stage_job(str(job.job_id))
+        dispatch_stage_job(str(job.job_id), at_front=not batch)
+    return job
+
+
+def request_stage_job_if_ready(
+    *,
+    state: ScanTailorStageState,
+    requested_by_user_id: int | None = None,
+    dispatch: bool = True,
+    batch: bool = False,
+) -> tuple[ProcessingJob | None, str | None]:
+    """Queue ``state`` only if it can run and its result is not current (#205).
+
+    Returns ``(job, waiting_for)``. A stage whose predecessors are not all successful
+    and current gets no job: ``waiting_for`` names the first such stage, and the stage
+    is queued by :func:`queue_ready_successor` once that predecessor chain completes.
+    A stage whose result already matches its settings and input needs no job either.
+    """
+    waiting = stage_waiting_for(state)
+    if waiting is not None:
+        return None, waiting
+    if stage_result_is_current(state):
+        return None, None
+    job = request_stage_job(
+        state=state,
+        requested_by_user_id=requested_by_user_id,
+        dispatch=dispatch,
+        batch=batch,
+    )
+    return job, None
+
+
+def queue_ready_successor(
+    state: ScanTailorStageState,
+    *,
+    requested_by_user_id: int | None = None,
+    batch: bool = False,
+) -> ProcessingJob | None:
+    """After ``state`` succeeded, queue the next stage of its page if it is stale (#205).
+
+    The next stage runs with its saved settings (defaults if never edited) when its
+    result is not current and every stage before it is. A stage already queued keeps
+    its pending job, which reads the new input when it runs.
+    """
+    next_name = next(iter(downstream_stages(state.stage)), None)
+    if next_name is None or not stage_result_is_current(state):
+        return None
+    if ScanJob.objects.filter(pk=state.scan_job_id).values_list("state", flat=True).first() not in (
+        scan_lifecycle.PROCESSING_STATES
+    ):
+        return None
+    # A stage never opened has no row yet; it runs with its defaults.
+    successor = get_or_create_stage_state(
+        scan_job_id=str(state.scan_job_id), page_id=str(state.scan_page_id), stage=next_name
+    )
+    if successor.input_stage_state_id != state.id:
+        return None
+    successor.input_stage_state = state
+    if successor.status == ScanTailorStageState.StageStatus.QUEUED:
+        return None
+    job, _ = request_stage_job_if_ready(
+        state=successor,
+        requested_by_user_id=requested_by_user_id,
+        batch=batch,
+    )
     return job
 
 
@@ -1529,17 +1749,18 @@ def request_stage_job(
 STAGE_BATCH_CHUNK: Final[int] = 8
 
 
-def dispatch_stage_job(job_id: str) -> None:
+def dispatch_stage_job(job_id: str, *, at_front: bool = True) -> None:
     """Run one interactive stage job before any queued batch work (#195 §8.2 item 11).
 
     Upstream Scan Tailor processes the page the user is looking at first. Here a
-    single-page edit goes to the front of the queue; batch chunks go to the back.
+    single-page edit goes to the front of the queue; batch chunks go to the back, and
+    so do the stages a batch job chains to (``at_front=False``).
     """
     queue = get_queue()
     if queue is None:
         process_stage_job(job_id)
         return
-    queue.enqueue(process_stage_job, job_id, at_front=True)
+    queue.enqueue(process_stage_job, job_id, at_front=at_front)
 
 
 def process_stage_jobs(job_ids: list[str]) -> None:
@@ -1586,6 +1807,11 @@ def _upstream_chain(state: ScanTailorStageState) -> list[ScanTailorStageState]:
     return chain
 
 
+def _result_parameters(state: ScanTailorStageState) -> dict[str, Any]:
+    """Parameters recorded by the run that produced ``state``'s result (#205)."""
+    return dict(state.applied_parameters or state.parameters or {})
+
+
 def _page_version(
     state: ScanTailorStageState, chain: list[ScanTailorStageState]
 ) -> ScanPageVersion:
@@ -1612,7 +1838,9 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
         full_size = (page_image.full_width, page_image.full_height)
     else:
         for upstream in chain:
-            op = (upstream.parameters or {}).get("transform")
+            # What the upstream result was computed with (#205), not settings that
+            # were edited since: only current upstream results are read.
+            op = _result_parameters(upstream).get("transform")
             if not isinstance(op, dict):
                 raise RuntimeError(
                     f"upstream stage {upstream.stage} has no recorded transform; re-run it"
@@ -1620,7 +1848,7 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
             ops.append(op)
         predecessor = chain[-1]
         work_identifier = predecessor.output_storage_identifier
-        parameters = predecessor.parameters or {}
+        parameters = _result_parameters(predecessor)
         try:
             full_size = (int(parameters["output_width"]), int(parameters["output_height"]))
         except (KeyError, TypeError, ValueError) as exc:
@@ -1724,11 +1952,12 @@ def process_stage_job(job_id: str) -> None:
         _supersede_stage_job(job, details, "stage revision changed after dispatch")
         return
 
-    if state.input_stage_state is not None:
-        input_state = state.input_stage_state
-        if input_state.status != ScanTailorStageState.StageStatus.SUCCESS:
-            _fail_stage_job(job, f"upstream stage {input_state.stage} not complete")
-            return
+    # A predecessor changed after this job was queued (#205): this is not a failure.
+    # The stage waits; the predecessor's successful run queues it again.
+    waiting = stage_waiting_for(state)
+    if waiting is not None:
+        _park_waiting_stage_job(job, details, state, waiting)
+        return
 
     now = timezone.now()
     job.state = ProcessingJob.JobState.RUNNING
@@ -1737,6 +1966,7 @@ def process_stage_job(job_id: str) -> None:
     claimed = ScanTailorStageState.objects.filter(
         id=state.id,
         revision=started_revision,
+        worker_job_id=str(job.job_id),
     ).update(
         status=ScanTailorStageState.StageStatus.RUNNING,
         started_at=now,
@@ -1764,6 +1994,8 @@ def process_stage_job(job_id: str) -> None:
         runner = _resolve_stage_algorithm(state)
         # Per-phase timings for the structured log (#195 section 8.3).
         timer_start = time.perf_counter()
+        # Recorded with the result (#205): what this run reads, taken before reading it.
+        input_fingerprint = stage_input_fingerprint(state)
         stage_input = _stage_input(state, storage)
         input_done = time.perf_counter()
         result = runner(state, stage_input)
@@ -1802,6 +2034,8 @@ def process_stage_job(job_id: str) -> None:
                 output_size,
                 output_sha,
                 thumbnail=staged_thumbnail,
+                input_fingerprint=input_fingerprint,
+                job_id=str(job.job_id),
             ):
                 _supersede_stage_job(job, details, "stage edited while job was running")
                 return
@@ -1832,12 +2066,21 @@ def process_stage_job(job_id: str) -> None:
         )
     except Exception as exc:
         with transaction.atomic():
-            if _locked_if_current(state.id, started_revision) is not None:
+            if _locked_if_current(state.id, started_revision, str(job.job_id)) is not None:
                 state.status = ScanTailorStageState.StageStatus.FAILED
                 state.last_error = str(exc)
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc))
+        return
+
+    # Chaining (#205): the next stage of the page runs now if its result is stale.
+    requested_by = details.get("requested_by_user_id")
+    queue_ready_successor(
+        state,
+        requested_by_user_id=requested_by if isinstance(requested_by, int) else None,
+        batch=bool(details.get("batch")),
+    )
 
 
 def _publish_stage_artifacts(
@@ -1852,6 +2095,8 @@ def _publish_stage_artifacts(
     output_size: int,
     output_sha: str,
     thumbnail: Path | None = None,
+    input_fingerprint: str = "",
+    job_id: str | None = None,
 ) -> bool:
     """Copy privately, then promote under the same row lock used by retirement.
 
@@ -1875,7 +2120,7 @@ def _publish_stage_artifacts(
         ) != _compute_sha256(preview):
             raise RuntimeError("staged processing artifact checksum mismatch")
         with transaction.atomic():
-            if _locked_if_current(state.id, revision) is None:
+            if _locked_if_current(state.id, revision, job_id) is None:
                 return False
             storage.commit_staged(private_output, output_identifier)
             storage.commit_staged(private_preview, preview_identifier)
@@ -1891,8 +2136,15 @@ def _publish_stage_artifacts(
             state.finished_at = timezone.now()
             state.last_error = ""
             state.algorithm_version = _default_algorithm_version(state.stage, state.algorithm)
+            # The result's fingerprint (#205): input, settings as run, revision.
+            state.applied_input_sha256 = input_fingerprint
+            state.applied_parameters = dict(state.parameters or {})
+            state.applied_revision = revision
             state.save(
                 update_fields=[
+                    "applied_input_sha256",
+                    "applied_parameters",
+                    "applied_revision",
                     "algorithm_version",
                     "output_storage_location",
                     "preview_storage_location",
@@ -1916,12 +2168,15 @@ def _publish_stage_artifacts(
                 logger.warning("scantailor_private_cleanup_failed", stage_state_id=state.pk)
 
 
-def _locked_if_current(state_id: int, revision: int) -> ScanTailorStageState | None:
+def _locked_if_current(
+    state_id: int, revision: int, job_id: str | None = None
+) -> ScanTailorStageState | None:
     """Lock the stage row; return it only if this job's run is still the current one.
 
-    A user edit bumps ``revision`` (and re-queues the state); an upstream edit flips
-    the status to INVALIDATED. In either case this job's result is stale and must not
-    overwrite the newer parameters/status.
+    A user edit bumps ``revision``; a newer job for the same revision (queued when the
+    predecessor's result changed, #205) takes over ``worker_job_id`` and the status.
+    In either case this job's result is stale and must not overwrite the newer
+    parameters/status.
     """
     with transaction.atomic():
         fresh = ScanTailorStageState.objects.select_for_update().filter(id=state_id).first()
@@ -1931,7 +2186,33 @@ def _locked_if_current(state_id: int, revision: int) -> ScanTailorStageState | N
             return None
         if fresh.status != ScanTailorStageState.StageStatus.RUNNING:
             return None
+        if job_id is not None and fresh.worker_job_id != job_id:
+            return None
         return fresh
+
+
+def _park_waiting_stage_job(
+    job: ProcessingJob,
+    details: dict[str, Any],
+    state: ScanTailorStageState,
+    waiting_for: str,
+) -> None:
+    """Close a job whose predecessor is not current any more, without failing the stage.
+
+    If the row still waits on this job, it returns to its idle status (its previous
+    result, if any, stays as a stale result). The predecessor's next successful run
+    queues the stage again (:func:`queue_ready_successor`).
+    """
+    with transaction.atomic():
+        fresh = ScanTailorStageState.objects.select_for_update().filter(id=state.id).first()
+        if (
+            fresh is not None
+            and fresh.worker_job_id == str(job.job_id)
+            and fresh.status == ScanTailorStageState.StageStatus.QUEUED
+        ):
+            fresh.status = stage_idle_status(fresh)
+            fresh.save(update_fields=["status", "updated_at"])
+    _supersede_stage_job(job, {**details, "waiting_for": waiting_for}, f"waiting for {waiting_for}")
 
 
 def _supersede_stage_job(job: ProcessingJob, details: dict[str, Any], reason: str) -> None:

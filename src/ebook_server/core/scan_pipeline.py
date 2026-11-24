@@ -30,6 +30,7 @@ from . import (
     scan_events,
     scan_lifecycle,
     scan_logs,
+    scantailor,
 )
 from .models import (
     FileVariant,
@@ -65,7 +66,7 @@ def _ordered_pages(job: ScanJob) -> list[ScanPage]:
 
 
 def _active_output_state(page: ScanPage) -> ScanTailorStageState | None:
-    return (
+    state = (
         ScanTailorStageState.objects.filter(
             scan_job=page.scan_job,
             scan_page=page,
@@ -75,6 +76,10 @@ def _active_output_state(page: ScanPage) -> ScanTailorStageState | None:
         .order_by("-revision", "-created_at")
         .first()
     )
+    # A stale result (its input or settings changed since it ran, #205) is not used.
+    if state is None or not scantailor.stage_result_is_current(state):
+        return None
+    return state
 
 
 def _select_page_source_identifier(

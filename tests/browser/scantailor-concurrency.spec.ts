@@ -165,9 +165,10 @@ test("a member completes the physical-book pipeline through the browser", async 
     await member.getByLabel("Sequence").fill("1");
     await member.getByRole("button", { name: "Upload page" }).click();
     await expect(member.locator(".scan-page-card")).not.toContainText("Rescan requested");
+    // The replacement changed Deskew's input; later results are stale until it re-runs (#205).
     await expect(
-      member.locator('[data-stage-row][data-stage="output"] [data-stage-status]'),
-    ).toHaveText("invalidated");
+      member.locator('[data-stage-row][data-stage="output"] [data-stage-readiness]'),
+    ).toHaveText("waiting for Deskew");
     await runAllScanTailorStages(member);
 
     await member.getByRole("button", { name: "Search metadata" }).click();

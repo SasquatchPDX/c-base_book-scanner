@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from django.db import connection
+from django.db.models import F
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from PIL import Image
@@ -48,21 +49,23 @@ def _run(client: Any, job_id: str, page: ScanPage, stage: str, parameters: dict[
 
 
 @pytest.mark.django_db(transaction=True)
-def test_invalidation_is_one_update_and_bumps_updated_at() -> None:
+def test_source_change_is_two_updates_and_bumps_updated_at() -> None:
+    """A replacement scan only rebinds the first stage; staleness is derived (#205)."""
     client, job = _create_scan_job("serving-invalidate")
     page = _page(client, str(job.id))
     client.get(f"/scan/jobs/{job.id}/pages/{page.id}/stages/")
-    before = {s.stage: s.updated_at for s in ScanTailorStageState.objects.filter(scan_page=page)}
+    before = {s.stage: s for s in ScanTailorStageState.objects.filter(scan_page=page)}
     with CaptureQueriesContext(connection) as queries:
-        count = scantailor.invalidate_downstream_states(page, from_stage="deskew", reason="x")
-    assert count == 4
+        count = scantailor.mark_state_stale(
+            scan_job_id=str(job.id), page_id=str(page.id), reason="x"
+        )
+    assert count == len(scantailor.stage_order())
     writes = [q["sql"] for q in queries if q["sql"].startswith("UPDATE")]
-    assert len(writes) == 1
+    assert len(writes) == 2
     after = {s.stage: s for s in ScanTailorStageState.objects.filter(scan_page=page)}
-    for stage in ("select_content", "dewarping", "margins", "output"):
-        assert after[stage].status == ScanTailorStageState.StageStatus.INVALIDATED
-        assert after[stage].updated_at > before[stage]
-    assert after["deskew"].updated_at == before["deskew"]
+    for stage in scantailor.stage_order():
+        assert after[stage].status == before[stage].status
+        assert after[stage].updated_at > before[stage].updated_at
 
 
 @pytest.mark.django_db(transaction=True)
@@ -178,6 +181,8 @@ def test_thumbnail_bytes_and_token_come_from_one_selection_under_invalidation(
         client, str(job.id), sequence=1, side="single", payload=_landscape_png(), filename="p.png"
     )
     page = ScanPage.objects.get(scan_job_id=job.id, logical_sequence_number=1)
+    # Only Deskew runs, so the thumbnail shows its result (#205 chains later stages).
+    monkeypatch.setattr(scantailor, "queue_ready_successor", lambda *args, **kwargs: None)
     _run(client, str(job.id), page, "deskew", {"manual_angle": 45})
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     version = page.active_version()
@@ -206,8 +211,9 @@ def test_thumbnail_bytes_and_token_come_from_one_selection_under_invalidation(
         nonlocal calls
         calls += 1
         if calls == 1:
-            ScanTailorStageState.objects.filter(scan_page=page).update(
-                status=ScanTailorStageState.StageStatus.INVALIDATED
+            # Deskew's settings change: its result is stale from now on (#205).
+            ScanTailorStageState.objects.filter(scan_page=page, stage="deskew").update(
+                parameters={"manual_angle": 10}, revision=F("revision") + 1
             )
         return stage_order()
 
@@ -282,7 +288,8 @@ def test_state_endpoint_returns_only_changed_rows_without_writing(
     _run(client, str(job.id), pages[1], "margins", {"margin": 4})
     changed = client.get(url, {"since": cursor}).json()["stages"]
     assert {row["scan_page_id"] for row in changed} == {str(pages[1].id)}
-    assert {row["stage"] for row in changed} >= {"margins", "output"}
+    # Saving stores Margins' settings only; nothing else is written (#205).
+    assert {row["stage"] for row in changed} == {"margins"}
 
     assert client.get(url, {"since": "yesterday"}).status_code == 400
     assert client.get(url, {"since": "2026-11-18T10:00:00"}).status_code == 400

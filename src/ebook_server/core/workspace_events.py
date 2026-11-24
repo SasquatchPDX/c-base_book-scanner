@@ -70,7 +70,10 @@ class WorkspaceEventPoller:
         )
         if unchanged_stages and job_token == self._job_token:
             return WorkspaceUpdate(True, None)
-        query = ScanTailorStageState.objects.filter(scan_job_id=self.job_id)
+        # The first stage serializes its input version's checksum (#205).
+        query = ScanTailorStageState.objects.filter(scan_job_id=self.job_id).select_related(
+            "input_scan_page_version"
+        )
         if self._tokens is None:
             states = list(
                 query.order_by(
