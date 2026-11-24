@@ -424,6 +424,50 @@ export function stageStatusMessage(
   return { text: base, tone: "info" };
 }
 
+/** The first earlier stage of the page without a result: the stage ``stage`` waits for. */
+export function stageWaitingFor(
+  page: Pick<WorkspacePage, "stages">,
+  stage: StageName,
+): StageName | null {
+  for (const name of STAGE_ORDER) {
+    if (name === stage) return null;
+    if (page.stages.find((state) => state.stage === name)?.status !== "success") return name;
+  }
+  return null;
+}
+
+/**
+ * Editor status line while the active stage runs by itself (#209): what it waits for,
+ * that it runs (or restarts with newer settings), or why it failed.
+ */
+export function stageRunMessage(
+  page: Pick<WorkspacePage, "stages">,
+  state: Pick<StageState, "stage" | "status" | "last_error" | "revision" | "invalidated_reason">,
+  restarting = false,
+): { text: string; tone: "info" | "error" } {
+  const waitingFor = state.status === "success" ? null : stageWaitingFor(page, state.stage);
+  if (waitingFor) return { text: `Waiting for ${STAGE_LABELS[waitingFor]}.`, tone: "info" };
+  if (state.status === "queued" || state.status === "running") {
+    return {
+      text: restarting ? "Restarting with new settings…" : "Running…",
+      tone: "info",
+    };
+  }
+  return stageStatusMessage(state);
+}
+
+/** JSON with sorted object keys, to compare drafts regardless of key order. */
+export function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    isObject(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
+      : item,
+  );
+}
+
+/** Pause after the last change before the draft is saved and the stage runs (#209). */
+export const AUTOSAVE_DELAY_MS = 600;
+
 export function normalizeBox(value: unknown, fallback: Box): Box {
   if (Array.isArray(value) && value.length >= 4) {
     return orderedBox({
@@ -521,7 +565,7 @@ class WorkspaceController {
   private readonly message: HTMLElement;
   private readonly liveStatus: HTMLElement;
   private readonly title: HTMLElement;
-  private readonly saveButton: HTMLButtonElement;
+  private readonly revertButton: HTMLButtonElement | null;
   private readonly batchButton: HTMLButtonElement;
   private readonly batchScope: HTMLSelectElement;
   private readonly preserveExceptions: HTMLInputElement;
@@ -555,9 +599,13 @@ class WorkspaceController {
   private deskewOverlay: DeskewOverlay | null = null;
   private contentOverlay: ContentBoxOverlay | null = null;
   private dewarpOverlay: DewarpOverlay | null = null;
-  private deskewSaveTimer: number | null = null;
+  private commitTimer: number | null = null;
   private saving = false;
   private saveQueued = false;
+  /** The draft as last saved (or loaded), to skip saving an unchanged draft (#209). */
+  private savedDraft = "";
+  /** Revision saved while an older run was active: it restarts with the new settings. */
+  private restartingRevision: number | null = null;
 
   constructor(root: HTMLElement, pages: WorkspacePage[]) {
     this.root = root;
@@ -568,7 +616,7 @@ class WorkspaceController {
     this.message = element(root, "[data-editor-message]");
     this.liveStatus = element(root, "[data-live-status]");
     this.title = element(root, "[data-editor-title]");
-    this.saveButton = element(root, "[data-save-stage]");
+    this.revertButton = root.querySelector<HTMLButtonElement>("[data-revert-stage]");
     this.batchButton = element(root, "[data-batch-stage]");
     this.batchScope = element(root, "[data-batch-scope]");
     this.preserveExceptions = element(root, "[data-preserve-exceptions]");
@@ -633,7 +681,7 @@ class WorkspaceController {
         if (isStageName(value)) void this.runStageForAllPages(value, button);
       });
     });
-    this.saveButton.addEventListener("click", () => void this.saveActiveStage());
+    this.revertButton?.addEventListener("click", () => this.revertDraft());
     this.batchButton.addEventListener("click", () => void this.applyBatch());
     this.bindCanvas();
     this.bindStrip();
@@ -649,9 +697,9 @@ class WorkspaceController {
       if (this.previewRetry !== INITIAL_PREVIEW_RETRY) {
         // Recovered after a retry: replace the "being prepared" note.
         this.previewRetry = INITIAL_PREVIEW_RETRY;
-        const state = this.activeContext()?.state;
-        if (state) {
-          const message = stageStatusMessage(state);
+        const context = this.activeContext();
+        if (context) {
+          const message = stageRunMessage(context.page, context.state);
           this.setMessage(message.text, message.tone);
         }
       }
@@ -727,6 +775,8 @@ class WorkspaceController {
     const page = this.pages.get(pageId);
     const state = page ? stageFor(page, stage) : undefined;
     if (!page || !state) return;
+    // A change still waiting for its autosave is saved before the editor moves on.
+    if (this.commitTimer !== null) void this.commitDraft();
     const stageChanged = stage !== this.activeStage;
     if (pageId !== this.activePageId || stageChanged) this.fitPending = true;
     this.activePageId = pageId;
@@ -745,11 +795,45 @@ class WorkspaceController {
     this.updateSelectionCount();
     this.title.textContent = `Page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}`;
     this.markActiveControls();
+    this.restartingRevision = null;
     this.renderControls();
+    // After renderControls: the controls fill in their defaults.
+    this.savedDraft = stableJson(this.draft);
     this.showPreview("input");
-    this.saveButton.disabled = !this.editable;
-    const message = stageStatusMessage(state);
+    if (this.revertButton) this.revertButton.disabled = !this.editable;
+    const message = stageRunMessage(page, state);
     this.setMessage(message.text, message.tone);
+    void this.ensureActiveStage();
+  }
+
+  /**
+   * Run the stage being opened unless its result is current (#209). The server
+   * queues it at most once, and not before every earlier stage has a result.
+   */
+  private async ensureActiveStage(): Promise<void> {
+    const context = this.activeContext();
+    if (!context || !this.editable) return;
+    const url = this.url("ensureUrlTemplate", context.page.id, context.state.stage);
+    if (!url) return;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-CSRFToken": csrfToken() },
+      });
+      if (!response.ok) return;
+      const payload = (await response.json()) as { stage: StageState };
+      this.mergeStage(payload.stage);
+    } catch {
+      // Live updates or the next visit try again.
+    }
+  }
+
+  /** "Revert to saved": drop unsaved changes and show the stored settings again. */
+  private revertDraft(): void {
+    if (this.commitTimer !== null) window.clearTimeout(this.commitTimer);
+    this.commitTimer = null;
+    if (this.activePageId) this.activate(this.activePageId, this.activeStage);
   }
 
   private showPreview(mode: "input" | "result"): void {
@@ -810,6 +894,12 @@ class WorkspaceController {
     const justCompleted =
       state.status === "success" &&
       (previous?.status !== "success" || previous.revision !== state.revision);
+    const page = this.pages.get(state.scan_page_id);
+    if (state.status !== "success" && page && !this.saving) {
+      // Waiting, running, restarting with new settings, or failed (#209).
+      const message = stageRunMessage(page, state, this.restartingRevision === state.revision);
+      this.setMessage(message.text, message.tone);
+    }
     if (state.stage === "deskew") {
       // The input view already shows the rotation live; stay there and show the result.
       this.showPreview(this.previewMode);
@@ -1001,23 +1091,28 @@ class WorkspaceController {
     const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
     if (result) result.textContent = `${describeAngle(rounded)} (manual, not saved yet).`;
     this.applyDeskewPreview();
-    if (commit) this.scheduleDeskewCommit();
+    if (commit) this.scheduleCommit();
   }
 
-  private scheduleDeskewCommit(): void {
-    if (this.deskewSaveTimer !== null) window.clearTimeout(this.deskewSaveTimer);
-    this.deskewSaveTimer = window.setTimeout(() => {
-      this.deskewSaveTimer = null;
+  /**
+   * Save the draft after a short pause (#209): every stage saves by itself, and the
+   * server runs it with the new settings (a run of older settings is cancelled).
+   */
+  private scheduleCommit(): void {
+    if (!this.editable) return;
+    if (this.commitTimer !== null) window.clearTimeout(this.commitTimer);
+    this.commitTimer = window.setTimeout(() => {
+      this.commitTimer = null;
       void this.commitDraft();
-    }, 600);
+    }, AUTOSAVE_DELAY_MS);
   }
 
   /** Save the stage draft; a change made while a save is running is saved after it. */
   private async commitDraft(): Promise<void> {
     if (!this.editable) return;
-    if (this.deskewSaveTimer !== null) {
-      window.clearTimeout(this.deskewSaveTimer);
-      this.deskewSaveTimer = null;
+    if (this.commitTimer !== null) {
+      window.clearTimeout(this.commitTimer);
+      this.commitTimer = null;
     }
     if (this.saving) {
       this.saveQueued = true;
@@ -1037,7 +1132,7 @@ class WorkspaceController {
     if (!state) return;
     const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
     const editing =
-      this.deskewSaveTimer !== null ||
+      this.commitTimer !== null ||
       this.saving ||
       this.deskewOverlay?.isDragging() === true ||
       (field !== null && document.activeElement === field);
@@ -1398,6 +1493,7 @@ class WorkspaceController {
               finiteNumber(input.value, zone.box[coordinate] ?? 0),
             );
             this.renderGeometry();
+            this.scheduleCommit();
           });
           wrapper.append(input);
           this.controls.append(wrapper);
@@ -1439,7 +1535,10 @@ class WorkspaceController {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = label;
-    button.addEventListener("click", action);
+    button.addEventListener("click", () => {
+      action();
+      this.scheduleCommit();
+    });
     this.controls.append(button);
   }
 
@@ -1477,7 +1576,10 @@ class WorkspaceController {
       option.selected = value === current;
       select.append(option);
     }
-    select.addEventListener("change", () => change(select.value));
+    select.addEventListener("change", () => {
+      change(select.value);
+      this.scheduleCommit();
+    });
     label.append(select);
     this.controls.append(label);
   }
@@ -1500,9 +1602,10 @@ class WorkspaceController {
     if (maximum !== undefined) input.max = String(maximum);
     this.draft[key] = Number(input.value);
     input.addEventListener("input", () => {
-      if (input.validity.valid) {
+      if (input.validity.valid && input.value !== "") {
         this.draft[key] = Number(input.value);
         this.renderGeometry();
+        this.scheduleCommit();
       }
     });
     label.append(input);
@@ -1518,6 +1621,7 @@ class WorkspaceController {
     this.draft[key] = input.checked;
     input.addEventListener("change", () => {
       this.draft[key] = input.checked;
+      this.scheduleCommit();
     });
     label.append(input, document.createTextNode(labelText));
     this.controls.append(label);
@@ -1669,6 +1773,7 @@ class WorkspaceController {
       const next = displayBoxToSource(displayed, source, display);
       if (onChange) onChange(next);
       else this.draft[key] = [next.x1, next.y1, next.x2, next.y2];
+      this.scheduleCommit();
     };
     const restriction = interact.modifiers.restrictRect({
       restriction: "parent",
@@ -1738,9 +1843,13 @@ class WorkspaceController {
     if (!context || !this.activePageId || !this.editable) return;
     const url = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
     if (!url) return;
+    const draft = stableJson(this.draft);
+    if (draft === this.savedDraft) return; // nothing changed: nothing to run
+    const restarting = context.state.status === "queued" || context.state.status === "running";
+    const pageId = this.activePageId;
+    const stage = this.activeStage;
     this.saving = true;
-    this.saveButton.disabled = true;
-    this.setMessage("Saving revision and queueing a preview…", "info");
+    this.setMessage(restarting ? "Restarting with new settings…" : "Saving…", "info");
     try {
       const response = await fetch(url, {
         method: "POST",
@@ -1765,25 +1874,38 @@ class WorkspaceController {
       }
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as { stage: StageState };
+      // The editor may have moved on to another page or stage while this was saved.
+      const stillActive = this.activePageId === pageId && this.activeStage === stage;
+      if (stillActive) {
+        this.savedDraft = draft;
+        this.restartingRevision =
+          restarting && payload.stage.status !== "success" ? payload.stage.revision : null;
+      }
       this.mergeStage(payload.stage);
+      if (!stillActive) return;
       const done = payload.stage.status === "success";
+      if (!done) {
+        const page = this.pages.get(payload.stage.scan_page_id);
+        const message = page
+          ? stageRunMessage(page, payload.stage, this.restartingRevision !== null)
+          : stageStatusMessage(payload.stage);
+        this.setMessage(message.text, message.tone);
+        return;
+      }
       this.setMessage(
-        done && payload.stage.stage === "deskew"
+        payload.stage.stage === "deskew"
           ? `Saved. ${deskewResultText(payload.stage.parameters)}`
-          : done && payload.stage.stage === "dewarping"
+          : payload.stage.stage === "dewarping"
             ? `Saved. ${describeDewarp(payload.stage.parameters)}`
-          : done && payload.stage.stage === "select_content"
+          : payload.stage.stage === "select_content"
             ? `Saved. ${describeContent(payload.stage.parameters, this.contentBox(), this.contentDpi())}`
-            : done
-            ? "Saved. Result preview is ready."
-            : "Saved. The worker is generating the new preview.",
+            : "Saved. Result preview is ready.",
         "success",
       );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Stage update failed.", "error");
     } finally {
       this.saving = false;
-      this.saveButton.disabled = !this.editable;
       if (!this.saveQueued) this.syncDeskewControls();
     }
   }
@@ -2151,7 +2273,7 @@ class WorkspaceController {
   private disableEditor(message: string): void {
     this.image.hidden = true;
     this.controls.replaceChildren();
-    this.saveButton.disabled = true;
+    if (this.revertButton) this.revertButton.disabled = true;
     this.batchButton.disabled = true;
     this.setMessage(message, "info");
   }

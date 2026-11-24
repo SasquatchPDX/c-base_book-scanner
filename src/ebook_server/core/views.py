@@ -1243,18 +1243,21 @@ def _coerce_uuid_list(raw_values: Any) -> list[str] | None:
     return page_ids
 
 
-def _apply_stage_payload_to_state(
+def _edited_stage_settings(
     state: ScanTailorStageState,
-    page: ScanPage,
     stage: str,
     payload: dict[str, Any],
-) -> None:
+) -> tuple[str, str, dict[str, Any]]:
+    """The algorithm, version and parameters ``state`` has after the edit ``payload``."""
+    algorithm_name = state.algorithm
+    version = state.algorithm_version
+    new_parameters = state.parameters
     algorithm = payload.get("algorithm")
     if isinstance(algorithm, str) and algorithm.strip():
-        state.algorithm = algorithm.strip()
+        algorithm_name = algorithm.strip()
     algorithm_version = payload.get("algorithm_version")
     if isinstance(algorithm_version, str) and algorithm_version.strip():
-        state.algorithm_version = algorithm_version.strip()
+        version = algorithm_version.strip()
     parameters = payload.get("parameters")
     if isinstance(parameters, dict):
         merged = dict(parameters)
@@ -1267,9 +1270,81 @@ def _apply_stage_payload_to_state(
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
-                state.algorithm = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
-        state.parameters = merged
+                algorithm_name = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
+        new_parameters = merged
+    return algorithm_name, version, new_parameters
 
+
+# The settings a member edits per stage; the frontend's EDITABLE_KEYS (#209).
+_EDITABLE_STAGE_KEYS: Final[dict[str, frozenset[str]]] = {
+    "deskew": frozenset({"manual_angle"}),
+    "select_content": frozenset({"content_mode", "content_box"}),
+    "dewarping": frozenset({"dewarp_mode", "depth_perception", "top_curve", "bottom_curve"}),
+    "margins": frozenset(
+        {
+            "margins_mode",
+            "margin",
+            "top",
+            "right",
+            "bottom",
+            "left",
+            "canvas_width",
+            "canvas_height",
+            "align_x",
+            "align_y",
+        }
+    ),
+    "output": frozenset(
+        {
+            "output_mode",
+            "keep_color",
+            "invert",
+            "zone_mode",
+            "zones",
+            "text_box",
+            "picture_box",
+            "text_algorithm",
+            "picture_algorithm",
+            "window_size",
+            "k",
+            "r",
+        }
+    ),
+}
+
+
+def _stage_edit_is_noop(state: ScanTailorStageState, stage: str, payload: dict[str, Any]) -> bool:
+    """Whether ``payload`` posts the settings ``state`` already has (#209).
+
+    Every posted parameter must equal the stored one, and no stored setting may be
+    missing from the post (switching a mode back to auto drops its manual values). A
+    request without parameters asks for a run and is never a no-op.
+    """
+    if not isinstance(payload.get("parameters"), dict):
+        return False
+    algorithm, _, parameters = _edited_stage_settings(state, stage, payload)
+    if algorithm != state.algorithm:
+        return False
+    stored = dict(state.parameters or {})
+    missing = object()
+    if any(stored.get(key, missing) != value for key, value in parameters.items()):
+        return False
+    return not any(
+        key not in parameters and stored[key] not in (None, "", [], {})
+        for key in _EDITABLE_STAGE_KEYS.get(stage, frozenset())
+        if key in stored
+    )
+
+
+def _apply_stage_payload_to_state(
+    state: ScanTailorStageState,
+    page: ScanPage,
+    stage: str,
+    payload: dict[str, Any],
+) -> None:
+    state.algorithm, state.algorithm_version, state.parameters = _edited_stage_settings(
+        state, stage, payload
+    )
     _bind_stage_inputs(state, page)
     state.revision += 1
     state.last_error = ""
@@ -1580,24 +1655,83 @@ def scan_page_stage(
         state = _lock_stage_state(state)
         if expected_revision is not None and expected_revision != state.revision:
             return _conflict_response(state, expected_revision)
-        _apply_and_save_stage_edit(state, page, normalized_stage, payload)
-        scantailor.invalidate_downstream_states(
-            page,
-            from_stage=state.stage,
-            reason=f"{state.stage} updated",
-        )
+        # Posting the stored settings again changes nothing: no revision, no job (#209).
+        unchanged = _stage_edit_is_noop(state, normalized_stage, payload)
+        if not unchanged:
+            _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+            scantailor.invalidate_downstream_states(
+                page,
+                from_stage=state.stage,
+                reason=f"{state.stage} updated",
+            )
 
-    processing_job = scantailor.request_stage_job(
-        state=state,
-        requested_by_user_id=profile.user_id,
-    )
-    response_payload = {
-        "stage": _serialize_stage_state(state),
-        "job": scantailor.stage_job_payload(processing_job),
-    }
+    # Queued only when every earlier stage has a current result; otherwise the stage
+    # runs once they finish and the answer says what it waits for (#205, #209).
+    ensured = scantailor.ensure_stage_result(state, requested_by_user_id=profile.user_id)
+    response_payload = _ensure_payload(ensured)
+    response_payload["unchanged"] = unchanged
     if _wants_html(request):
         return redirect("scan-job-workspace", job_id=page.scan_job_id)
-    return JsonResponse(response_payload, status=202)
+    # 202 while work is pending for the edit; 200 when nothing changed and nothing runs.
+    idle = unchanged and ensured.outcome in {"current", "failed", "waiting"}
+    return JsonResponse(response_payload, status=200 if idle else 202)
+
+
+def _ensure_payload(ensured: scantailor.EnsureResult) -> dict[str, Any]:
+    return {
+        "stage": _serialize_stage_state(ensured.state),
+        "outcome": ensured.outcome,
+        "waiting_for": ensured.waiting_for,
+        "job": scantailor.stage_job_payload(ensured.job) if ensured.job is not None else None,
+    }
+
+
+@require_POST
+@scan_api_login_required
+def scan_page_stage_ensure(
+    request: HttpRequest,
+    job_id: str,
+    page_id: str,
+    stage: str,
+) -> HttpResponseBase:
+    """Ensure a current result for one page and stage, e.g. when the editor opens it (#209).
+
+    Queues the stage once if its result is not current and every earlier stage has a
+    current result; returns what it found (``outcome``, ``waiting_for``) either way.
+    Reopening a page whose result is current queues nothing.
+    """
+    if normalize_scan_job_id(job_id) is None or _coerce_uuid(page_id) is None:
+        return HttpResponseBadRequest("invalid uuid")
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    normalized_stage = _normalize_stage(stage)
+    if normalized_stage is None:
+        return HttpResponseBadRequest("invalid stage")
+    try:
+        page = ScanPage.objects.select_related("scan_job").get(pk=page_id, scan_job_id=job_id)
+    except (ScanPage.DoesNotExist, ValueError):
+        return HttpResponseNotFound()
+    if page.scan_job.state not in scan_lifecycle.PROCESSING_STATES:
+        return HttpResponseBadRequest("scan job is not accepting processing changes")
+
+    _ensure_workspace_stage_states(page.scan_job, page)
+    state = scantailor.get_or_create_stage_state(
+        scan_job_id=str(page.scan_job_id),
+        page_id=str(page.id),
+        stage=normalized_stage,
+    )
+    if _bind_stage_inputs(state, page):
+        state.save(
+            update_fields=[
+                "input_stage_state",
+                "input_scan_page_version",
+                "input_storage_identifier",
+                "updated_at",
+            ],
+        )
+    ensured = scantailor.ensure_stage_result(state, requested_by_user_id=profile.user_id)
+    return JsonResponse(_ensure_payload(ensured))
 
 
 @require_POST

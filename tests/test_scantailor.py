@@ -364,7 +364,14 @@ def test_concurrent_edit_conflict_is_reported() -> None:
     assert payload["expected_revision"] == expected_revision
 
 
+@pytest.fixture
+def no_stage_chaining(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a finished stage from running the next one, to observe a single step."""
+    monkeypatch.setattr(scantailor, "_queue_following_stage", lambda *args, **kwargs: None)
+
+
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("no_stage_chaining")
 def test_upstream_change_invalidates_downstream_stages() -> None:
     client, job = _create_scan_job("scan-user-invalidation")
     _upload_scan_page(
@@ -396,10 +403,10 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
         assert by_stage[stage_name]["last_error"] == ""
         assert by_stage[stage_name]["invalidated_reason"] == "deskew updated"
 
-    # Re-running a stage clears its invalidation note.
+    # Editing a stage clears its invalidation note.
     rerun = client.post(
         _stage_url(str(job.id), str(page.id), "select_content"),
-        data=json.dumps({"parameters": {}}),
+        data=json.dumps({"parameters": {"content_mode": "disabled"}}),
         content_type="application/json",
     )
     assert rerun.status_code == 202
@@ -505,12 +512,21 @@ def test_deskew_reproducible_with_manual_angle() -> None:
     first_angle = deskew_state.parameters.get("angle")
     assert first_angle == 2.25
 
-    second = client.post(
+    unchanged = client.post(
         deskew_url,
         data=json.dumps({"parameters": {"manual_angle": 2.25}}),
         content_type="application/json",
     )
-    assert second.status_code == 202
+    assert unchanged.status_code == 200
+    assert unchanged.json()["unchanged"] is True
+
+    for angle in (1.0, 2.25):
+        rerun = client.post(
+            deskew_url,
+            data=json.dumps({"parameters": {"manual_angle": angle}}),
+            content_type="application/json",
+        )
+        assert rerun.status_code == 202
 
     deskew_state.refresh_from_db()
     assert deskew_state.output_sha256 == first_hash
@@ -616,12 +632,13 @@ def test_margin_pipeline_reproducible_with_same_parameters() -> None:
     first_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     first_hash = first_state.output_sha256
 
-    second = client.post(
-        _stage_url(str(job.id), str(page.id), "margins"),
-        data=json.dumps(payload),
-        content_type="application/json",
-    )
-    assert second.status_code == 202
+    for margin in (25, 24):
+        second = client.post(
+            _stage_url(str(job.id), str(page.id), "margins"),
+            data=json.dumps({"parameters": {**payload["parameters"], "margin": margin}}),
+            content_type="application/json",
+        )
+        assert second.status_code == 202
     second_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     assert second_state.output_sha256 == first_hash
 
@@ -694,6 +711,7 @@ def test_batch_stage_avoids_manual_exceptions_by_default() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("no_stage_chaining")
 def test_content_change_invalidates_downstream_artifacts() -> None:
     client, job = _create_scan_job("scan-user-content-invalidation")
     _upload_scan_page(
@@ -1273,6 +1291,7 @@ def _thumbnail_size(client: Client, page_id: str) -> tuple[tuple[int, int], str]
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("no_stage_chaining")
 def test_page_thumbnail_follows_latest_completed_stage() -> None:
     """#58: the overview thumbnail shows the latest completed stage, not the raw scan."""
     client, job = _create_scan_job("scan-user-thumbnail-stage")

@@ -33,23 +33,24 @@ for (const transport of ["events", "polling"] as const) {
     const input = page.getByRole("button", { name: "Input", exact: true });
     const result = page.getByRole("button", { name: "Result", exact: true });
     const image = page.locator("[data-editor-image]");
+    const controls = page.locator("[data-stage-controls]");
+    // A changed setting is saved and run without a button (#209).
     const save = async () => {
-      await page.getByRole("button", { name: "Save and run" }).click();
       await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
       await expect(image).toHaveAttribute("alt", "Processing-stage result preview");
     };
-    // Deskew keeps the live input view and says when it leaves a page unchanged.
+    // Opening the editor runs the stages. Deskew keeps the live input view and says
+    // when it leaves a page unchanged.
     await page.locator('[data-stage-select="deskew"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("Angle 0.00°, no change", {
-      timeout: 30_000,
-    });
+    await expect(controls.locator("[data-deskew-result]")).toContainText(
+      "Angle 0.00°, no change",
+      { timeout: 30_000 },
+    );
     await expect(input).toHaveAttribute("aria-pressed", "true");
 
     // Select Content also keeps the input view, with its box; this blank page has none.
     await page.locator('[data-stage-select="select_content"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No content found", {
+    await expect(controls.locator("[data-content-result]")).toContainText("No content found", {
       timeout: 30_000,
     });
     await expect(input).toHaveAttribute("aria-pressed", "true");
@@ -57,14 +58,16 @@ for (const transport of ["events", "polling"] as const) {
     // Dewarping runs before Margins (#195); on a blank page it explains its fallback
     // and stays on the input view with the model grid.
     await page.locator('[data-stage-select="dewarping"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(page.locator("[data-editor-message]")).toContainText("No text lines", {
+    await expect(controls.locator("[data-dewarp-result]")).toContainText("No text lines", {
       timeout: 30_000,
     });
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
     await expect(input).toHaveAttribute("aria-pressed", "true");
 
     await page.locator('[data-stage-select="margins"]').click();
+    await expect(
+      page.locator('[data-strip-page] .st-status-icon[data-stage="margins"]').first(),
+    ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
     await page.getByLabel("All margins (pixels)").fill("20");
     await save();
     await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth))

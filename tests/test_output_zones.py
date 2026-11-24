@@ -211,7 +211,9 @@ def test_list_zone_edit_survives_batch_and_only_replaces_output() -> None:
     replay = client.post(
         url, json.dumps({"parameters": manual.parameters}), content_type="application/json"
     )
-    assert replay.status_code == 202
+    # Identical settings: nothing to run (#209).
+    assert replay.status_code == 200
+    assert replay.json()["unchanged"] is True
     manual.refresh_from_db()
     assert manual.output_sha256 == original
     assert manual.algorithm_version == "opencv-zones-v3"

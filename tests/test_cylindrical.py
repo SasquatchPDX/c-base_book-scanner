@@ -239,11 +239,15 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
         "depth_perception": 2.5,
     }
     transforms = []
-    for _ in range(2):  # the same manual model replays to the same result
+    # The same manual model replays to the same result (after another run in between:
+    # posting identical settings is a no-op, #209).
+    for parameters in (manual, {**manual, "depth_perception": 2.0}, manual):
         response = client.post(
-            url, data=json.dumps({"parameters": manual}), content_type="application/json"
+            url, data=json.dumps({"parameters": parameters}), content_type="application/json"
         )
         assert response.status_code == 202, response.content
+        if parameters is not manual:
+            continue
         state = ScanTailorStageState.objects.get(scan_page=page, stage="dewarping")
         assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
         assert state.algorithm == "cylindrical_dewarp"

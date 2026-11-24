@@ -57,17 +57,16 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
   const message = page.locator("[data-editor-message]");
-  const runStage = async (stage: string, expected: string): Promise<void> => {
+  // Opening a stage runs it; each finished stage runs the next one (#209).
+  const runStage = async (stage: string): Promise<void> => {
     await page.locator(`[data-stage-select="${stage}"]`).click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(message).toContainText(expected, { timeout: 30_000 });
     await expect(
       page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
     ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   };
-  await runStage("deskew", "Angle");
-  await runStage("select_content", "mm");
-  await runStage("dewarping", "");
+  await runStage("deskew");
+  await runStage("select_content");
+  await runStage("dewarping");
 
   // Upstream's view: the model grid with red control points on the page.
   const overlay = page.locator("[data-dewarp-overlay]");

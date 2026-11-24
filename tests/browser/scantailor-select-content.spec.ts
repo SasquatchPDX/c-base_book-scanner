@@ -57,19 +57,16 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
   const message = page.locator("[data-editor-message]");
-  // Deskew first: Select Content reads its result.
-  await page.getByRole("button", { name: "Save and run" }).click();
-  await expect(message).toContainText("Angle", { timeout: 30_000 });
-
+  // Opening the editor runs Deskew, and Select Content runs on its result (#209).
   await page.locator('[data-stage-select="select_content"]').click();
   const controls = page.locator("[data-stage-controls]");
   await expect(controls.getByRole("radio", { name: "Auto" })).toBeChecked();
-  await page.getByRole("button", { name: "Save and run" }).click();
-  await expect(message).toContainText("mm", { timeout: 30_000 });
-  await expect(message).toContainText("auto");
   await expect(
     page.locator('[data-strip-page] .st-status-icon[data-stage="select_content"]').first(),
-  ).toHaveAttribute("data-status", "success");
+  ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
+  const result = controls.locator("[data-content-result]");
+  await expect(result).toContainText("mm");
+  await expect(result).toContainText("auto");
 
   // The auto result is drawn and stays on the input view.
   const box = page.locator("[data-content-box]");

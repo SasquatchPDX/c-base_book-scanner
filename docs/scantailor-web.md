@@ -248,6 +248,43 @@ times the `page_image` step and each stage on this pipeline.
   working images make a stage's decode cheap instead (about 10 ms in
   `scripts/benchmark_scanning.py`).
 
+## Automatic runs and cancellation (#209)
+
+The editor has no "Save and run" button: the stage being shown runs by itself.
+
+- **Ensure on open.** Selecting a page or stage posts
+  `POST /scan/jobs/{id}/pages/{page}/stages/{stage}/ensure/`. It returns the stage
+  with an `outcome`: `current` (the result matches the settings, nothing queued),
+  `queued` or `running` (one job of the current revision exists; a second request,
+  or a second editor, gets the same job), `waiting` with `waiting_for` (an earlier
+  stage of the page has no current result: nothing is queued), or `failed` (the
+  current settings already failed; changing them runs the stage again).
+- **Autosave.** Every stage's options, including the content box, the dewarping
+  curves, margins and output zones, are saved 0.6 s after the last change (a drag
+  is saved when released). A draft equal to the saved settings is not sent.
+  "Revert to saved" drops a change that has not been saved yet. A concurrent edit
+  is still detected by `expected_revision` (409).
+- **No-op edits.** A stage edit whose parameters equal the stored ones returns the
+  stage (`unchanged: true`, 200) without a new revision or job.
+- **Chaining.** A stage that finishes successfully queues the next stage of the
+  page (at the back of the queue) if it has no current result, so a stage edited
+  while it waited runs without another click.
+- **Queue order.** An edit's job goes to the front of the queue; a job of an older
+  revision of the same stage that has not started yet is closed as superseded.
+- **Cancellation.** The worker re-reads the stage's revision and status between
+  its steps (input load, run, encode, hash, publish) and between tiles of Output's
+  thresholding, after Output's full-resolution render and zone detection, and every
+  64 columns of the full-resolution dewarp sampling. A run whose stage was edited
+  meanwhile stops with a superseded job result; its temporary files are deleted and
+  nothing of it reaches scan storage.
+- **Status line.** The editor shows "Waiting for <stage>", "Running…",
+  "Restarting with new settings…" (saved while an older run was active) or the
+  failure.
+
+Until #205 lands, "current" means the stage's last run succeeded (every edit
+resets the status and an upstream edit invalidates it); #205 replaces this with
+input fingerprints.
+
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
@@ -277,8 +314,8 @@ Two pages (#195 step 3):
   fills the browser viewport (no site header, no page scrolling) with three columns:
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
-    batch processing"), the options of the selected stage with "Save and run" and
-    "Apply to…" (selected pages, all pages, this page only, this page and the
+    batch processing"), the options of the selected stage with "Revert to saved"
+    (there is no save button, see below) and "Apply to…" (selected pages, all pages, this page only, this page and the
     following ones, or every other page counted from this one, optionally keeping
     pages with manual settings), and a
     status bar with the stage's hint (upstream strings where they exist) and the

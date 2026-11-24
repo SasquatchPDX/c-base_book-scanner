@@ -18,7 +18,10 @@ import {
   sourceBoxToDisplay,
   stageErrorText,
   stageStatusLabel,
+  stableJson,
+  stageRunMessage,
   stageStatusMessage,
+  stageWaitingFor,
   stageWorkerWarnings,
   STAGE_ORDER,
 } from "./scantailor-workspace";
@@ -100,7 +103,7 @@ describe("editable stage parameters", () => {
       },
     };
     document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
-      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
+      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
     const fetcher = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -116,8 +119,10 @@ describe("editable stage parameters", () => {
     click("Add picture region");
     expect(host.textContent).toContain("Remove region 3");
     click("Remove region 2");
-    host.querySelector<HTMLButtonElement>("[data-save-stage]")!.click();
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+    // No button: the edits are saved together after a short pause (#209).
+    expect(fetcher).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled(), { timeout: 3000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
     const posted = JSON.parse(fetcher.mock.calls[0]![1].body);
     expect(posted.parameters.zone_mode).toBe("manual");
     expect(posted.parameters.zones.map((z: { kind: string }) => z.kind)).toEqual([
@@ -287,6 +292,107 @@ describe("stage status presentation", () => {
   });
 });
 
+describe("automatic runs (#209)", () => {
+  const stages = (statuses: Record<string, string>) => ({
+    stages: Object.entries(statuses).map(([stage, status]) => ({
+      stage,
+      status,
+      revision: 1,
+      last_error: "",
+    })) as never,
+  });
+
+  it("names the first earlier stage without a result", () => {
+    const page = stages({ deskew: "success", select_content: "queued", dewarping: "unknown" });
+    expect(stageWaitingFor(page, "deskew")).toBeNull();
+    expect(stageWaitingFor(page, "select_content")).toBeNull();
+    expect(stageWaitingFor(page, "margins")).toBe("select_content");
+  });
+
+  it("says what a stage waits for, that it runs, or that it restarts", () => {
+    const page = stages({ deskew: "unknown", select_content: "unknown" });
+    const state = { stage: "select_content" as const, status: "unknown", revision: 2, last_error: "" };
+    expect(stageRunMessage(page, state).text).toBe("Waiting for Deskew.");
+    const ready = stages({ deskew: "success", select_content: "running" });
+    const running = { ...state, status: "running" };
+    expect(stageRunMessage(ready, running).text).toBe("Running…");
+    expect(stageRunMessage(ready, running, true).text).toBe("Restarting with new settings…");
+    const failed = { ...state, status: "failed", last_error: "cannot read image" };
+    expect(stageRunMessage(ready, failed)).toEqual({ text: "cannot read image", tone: "error" });
+  });
+
+  it("runs the opened stage and saves a changed setting without a button", async () => {
+    const flush = async (): Promise<void> => {
+      for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    };
+    vi.useFakeTimers();
+    const base = {
+      id: 4,
+      scan_page_id: "page",
+      stage: "margins",
+      stage_label: "Margins",
+      revision: 1,
+      status: "unknown",
+      algorithm: "margin_pad",
+      parameters: {},
+      last_error: "",
+    };
+    const done = { stage: "deskew", status: "success", revision: 1, parameters: {} };
+    const earlier = ["deskew", "select_content", "dewarping"].map((stage) => ({ ...done, stage }));
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [...earlier, base] }])}</script>
+      <div id="auto-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/" data-ensure-url-template="/pages/__PAGE__/stages/__STAGE__/ensure/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="margins">Margins</button></div>`;
+    const fetcher = vi.fn(async (url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 202,
+      json: async () => ({
+        stage: url.endsWith("/ensure/")
+          ? { ...base, status: "queued" }
+          : { ...base, revision: 2, status: "queued", parameters: JSON.parse(String(init?.body)).parameters },
+      }),
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    const host = document.querySelector<HTMLElement>("#auto-host")!;
+    initializeScanTailorWorkspace(host);
+    host.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    // Opening the stage asks the server to run it (once; the server deduplicates).
+    expect(fetcher.mock.calls.some(([url]) => url === "/pages/page/stages/margins/ensure/")).toBe(true);
+    const posts = () => fetcher.mock.calls.filter(([url]) => url === "/pages/page/stages/margins/");
+    const margin = [...host.querySelectorAll("label")]
+      .find((label) => label.textContent?.startsWith("All margins"))!
+      .querySelector("input")!;
+    margin.value = "20";
+    margin.dispatchEvent(new Event("input"));
+    margin.value = "24";
+    margin.dispatchEvent(new Event("input"));
+    await vi.advanceTimersByTimeAsync(599);
+    expect(posts()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(posts()).toHaveLength(1);
+    expect(JSON.parse(String(posts()[0]![1]!.body)).parameters.margin).toBe(24);
+    // Saved while queued: the old run restarts with the new settings.
+    expect(host.querySelector("[data-editor-message]")!.textContent).toBe(
+      "Restarting with new settings…",
+    );
+    // The same value again is not saved again.
+    margin.dispatchEvent(new Event("input"));
+    await vi.advanceTimersByTimeAsync(600);
+    await flush();
+    expect(posts()).toHaveLength(1);
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
+
+  it("compares drafts regardless of key order", () => {
+    expect(stableJson({ b: 1, a: { d: [1, 2], c: true } })).toBe(
+      stableJson({ a: { c: true, d: [1, 2] }, b: 1 }),
+    );
+    expect(stableJson({ a: 1 })).not.toBe(stableJson({ a: 2 }));
+  });
+});
+
 describe("pipeline stages (#195)", () => {
   it("runs the five stages in order with no Page Split or Fix Orientation", () => {
     expect(STAGE_ORDER).toEqual(["deskew", "select_content", "dewarping", "margins", "output"]);
@@ -387,7 +493,7 @@ describe("editor preview recovery (#195)", () => {
       status: "unknown",
       parameters: {},
     };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
     const host = document.querySelector<HTMLElement>("#retry-host")!;
     initializeScanTailorWorkspace(host);
     return {
