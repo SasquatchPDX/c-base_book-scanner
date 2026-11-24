@@ -161,6 +161,11 @@ def test_superseded_worker_cannot_recreate_a_quarantined_final_path(
             "stage": "deskew",
         },
     )
+    # request_stage_job records the queued job on the row; process_stage_job only
+    # claims a row that names it (#205).
+    ScanTailorStageState.objects.filter(pk=state.pk).update(
+        status="queued", worker_job_id=str(worker.job_id)
+    )
     copying = threading.Event()
     release = threading.Event()
     first_copy: list[bool] = []
@@ -195,6 +200,7 @@ def test_superseded_worker_cannot_recreate_a_quarantined_final_path(
                 "stage": "deskew",
             },
         )
+        ScanTailorStageState.objects.filter(pk=state.pk).update(worker_job_id=str(winner.job_id))
         scantailor.process_stage_job(str(winner.job_id))
         winner.refresh_from_db()
         assert winner.state == "success", winner.details
