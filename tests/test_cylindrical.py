@@ -221,7 +221,7 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
 
     from ebook_server.core.models import ScanPage
     from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
-    from tests.test_scantailor import _stage_url
+    from tests.test_scantailor import _run_pipeline, _stage_url
 
     client, job = _create_scan_job("scan-user-cylindrical")
     page_image = Image.new("L", (400, 600), 235)
@@ -231,6 +231,7 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
         client, str(job.id), sequence=1, side="single", payload=payload.getvalue(), filename="p.png"
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1)
+    _run_pipeline(client, str(job.id), str(page.id))  # Dewarping reads Select Content (#205)
     url = _stage_url(str(job.id), str(page.id), "dewarping")
     manual = {
         "dewarp_mode": "manual",

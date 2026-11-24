@@ -62,38 +62,46 @@ for (const transport of ["events", "polling"] as const) {
     // Before a run the result pane says why it is empty.
     await expect(status).toContainText("Not run yet");
     await expect(result).toBeHidden();
+    // A later stage waits for Deskew; the pane gives the status line's reason (#205).
+    await page.locator('[data-stage-select="select_content"]').click();
+    await expect(message).toContainText("Waiting for Deskew");
+    await expect(status).toContainText("Waiting for Deskew");
+    await expect(result).toBeHidden();
 
-    // Deskew says when it leaves a page unchanged.
+    // Deskew says when it leaves a page unchanged. Its run queues the later stages,
+    // which run with their defaults (#205 chaining).
+    await page.locator('[data-stage-select="deskew"]').click();
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(message).toContainText("Angle 0.00°, no change", { timeout: 30_000 });
     await expectResult("deskew");
+    await expect(page.locator("[data-deskew-result]")).toContainText("Angle 0.00°, no change");
 
     // Select Content: this blank page has no content box.
     await page.locator('[data-stage-select="select_content"]').click();
-    // The Deskew run marked it out of date (#205 will call this "waiting").
-    await expect(status).toContainText("Settings not applied (deskew updated)");
-    await expect(result).toBeHidden();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(message).toContainText("No content found", { timeout: 30_000 });
     await expectResult("select_content");
+    await expect(page.locator("[data-content-result]")).toContainText("No content found");
 
     // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
     await page.locator('[data-stage-select="dewarping"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect(message).toContainText("No text lines", { timeout: 30_000 });
-    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
     await expectResult("dewarping");
+    await expect(page.locator("[data-dewarp-result]")).toContainText("No text lines");
+    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
 
-    // Margins: the input stays the 100 px page, the result grows by the margins.
+    // Margins: an edit is a draft, and no result is shown for it until it is saved.
     await page.locator('[data-stage-select="margins"]').click();
-    await page.getByLabel("All margins (pixels)").fill("20");
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expectResult("margins");
-    await expect.poll(() => naturalWidth(result)).toBe(140);
+    await page.getByLabel("All margins (pixels)").fill("20");
+    await expect(message).toContainText("Settings not applied");
+    await expect(status).toContainText("Settings not applied");
+    await expect(result).toBeHidden();
+    // Saved, the result updates in place: the input stays the 100 px page, the
+    // result grows by the margins.
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(140);
+    await expectResult("margins");
     await expect.poll(() => naturalWidth(input)).toBe(100);
 
+    // Output re-ran on its own with the new margins.
     await page.locator('[data-stage-select="output"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expectResult("output");
 
     // Reopen the stage, as a user does when adjusting an already completed result.
@@ -105,11 +113,9 @@ for (const transport of ["events", "polling"] as const) {
     await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(100);
     await expectResult("margins");
 
-    // Output's settings no longer match its input: the pane says so instead of
-    // showing the stale result.
+    // Output follows again; its earlier (stale) result is never shown as current.
     await page.locator('[data-stage-select="output"]').click();
-    await expect(status).toContainText("Settings not applied");
-    await expect(result).toBeHidden();
+    await expectResult("output");
 
     await page.locator('[data-stage-select="dewarping"]').click();
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
@@ -142,13 +148,37 @@ test("a narrow screen shows one pane and brings the result forward after a run",
     /\/stages\/deskew\/preview\/\?v=/,
   );
 
-  // The choice is remembered when another stage opens.
+  // The choice is remembered when another stage opens; Select Content ran on its own
+  // after Deskew (#205 chaining).
   await page.locator('[data-stage-select="select_content"]').click();
   await expect(resultButton).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator("[data-result-status]")).toContainText("Settings not applied");
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/select_content\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
 
   await inputButton.click();
   await expect(inputPane).toBeVisible();
   await expect(resultPane).toBeHidden();
   await expect(page.locator("[data-editor-image]")).toBeVisible();
+
+  // Editing a setting brings the input forward; the result pane then says why it
+  // shows no result.
+  await page.locator('[data-stage-select="margins"]').click();
+  await resultButton.click();
+  await expect(resultPane).toBeVisible();
+  // Wait for the chained Margins run, which would bring the result forward again.
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/margins\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
+  await page.getByLabel("All margins (pixels)").fill("20");
+  await expect(inputButton).toHaveAttribute("aria-pressed", "true");
+  await expect(inputPane).toBeVisible();
+  await expect(resultPane).toBeHidden();
+  await resultButton.click();
+  await expect(page.locator("[data-result-status]")).toContainText("Settings not applied");
+  await expect(page.locator("[data-result-image]")).toBeHidden();
 });

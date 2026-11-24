@@ -1,0 +1,12 @@
+# Runs book-scanner-scan-prune.service every hour.
+# Enable with: systemctl enable --now book-scanner-scan-prune.timer
+[Unit]
+Description=Hourly Book Scanner scan artifact sweep
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

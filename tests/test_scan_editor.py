@@ -55,9 +55,13 @@ def test_editor_page_embeds_pages_with_file_names_and_manual_flags() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_stage_thumbnail_is_written_by_the_worker_and_immutable_with_its_token() -> None:
+def test_stage_thumbnail_is_written_by_the_worker_and_immutable_with_its_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, job = _create_scan_job("editor-thumbnail")
     page = _page(client, str(job.id))
+    # Only Deskew runs; the later stages would otherwise follow it (#205).
+    monkeypatch.setattr(scantailor, "queue_ready_successor", lambda *args, **kwargs: None)
     client.post(
         f"/scan/jobs/{job.id}/pages/{page.id}/stages/deskew/",
         data=json.dumps({"parameters": {"manual_angle": 2}}),

@@ -74,3 +74,8 @@ Optional: `book-scanner-contributions.service` and `.timer` run the daily
 contribution settlement (`manage.py settle_contributions --enqueue`). They only
 do work when `BOOK_SCANNER_CONTRIBUTIONS_ENABLED=true`; see
 [docs/contributions.md](../../docs/contributions.md).
+
+Recommended: `book-scanner-scan-prune.service` and `.timer` run the hourly sweep of
+ScanTailor-Web stage files no stage row refers to any more
+(`manage.py prune_scan_artifacts --enqueue`, #204); see "Disk use" in
+[docs/scantailor-web.md](../../docs/scantailor-web.md).

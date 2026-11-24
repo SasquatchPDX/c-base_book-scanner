@@ -1566,12 +1566,14 @@ class ScanTailorStageState(models.Model):
         OUTPUT = "output", "Output/binarization"
 
     class StageStatus(models.TextChoices):
+        # Run states only (#205). Whether a successful result is still current is
+        # derived from its input fingerprint (``scantailor.stage_result_is_current``),
+        # never stored.
         UNKNOWN = "unknown", "Unknown"
         QUEUED = "queued", "Queued"
         RUNNING = "running", "Running"
         SUCCESS = "success", "Success"
         FAILED = "failed", "Failed"
-        INVALIDATED = "invalidated", "Invalidated"
 
     scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="stage_states")
     scan_page = models.ForeignKey(
@@ -1623,10 +1625,17 @@ class ScanTailorStageState(models.Model):
     )
     preview_storage_identifier = models.CharField(max_length=512, blank=True)
     worker_job_id = models.CharField(max_length=64, blank=True)
-    # Only genuine processing failures (status FAILED) go in last_error. Routine
-    # bookkeeping such as "upstream stage changed" goes in invalidated_reason.
+    # Only genuine processing failures (status FAILED) go in last_error. Staleness
+    # ("input changed", "settings changed, not applied") is derived, not stored (#205).
     last_error = models.TextField(blank=True)
-    invalidated_reason = models.TextField(blank=True)
+    # Fingerprint of the result in the output fields (#205): the input it was computed
+    # from (the predecessor's output_sha256, or the page version's checksum for the
+    # first stage), the parameters as recorded by that run and the revision it ran at.
+    # ``parameters`` holds the settings the user wants; the result is current iff
+    # these match the predecessor's current result and those settings.
+    applied_input_sha256 = models.CharField(max_length=64, blank=True)
+    applied_parameters = models.JSONField(default=dict, blank=True)
+    applied_revision = models.PositiveIntegerField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

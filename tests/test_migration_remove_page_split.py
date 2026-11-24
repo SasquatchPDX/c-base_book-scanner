@@ -186,7 +186,8 @@ def test_completed_scan_keeps_its_results_and_can_still_be_refinished(
     # Finished jobs keep their results; the raw scan re-runs once.
     for job_id in (complete.pk, cancelled.pk):
         assert statuses(job_id) == {stage: ("success", 2) for stage in new_stages}
-    assert statuses(captured.pk) == {stage: ("invalidated", 3) for stage in new_stages}
+    # Migration 0053 (#205) turns the invalidated rows into "not run".
+    assert statuses(captured.pk) == {stage: ("unknown", 3) for stage in new_stages}
     job = ScanJob.objects.get(pk=complete.pk)
     assert job.state == ScanJob.State.COMPLETE
     assert job.book_id == book.pk
