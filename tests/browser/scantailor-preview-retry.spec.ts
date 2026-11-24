@@ -90,6 +90,11 @@ test("an upload whose working image is still queued appears once it is ready", a
   await expect(message).toContainText("still being prepared");
   await expect.poll(() => naturalWidth(page), { timeout: 30_000 }).toBe(100);
   expect(held).toBe(3);
-  await expect(page.locator("[data-editor-image]")).toHaveAttribute("src", /retry=\d+/);
+  // The image arrives by a retry or, as opening the editor also runs Deskew (#209),
+  // by the reload its status change brings; either way it is the Deskew input.
+  await expect(page.locator("[data-editor-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/deskew\/preview\/\?input=true/,
+  );
   await expect(message).not.toContainText("still being prepared");
 });
