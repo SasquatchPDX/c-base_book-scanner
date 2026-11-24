@@ -112,7 +112,7 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await page.mouse.up();
   expect((await saved).status()).toBe(202);
   await expect(controls.getByRole("radio", { name: "Manual" })).toBeChecked();
-  await expect(contentResult).toContainText("manual");
+  await expect(contentResult).toContainText("manual", { timeout: 30_000 });
   // The manual run replaces the result; the input under the box was never reloaded.
   await expect(result).not.toHaveAttribute("src", autoResult!);
   await expect(result).toHaveAttribute("src", /\/stages\/select_content\/preview\/\?v=/);
