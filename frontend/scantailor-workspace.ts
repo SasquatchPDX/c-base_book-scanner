@@ -1493,14 +1493,18 @@ class WorkspaceController {
     if (!state) return;
     const field = this.controls.querySelector<HTMLInputElement>("[data-deskew-angle]");
     const editing =
-      this.commitTimer !== null ||
-      this.saving ||
-      this.deskewOverlay?.isDragging() === true ||
-      (field !== null && document.activeElement === field);
+      this.commitTimer !== null || this.saving || this.deskewOverlay?.isDragging() === true;
     if (editing) return;
-    if (!("manual_angle" in this.draft) && field) field.value = this.deskewAngle().toFixed(2);
+    // A focused field keeps what the member typed; the result line still follows the
+    // run, so a saved angle stops reading "not saved yet" while the field has focus.
+    const typing = field !== null && document.activeElement === field;
+    if (!typing && !("manual_angle" in this.draft) && field) {
+      field.value = this.deskewAngle().toFixed(2);
+    }
     const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
-    if (result && state.status === "success") result.textContent = deskewResultText(state.parameters);
+    if (result && state.status === "success" && !this.settingsNotApplied()) {
+      result.textContent = deskewResultText(state.parameters);
+    }
     this.applyDeskewPreview();
   }
 

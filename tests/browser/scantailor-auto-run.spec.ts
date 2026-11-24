@@ -111,7 +111,7 @@ test("every stage reruns by itself when a setting changes", async ({ page }) => 
   const result = page.locator("[data-result-image]");
   const resultFor = async (stage: string): Promise<void> => {
     await expect(result).toBeVisible({ timeout: 30_000 });
-    await expect(result).toHaveAttribute("src", new RegExp(`/stages/${stage}/preview/\?v=`));
+    await expect(result).toHaveAttribute("src", new RegExp(`/stages/${stage}/preview/\\?v=`));
   };
   // Margins in millimetres (#208) autosave like every other control.
   await changeAndWait("margins", () =>

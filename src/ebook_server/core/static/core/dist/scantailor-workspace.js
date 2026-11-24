@@ -4765,6 +4765,7 @@ var N = class {
 	constructor(e, t, n, r, i) {
 		this.top = t, this.bottom = n, this.editable = r, this.callbacks = i, this.element = M("svg", { class: "st-dewarp-overlay" }), this.element.dataset.dewarpOverlay = "", this.margins = M("path", { class: "st-dewarp-margins" }), this.grid = M("path", { class: "st-dewarp-grid" }), this.points = M("g", { class: "st-dewarp-points" }), this.hit = M("path", { class: "st-dewarp-hit" }), this.element.append(this.margins, this.grid, this.hit, this.points), r && (this.hit.dataset.capturesPointer = "true", this.hit.dataset.dewarpCurve = "", this.element.addEventListener("pointerdown", (e) => this.onCurvePointerDown(e)), document.addEventListener("keydown", this.onKey)), e.append(this.element);
 	}
+	drawnShape = "";
 	isDragging() {
 		return this.drag !== null;
 	}
@@ -4790,7 +4791,15 @@ var N = class {
 			r,
 			[n[0], r[0]],
 			[n[n.length - 1], r[r.length - 1]]
-		].map((n) => ue(n, e, t)).join(" "), this.grid.setAttribute("d", i), this.margins.setAttribute("d", this.marginPath(n, r, e, t)), this.hit.setAttribute("d", `${ue(n, e, t)} ${ue(r, e, t)}`), this.points.replaceChildren(), [this.top, this.bottom].forEach((n, r) => {
+		].map((n) => ue(n, e, t)).join(" "), this.grid.setAttribute("d", i), this.margins.setAttribute("d", this.marginPath(n, r, e, t)), this.hit.setAttribute("d", `${ue(n, e, t)} ${ue(r, e, t)}`);
+		let a = `${this.top.points.length}:${this.bottom.points.length}`, o = [...this.points.children];
+		if (a === this.drawnShape && o.length > 0) {
+			let n = 0;
+			for (let r of [this.top, this.bottom]) for (let [i, a] of r.points) {
+				let r = o[n++];
+				r.setAttribute("cx", String(i * e)), r.setAttribute("cy", String(a * t));
+			}
+		} else this.drawnShape = a, this.points.replaceChildren(), [this.top, this.bottom].forEach((n, r) => {
 			n.points.forEach(([i, a], o) => {
 				let s = M("circle", {
 					cx: i * e,
@@ -5861,10 +5870,10 @@ var wt = class {
 		let e = this.activeContext()?.state;
 		if (!e) return;
 		let t = this.controls.querySelector("[data-deskew-angle]");
-		if (this.commitTimer !== null || this.saving || this.deskewOverlay?.isDragging() === !0 || t !== null && document.activeElement === t) return;
-		!("manual_angle" in this.draft) && t && (t.value = this.deskewAngle().toFixed(2));
+		if (this.commitTimer !== null || this.saving || this.deskewOverlay?.isDragging() === !0) return;
+		(t === null || document.activeElement !== t) && !("manual_angle" in this.draft) && t && (t.value = this.deskewAngle().toFixed(2));
 		let n = this.controls.querySelector("[data-deskew-result]");
-		n && e.status === "success" && (n.textContent = xe(e.parameters)), this.applyDeskewPreview();
+		n && e.status === "success" && !this.settingsNotApplied() && (n.textContent = xe(e.parameters)), this.applyDeskewPreview();
 	}
 	applyDeskewPreview() {
 		if (this.activeStage !== "deskew" || this.image.hidden || !this.viewport || !this.image.naturalWidth) {
