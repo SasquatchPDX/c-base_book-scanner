@@ -50,14 +50,21 @@ def test_editor_page_embeds_pages_with_file_names_and_manual_flags() -> None:
     assert stages["deskew"]["manual"] is True
     assert stages["select_content"]["manual"] is False
     hints = {stage["name"]: stage["hint"] for stage in response.context["stage_navigation"]}
-    assert hints["margins"] == "Resize margins by dragging any of the solid lines."
+    assert (
+        hints["margins"]
+        == "Set the margins in millimetres; aligned pages share the size of the largest page."
+    )
     assert client.get("/scan/jobs/not-a-job/editor/").status_code in {400, 404}
 
 
 @pytest.mark.django_db(transaction=True)
-def test_stage_thumbnail_is_written_by_the_worker_and_immutable_with_its_token() -> None:
+def test_stage_thumbnail_is_written_by_the_worker_and_immutable_with_its_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, job = _create_scan_job("editor-thumbnail")
     page = _page(client, str(job.id))
+    # Only Deskew runs; the later stages would otherwise follow it (#205).
+    monkeypatch.setattr(scantailor, "queue_ready_successor", lambda *args, **kwargs: None)
     client.post(
         f"/scan/jobs/{job.id}/pages/{page.id}/stages/deskew/",
         data=json.dumps({"parameters": {"manual_angle": 2}}),

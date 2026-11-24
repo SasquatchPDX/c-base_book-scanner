@@ -248,3 +248,172 @@ def test_long_steps_stop_between_tiles_and_column_blocks() -> None:
     # Outside a worker run the checks do nothing.
     checkpoint(force=True)
     assert scantailor._threshold_tiles(page, "sauvola", {}).size == page.size
+
+
+@pytest.fixture
+def held_with_position(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Like ``held_jobs``, but records whether each job went to the front of the queue."""
+    held: list[tuple[str, bool]] = []
+
+    def hold(job_id: str, *, at_front: bool = True) -> None:
+        held.append((job_id, at_front))
+
+    monkeypatch.setattr(scantailor, "dispatch_stage_job", hold)
+    return held
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_queues_a_stale_stage_once_at_the_front(
+    held_with_position: list[tuple[str, bool]],
+) -> None:
+    client, job, page = _page("auto-run-front")
+    url = _ensure_url(str(job.id), str(page.id), "deskew")
+    first = client.post(url).json()
+    assert first["outcome"] == "queued"
+    assert first["stage"]["current"] is False  # #205's derived state comes along
+    assert held_with_position == [(first["job"]["job_id"], True)]
+    scantailor.process_stage_job(held_with_position[0][0])
+
+    # The page's source changes: the result is stale (#205) and runs again, once.
+    state = _state(page, "deskew")
+    state.applied_input_sha256 = "0" * 64
+    state.save(update_fields=["applied_input_sha256"])
+    stale = client.post(url).json()
+    assert stale["outcome"] == "queued"
+    assert client.post(url).json()["job"]["job_id"] == stale["job"]["job_id"]
+    deskew_jobs = {str(queued.job_id) for queued in _stage_jobs("deskew")}
+    assert len(deskew_jobs) == 2
+    assert all(at_front for job_id, at_front in held_with_position if job_id in deskew_jobs)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_does_not_repeat_a_failed_run(
+    held_jobs: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, job, page = _page("auto-run-failed")
+
+    def broken(state: Any, given: scantailor.StageInput) -> Any:
+        raise RuntimeError("broken page")
+
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "skew_finder", broken)
+    url = _ensure_url(str(job.id), str(page.id), "deskew")
+    assert client.post(url).json()["outcome"] == "queued"
+    scantailor.process_stage_job(held_jobs[-1])
+    assert _state(page, "deskew").status == ScanTailorStageState.StageStatus.FAILED
+
+    again = client.post(url).json()
+    assert again["outcome"] == "failed"
+    assert again["job"] is None
+    assert len(_stage_jobs("deskew")) == 1
+    # A failure on an older input (e.g. before a replacement scan) is run again once.
+    failed_job = _stage_jobs("deskew")[0]
+    assert failed_job.details["input_fingerprint"]
+    failed_job.details = {**failed_job.details, "input_fingerprint": "an older input"}
+    failed_job.save(update_fields=["details"])
+    retried = client.post(url).json()
+    assert retried["outcome"] == "queued"
+    scantailor.process_stage_job(held_jobs[-1])
+    assert client.post(url).json()["outcome"] == "failed"
+    assert len(_stage_jobs("deskew")) == 2
+    # Editing the settings runs it again.
+    edited = client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        json.dumps({"parameters": {"manual_angle": 1.0}}),
+        content_type="application/json",
+    )
+    assert edited.json()["outcome"] == "queued"
+    assert len(_stage_jobs("deskew")) == 3
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_failed_successor_runs_again_on_a_new_predecessor_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#205's chaining re-queues a FAILED next stage; #209's own hook is not needed."""
+    client, job, page = _page("auto-run-chain-retry")
+    runner = scantailor._run_select_content
+    failures = [RuntimeError("first attempt")]
+
+    def flaky(state: Any, given: scantailor.StageInput) -> Any:
+        if failures:
+            raise failures.pop()
+        return runner(state, given)
+
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["select_content"], "content_box_finder", flaky)
+    client.post(_ensure_url(str(job.id), str(page.id), "deskew"))
+    assert _state(page, "select_content").status == ScanTailorStageState.StageStatus.FAILED
+
+    client.post(
+        _stage_url(str(job.id), str(page.id), "deskew"),
+        json.dumps({"parameters": {"manual_angle": 1.0}}),
+        content_type="application/json",
+    )
+    assert _state(page, "select_content").status == ScanTailorStageState.StageStatus.SUCCESS
+    for stage in scantailor.stage_order():
+        assert _state(page, stage).status == ScanTailorStageState.StageStatus.SUCCESS
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_newer_job_of_the_same_revision_stops_the_running_one_and_its_files_go(
+    held_jobs: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#205's claim check and #209's cancellation are one rule; #204 cleans up after it."""
+    client, job, page = _page("auto-run-takeover")
+    client.post(_ensure_url(str(job.id), str(page.id), "deskew"))
+    first_job = held_jobs[-1]
+    revision = _state(page, "deskew").revision
+    folder = (
+        Path(settings.APP_DATA_DIR)
+        / "scan-artifacts"
+        / scantailor.STAGE_NAMESPACE
+        / f"{job.id}/{page.id}/deskew/v{revision}"
+    )
+    runner = scantailor._run_deskew
+
+    def taken_over(state: Any, given: scantailor.StageInput) -> Any:
+        # A newer job for the same revision takes over the row (a new predecessor
+        # result in #205), and the older run left a file in its revision folder.
+        scantailor.request_stage_job(state=_state(page, "deskew"), dispatch=False)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "work.png").write_bytes(b"left behind")
+        return runner(state, given)
+
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "skew_finder", taken_over)
+    scantailor.process_stage_job(first_job)
+    superseded = ProcessingJob.objects.get(job_id=first_job)
+    assert superseded.details["superseded"] is True
+    assert not (folder / "work.png").exists()  # #204's revision cleanup removed it
+    newer_job = _state(page, "deskew").worker_job_id
+    assert newer_job != first_job
+    assert _state(page, "deskew").status == ScanTailorStageState.StageStatus.QUEUED
+
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "skew_finder", runner)
+    scantailor.process_stage_job(newer_job)
+    state = _state(page, "deskew")
+    assert state.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert state.worker_job_id == newer_job
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_computes_the_common_page_size_at_most_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#208: the page's rows are linked with one aggregate, not one query per check."""
+    client, job, page = _page("auto-run-aggregate")
+    client.post(_ensure_url(str(job.id), str(page.id), "deskew"))
+    margins = _state(page, "margins")
+    assert margins.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert scantailor.margins_depends_on_aggregate(margins)
+
+    calls: list[object] = []
+    computed = scantailor.margins_aggregate
+
+    def counting(scan_job: object) -> Any:
+        calls.append(scan_job)
+        return computed(scan_job)
+
+    monkeypatch.setattr(scantailor, "margins_aggregate", counting)
+    response = client.post(_ensure_url(str(job.id), str(page.id), "output")).json()
+    assert response["outcome"] == "current"
+    assert response["stage"]["current"] is True
+    assert len(calls) == 1

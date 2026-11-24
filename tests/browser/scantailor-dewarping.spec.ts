@@ -56,17 +56,25 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
-  const message = page.locator("[data-editor-message]");
-  // Opening a stage runs it; each finished stage runs the next one (#209).
-  const runStage = async (stage: string): Promise<void> => {
+  // Opening a stage runs it (#209), and each finished stage runs the next one (#205).
+  // Each stage's own result line: the status line moves on to the chained stages.
+  const runStage = async (stage: string, resultLine: string, expected: string): Promise<void> => {
     await page.locator(`[data-stage-select="${stage}"]`).click();
+    await expect(page.locator(`[data-stage-controls] ${resultLine}`)).toContainText(expected, {
+      timeout: 30_000,
+    });
     await expect(
       page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
     ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   };
-  await runStage("deskew");
-  await runStage("select_content");
-  await runStage("dewarping");
+  await runStage("deskew", "[data-deskew-result]", "Angle");
+  await runStage("select_content", "[data-content-result]", "mm");
+  await runStage("dewarping", "[data-dewarp-result]", "");
+  // The result pane beside the input shows the dewarped page (#206).
+  const result = page.locator("[data-result-image]");
+  await expect(result).toHaveAttribute("src", /\/stages\/dewarping\/preview\/\?v=/);
+  const autoResult = await result.getAttribute("src");
+  const inputSource = await page.locator("[data-editor-image]").getAttribute("src");
 
   // Upstream's view: the model grid with red control points on the page.
   const overlay = page.locator("[data-dewarp-overlay]");
@@ -102,5 +110,11 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await expect(
     page.locator("[data-stage-controls]").getByRole("radio", { name: "Manual" }),
   ).toBeChecked();
-  await expect(message).toContainText("manual", { timeout: 30_000 });
+  await expect(page.locator("[data-dewarp-result]")).toContainText("manual", {
+    timeout: 30_000,
+  });
+  // The manual model's result replaces the auto one; the input was never reloaded.
+  await expect(result).not.toHaveAttribute("src", autoResult!);
+  await expect(result).toHaveAttribute("src", /\/stages\/dewarping\/preview\/\?v=/);
+  await expect(page.locator("[data-editor-image]")).toHaveAttribute("src", inputSource!);
 });

@@ -107,14 +107,22 @@ test("every stage reruns by itself when a setting changes", async ({ page }) => 
   await changeAndWait("dewarping", () => controls.getByRole("radio", { name: "Off" }).check());
   await expect(controls.locator("[data-dewarp-result]")).toContainText("Dewarping is off");
 
-  const result = page.getByRole("button", { name: "Result", exact: true });
-  await changeAndWait("margins", () => page.getByLabel("All margins (pixels)").fill("12"));
-  await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  // The result pane beside the input (#206) shows each new result.
+  const result = page.locator("[data-result-image]");
+  const resultFor = async (stage: string): Promise<void> => {
+    await expect(result).toBeVisible({ timeout: 30_000 });
+    await expect(result).toHaveAttribute("src", new RegExp(`/stages/${stage}/preview/\?v=`));
+  };
+  // Margins in millimetres (#208) autosave like every other control.
+  await changeAndWait("margins", () =>
+    controls.getByLabel("Left", { exact: true }).fill("4"),
+  );
+  await resultFor("margins");
 
   await changeAndWait("output", async () => {
     await page.getByLabel("Output algorithm").selectOption("sauvola");
   });
-  await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  await resultFor("output");
 
   // Reopening a page whose results are current runs nothing.
   const posts: string[] = [];

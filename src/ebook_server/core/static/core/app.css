@@ -41,7 +41,21 @@
 .st-viewport.panning{cursor:grabbing}
 .st-surface{position:absolute;top:0;left:0;transform-origin:0 0}
 .st-surface img{display:block;max-width:none;max-height:none;box-shadow:0 2px 12px rgba(0,0,0,.5)}
+.st-surface img[hidden]{display:none}
 .st-surface .geometry-layer{inset:auto;top:0;left:0;margin:0;transform:none}
+/* Stage panes (#206): the input with its editable overlay beside this stage's result; one pane at a time on narrow screens. */
+.st-panes{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:2px;background:#151a17}
+.st-pane{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;background:#262e29}
+.st-pane-label{position:absolute;top:6px;left:8px;z-index:3;padding:1px 8px;border-radius:999px;background:rgba(29,36,32,.85);color:#e8ece9;font-size:.7rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;pointer-events:none}
+.st-pane-toggle{display:none}
+.st-result-status{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:10px;padding:24px;text-align:center;color:#e8ece9;font-size:.9rem;pointer-events:none}
+.st-result-status[hidden]{display:none}
+.st-result-status span:last-child{max-width:32ch;padding:6px 10px;border-radius:8px;background:rgba(29,36,32,.85)}
+.st-pane-result.busy .st-surface img{opacity:.4}
+.st-spinner{flex:none;width:22px;height:22px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:st-spin .8s linear infinite}
+@keyframes st-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.st-spinner{animation:none}}
+@media (max-width:900px){.st-panes{grid-template-columns:minmax(0,1fr)}.st-pane-toggle{display:flex}.st-panes[data-pane=input] .st-pane-result,.st-panes[data-pane=result] .st-pane-input{display:none}}
 .st-strip{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(--line);background:#f2f4f2}
 .st-strip-scroll{flex:1;min-height:0;overflow-y:auto;position:relative;outline:none}
 .st-strip-spacer{position:relative;width:100%}
@@ -58,6 +72,8 @@
 .st-status-done{background:#2e6b4d}
 .st-status-manual{background:#2f5fa7}
 .st-status-failed{background:#b23b2a}
+.st-status-stale{background:#fff;color:#2e6b4d;box-shadow:inset 0 0 0 2px #2e6b4d}
+.st-status-waiting{background:#fff;color:#6b746e;box-shadow:inset 0 0 0 2px #9aa39d}
 @keyframes st-pulse{from{opacity:1}to{opacity:.45}}
 @media (prefers-reduced-motion:reduce){.st-status-working{animation:none}}
 .st-strip-footer{display:grid;gap:4px;padding:6px 8px;border-top:1px solid var(--line);font-size:.78rem}
@@ -93,3 +109,10 @@
 .st-dewarp-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:copy}
 .st-dewarp-point{fill:#ff0000;stroke:#fff;stroke-width:1.5;pointer-events:all;cursor:grab;touch-action:none}
 .st-dewarp-point:hover{fill:#00ffff}
+/* Margins (#208): upstream page_layout options, mm fields and a 3 x 3 alignment grid. */
+.st-margins{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 10px;border:0;margin:0;padding:0}
+.st-margins legend{font-weight:700;padding:0;margin-bottom:4px}
+.st-margins .checkbox{grid-column:1/-1}
+.st-align-grid{display:grid;grid-template-columns:repeat(3,22px);gap:6px;border:0;margin:0;padding:0}
+.st-align-grid legend{font-weight:700;padding:0;margin-bottom:4px}
+.st-align-grid input{width:18px;height:18px;margin:0}

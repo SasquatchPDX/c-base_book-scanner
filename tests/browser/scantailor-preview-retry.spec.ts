@@ -42,6 +42,13 @@ test("first open of a page migrated without a working image shows its Deskew inp
   expect(statuses.at(-1)).toBe(200);
   expect(statuses.every((status) => status === 200 || status === 503)).toBe(true);
   await expect(page.locator("[data-editor-message]")).not.toHaveClass(/editor-message-error/);
+  // Opening the page runs Deskew (#209); its result appears beside the input (#206).
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/deskew\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
+  await expect(page.locator("[data-result-status]")).toBeHidden();
 });
 
 test("an upload whose working image is still queued appears once it is ready", async ({
