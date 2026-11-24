@@ -15,6 +15,7 @@ import {
   previewIsBeingPrepared,
   previewRetryUrl,
   previousStageName,
+  resultPaneMessage,
   sourceBoxToDisplay,
   stageErrorText,
   stageStatusLabel,
@@ -284,6 +285,34 @@ describe("stage status presentation", () => {
       text: "Revision 1 · success",
       tone: "info",
     });
+  });
+});
+
+describe("result pane message (#206)", () => {
+  const state = (status: string, extra: Record<string, string> = {}) => ({
+    status,
+    last_error: "",
+    invalidated_reason: "",
+    preview_storage_identifier: "",
+    output_storage_identifier: "",
+    ...extra,
+  });
+
+  it("is empty when the stage has a result", () => {
+    expect(resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }))).toBe("");
+    expect(resultPaneMessage(state("success"))).toMatch(/no result preview/);
+  });
+
+  it("says why there is no result", () => {
+    expect(resultPaneMessage(state("unknown"))).toMatch(/^Not run yet/);
+    expect(resultPaneMessage(state("queued"))).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("running"))).toMatch(/^Running/);
+    expect(resultPaneMessage(state("failed", { last_error: "cannot read image" }))).toBe(
+      "Failed: cannot read image",
+    );
+    expect(
+      resultPaneMessage(state("invalidated", { invalidated_reason: "deskew changed" })),
+    ).toBe("Settings not applied (deskew changed). Save and run to update the result.");
   });
 });
 

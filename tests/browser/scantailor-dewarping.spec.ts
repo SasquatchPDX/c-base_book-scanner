@@ -68,6 +68,11 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await runStage("deskew", "Angle");
   await runStage("select_content", "mm");
   await runStage("dewarping", "");
+  // The result pane beside the input shows the dewarped page (#206).
+  const result = page.locator("[data-result-image]");
+  await expect(result).toHaveAttribute("src", /\/stages\/dewarping\/preview\/\?v=/);
+  const autoResult = await result.getAttribute("src");
+  const inputSource = await page.locator("[data-editor-image]").getAttribute("src");
 
   // Upstream's view: the model grid with red control points on the page.
   const overlay = page.locator("[data-dewarp-overlay]");
@@ -104,4 +109,8 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
     page.locator("[data-stage-controls]").getByRole("radio", { name: "Manual" }),
   ).toBeChecked();
   await expect(message).toContainText("manual", { timeout: 30_000 });
+  // The manual model's result replaces the auto one; the input was never reloaded.
+  await expect(result).not.toHaveAttribute("src", autoResult!);
+  await expect(result).toHaveAttribute("src", /\/stages\/dewarping\/preview\/\?v=/);
+  await expect(page.locator("[data-editor-image]")).toHaveAttribute("src", inputSource!);
 });

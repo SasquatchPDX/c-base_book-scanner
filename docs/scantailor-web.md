@@ -283,7 +283,17 @@ Two pages (#195 step 3):
     pages with manual settings), and a
     status bar with the stage's hint (upstream strings where they exist) and the
     live-update state;
-  - *middle*: the preview canvas. The wheel zooms around the cursor, dragging the
+  - *middle*: the preview canvas, in two panes (#206): on the left the stage's
+    *input* with its editable overlay (deskew grid, content box, dewarp curves,
+    output zones), on the right this stage's *result*. After a run the result pane
+    updates in place without leaving the stage; while the stage is queued or running
+    it keeps the previous result dimmed under a spinner, and without a current result
+    it says why (not run yet, settings not applied, failed). The input pane is not
+    reloaded while an overlay is being dragged. Both panes share zoom and pan, the
+    result centred where the input is. Below 900 px width only one pane fits: an
+    Input/Result toggle picks it, keeps the choice across pages and stages, switches
+    to the result when a run finishes and back to the input when the deskew angle
+    changes. The wheel zooms around the cursor, dragging the
     background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
     and pan only translates it, so overlays and their handles keep working at any
     zoom; handles capture their own pointer events. Ctrl+Wheel is reserved for
