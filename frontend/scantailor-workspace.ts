@@ -758,7 +758,7 @@ class WorkspaceController {
    */
   private async explainPreviewFailure(source: string, stage: StageName): Promise<void> {
     if (!source) return;
-    if (this.previewRetry === INITIAL_PREVIEW_RETRY) {
+    if (this.previewRetry === INITIAL_PREVIEW_RETRY && !this.settingsNotApplied()) {
       this.setMessage("Loading the preview failed; checking why…", "error");
     }
     let failure: PreviewFailure;
@@ -778,16 +778,45 @@ class WorkspaceController {
     const retry = nextPreviewRetry(failure, this.previewRetry);
     if (retry) {
       this.previewRetry = retry.state;
-      if (retry.delay > 0) this.setMessage(previewErrorMessage(stage, failure), "info");
+      if (retry.delay > 0) {
+        this.showInputFailure(stage, failure, previewErrorMessage(stage, failure), "info");
+      }
       this.schedulePreviewReload(retry.delay);
       return;
     }
-    this.setMessage(
+    this.showInputFailure(
+      stage,
+      failure,
       previewIsBeingPrepared(failure)
         ? PREVIEW_RETRY_EXHAUSTED_MESSAGE
         : previewErrorMessage(stage, failure),
       "error",
     );
+  }
+
+  /**
+   * Show why the input pane is empty. A missing input only means an earlier stage
+   * has no current result: name the stage the page actually waits for (#205), and
+   * leave "Settings not applied" in place while the member has unsaved edits.
+   */
+  private showInputFailure(
+    stage: StageName,
+    failure: PreviewFailure,
+    text: string,
+    kind: "info" | "error",
+  ): void {
+    const inputNotReady =
+      failure.status === 404 && failure.body.trim().toLowerCase() === "input preview not ready";
+    if (inputNotReady) {
+      if (this.settingsNotApplied()) return;
+      const page = this.activeContext()?.page;
+      const waiting = page ? stageReadiness(page, stage).waitingFor : null;
+      if (waiting) {
+        this.setMessage(`Waiting for ${STAGE_LABELS[waiting]}: its result is not ready yet.`, kind);
+        return;
+      }
+    }
+    this.setMessage(text, kind);
   }
 
   private schedulePreviewReload(delay: number): void {
