@@ -2695,8 +2695,22 @@ def _publish_stage_artifacts(
             state.applied_input_sha256 = input_fingerprint
             state.applied_parameters = dict(state.parameters or {})
             state.applied_revision = revision
+            # A chained rerun (#205) reads the predecessor's newest output; record that
+            # file as this row's input so the superseded upstream revision is no longer
+            # referenced and can be pruned (#204).
+            if state.input_stage_state_id is not None and input_fingerprint:
+                used_input = (
+                    ScanTailorStageState.objects.filter(
+                        pk=state.input_stage_state_id, output_sha256=input_fingerprint
+                    )
+                    .values_list("output_storage_identifier", flat=True)
+                    .first()
+                )
+                if used_input:
+                    state.input_storage_identifier = used_input
             state.save(
                 update_fields=[
+                    "input_storage_identifier",
                     "applied_input_sha256",
                     "applied_parameters",
                     "applied_revision",
