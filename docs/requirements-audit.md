@@ -171,44 +171,13 @@ full project is acceptance-complete.
 
 Run this lane against the hackerspace staging deployment using scans approved
 for the AI server. The browser fixture covers orchestration. Site recognition
-quality and the acceptance thresholds are still unmeasured.
-
-1. Prepare one scan job per labelled page. Include flat and physically curved
-   pages and the languages represented in the acceptance set. Transcribe the
-   printed text in reading order in a UTF-8 file. Record the permission covering
-   the images, transcriptions and processing. Keep the corpus in approved storage.
-2. Run the normal ScanTailor stages and finish with cleaned output and OCR enabled.
-   Record the finalization job ID, raw image SHA-256, OCR service language code,
-   and transcription path. A replacement page requires a fresh finalization.
-3. Set `OCR_ACCEPTANCE_ORIGIN` to the HTTPS staging origin and supply a staging
-   member's session cookie value as `OCR_ACCEPTANCE_SESSION` through the local
-   credential store. Run `uv run python scripts/measure_site_ocr.py corpus.json`.
-   The tool reads the portal's finalization receipt, checks the single raw page
-   and the cleaned PDF lineage, then downloads the member-visible TXT variant.
-   This read-only step can be repeated after a processing or model change.
-
-The manifest below is a template. Substitute actual source digests, completed
-job IDs and the engine reported by the site.
-
-```json
-{
-  "source_permission": "Record the licence or site permission here",
-  "engine": "site-reported-engine",
-  "pages": [
-    {"finalization_id": "00000000-0000-0000-0000-000000000001", "image_sha256": "replace-with-flat-page-sha256", "page_class": "flat", "reference": "flat.en.txt", "language": "eng"},
-    {"finalization_id": "00000000-0000-0000-0000-000000000002", "image_sha256": "replace-with-curved-page-sha256", "page_class": "curved", "reference": "curved.de.txt", "language": "deu"}
-  ]
-}
-```
-
-The report gives per-page character and word edit rates and reference-weighted
-rates by page class, language and model. Unicode is normalized to NFC and
-whitespace is collapsed. Case and punctuation count. The site operator can
-set `thresholds` with a `cer` and `wer` ceiling for each class after inspecting
-the calibration results. One page above either limit fails the run. Exit codes
-are 0 for a passing graded run, 1 for failure, 3 for ungraded calibration and
-77 for an unavailable staging environment. The ordinary test suite includes a
-deliberately degraded download to verify the failure path.
+quality and the acceptance thresholds are still unmeasured: no OCR model has been
+chosen and the test instance cannot reach the AI server (#170). The procedure,
+manifest format, threshold calibration and exit codes for
+`scripts/measure_site_ocr.py` are in `docs/operations.md` ("Site OCR quality
+acceptance"). The ordinary test suite proves the scoring, a deliberately degraded
+download failing, and unreachable staging or OCR server being reported as
+`unavailable` (exit 77) rather than as a pass or a crash.
 
 - Async purity: development intentionally supports synchronous execution without
   Redis; deployed production is prevented from using that configuration.

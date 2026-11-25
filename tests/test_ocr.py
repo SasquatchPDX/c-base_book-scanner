@@ -617,6 +617,8 @@ def test_ocr_failed_job_records_error(
     job = ProcessingJob.objects.get(job_id=payload["job_id"])
     assert job.state == ProcessingJob.JobState.FAILED
     assert "simulated ocr error" in str(job.details.get("error", ""))
+    # The service answered with a failure: that is a result, not an outage.
+    assert ocr.ocr_job_payload(job)["service_unavailable"] is False
     assert FileVariant.objects.filter(source_type=FileVariant.SourceType.OCR).count() == 0
 
 
@@ -836,6 +838,60 @@ def test_ocr_fails_after_too_many_consecutive_transport_errors(
     assert job.state == ProcessingJob.JobState.FAILED
     assert "3 times in a row" in job.details["error"]
     assert service.polls == 3
+    assert ocr.ocr_job_payload(job)["service_unavailable"] is True
+
+
+def _refuse(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+@pytest.mark.parametrize(
+    ("handler", "unavailable"),
+    [
+        (_refuse, True),
+        (lambda request: httpx.Response(503), True),
+        (lambda request: httpx.Response(400), False),
+        (lambda request: httpx.Response(200, content=b"not json"), False),
+    ],
+)
+def test_http_ocr_submit_marks_unreachable_service(
+    tmp_path: Path, handler: Any, unavailable: bool
+) -> None:
+    source = tmp_path / "page.pdf"
+    source.write_bytes(b"source")
+    client = ocr.HttpxOCRClient("https://ocr.test")
+    client._client.close()
+    client._client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ocr.OCRClientError, match="submit failed") as failure:
+            client.submit_job(
+                source_path=source,
+                source_format="pdf",
+                source_mime="application/pdf",
+                request=ocr.OCRJobRequest(target_formats=["txt"]),
+            )
+    finally:
+        client._client.close()
+    assert failure.value.service_unavailable is unavailable
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ocr_job_against_unreachable_service_is_flagged_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = _seed_ocr_variant(tmp_path, monkeypatch, f"ocr-down-{uuid4().hex[:8]}")
+    http_client = ocr.HttpxOCRClient("https://ocr.test")
+    http_client._client.close()
+    http_client._client = httpx.Client(transport=httpx.MockTransport(_refuse))
+    monkeypatch.setattr(ocr, "_get_ocr_client", lambda: http_client)
+    try:
+        job = ocr.request_ocr_from_variant(source_variant=variant, target_formats=["txt"])
+    finally:
+        http_client._client.close()
+    assert job.state == ProcessingJob.JobState.FAILED
+    payload = ocr.ocr_job_payload(job)
+    assert payload["service_unavailable"] is True
+    assert "OCR submit failed" in payload["error"]
 
 
 @pytest.mark.django_db(transaction=True)

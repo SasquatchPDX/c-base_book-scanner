@@ -45,11 +45,16 @@ class OCRClientError(RuntimeError):
 
     ``transient`` marks failures worth retrying while polling (network errors,
     timeouts, HTTP 5xx/408/429); other failures abort the OCR job immediately.
+    ``service_unavailable`` marks failures where the OCR service could not be
+    reached or kept answering, as opposed to a service that returned a bad result.
     """
 
-    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+    def __init__(
+        self, message: str = "", *, transient: bool = False, service_unavailable: bool = False
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.service_unavailable = service_unavailable
 
 
 class OCRMalformedResponseError(RuntimeError):
@@ -171,7 +176,12 @@ class HttpxOCRClient:
                 )
             response.raise_for_status()
             raw = response.json()
-        except (httpx.HTTPError, OSError, ValueError) as exc:
+        except (httpx.HTTPError, OSError) as exc:
+            raise OCRClientError(
+                f"OCR submit failed: {exc}",
+                service_unavailable=_is_transient_http_error(exc),
+            ) from exc
+        except ValueError as exc:
             raise OCRClientError(f"OCR submit failed: {exc}") from exc
         return _coerce_remote_job_id(raw)
 
@@ -723,6 +733,7 @@ def process_ocr_job(job_id: str) -> None:
             "reported": reported,
             "output_variants": output_variants,
             "error": "",
+            "service_unavailable": False,
         }
         ocr_job.state = ProcessingJob.JobState.SUCCESS
         ocr_job.finished_at = timezone.now()
@@ -735,7 +746,11 @@ def process_ocr_job(job_id: str) -> None:
         )
     except Exception as exc:  # pragma: no cover - defensive
         close_old_connections()
-        _fail_ocr_job(ocr_job, str(exc))
+        _fail_ocr_job(
+            ocr_job,
+            str(exc),
+            service_unavailable=bool(getattr(exc, "service_unavailable", False)),
+        )
         if worker_failures.retry_pending(ocr_job):
             raise
     finally:
@@ -778,6 +793,7 @@ def _submit_and_poll(
             if consecutive_errors >= schedule.max_consecutive_errors:
                 raise OCRClientError(
                     f"OCR polling failed {consecutive_errors} times in a row: {exc}",
+                    service_unavailable=True,
                 ) from exc
         else:
             consecutive_errors = 0
@@ -1027,9 +1043,10 @@ def _ensure_dict(raw: object) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, Mapping) else {}
 
 
-def _fail_ocr_job(job: ProcessingJob, message: str) -> None:
+def _fail_ocr_job(job: ProcessingJob, message: str, *, service_unavailable: bool = False) -> None:
     details = _ensure_dict(job.details)
     details["error"] = message
+    details["service_unavailable"] = service_unavailable
     details["remote_status"] = "failed"
     pending = worker_failures.retry_pending(job)
     job.state = ProcessingJob.JobState.QUEUED if pending else ProcessingJob.JobState.FAILED
@@ -1055,5 +1072,7 @@ def ocr_job_payload(job: ProcessingJob) -> dict[str, Any]:
         "reported": details.get("reported", {}),
         "target_formats": details.get("target_formats", []),
         "error": details.get("error", ""),
+        # True when the last failure was the OCR service being unreachable.
+        "service_unavailable": bool(details.get("service_unavailable", False)),
         "output_variants": details.get("output_variants", []),
     }

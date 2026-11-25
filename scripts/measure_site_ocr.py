@@ -16,6 +16,15 @@ import httpx
 from pydantic import BaseModel, Field
 from rapidfuzz.distance import Levenshtein
 
+# Run states that are neither a pass nor a failure: the measurement could not be made.
+PENDING_STATES = {"queued", "running"}
+# Staging gateway answers that mean the portal, not the OCR result, is unavailable.
+GATEWAY_UNAVAILABLE = {502, 503, 504}
+
+
+class SiteUnavailable(Exception):
+    """The staging portal or the site OCR server could not produce a result to score."""
+
 
 class Limits(BaseModel):
     cer: float = Field(ge=0, allow_inf_nan=False)
@@ -62,6 +71,8 @@ def downloaded_text(client: httpx.Client, page: Page, engine: str) -> tuple[str,
         return dict(client.get(path).raise_for_status().json())
 
     finish = get(f"/scan-finalizations/{page.finalization_id}/")
+    if finish["state"] in PENDING_STATES:
+        raise SiteUnavailable(f"Finalization {page.finalization_id} has not finished.")
     if finish["state"] != "success" or finish["allow_raw_pages"] is not False:
         raise ValueError("Expected a successful finalization with processed pages required.")
     scan = get(f"/scan/jobs/{finish['scan_job_id']}/")
@@ -72,6 +83,10 @@ def downloaded_text(client: httpx.Client, page: Page, engine: str) -> tuple[str,
     ):
         raise ValueError("The completed scan does not match the labelled source image.")
     job = get(f"/ocr/{finish['ocr_job_id']}/")
+    if job["state"] in PENDING_STATES:
+        raise SiteUnavailable(f"OCR job {finish['ocr_job_id']} has not finished.")
+    if job["state"] == "failed" and job.get("service_unavailable"):
+        raise SiteUnavailable(f"OCR server unreachable: {job.get('error', '')}")
     if (
         job["state"] != "success"
         or not job["remote_job_id"]
@@ -141,10 +156,10 @@ def measure(client: httpx.Client, corpus: Corpus, root: Path) -> dict[str, Any]:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None, transport: httpx.BaseTransport | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     target, session = os.getenv("OCR_ACCEPTANCE_ORIGIN"), os.getenv("OCR_ACCEPTANCE_SESSION")
     if not target or not session:
         print(
@@ -165,12 +180,24 @@ def main() -> int:
         ):
             raise ValueError("Specify an HTTPS staging origin.")
         corpus = Corpus.model_validate_json(args.manifest.read_text("utf-8"))
-        with httpx.Client(base_url=url, cookies={"sessionid": session}, timeout=30) as client:
+        with httpx.Client(
+            base_url=url, cookies={"sessionid": session}, timeout=30, transport=transport
+        ) as client:
             report = measure(client, corpus, args.manifest.parent)
     except httpx.TransportError as exc:
         print(json.dumps({"status": "unavailable", "reason": type(exc).__name__}))
         return 77
-    except (KeyError, OSError, ValueError, httpx.HTTPStatusError) as exc:
+    except SiteUnavailable as exc:
+        print(json.dumps({"status": "unavailable", "reason": str(exc)}))
+        return 77
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in GATEWAY_UNAVAILABLE:
+            reason = f"staging returned HTTP {exc.response.status_code}"
+            print(json.dumps({"status": "unavailable", "reason": reason}))
+            return 77
+        print(json.dumps({"status": "failed", "reason": str(exc)}))
+        return 1
+    except (KeyError, OSError, ValueError) as exc:
         print(json.dumps({"status": "failed", "reason": str(exc)}))
         return 1
     print(json.dumps(report, indent=2))
