@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from ebook_server.core import scan_artifact_pruning
 from ebook_server.jobs import get_queue
+from ebook_server.storage import StorageUnavailableError
 
 
 class Command(BaseCommand):
@@ -51,11 +52,14 @@ class Command(BaseCommand):
                 self.stdout.write(f"enqueued scan artifact sweep {getattr(job, 'id', '')}")
                 return
             self.stdout.write("no queue configured; running in this process")
-        report = scan_artifact_pruning.sweep(
-            dry_run=dry_run,
-            min_age_seconds=options["min_age_seconds"],
-            limit=options["limit"],
-        )
+        try:
+            report = scan_artifact_pruning.sweep(
+                dry_run=dry_run,
+                min_age_seconds=options["min_age_seconds"],
+                limit=options["limit"],
+            )
+        except (OSError, ValueError, StorageUnavailableError) as exc:
+            raise CommandError(f"scan artifact sweep failed, nothing deleted: {exc}") from exc
         verb = "would delete" if dry_run else "deleted"
         self.stdout.write(
             self.style.SUCCESS(

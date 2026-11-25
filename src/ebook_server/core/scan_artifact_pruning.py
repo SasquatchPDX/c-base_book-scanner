@@ -144,14 +144,25 @@ def references(prefix: str = STAGE_NAMESPACE + "/") -> References:
 
 
 def _list(
-    storage: LocalFilesystemStorage, prefix: str, limit: int
+    storage: LocalFilesystemStorage,
+    prefix: str,
+    limit: int = DEFAULT_SWEEP_LIMIT,
+    *,
+    strict: bool = False,
 ) -> list[tuple[StageFile, StorageEntry]]:
-    """Stage files under ``prefix`` with their storage entries (size, mtime)."""
+    """Stage files under ``prefix`` with their storage entries (size, mtime).
+
+    A missing folder lists as empty. Any other listing failure is logged and lists
+    as empty too, unless ``strict``: then it is raised, so the sweep reports it
+    instead of claiming there was nothing to delete.
+    """
     try:
         if not storage.resolve_location(prefix).is_dir():
             return []
         entries = list(storage.inventory(limit=limit, prefix=prefix))
     except (OSError, ValueError, StorageUnavailableError):
+        if strict:
+            raise
         logger.warning("scan_artifact_listing_failed", prefix=prefix, exc_info=True)
         return []
     found: list[tuple[StageFile, StorageEntry]] = []
@@ -199,13 +210,25 @@ def prune_superseded_revisions(state: ScanTailorStageState) -> int:
     Called after the commit. A revision below the current one is never written
     again (a commit requires the row's current revision), so only references can
     keep its files. Partial copies are left to their worker and to the sweep.
-    Returns the number of files deleted.
+
+    The run also rebound ``state`` to its upstream stage's current output, which
+    can release an older upstream revision that only this row still named; those
+    files go too. Returns the number of files deleted.
     """
     storage = _storage()
+    deleted = _prune_older_revisions(storage, state)
+    if state.input_stage_state_id is not None:
+        upstream = ScanTailorStageState.objects.filter(pk=state.input_stage_state_id).first()
+        if upstream is not None:
+            deleted += _prune_older_revisions(storage, upstream)
+    return deleted
+
+
+def _prune_older_revisions(storage: LocalFilesystemStorage, state: ScanTailorStageState) -> int:
     prefix = _stage_prefix(state)
     stale = [
         item
-        for item, _entry in _list(storage, prefix, DEFAULT_SWEEP_LIMIT)
+        for item, _entry in _list(storage, prefix)
         if item.revision < state.revision and not item.partial
     ]
     if not stale:
@@ -251,11 +274,7 @@ def discard_revision_artifacts(stage_state_id: object, revision: object) -> int:
         if state is None:
             return 0
         folder = f"{_stage_prefix(state)}v{revision}"
-        items = [
-            item
-            for item, _entry in _list(storage, folder + "/", DEFAULT_SWEEP_LIMIT)
-            if not item.partial
-        ]
+        items = [item for item, _entry in _list(storage, folder + "/") if not item.partial]
         if not items:
             return 0
         held = references(folder + "/")
@@ -306,11 +325,12 @@ def sweep(
     The tree is listed before the references are read, and only files older than
     ``min_age_seconds`` are candidates, so a run that commits meanwhile (file
     renamed into place, row saved a moment later) is never swept. ``dry_run``
-    counts what would go and deletes nothing.
+    counts what would go and deletes nothing. A listing failure (for example more
+    than ``limit`` entries) raises instead of reporting nothing to delete.
     """
     storage = _storage()
     report = SweepReport(dry_run=dry_run)
-    listed = _list(storage, prefix, limit)
+    listed = _list(storage, prefix, limit, strict=True)
     held = references(prefix)
     cutoff_ns = time.time_ns() - max(min_age_seconds, 0) * 1_000_000_000
     folders: set[str] = set()
@@ -375,7 +395,7 @@ def prune_scan_job_stage_artifacts(scan_job_id: str) -> int:
     )
     storage = _storage()
     prefix = f"{STAGE_NAMESPACE}/{scan_job_id}/"
-    listed = _list(storage, prefix, DEFAULT_SWEEP_LIMIT)
+    listed = _list(storage, prefix)
     held = references(prefix)
     deleted = 0
     folders: set[str] = set()
