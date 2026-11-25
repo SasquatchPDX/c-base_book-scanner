@@ -311,14 +311,17 @@ the same `scan-jobs/<job>/` folder are originals and are never touched. Deletion
 through the storage backend; a failure is logged and never fails the job.
 
 - **Commit.** When a stage run commits, the files of the stage's earlier revisions
-  are deleted. A lower revision is never written again, so this needs no lock.
+  are deleted. A lower revision is never written again, so this needs no lock. The
+  run also rebinds the stage to its upstream stage's current output, so earlier
+  upstream revisions only this row still named are deleted as well.
 - **Closed jobs.** A stage job closed as superseded or failed deletes the files of
   its own revision folder, under the stage row's lock (the lock a commit takes),
   unless a row refers to them.
 - **Sweep.** `manage.py prune_scan_artifacts` deletes every unreferenced stage file
   under `scan-jobs/` older than an hour (`--min-age-seconds`), including crashed
   workers' `.partial` copies and the folders of deleted jobs. `--dry-run` prints the
-  file and byte count and deletes nothing. `deploy/systemd/book-scanner-scan-prune.timer`
+  file and byte count and deletes nothing. A listing failure (more than `--limit`
+  entries, unreadable folder) exits with an error before anything is deleted. `deploy/systemd/book-scanner-scan-prune.timer`
   runs it hourly with `--enqueue`, so a worker does the work.
 - **Job end.** When a finish has put the cleaned PDF into the library, and when a
   job is cancelled (in a worker), the job's stage rows lose their output and preview
