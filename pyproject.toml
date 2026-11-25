@@ -38,6 +38,7 @@ dependencies = [
   "uvicorn>=0.35,<1",
   "pycountry>=24.6,<27",
   "nh3>=0.3.7,<0.4",
+  "scipy>=1.14,<2",
 ]
 
 [project.scripts]

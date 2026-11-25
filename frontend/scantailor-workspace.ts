@@ -9,6 +9,11 @@ import {
   type StripItem,
 } from "./page-strip";
 import {
+  ContentBoxOverlay,
+  describeContent,
+  type SourceBox,
+} from "./content-box-view";
+import {
   type ApplyScope,
   applyScopePages,
   clampAngle,
@@ -574,6 +579,7 @@ class WorkspaceController {
   private previewRetry: PreviewRetryState = INITIAL_PREVIEW_RETRY;
   private previewRetryTimer: number | null = null;
   private deskewOverlay: DeskewOverlay | null = null;
+  private contentOverlay: ContentBoxOverlay | null = null;
   private deskewSaveTimer: number | null = null;
   private saving = false;
   private saveQueued = false;
@@ -843,6 +849,17 @@ class WorkspaceController {
       if (justCompleted) this.setMessage(deskewResultText(state.parameters), "success");
       return;
     }
+    if (state.stage === "select_content") {
+      // The input view shows the content box; keep it unless a drag is in progress.
+      if (this.contentOverlay?.isDragging()) return;
+      this.showPreview(this.previewMode);
+      this.updateContentText();
+      if (justCompleted) {
+        const box = this.contentBox();
+        this.setMessage(describeContent(state.parameters, box, this.contentDpi()), "success");
+      }
+      return;
+    }
     this.showPreview(justCompleted ? "result" : this.previewMode);
     if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
   }
@@ -908,7 +925,7 @@ class WorkspaceController {
           delete this.draft.manual_angle;
           this.applyDeskewPreview();
         }
-        void this.commitDeskew();
+        void this.commitDraft();
       });
       label.append(radio, document.createTextNode(value === "auto" ? "Auto" : "Manual"));
       modes.append(label);
@@ -1015,12 +1032,12 @@ class WorkspaceController {
     if (this.deskewSaveTimer !== null) window.clearTimeout(this.deskewSaveTimer);
     this.deskewSaveTimer = window.setTimeout(() => {
       this.deskewSaveTimer = null;
-      void this.commitDeskew();
+      void this.commitDraft();
     }, 600);
   }
 
-  /** Save the deskew draft; a change made while a save is running is saved after it. */
-  private async commitDeskew(): Promise<void> {
+  /** Save the stage draft; a change made while a save is running is saved after it. */
+  private async commitDraft(): Promise<void> {
     if (!this.editable) return;
     if (this.deskewSaveTimer !== null) {
       window.clearTimeout(this.deskewSaveTimer);
@@ -1033,7 +1050,7 @@ class WorkspaceController {
     await this.saveActiveStage();
     if (this.saveQueued) {
       this.saveQueued = false;
-      await this.commitDeskew();
+      await this.commitDraft();
     }
   }
 
@@ -1072,7 +1089,7 @@ class WorkspaceController {
         onPreview: (value) => this.setDeskewAngle(value, false),
         onCommit: (value) => {
           this.setDeskewAngle(value, false);
-          void this.commitDeskew();
+          void this.commitDraft();
         },
       });
       this.deskewOverlay.setKeepGrid(readKeepGrid());
@@ -1096,7 +1113,128 @@ class WorkspaceController {
   }
 
   private renderContentControls(): void {
-    this.addSelect("Mode", "content_mode", ["auto", "manual"], "auto", true);
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.content_mode ?? state?.parameters.content_mode ?? "auto");
+    const modes = document.createElement("fieldset");
+    modes.className = "st-radio-group";
+    const legend = document.createElement("legend");
+    legend.textContent = "Mode";
+    modes.append(legend);
+    for (const [value, text] of [
+      ["auto", "Auto"],
+      ["manual", "Manual"],
+      ["disabled", "Disabled"],
+    ] as const) {
+      const label = document.createElement("label");
+      label.className = "checkbox";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "content-mode";
+      radio.value = value;
+      radio.checked = mode === value;
+      radio.disabled = !this.editable;
+      radio.dataset.contentMode = value;
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        this.draft.content_mode = value;
+        if (value === "manual") {
+          // Start from the box on screen (the auto result), as upstream does.
+          const box = this.contentBox() ?? this.defaultContentBox();
+          this.draft.content_box = [box.x1, box.y1, box.x2, box.y2];
+        } else {
+          delete this.draft.content_box;
+        }
+        this.renderGeometry();
+        void this.commitDraft();
+      });
+      label.append(radio, document.createTextNode(text));
+      modes.append(label);
+    }
+    this.controls.append(modes);
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.contentResult = "";
+    this.controls.append(result);
+    this.updateContentText();
+  }
+
+  /** The box to draw: the manual draft, else what auto mode found last. */
+  private contentBox(): SourceBox | null {
+    const state = this.activeContext()?.state;
+    const mode = String(this.draft.content_mode ?? state?.parameters.content_mode ?? "auto");
+    if (mode === "disabled") return null;
+    const fallback = { x1: 0, y1: 0, x2: 0, y2: 0 };
+    if (mode === "manual" && this.draft.content_box !== undefined) {
+      const box = normalizeBox(this.draft.content_box, fallback);
+      return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
+    }
+    if (!state || state.status !== "success" || state.parameters.content_found === false)
+      return null;
+    const box = normalizeBox(state.parameters.content_box, fallback);
+    return box.x2 > box.x1 && box.y2 > box.y1 ? box : null;
+  }
+
+  /** Upstream `createContentBox`: 70 % of the page, centred. */
+  private defaultContentBox(): SourceBox {
+    const source = this.sourceSize();
+    return {
+      x1: Math.round(source.width * 0.15),
+      y1: Math.round(source.height * 0.15),
+      x2: Math.round(source.width * 0.85),
+      y2: Math.round(source.height * 0.85),
+    };
+  }
+
+  private contentDpi(): { x: number; y: number } | null {
+    const dpi = this.activeContext()?.state.parameters.dpi;
+    if (Array.isArray(dpi) && dpi.length >= 2) {
+      const x = positiveNumber(dpi[0]);
+      const y = positiveNumber(dpi[1]);
+      if (x && y) return { x, y };
+    }
+    return null;
+  }
+
+  private updateContentText(box: SourceBox | null = this.contentBox()): void {
+    const result = this.controls.querySelector<HTMLElement>("[data-content-result]");
+    if (!result) return;
+    const state = this.activeContext()?.state;
+    const parameters = { ...(state?.parameters ?? {}), ...this.draft };
+    const known = state?.status === "success" || this.draft.content_mode === "manual";
+    result.textContent = known ? describeContent(parameters, box, this.contentDpi()) : "";
+  }
+
+  /**
+   * Draw the content box. The overlay persists across re-renders (live updates,
+   * zoom, image reloads), like the Deskew overlay, so a drag in progress survives them.
+   */
+  private renderContentBox(source: Size, display: Size): void {
+    const box = this.contentBox();
+    const existing = this.contentOverlay;
+    if (existing && (box || existing.isDragging())) {
+      if (box) existing.setBox(box); // ignored while dragging
+      if (existing.element.parentElement !== this.geometryLayer)
+        this.geometryLayer.append(existing.element);
+      existing.layout(source, display);
+      return;
+    }
+    this.removeContentOverlay();
+    if (!box) return;
+    this.contentOverlay = new ContentBoxOverlay(this.geometryLayer, box, this.editable, {
+      onPreview: (next) => this.updateContentText(next),
+      onCommit: (next) => {
+        // Upstream manualContentRectSet: a drag makes the box manual and commits it.
+        this.draft.content_mode = "manual";
+        this.draft.content_box = [next.x1, next.y1, next.x2, next.y2];
+        const radio = this.controls.querySelector<HTMLInputElement>(
+          '[data-content-mode="manual"]',
+        );
+        if (radio) radio.checked = true;
+        this.updateContentText(next);
+        void this.commitDraft();
+      },
+    });
+    this.contentOverlay.layout(source, display);
   }
 
   private renderMarginControls(): void {
@@ -1424,9 +1562,7 @@ class WorkspaceController {
     this.geometryLayer.style.height = `${display.height}px`;
     switch (this.activeStage) {
       case "select_content":
-        if (this.draft.content_mode === "manual") {
-          this.renderRectangle("content_box", "Content", "content", source, display, 0.08);
-        }
+        this.renderContentBox(source, display);
         break;
       case "dewarping":
         if (this.draft.dewarp_mode === "manual") {
@@ -1480,7 +1616,20 @@ class WorkspaceController {
   private clearGeometry(): void {
     for (const interaction of this.interactions) interaction.unset();
     this.interactions = [];
-    this.geometryLayer.replaceChildren();
+    // Keep the content box element (and any drag on it); renderGeometry re-adds it.
+    const keep =
+      this.activeStage === "select_content" && this.previewMode === "input"
+        ? this.contentOverlay
+        : null;
+    if (!keep) this.removeContentOverlay();
+    for (const child of [...this.geometryLayer.children]) {
+      if (child !== keep?.element) child.remove();
+    }
+  }
+
+  private removeContentOverlay(): void {
+    this.contentOverlay?.remove();
+    this.contentOverlay = null;
   }
 
   private renderRectangle(
@@ -1748,7 +1897,9 @@ class WorkspaceController {
       this.setMessage(
         done && payload.stage.stage === "deskew"
           ? `Saved. ${deskewResultText(payload.stage.parameters)}`
-          : done
+          : done && payload.stage.stage === "select_content"
+            ? `Saved. ${describeContent(payload.stage.parameters, this.contentBox(), this.contentDpi())}`
+            : done
             ? "Saved. Result preview is ready."
             : "Saved. The worker is generating the new preview.",
         "success",

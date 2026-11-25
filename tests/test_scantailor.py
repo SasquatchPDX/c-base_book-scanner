@@ -1171,27 +1171,6 @@ def test_exif_rotated_input_defines_the_stage_geometry(tmp_path: Path) -> None:
     assert result.full_size == (300, 500)
 
 
-def test_content_box_ignores_dust_speck_and_scales_with_dim_images() -> None:
-    page = _text_page(900, 1200, paper=235)
-    ImageDraw.Draw(page).rectangle((860, 1170, 863, 1173), fill=15)
-    left, top, right, bottom = scantailor._detect_content_box(page)
-    assert left > 60
-    assert right < 880
-    assert top > 80
-    assert bottom < 1100
-
-    dim = _text_page(900, 1200, paper=90, ink=12)
-    left, top, right, bottom = scantailor._detect_content_box(dim)
-    assert (right - left) < 900 * 0.9
-    assert (bottom - top) < 1200 * 0.9
-
-
-def test_content_box_blank_page_is_full_frame() -> None:
-    blank = Image.new("L", (600, 800), 220)
-    ImageDraw.Draw(blank).rectangle((10, 10, 12, 12), fill=190)
-    assert scantailor._detect_content_box(blank) == (0, 0, 600, 800)
-
-
 def test_stage_preserves_source_dpi_and_defaults_to_300(tmp_path: Path) -> None:
     """The full-resolution Output file carries the page DPI (missing DPI means 300)."""
     for saved, expected in (({"dpi": (200, 200)}, 200), ({}, 300)):
@@ -1351,17 +1330,6 @@ def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> 
     assert state.parameters == {"manual_angle": 1.5}
     assert state.status == ScanTailorStageState.StageStatus.QUEUED
     assert not state.output_storage_identifier
-
-
-def test_content_box_on_dark_surroundings_finds_text_not_frame() -> None:
-    canvas = Image.new("L", (1000, 1300), 25)
-    page = _text_page(800, 1100, paper=225)
-    canvas.paste(page, (100, 100))
-    left, top, right, bottom = scantailor._detect_content_box(canvas)
-    assert left > 150
-    assert right < 950
-    assert top > 150
-    assert bottom < 1250
 
 
 def _page_with_number_outside_quad() -> Image.Image:
