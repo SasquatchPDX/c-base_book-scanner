@@ -68,6 +68,10 @@ def save_work_png(image: Image.Image, path: Path, dpi: tuple[int, int] | None = 
     image.save(path, **options)
 
 
+def ensure_rgb_or_l(image: Image.Image) -> Image.Image:
+    return image if image.mode in {"L", "RGB"} else image.convert("RGB")
+
+
 def save_preview_jpeg(image: Image.Image, path: Path) -> None:
     rgb = image if image.mode in {"L", "RGB"} else image.convert("RGB")
     rgb.save(path, format="JPEG", quality=85)

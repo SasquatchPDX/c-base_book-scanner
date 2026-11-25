@@ -112,7 +112,7 @@ describe("editable stage parameters", () => {
         ],
       },
     };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="curvature-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="dewarping">Dewarping</button><button data-stage-open data-page-id="page" data-stage="dewarping" data-stage-url="/dewarp"></button></div>`;
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="curvature-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="dewarping">Dewarping</button></div>`;
     const fetcher = vi
       .fn()
       .mockResolvedValue({ ok: true, status: 202, json: async () => ({ stage: state }) });
@@ -184,7 +184,7 @@ describe("editable stage parameters", () => {
       },
     };
     document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
-      <div id="zones-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-stage-select="output">Output</button><button data-stage-open data-page-id="page" data-stage="output" data-stage-url="/output"></button></div>`;
+      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
     const fetcher = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -471,7 +471,7 @@ describe("editor preview recovery (#195)", () => {
       status: "unknown",
       parameters: {},
     };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button><button data-stage-open data-page-id="page" data-stage="deskew" data-input-preview-url="/preview/?input=true"></button></div>`;
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
     const host = document.querySelector<HTMLElement>("#retry-host")!;
     initializeScanTailorWorkspace(host);
     return {
@@ -490,20 +490,20 @@ describe("editor preview recovery (#195)", () => {
       .mockResolvedValue(response(200));
     vi.stubGlobal("fetch", fetcher);
     const { image, message } = mountDeskew();
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown");
 
     image.dispatchEvent(new Event("error"));
     await flush();
     expect(message.textContent).toMatch(/still being prepared/);
     await vi.advanceTimersByTimeAsync(999);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown");
     await vi.advanceTimersByTimeAsync(1);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
 
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(2000);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=2");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=2");
 
     // Generation finished: this load succeeds and the stage status returns.
     image.dispatchEvent(new Event("load"));
@@ -520,13 +520,13 @@ describe("editor preview recovery (#195)", () => {
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(0);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
 
     // A response that is fine but undecodable is not reloaded forever.
     image.dispatchEvent(new Event("error"));
     await flush();
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(image.getAttribute("src")).toBe("/preview/?input=true&revision=1-unknown&retry=1");
+    expect(image.getAttribute("src")).toBe("/page/preview/?input=true&revision=1-unknown&retry=1");
   });
 
   it("gives up after the retry budget with an explanation", async () => {
@@ -553,11 +553,10 @@ describe("editor preview recovery (#195)", () => {
     await flush();
     // Showing the result mode (no result yet) keeps the same URL; switching the
     // source clears the pending retry.
-    const trigger = host.querySelector<HTMLElement>("[data-stage-open]")!;
-    trigger.dataset.inputPreviewUrl = "/other/?input=true";
+    host.dataset.previewUrlTemplate = "/other/__PAGE__/preview/";
     host.querySelector<HTMLButtonElement>("[data-preview-input]")!.click();
-    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/other/page/preview/?input=true&revision=1-unknown");
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(image.getAttribute("src")).toBe("/other/?input=true&revision=1-unknown");
+    expect(image.getAttribute("src")).toBe("/other/page/preview/?input=true&revision=1-unknown");
   });
 });

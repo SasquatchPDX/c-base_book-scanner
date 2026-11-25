@@ -30,8 +30,9 @@ test("first open of a page migrated without a working image shows its Deskew inp
     }
   });
   await signIn(page);
-  await page.goto(`/scan/jobs/${MIGRATED_JOB_ID}/workspace/`);
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
+  // The editor (#195 step 3) opens on the first page's Deskew input.
+  await page.goto(`/scan/jobs/${MIGRATED_JOB_ID}/editor/`);
+  await expect(page.locator("[data-strip-page]")).toHaveCount(1);
   const image = page.locator("[data-editor-image]");
   await expect(image).toHaveAttribute("alt", "Processing-stage input preview");
 
@@ -76,6 +77,7 @@ test("an upload whose working image is still queued appears once it is ready", a
   await page.getByLabel("Sequence").fill("1");
   await page.getByRole("button", { name: "Upload page" }).click();
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
+  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
   const message = page.locator("[data-editor-message]");
   await expect(message).toContainText("still being prepared");
