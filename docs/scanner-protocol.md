@@ -201,17 +201,22 @@ keyed by scan job, because the job may still be unidentified and stages are re-r
 The infrastructure browser suite exercises a simulated device against the running
 scanner API, then signs in as a member through the portal. It drops an upload
 acknowledgement after the server commits, retries the upload, sends a cover,
-OPF and events, and checks the completion manifest. After the member finishes
-the raw scan, the test claims a rescan, uploads the replacement twice, checks
-both immutable version checksums and downloads the re-finished PDF.
+OPF and events (each repeated once, answered `200`), and checks that a manifest
+naming bytes serif does not hold is refused (`409 incomplete`) before the real
+manifest verifies. After the member finishes the raw scan, the test claims a
+rescan, uploads the replacement twice, checks the logical page identity and both
+immutable version checksums, and downloads the re-finished PDF: the variant of
+the second finish, not the first. The device API then reports the job complete
+with the replacement's checksum and no open rescans.
 Run `scripts/run_infrastructure_tests.sh` for this scenario.
 
-The physical scanner acceptance run for #169 remains outstanding. Use a
-disposable scan on the approved staging deployment. Record the scanner firmware,
-server commit, opaque job ID, first and replacement checksums, completion response
-and downloaded PDF checksum. Keep the local captures until the scanner receives
-a successful completion response with `verified: true`. A successful page
-upload alone cannot authorize local deletion.
+The physical scanner acceptance run for #169 is a separate site run on the
+approved staging deployment. The procedure is "Recording the physical scanner
+acceptance run" in `docs/operations.md`; `scripts/record_scanner_site_run.py`
+checks the result read-only and prints the record, which goes into
+`docs/measurements/scanner-site-run.md`. Keep the local captures until the
+scanner receives a successful completion response with `verified: true`. A
+successful page upload alone cannot authorize local deletion.
 
 - Scanner sends raw image artifacts; server stores immutable upload.
 - Replacements create new page version and mark previous version inactive.
