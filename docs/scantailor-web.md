@@ -32,6 +32,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    manual. The output keeps the input's size. Auto detection is not ported yet
    (step 6b): until then it takes the top and bottom baselines found by the earlier
    baseline detector, and a page without text lines stays unchanged and says so.
+   Manual curves are limited to 64 control points each, within one page size of the
+   page; other curves, an invalid model or a failed render leave the page unchanged
+   with a `dewarp_warning`. Measurements: [`measurements/dewarping-acceptance.md`](measurements/dewarping-acceptance.md).
 4. Margins — a port of upstream `page_layout` (#208, `core/page_layout.py`): one
    common page size for the job. Each page's *hard size* is its content plus its
    hard margins (millimetres, default 10/5/10/5 mm left/top/right/bottom); the

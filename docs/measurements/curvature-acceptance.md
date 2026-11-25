@@ -1,5 +1,9 @@
 # Opt-in baseline curvature acceptance (#171)
 
+> Historical: this measured the pre-port `baseline-curvature-v1` model of #191. Since
+> #195 step 6a the Dewarping stage runs the cylindrical model; its acceptance
+> measurements are in [`dewarping-acceptance.md`](dewarping-acceptance.md).
+
 The generated fixtures below are **synthetic**, not scanned books. Two public
 photographs were also measured independently, as described separately below. No
 site-connected scanner corpus was supplied. This does not close the broader
