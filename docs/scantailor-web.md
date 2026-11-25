@@ -25,8 +25,13 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    to the text. Modes: auto, manual (the box as drawn) and disabled (the whole page).
    A page without content keeps the whole page and says so. The content size is also
    recorded in millimetres (upstream `PhysSizeCalc`).
-3. Dewarping — OpenCV projective correction using detected or draggable control
-   points, with an explicit bypass and deterministic failure behavior.
+3. Dewarping — upstream Scan Tailor's cylindrical-surface model (#195 step 6,
+   `core/cylindrical.py`): a top and a bottom X-spline follow the text block, and
+   the page between them is unrolled as a cylinder (`CylindricalSurfaceDewarper`,
+   with upstream's depth perception, 1 to 3, default 2). Modes are off, auto and
+   manual. The output keeps the input's size. Auto detection is not ported yet
+   (step 6b): until then it takes the top and bottom baselines found by the earlier
+   baseline detector, and a page without text lines stays unchanged and says so.
 4. Margins — per-side/canvas padding and horizontal/vertical alignment.
 5. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
@@ -322,6 +327,17 @@ page. Releasing a handle makes the box manual and saves it, as upstream commits 
 release. Auto, Manual and Disabled are radio buttons; the options show the content
 size, e.g. "Content 151.0 × 233.2 mm (892 × 1377 px, auto)". The page strip can be
 sorted by content width or height.
+
+**Dewarping** (upstream `DewarpingView`): the input view shows the model as upstream
+draws it, a 30 × 30 blue grid that follows the cylinder, translucent white beyond its
+left and right edges, and the red control points of the top and bottom curves. Drag a
+middle point to move it; drag an end point to turn and scale its whole curve about the
+other end; click a curve to add a point there (and drag it); press Del or D over a
+middle point to remove it. The grid follows every movement in the browser (a
+TypeScript twin of the model, checked against the server with
+`tests/fixtures/dewarp_model_cases.json`); releasing saves the curves and makes an
+auto model manual, as upstream does. Off, Auto and Manual are radio buttons; the
+depth-perception slider redraws the grid live and saves on release.
 
 The editor also keeps:
 

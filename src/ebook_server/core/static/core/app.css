@@ -86,3 +86,10 @@
 .st-content-top-left,.st-content-top-right,.st-content-bottom-left,.st-content-bottom-right{width:14px;height:14px;background:#5ad1ff;border:2px solid #fff;border-radius:3px;box-sizing:border-box}
 .st-content-top-left{left:-7px;top:-7px;cursor:nwse-resize}.st-content-bottom-right{right:-7px;bottom:-7px;cursor:nwse-resize}
 .st-content-top-right{right:-7px;top:-7px;cursor:nesw-resize}.st-content-bottom-left{left:-7px;bottom:-7px;cursor:nesw-resize}
+/* Dewarping (#195 step 6): upstream DewarpingView's blue model grid, white margins, red points. */
+.st-dewarp-overlay{position:absolute;top:0;left:0;overflow:visible;pointer-events:none}
+.st-dewarp-grid{fill:none;stroke:#0000ff;stroke-width:1.2;vector-effect:non-scaling-stroke}
+.st-dewarp-margins{fill:rgba(255,255,255,.59);stroke:none}
+.st-dewarp-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:copy}
+.st-dewarp-point{fill:#ff0000;stroke:#fff;stroke-width:1.5;pointer-events:all;cursor:grab;touch-action:none}
+.st-dewarp-point:hover{fill:#00ffff}

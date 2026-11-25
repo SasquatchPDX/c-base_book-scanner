@@ -54,12 +54,15 @@ for (const transport of ["events", "polling"] as const) {
     });
     await expect(input).toHaveAttribute("aria-pressed", "true");
 
-    // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
+    // Dewarping runs before Margins (#195); on a blank page it explains its fallback
+    // and stays on the input view with the model grid.
     await page.locator('[data-stage-select="dewarping"]').click();
-    await save();
-    await expect(page.locator("[data-stage-warnings]")).toContainText(
-      "the input was kept unchanged",
-    );
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("No text lines", {
+      timeout: 30_000,
+    });
+    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
+    await expect(input).toHaveAttribute("aria-pressed", "true");
 
     await page.locator('[data-stage-select="margins"]').click();
     await page.getByLabel("All margins (pixels)").fill("20");
@@ -82,9 +85,7 @@ for (const transport of ["events", "polling"] as const) {
       .toBe(100);
 
     await page.locator('[data-stage-select="dewarping"]').click();
-    await expect(page.locator("[data-stage-warnings]")).toContainText(
-      "the input was kept unchanged",
-    );
+    await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
     await page.locator('[data-stage-select="margins"]').click();
     await expect(page.locator("[data-stage-warnings]")).toBeHidden();
   });

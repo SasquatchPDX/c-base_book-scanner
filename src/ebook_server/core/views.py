@@ -1198,9 +1198,11 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
             for key in {"top", "right", "bottom", "left", "margin", "canvas_width", "canvas_height"}
         )
     if stage == "dewarping":
-        if str(parameters.get("dewarp_mode", "")).strip().lower() == "manual":
-            return True
-        return "dewarp_points" in parameters or "dewarp_curves" in parameters
+        mode = str(parameters.get("dewarp_mode", "")).strip().lower()
+        if mode:
+            # Auto results record the curves they found; only the chosen mode counts.
+            return mode in {"manual", "off", "bypass"}
+        return "top_curve" in parameters or "dewarp_curves" in parameters
     if stage == "output":
         if str(parameters.get("zone_mode", "")).strip().lower() == "manual":
             return True
@@ -1262,12 +1264,6 @@ def _apply_stage_payload_to_state(
         elif stage == "margins":
             if _contains_stage_manual_override(stage, merged):
                 merged.setdefault("margins_mode", "manual")
-        elif stage == "dewarping":
-            model = merged.get("dewarp_model")
-            if isinstance(model, str) and model in {"perspective", "curvature"}:
-                state.algorithm = (
-                    "baseline_curvature" if model == "curvature" else "projective_dewarp"
-                )
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
             if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
@@ -1432,7 +1428,10 @@ def scan_job_editor(request: HttpRequest, job_id: str) -> HttpResponseBase:
 EDITOR_STAGE_HINTS: Final[dict[str, str]] = {
     "deskew": "Use Ctrl+Wheel to rotate or Ctrl+Shift+Wheel for finer rotation.",
     "select_content": "Drag lines or corners to resize the content box.",
-    "dewarping": "Drag the points or curves to describe how the page is bent.",
+    "dewarping": (
+        "Drag the red points to bend the grid; click the top or bottom curve to add a "
+        "point, press Del or D to remove one."
+    ),
     "margins": "Resize margins by dragging any of the solid lines.",
     "output": "Draw text and picture zones; choose how each kind is binarised.",
 }

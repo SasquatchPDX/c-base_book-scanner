@@ -24,6 +24,10 @@ Ops are plain JSON objects, stored in the stage's ``parameters["transform"]``:
     Baseline flattening (:mod:`.curvature`); the output is ``2 * p`` taller.
 ``{"op": "pad", "offset": [x, y], "canvas": [w, h]}``
     Place the input at ``offset`` on a paper-coloured canvas.
+``{"op": "cylindrical", "top": [[x, y], ...], "bottom": [...], "depth": d, "canvas": [w, h]}``
+    Upstream's cylindrical-surface dewarping (#195 step 6, :mod:`.cylindrical`): the
+    top and bottom curves are polylines in continuous input coordinates (pixel ``i``
+    covers ``[i, i + 1)``); the output keeps the input's size.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from . import curvature
+from . import curvature, cylindrical
 
 type Size = tuple[int, int]
 type Op = dict[str, Any]
@@ -76,6 +80,39 @@ def perspective(matrix: Any, canvas: Size) -> Op:
 
 def curvature_op(curves: list[list[list[float]]], padding: int) -> Op:
     return {"op": "curvature", "curves": curves, "padding": int(padding)}
+
+
+def cylindrical_op(
+    top: list[tuple[float, float]],
+    bottom: list[tuple[float, float]],
+    depth: float,
+    canvas: Size,
+) -> Op:
+    return {
+        "op": "cylindrical",
+        "top": [[float(x), float(y)] for x, y in top],
+        "bottom": [[float(x), float(y)] for x, y in bottom],
+        "depth": float(depth),
+        "canvas": [int(canvas[0]), int(canvas[1])],
+    }
+
+
+def _cylindrical_model(
+    op: Op, sx: float = 1.0, sy: float = 1.0
+) -> tuple[cylindrical.CylindricalSurfaceDewarper, tuple[float, float, float, float], Size]:
+    """The dewarper, its model domain and the output size of a cylindrical op at a scale."""
+    try:
+        top = [(float(x) * sx, float(y) * sy) for x, y in op["top"]]
+        bottom = [(float(x) * sx, float(y) * sy) for x, y in op["bottom"]]
+        canvas = (
+            max(1, round(int(op["canvas"][0]) * sx)),
+            max(1, round(int(op["canvas"][1]) * sy)),
+        )
+        dewarper = cylindrical.CylindricalSurfaceDewarper(top, bottom, float(op["depth"]))
+        domain = cylindrical.model_domain(top, bottom, dewarper, (0.0, 0.0, canvas[0], canvas[1]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TransformError(f"bad cylindrical op: {exc}") from exc
+    return dewarper, domain, canvas
 
 
 def pad(offset: tuple[int, int], canvas: Size, size: Size) -> Op:
@@ -140,7 +177,7 @@ def output_size(op: Op, size: Size) -> Size:
     if kind == "crop":
         left, top, right, bottom = _box(op)
         return max(1, right - left), max(1, bottom - top)
-    if kind in {"perspective", "pad"}:
+    if kind in {"perspective", "pad", "cylindrical"}:
         canvas = op["canvas"]
         return int(canvas[0]), int(canvas[1])
     if kind == "curvature":
@@ -178,6 +215,13 @@ def map_point(op: Op, point: tuple[float, float], size: Size) -> tuple[float, fl
         return x + int(op["offset"][0]), y + int(op["offset"][1])
     if kind == "curvature":
         return x, y + int(op["padding"])
+    if kind == "cylindrical":
+        dewarper, domain, _ = _cylindrical_model(op)
+        crv_x, crv_y = dewarper.map_to_dewarped((x + 0.5, y + 0.5))
+        return (
+            float(domain[0] + crv_x * (domain[2] - domain[0]) - 0.5),
+            float(domain[1] + crv_y * (domain[3] - domain[1]) - 0.5),
+        )
     raise TransformError(f"unknown transform op {kind!r}")
 
 
@@ -278,6 +322,13 @@ def apply(
         ]
         padding = max(0, round(int(op["padding"]) * sy))
         return curvature.warp(image, curves, padding, fill)
+    if kind == "cylindrical":
+        dewarper, domain, canvas = _cylindrical_model(op, sx, sy)
+        try:
+            warped = cylindrical.dewarp_image(np.asarray(image), canvas, dewarper, domain, fill)
+        except cylindrical.DewarpError as exc:
+            raise TransformError(str(exc)) from exc
+        return Image.fromarray(warped)
     raise TransformError(f"unknown transform op {kind!r}")
 
 
