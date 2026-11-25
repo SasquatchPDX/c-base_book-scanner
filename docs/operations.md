@@ -471,6 +471,72 @@ curl -s -o /dev/null -w '%{http_code}\n' http://serif.lan.example/api/scanner/v1
 
 Then run the onboarding steps with the real scanner.
 
+### Recording the physical scanner acceptance run
+
+CI drives a simulated device through the whole capture, rescan and re-finish
+journey (`tests/browser/scantailor-concurrency.spec.ts`, see "Storage and
+resilience" in `docs/scanner-protocol.md`). Issue #169 also needs the same
+journey once on the real scanner. Do it after a passing
+`scripts/check_scanner_onboarding.sh --pi` run, on the approved staging
+deployment, with a disposable book of at least two pages.
+
+1. Note the deployed server commit (`git rev-parse --short HEAD` in the
+   checkout on the VM) and the scanner firmware/sans version.
+2. Start a job on the scanner. Its ID is scanner-assigned
+   (`YYYYMMDDTHHMMSSZ[-N]`). Capture the pages, a front cover and the OPF.
+3. Interrupt one page upload: while sans uploads a page, stop the web service
+   on the VM (or disconnect the Pi's network) for a few seconds, then restore
+   it. sans retries on its own; the page must end up with one version.
+4. Let sans send `capture-complete`. Save the JSON body of the response it
+   received (from the sans upload log) as `completion.json`. It must read
+   `"verified": true`. Check that sans keeps its local captures until that
+   response arrives and only then frees them; note what you saw.
+5. In the portal, as a member, open the job from the scanner's QR code
+   (`/j/<job_id>`), run the ScanTailor stages and queue finalization. Request a
+   rescan of one page.
+6. Claim the rescan as the member, then capture the replacement on the scanner
+   (sans lists it from `GET /api/scanner/v1/rescans`). The portal has no claim
+   button yet, so claim it through the session API with the member's cookies
+   (`sessionid`, `csrftoken`) from the browser:
+
+   ```bash
+   origin=https://serif.lan.example
+   read -rs session && read -rs csrf    # paste sessionid, then csrftoken
+   curl --cacert serif-ca.pem -b "sessionid=$session" "$origin/scan/todos/?job_id=<job_id>&state=open"
+   curl --cacert serif-ca.pem -b "sessionid=$session; csrftoken=$csrf" \
+     -H "X-CSRFToken: $csrf" -H "Referer: $origin/" -X POST "$origin/scan/todos/<todo id>/claim/"
+   ```
+
+   The claim answers `"state": "claimed"`.
+7. In the portal, re-run the stages for that page and queue finalization again.
+   Note the finalization ID from the page you land on
+   (`/scan-finalizations/<id>/`).
+8. Run the recorder from any host that reaches the staging origin. It only
+   reads, downloads the member-visible re-finished PDF and never prints the key:
+
+   ```bash
+   export SCANNER_SITE_RUN_ORIGIN=https://serif.lan.example/
+   read -rs SCANNER_SITE_RUN_SESSION && export SCANNER_SITE_RUN_SESSION  # the member's sessionid cookie
+   uv run python scripts/record_scanner_site_run.py \
+     --job-id 20261125T101500Z --sequence 3 --refinish <finalization id> \
+     --completion-response completion.json \
+     --scanner-firmware "<sans version>" --server-commit <commit> \
+     --ca-file serif-ca.pem --scanner-key-file ~/serif-api-key  # key file optional
+   ```
+
+   It checks that the job is complete; that the rescanned page is one logical
+   page holding both versions with different checksums and the replacement
+   active; that every other page holds exactly one version (the interrupted
+   upload created no duplicate); that the rescan to-do is completed and none is
+   open; that the re-finish succeeded after the replacement arrived; and that
+   the downloaded PDF is that finish's cleaned variant, complete and a PDF.
+   With the key file it also checks that the device API reports the job
+   complete, with no open rescans, no re-finish note and the replacement's
+   checksum. Exit status 0 is a pass, 1 a failure (the reason is printed), 77
+   means the origin, the session or the connection was unavailable.
+9. Add the printed JSON record and your notes from steps 3 and 4 to
+   `docs/measurements/scanner-site-run.md` in a pull request.
+
 ### Rehearsing migrations before an upgrade
 
 The scanner work brings migrations that rewrite large tables (notably
