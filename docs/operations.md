@@ -527,6 +527,136 @@ ADMIN_DATABASE_URL='postgresql://postgres:...@127.0.0.1/postgres' \
 CI runs the script end to end (`tests/integration/test_rehearse_migrations_postgres.py`)
 against a database seeded at the pre-0041 state.
 
+## Version 1 site acceptance
+
+CI proves the digital-library workflows against containers. Before Version 1 is
+released (#162) the same workflows are run once on the hackerspace deployment, with
+its real LDAP directory, PostgreSQL, storage mount, converter worker and alert
+route, and the observations are recorded. `manage.py site_acceptance` does that and
+appends everything it saw to one report: a JSON file and a Markdown rendering next to
+it (`site-acceptance.md`) that can be attached to the issue as it is.
+
+Each run records the deployed git revision (and whether the checkout has uncommitted
+changes), the host, the unapplied migrations at start, and for every check its
+status, start time, duration, job ids and states, and the SHA-256 of every artifact
+it handled. A check is `PASS` only when it observed the expected outcome; a missing
+precondition is `NOT_RUN`, and an alert whose delivery no operator confirmed is
+`INCOMPLETE`. Exit status: 0 when every check passed, 1 when any check failed, 3
+when some did not run or are unconfirmed. The password is never written to the
+report.
+
+### Before you start
+
+- A test member in the LDAP directory, made a library admin so it may resolve the
+  review tasks of source imports: `uv run python manage.py promote_admin <uid>`.
+  Pass its credentials in `SITE_ACCEPTANCE_USERNAME` and `SITE_ACCEPTANCE_PASSWORD`
+  (or leave the password unset to be prompted).
+- A scratch folder on the source share, mounted the way real network sources are,
+  writable by the service user and outside the archive root (the command refuses an
+  archive path), for example `/mnt/library-sources/acceptance`. Each run creates a
+  `site-acceptance-<run id>/` folder in it.
+- The TXT-to-EPUB converter (Pandoc) installed for the workers, and at least one
+  worker running. `--conversion-target` picks another target if TXT-to-EPUB is not
+  what the site converts.
+- For the alert check: the Alertmanager URL reachable from the VM (a bearer token,
+  if it needs one, in `SITE_ACCEPTANCE_ALERTMANAGER_TOKEN`), a route that sends
+  `alertname="BookScannerSiteAcceptanceTest"` (labels `severity="warning"`,
+  `job="book-scanner"`) to the site recipient, and `send_resolved: true` on that
+  receiver. Someone who can see the recipient's inbox or channel must be at the
+  terminal.
+
+### The procedure
+
+Run every step from the checkout as the service user, with the deployment's
+environment loaded, and pass the same `--report` each time:
+
+```bash
+cd /srv/book-scanner
+set -a; . ./.env; set +a
+REPORT=/var/lib/book-scanner/acceptance/site-acceptance.json
+
+# 1. Before the upgrade, with the new revision checked out: migration rehearsal on
+#    a copy of the database (runs scripts/rehearse_migrations.sh, see above).
+SOURCE_DATABASE_URL='postgresql://book_scanner:...@127.0.0.1/book_scanner' \
+ADMIN_DATABASE_URL='postgresql://postgres:...@127.0.0.1/postgres' \
+  uv run python manage.py site_acceptance --report "$REPORT" --check migrations
+
+# 2. The upgrade itself: stop the units, migrate, collectstatic, start the units.
+
+# 3. The library journey and the archive-write failure drill.
+SITE_ACCEPTANCE_USERNAME=acceptance-member \
+  uv run python manage.py site_acceptance --report "$REPORT" \
+    --check library --check archive-failure \
+    --base-url https://library.example.org \
+    --scratch-dir /mnt/library-sources/acceptance \
+    [--incoming-source-id <id of the configured incoming folder>] [--ca-bundle ca.pem]
+
+# 4. Monitoring: the test alert (answer the two questions) and the scrape.
+uv run python manage.py site_acceptance --report "$REPORT" --check alert --check scrape \
+  --alertmanager-url https://alertmanager.lan:9093 --prometheus-url https://prometheus.lan:9090
+```
+
+Attach `site-acceptance.md` (and the JSON, plus the rehearsal log written beside it)
+to #162. A failed check can be repeated alone; the report keeps every run.
+
+### What each check does
+
+- `migration-rehearsal`: runs `scripts/rehearse_migrations.sh` unchanged, keeps its
+  output in `<report>.rehearsal-<run id>.log`, and records its PASS/FAIL, the time
+  of every step, the `manage.py migrate` time (the expected downtime) and the total.
+- `sign-in`: signs the test member in at `/accounts/login/` through the front end,
+  so the directory bind and the session cookie go through the proxy.
+- The test collection is generated per run: one small TXT book per route, whose
+  title and text carry the run's token (`sa<hex>`). Metadata providers cannot
+  identify these titles, so each import waits for review, as an unknown book should.
+- `web-upload`: uploads the upload book at `/imports/upload/`; the job must reach
+  the review state with the uploaded checksum.
+- `review`: resolves its review task with the manual-entry action; the import must be
+  complete and the archive copy, re-read from the mount, must hash to the upload.
+- `deduplication`: uploads the same bytes under another name; the import must link
+  to the existing file variant, and exactly one variant may hold that checksum.
+- `incoming-discovery`: writes a book into the configured incoming folder (with
+  `--incoming-source-id`, in a `site-acceptance-<run id>/` subfolder when the source
+  is recursive) or a scratch incoming source, runs `ingest_sources` for that source
+  and lets the workers import it. Note that with a configured incoming folder this
+  queues anything else waiting there too, as `ingest_sources` normally would.
+- `copy` / `move`: the same through scratch COPY and MOVE sources. COPY must keep
+  the source unchanged; MOVE must remove it, and only after the archive copy verified.
+- `search`: the reviewed book must be found by its token at `/library/books/?q=`.
+- `conversion`: requests the conversion the book page offers, waits for the worker,
+  and records the route, the converter tool and version and the output checksum.
+- `authenticated-download`: an anonymous download must be refused; the member's
+  downloads of the original and the converted file must match their checksums.
+- `archive-write-failure`: a MOVE import of a generated book whose first attempt
+  runs inside the command with an archive backend that writes half the file and
+  then fails. Only that one in-process attempt sees the fault; the workers, and
+  every other import, keep the real backend. The check requires the job to be
+  `FAILED`, the source to be unchanged and the partial file to exist. It then
+  retries the way an operator would (`ingest_sources --retry-failed`, through the
+  real queue and workers) and requires: the same archive name, exactly one file in
+  the import's archive folder, a matching checksum, the source removed, and after
+  the review exactly one file variant with nothing left in the pending folder.
+- `alert-delivery`: posts a synthetic `BookScannerSiteAcceptanceTest` alert to the
+  Alertmanager API, waits until Alertmanager lists it as active, asks whether the
+  recipient got the firing notification, then resolves it, waits until it is no
+  longer active and asks whether the resolved notification arrived. The alert is
+  always resolved, also when the check fails. Without both answers (for example
+  with `--no-prompt`) the check is `INCOMPLETE`. This exercises routing and
+  delivery; the alert rules themselves are validated by `promtool` in CI. To see a
+  real rule fire and clear as well, stop `book-scanner-web` for more than two
+  minutes and watch `BookScannerMetricsTargetDown` arrive and resolve after the
+  restart.
+- `metrics-scrape`: queries `up{job="book-scanner"}` in Prometheus; every series
+  must be `1`.
+
+### Cleaning up
+
+The scratch sources are deactivated at the end of every run, so later
+`ingest_sources` runs ignore them. The test books stay in the library as evidence;
+they are titled `Site Acceptance <token> ...` and an admin can delete them from
+their book pages once the report is filed. The COPY sources stay in the scratch
+folder; delete the `site-acceptance-<run id>/` folder when done.
+
 ## Authentication modes
 
 `BOOK_SCANNER_LDAP_MODE` selects how members sign in at `/accounts/login/`:
