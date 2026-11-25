@@ -32,7 +32,16 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    manual. The output keeps the input's size. Auto detection is not ported yet
    (step 6b): until then it takes the top and bottom baselines found by the earlier
    baseline detector, and a page without text lines stays unchanged and says so.
-4. Margins — per-side/canvas padding and horizontal/vertical alignment.
+4. Margins — a port of upstream `page_layout` (#208, `core/page_layout.py`): one
+   common page size for the job. Each page's *hard size* is its content plus its
+   hard margins (millimetres, default 10/5/10/5 mm left/top/right/bottom); the
+   common size is the largest hard width and height over the pages aligned with the
+   others. Every aligned page is padded to it: the hard margin is a minimum and the
+   rest (*soft margins*) is split by the page's alignment (3 × 3, default top
+   centre). A page with "Align with other pages" off keeps its own size and does not
+   change the others. A page without content is a point in the middle of the page
+   (upstream `adaptContentRect`), so it gets the common size cut from around its
+   centre. Sizes are physical: pages of different dpi come out the same size in mm.
 5. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.
 
@@ -171,7 +180,9 @@ running, success, failed); there is no stored "invalidated" state.
   keys, `scantailor.STAGE_SETTING_KEYS`, so values the worker records do not count),
   its input fingerprint equals `scantailor.stage_input_fingerprint` now, and the
   predecessor is current. A result that is not current is *stale*, with the reason
-  "settings changed, not applied" or "input changed".
+  "settings changed, not applied", "input changed" or, for Margins, "common page
+  size changed" (#208: an aligned page's Margins input fingerprint also covers the
+  job's common page size, see below).
 - **Waiting** (`scantailor.stage_waiting_for`): the first earlier stage without a
   current result. A stage cannot run before it.
 - **Saving stores settings only.** An edit stores the parameters, bumps the stage's
@@ -211,11 +222,59 @@ Worker fallback warnings appear beside the preview when the stage has a current
 result. Updates work through
 both live events and compatibility polling.
 
-Margins record computed dimensions as `resolved_canvas_width` and
-`resolved_canvas_height`; `canvas_width` and `canvas_height` are reserved for explicit
-fixed-canvas requests. Reducing ordinary padding therefore shrinks the result again.
-The editor also recognizes legacy computed canvases equal to the input plus recorded
-padding, rather than silently resubmitting them as fixed dimensions.
+## Margins: the common page size (#208)
+
+The Margins stage is the pipeline's one cross-page dependency.
+
+- **Settings** (stage parameters): `left_mm`, `top_mm`, `right_mm`, `bottom_mm`,
+  `align_x` (`left`/`center`/`right`), `align_y` (`top`/`center`/`bottom`) and
+  `align_with_others`. Pixel settings written before #208 (`margin`, `left`, ...)
+  are converted with the page dpi; explicit pixel canvases (`canvas_width`,
+  `canvas_height`) are no longer supported and are dropped on the next run.
+- **Aggregate.** `scantailor.margins_aggregate(job)` computes the common size from
+  the job's Select Content results (content size in pixels and dpi, or an empty
+  box) and Margins settings in one query, and returns it with a stable fingerprint.
+  It is not stored on the job. A page counts once its Select Content has a result;
+  while that result is re-run, the previous one keeps counting until it is replaced,
+  so a re-run on one page does not make every other page stale meanwhile.
+- **Part of the input fingerprint (#205).** For a page aligned with the others,
+  `stage_input_fingerprint` of its Margins row is a sha256 of the predecessor's
+  `output_sha256` and the aggregate fingerprint
+  (`scantailor.margins_input_fingerprint`). A change of the common size therefore
+  makes every aligned page's Margins stale through the normal mechanism (reason
+  "common page size changed"), and its Output follows by itself. The aggregate costs
+  one query over the job's Select Content and Margins rows, so code deriving the
+  state of many pages computes it once per request and attaches it to the rows
+  (`link_page_states(..., aggregate)`, `attach_margins_aggregate`; the workspace
+  list, the live-update feeds and "Apply to…" do this); a single page's view or
+  thumbnail computes it only when its Margins row has an aligned result. The editor
+  cannot recompute the hash: Margins rows carry the server's `input_sha256`, the
+  `input_basis_sha256` (predecessor output) it was built from and
+  `common_size_changed`.
+- **Each run** records what it used: `aggregate_size_mm`, `aggregate_fingerprint`
+  (empty for a page not aligned with the others), `hard_margins_mm`/`_px`,
+  `soft_margins_mm`/`_px`, `hard_size_mm`, `content_size_mm`, `page_size_mm`,
+  `resolved_canvas_width/height` and the `pad` op. Hard margins are rounded to whole
+  pixels per side, so pages of one dpi have exactly the same pixel size.
+- **Re-queueing.** #205's chaining only runs a page's own next stage, but a change
+  on page A must re-run Margins on pages B..N. After every successful Select Content
+  or Margins run, after a Margins edit and once after a Margins "Apply to…" batch,
+  `scantailor.requeue_stale_margins(job)` computes the aggregate once and queues, as
+  one batch at the back of the queue, the aligned pages' Margins results that are no
+  longer current, through `request_stage_job_if_ready`. The re-run keeps the stage
+  revision (it is not an edit) and its `ProcessingJob` carries
+  `details.trigger = "margins_aggregate_changed"`; chaining then re-runs Output. A
+  page whose earlier stages are not current is not queued (or, if edited after it
+  was queued, its job is closed as waiting): it runs when its chain reaches Margins.
+  Nothing is ever written as failed. Margins rows that are queued or running take
+  the current aggregate when they run.
+
+The editor's Margins options show four millimetre fields with "Link top and bottom"
+and "Link left and right", "Align with other pages", the 3 × 3 alignment grid and,
+after a run, the page size, the common size and the page's soft margins. They sit
+beside #206's input and result panes; the status line and the result pane give
+#205's readiness messages. Margins are set in the fields only: upstream's draggable
+margin lines are not ported, so the input pane has no Margins overlay.
 
 ## Pipeline architecture: transforms, not images (#195 step 2)
 

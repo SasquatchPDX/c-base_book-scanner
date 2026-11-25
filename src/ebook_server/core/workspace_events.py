@@ -19,6 +19,7 @@ from typing import Any
 from django.db import connection
 from django.db.models.expressions import RawSQL
 
+from . import scantailor
 from .models import ScanJob, ScanTailorStageState
 
 StageToken = tuple[int, str, datetime]
@@ -70,9 +71,10 @@ class WorkspaceEventPoller:
         )
         if unchanged_stages and job_token == self._job_token:
             return WorkspaceUpdate(True, None)
-        # The first stage serializes its input version's checksum (#205).
+        # The first stage serializes its input version's checksum (#205); an aligned
+        # Margins row its predecessor's output and the job's common page size (#208).
         query = ScanTailorStageState.objects.filter(scan_job_id=self.job_id).select_related(
-            "input_scan_page_version"
+            "input_scan_page_version", "input_stage_state"
         )
         if self._tokens is None:
             states = list(
@@ -105,6 +107,8 @@ class WorkspaceEventPoller:
         self._tokens = tokens
         self._job_token = job_token
         self._fingerprint = fingerprint
+        # The common page size is computed once per tick, not once per Margins row.
+        scantailor.attach_margins_aggregate_if_needed(states)
         return WorkspaceUpdate(
             True,
             {

@@ -89,14 +89,17 @@ for (const transport of ["events", "polling"] as const) {
     // Margins: an edit is a draft, and no result is shown for it until it is saved.
     await page.locator('[data-stage-select="margins"]').click();
     await expectResult("margins");
-    await page.getByLabel("All margins (pixels)").fill("20");
+    // Margins are millimetres (#208): 1.7 mm is 20 px at 300 dpi; right follows (linked).
+    // The page is blank, so no content is found: the page is just its margins
+    // (adaptContentRect), 2 × 20 px wide.
+    await page.getByLabel("Left", { exact: true }).fill("1.7");
     await expect(message).toContainText("Settings not applied");
     await expect(status).toContainText("Settings not applied");
     await expect(result).toBeHidden();
     // Saved, the result updates in place: the input stays the 100 px page, the
-    // result grows by the margins.
+    // result is the margins' page.
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(140);
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
     await expectResult("margins");
     await expect.poll(() => naturalWidth(input)).toBe(100);
 
@@ -114,10 +117,11 @@ for (const transport of ["events", "polling"] as const) {
     // Reopen the stage, as a user does when adjusting an already completed result.
     await page.reload();
     await page.locator('[data-stage-select="margins"]').click();
-    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(140);
-    await page.getByLabel("All margins (pixels)").fill("0");
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
+    // 3.4 mm is 40 px a side.
+    await page.getByLabel("Left", { exact: true }).fill("3.4");
     await page.getByRole("button", { name: "Save and run" }).click();
-    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(100);
+    await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(80);
     await expectResult("margins");
 
     // Output follows again; its earlier (stale) result is never shown as current.
@@ -181,7 +185,7 @@ test("a narrow screen shows one pane and brings the result forward after a run",
     /\/stages\/margins\/preview\/\?v=/,
     { timeout: 30_000 },
   );
-  await page.getByLabel("All margins (pixels)").fill("20");
+  await page.getByLabel("Left", { exact: true }).fill("1.7");
   await expect(inputButton).toHaveAttribute("aria-pressed", "true");
   await expect(inputPane).toBeVisible();
   await expect(resultPane).toBeHidden();

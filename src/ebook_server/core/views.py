@@ -170,6 +170,38 @@ def _serialize_scan_page(
     }
 
 
+def _serialize_margins_input(state: ScanTailorStageState) -> dict[str, Any]:
+    if (
+        state.stage != ScanTailorStageState.Stage.MARGINS.value
+        or state.status != ScanTailorStageState.StageStatus.SUCCESS
+    ):
+        return {}
+    predecessor = state.input_stage_state
+    if predecessor is None or not scantailor.margins_depends_on_aggregate(state):
+        return {}
+    fingerprint = scantailor.stage_input_fingerprint(state)
+    if not fingerprint:
+        return {}
+    recorded = (state.parameters or {}).get("aggregate_fingerprint")
+    return {
+        "input_sha256": fingerprint,
+        "input_basis_sha256": predecessor.output_sha256,
+        "common_size_changed": bool(
+            isinstance(recorded, str)
+            and recorded
+            and fingerprint != state.applied_input_sha256
+            and scantailor.margins_input_fingerprint(predecessor.output_sha256, recorded)
+            == state.applied_input_sha256
+        ),
+    }
+
+
+def _serialize_stage_states(states: list[ScanTailorStageState]) -> list[dict[str, Any]]:
+    """Several rows of one job: the common page size (#208) is computed once."""
+    scantailor.attach_margins_aggregate_if_needed(states)
+    return [_serialize_stage_state(state) for state in states]
+
+
 def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
     return {
         "id": state.id,
@@ -204,6 +236,10 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
             if scantailor.previous_stage(state.stage) is None
             else ""
         ),
+        # An aligned page's Margins input includes the job's common page size (#208),
+        # which a client cannot recompute: the current fingerprint, the predecessor
+        # output it was built from, and whether only the common size differs.
+        **_serialize_margins_input(state),
         # Done with a manual override: a blue status icon in the page strip (#195).
         "manual": _is_manual_stage_state(state),
         "started_at": state.started_at.isoformat() if state.started_at else None,
@@ -637,6 +673,20 @@ def _serialize_scan_job_with_pages(
     return payload
 
 
+def _margins_rows_of(state: ScanTailorStageState) -> list[ScanTailorStageState]:
+    """``state`` and its predecessors, as the derived-state functions will follow them.
+
+    Loading the chain here costs the queries ``stage_waiting_for`` would make anyway;
+    Django caches each relation on the instance, so the attached aggregate is seen.
+    """
+    rows: list[ScanTailorStageState] = []
+    current: ScanTailorStageState | None = state
+    while current is not None and len(rows) < len(scantailor.stage_order()):
+        rows.append(current)
+        current = current.input_stage_state
+    return rows
+
+
 def _ordered_stages_for_page(page: ScanPage) -> list[ScanTailorStageState]:
     all_states = {
         state.stage: state
@@ -645,7 +695,9 @@ def _ordered_stages_for_page(page: ScanPage) -> list[ScanTailorStageState]:
             scan_job=page.scan_job,
         )
     }
-    scantailor.link_page_states(all_states, page.active_version())
+    scantailor.link_page_states(
+        all_states, page.active_version(), scantailor.page_margins_aggregate(all_states)
+    )
     ordered: list[ScanTailorStageState] = []
     for stage_name in scantailor.stage_order():
         state = all_states.get(stage_name)
@@ -1228,7 +1280,20 @@ def _contains_stage_manual_override(stage: str, parameters: dict[str, Any]) -> b
             return True
         return any(
             key in parameters
-            for key in {"top", "right", "bottom", "left", "margin", "canvas_width", "canvas_height"}
+            for key in {
+                "top_mm",
+                "right_mm",
+                "bottom_mm",
+                "left_mm",
+                # Pixel settings written before #208.
+                "top",
+                "right",
+                "bottom",
+                "left",
+                "margin",
+                "canvas_width",
+                "canvas_height",
+            }
         )
     if stage == "dewarping":
         mode = str(parameters.get("dewarp_mode", "")).strip().lower()
@@ -1414,7 +1479,7 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
         return HttpResponseNotFound()
     cursor = timezone.now()
     states = ScanTailorStageState.objects.filter(scan_job_id=job.pk).select_related(
-        "input_scan_page_version"
+        "input_scan_page_version", "input_stage_state"
     )
     raw_since = request.GET.get("since")
     if raw_since:
@@ -1428,7 +1493,7 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
             "state": job.state,
             "updated_at": job.updated_at.isoformat(),
             "cursor": cursor.isoformat(),
-            "stages": [_serialize_stage_state(state) for state in states.order_by("pk")],
+            "stages": _serialize_stage_states(list(states.order_by("pk"))),
         }
     )
 
@@ -1475,7 +1540,7 @@ EDITOR_STAGE_HINTS: Final[dict[str, str]] = {
         "Drag the red points to bend the grid; click the top or bottom curve to add a "
         "point, press Del or D to remove one."
     ),
-    "margins": "Resize margins by dragging any of the solid lines.",
+    "margins": "Set the margins in millimetres; aligned pages share the size of the largest page.",
     "output": "Draw text and picture zones; choose how each kind is binarised.",
 }
 
@@ -1635,6 +1700,10 @@ def scan_page_stage(
         state=state,
         requested_by_user_id=profile.user_id,
     )
+    if normalized_stage == ScanTailorStageState.Stage.MARGINS.value:
+        # Margins settings feed the common page size (#208): the other aligned pages'
+        # results may be stale now; queue them behind this page's run.
+        scantailor.requeue_stale_margins(page.scan_job)
     response_payload = {
         "stage": _serialize_page_stage_state(state),
         "job": scantailor.stage_job_payload(processing_job) if processing_job else None,
@@ -1711,6 +1780,7 @@ def scan_job_stage_batch(
     skipped: list[str] = []
     jobs: list[dict[str, Any]] = []
     batch_job_ids: list[str] = []
+    saved: list[tuple[ScanPage, ScanTailorStageState]] = []
 
     for page in pages:
         state = scantailor.get_or_create_stage_state(
@@ -1724,6 +1794,13 @@ def scan_job_stage_batch(
                 skipped.append(str(page.id))
                 continue
             _apply_and_save_stage_edit(state, page, normalized_stage, payload)
+        saved.append((page, state))
+
+    # The common page size (#208) follows from every page's Margins settings: compute
+    # it once, after all of the batch's edits are stored, not once per page.
+    aggregate = scantailor.margins_aggregate(job)
+    for page, state in saved:
+        scantailor.attach_margins_aggregate(_margins_rows_of(state), aggregate)
         # Same rule per page as a single edit (#205): queue only what can run now.
         processing_job, waiting_for = scantailor.request_stage_job_if_ready(
             state=state,
@@ -1746,6 +1823,10 @@ def scan_job_stage_batch(
     # One queued job per chunk of pages instead of one per page (#195 §8.2 item 5);
     # an interactive single-page edit still runs first.
     scantailor.dispatch_stage_batch(batch_job_ids)
+    if normalized_stage == ScanTailorStageState.Stage.MARGINS.value and applied:
+        # The new settings may change the common page size: re-queue the other pages'
+        # stale Margins results once for the whole batch, not once per page (#208).
+        scantailor.requeue_stale_margins(job)
 
     return JsonResponse(
         {
@@ -2515,7 +2596,7 @@ def scan_page_thumbnail(
         ).select_related("preview_storage_location", "output_storage_location")
     }
     version = page.active_version()
-    scantailor.link_page_states(states, version)
+    scantailor.link_page_states(states, version, scantailor.page_margins_aggregate(states))
     page_image = (
         ScanPageImage.objects.select_related("storage_location").filter(version=version).first()
         if version is not None

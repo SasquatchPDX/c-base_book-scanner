@@ -50,7 +50,10 @@ def test_editor_page_embeds_pages_with_file_names_and_manual_flags() -> None:
     assert stages["deskew"]["manual"] is True
     assert stages["select_content"]["manual"] is False
     hints = {stage["name"]: stage["hint"] for stage in response.context["stage_navigation"]}
-    assert hints["margins"] == "Resize margins by dragging any of the solid lines."
+    assert (
+        hints["margins"]
+        == "Set the margins in millimetres; aligned pages share the size of the largest page."
+    )
     assert client.get("/scan/jobs/not-a-job/editor/").status_code in {400, 404}
 
 

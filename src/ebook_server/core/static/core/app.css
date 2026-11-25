@@ -109,3 +109,10 @@
 .st-dewarp-hit{fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke;cursor:copy}
 .st-dewarp-point{fill:#ff0000;stroke:#fff;stroke-width:1.5;pointer-events:all;cursor:grab;touch-action:none}
 .st-dewarp-point:hover{fill:#00ffff}
+/* Margins (#208): upstream page_layout options, mm fields and a 3 x 3 alignment grid. */
+.st-margins{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 10px;border:0;margin:0;padding:0}
+.st-margins legend{font-weight:700;padding:0;margin-bottom:4px}
+.st-margins .checkbox{grid-column:1/-1}
+.st-align-grid{display:grid;grid-template-columns:repeat(3,22px);gap:6px;border:0;margin:0;padding:0}
+.st-align-grid legend{font-weight:700;padding:0;margin-bottom:4px}
+.st-align-grid input{width:18px;height:18px;margin:0}

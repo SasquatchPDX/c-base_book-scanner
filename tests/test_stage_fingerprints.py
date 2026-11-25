@@ -122,7 +122,10 @@ def test_margins_edited_before_deskew_waits_then_runs_without_another_click() ->
         assert scantailor.stage_waiting_for(states[stage]) is None
     margins = states["margins"]
     assert margins.parameters["margin"] == 12
-    assert margins.applied_input_sha256 == states["dewarping"].output_sha256
+    # Margins' input is Dewarping's output plus the job's common page size (#208).
+    assert margins.applied_input_sha256 == scantailor.margins_input_fingerprint(
+        states["dewarping"].output_sha256, scantailor.margins_aggregate(job).fingerprint
+    )
     assert margins.parameters["output_width"] == margins.parameters["input_width"] + 24
     _no_failures()
 
@@ -169,7 +172,10 @@ def test_deskew_edit_after_margins_marks_margins_stale_and_reruns_it(
         assert scantailor.stage_result_is_current(states[stage]), stage
     margins = states["margins"]
     assert margins.parameters["margin"] == 12
-    assert margins.applied_input_sha256 == states["dewarping"].output_sha256
+    # Margins' input is Dewarping's output plus the job's common page size (#208).
+    assert margins.applied_input_sha256 == scantailor.margins_input_fingerprint(
+        states["dewarping"].output_sha256, scantailor.margins_aggregate(job).fingerprint
+    )
     assert margins.output_sha256 != before["margins"].output_sha256
     _no_failures()
 

@@ -57,8 +57,9 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
 
   // 1. Margins first: an edit is a draft until it is saved.
   await page.locator('[data-stage-select="margins"]').click();
-  const margin = page.locator("[data-stage-controls]").getByLabel("All margins (pixels)");
-  await margin.fill("20");
+  // Millimetres (#208); the right margin follows the left (linked).
+  const margin = page.locator("[data-stage-controls]").getByLabel("Left", { exact: true });
+  await margin.fill("1.7");
   await expect(message).toContainText("Settings not applied");
   // The result pane beside the input gives the same reason (#206).
   const result = page.locator("[data-result-image]");
@@ -112,12 +113,12 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
         const row = await marginsRow();
         const parameters = row.parameters as Record<string, unknown>;
         return row.current === true && row.output_sha256 !== before.output_sha256
-          ? parameters.margin
+          ? parameters.left_mm
           : null;
       },
       { timeout: 30_000 },
     )
-    .toBe(20);
+    .toBe(1.7);
   for (const stage of ["deskew", "select_content", "dewarping", "margins", "output"]) {
     await expect(icon(stage)).toHaveAttribute("data-kind", /^(done|manual)$/, {
       timeout: 30_000,
@@ -126,7 +127,7 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   await expect(page.locator(".st-status-failed")).toHaveCount(0);
 
   await page.locator('[data-stage-select="margins"]').click();
-  await expect(margin).toHaveValue("20");
+  await expect(margin).toHaveValue("1.7");
   await expect(message).toContainText("success");
   // Only the current result is shown: the re-run one, not the stale one before it.
   await expect(result).toBeVisible();

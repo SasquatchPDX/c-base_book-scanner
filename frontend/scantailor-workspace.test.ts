@@ -24,6 +24,7 @@ import {
   stageWorkerWarnings,
   STAGE_ORDER,
 } from "./scantailor-workspace";
+import { describeMargins } from "./margins-view";
 
 describe("ScanTailor geometry coordinates", () => {
   it("round-trips a source box through a reduced preview", () => {
@@ -130,34 +131,65 @@ describe("editable stage parameters", () => {
     vi.unstubAllGlobals();
     document.body.replaceChildren();
   });
-  it("does not resubmit a legacy computed margin canvas as a fixed request", () => {
+  it("sends margins in millimetres, never legacy pixels or canvases (#208)", () => {
+    // Pixel settings written before #208 are converted with the recorded dpi.
     expect(
       editableParameters("margins", {
-        margin: 20,
-        input_width: 100,
-        input_height: 200,
-        margin_left: 20,
-        margin_right: 20,
-        margin_top: 20,
-        margin_bottom: 20,
+        margin: 59,
+        dpi: [300, 300],
         canvas_width: 140,
         canvas_height: 240,
+        margin_left: 20,
       }),
-    ).toEqual({ margin: 20 });
-    // A larger fixed canvas, and new explicit requests, remain intentional settings.
+    ).toEqual({
+      left_mm: 5,
+      top_mm: 5,
+      right_mm: 5,
+      bottom_mm: 5,
+      align_x: "center",
+      align_y: "top",
+      align_with_others: true,
+    });
+    // A page never edited gets upstream's defaults; explicit values are kept.
+    expect(editableParameters("margins", {})).toMatchObject({
+      left_mm: 10,
+      top_mm: 5,
+      right_mm: 10,
+      bottom_mm: 5,
+    });
     expect(
       editableParameters("margins", {
-        input_width: 100,
-        canvas_width: 300,
+        margins_mode: "manual",
+        left_mm: 12.5,
+        align_with_others: false,
+        align_x: "right",
+        align_y: "bottom",
       }),
-    ).toEqual({ canvas_width: 300 });
+    ).toEqual({
+      margins_mode: "manual",
+      left_mm: 12.5,
+      top_mm: 5,
+      right_mm: 10,
+      bottom_mm: 5,
+      align_x: "right",
+      align_y: "bottom",
+      align_with_others: false,
+    });
+  });
+  it("describes the common page size and the soft margins (#208)", () => {
     expect(
-      editableParameters("margins", {
-        input_width: 100,
-        canvas_width: 100,
-        resolved_canvas_width: 100,
+      describeMargins({
+        page_size_mm: { width: 148, height: 210 },
+        aggregate_size_mm: { width: 148, height: 210 },
+        soft_margins_mm: { left: 3, top: 0, right: 3, bottom: 12.5 },
       }),
-    ).toEqual({ canvas_width: 100 });
+    ).toBe(
+      "Page 148.0 × 210.0 mm (common size 148.0 × 210.0 mm). Soft margins left 3.0, top 0.0, right 3.0, bottom 12.5 mm.",
+    );
+    expect(
+      describeMargins({ page_size_mm: { width: 100, height: 50 }, align_with_others: false }),
+    ).toBe("Page 100.0 × 50.0 mm: not aligned with other pages, it keeps its own size.");
+    expect(describeMargins({})).toBe("");
   });
   it("keeps manual geometry while excluding worker-derived provenance", () => {
     expect(
@@ -373,6 +405,31 @@ describe("stage readiness from input fingerprints (#205)", () => {
       stages: [{ ...row("deskew", "success", "d1", "v1"), input_sha256: "v2" }],
     } as never;
     expect(stageReadiness(rescanned, "deskew").staleReason).toBe("input changed");
+  });
+
+  it("uses the server's Margins fingerprint, which includes the common page size (#208)", () => {
+    const upstream = [
+      row("deskew", "success", "d1", "v1"),
+      row("select_content", "success", "s1", "d1"),
+      row("dewarping", "success", "w1", "s1"),
+    ];
+    const margins = (extra: Record<string, unknown>) =>
+      ({ stages: [...upstream, row("margins", "success", "m1", "w1+a1", extra)] }) as never;
+    // Current: the fingerprint for the predecessor output on this page matches.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w1" }), "margins"),
+    ).toEqual({ current: true, waitingFor: null, staleReason: "" });
+    // Another page changed the common size.
+    expect(
+      stageReadiness(
+        margins({ input_sha256: "w1+a2", input_basis_sha256: "w1", common_size_changed: true }),
+        "margins",
+      ),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "common page size changed" });
+    // Dewarping produced a newer output than the one the server's fingerprint used.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w0" }), "margins"),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "input changed" });
   });
 });
 

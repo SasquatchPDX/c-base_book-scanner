@@ -24,6 +24,16 @@ import {
   roundAngle,
   wheelAngle,
 } from "./deskew-view";
+import {
+  type AlignX,
+  type AlignY,
+  describeMargins,
+  linkedSide,
+  MARGIN_SIDES,
+  type MarginSide,
+  marginSettings,
+  MAX_MARGIN_MM,
+} from "./margins-view";
 import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
 
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
@@ -59,8 +69,16 @@ interface StageState {
   applied_revision?: number | null;
   /** Whether the result was computed with the stage's current settings. */
   settings_applied?: boolean;
-  /** First stage only: the checksum of the page version it reads now. */
+  /**
+   * The input fingerprint the server computes now: the page version's checksum for
+   * the first stage; for an aligned page's Margins result its predecessor's output
+   * combined with the job's common page size (#208), which only the server knows.
+   */
   input_sha256?: string;
+  /** Margins (#208): the predecessor output ``input_sha256`` was built from. */
+  input_basis_sha256?: string;
+  /** Margins (#208): the result differs from its input only by the common page size. */
+  common_size_changed?: boolean;
   manual?: boolean;
 }
 
@@ -122,15 +140,13 @@ const EDITABLE_KEYS: Record<StageName, readonly string[]> = {
   select_content: ["content_mode", "content_box"],
   margins: [
     "margins_mode",
-    "margin",
-    "top",
-    "right",
-    "bottom",
-    "left",
-    "canvas_width",
-    "canvas_height",
+    "left_mm",
+    "top_mm",
+    "right_mm",
+    "bottom_mm",
     "align_x",
     "align_y",
+    "align_with_others",
   ],
   dewarping: ["dewarp_mode", "depth_perception", "top_curve", "bottom_curve"],
   output: [
@@ -186,24 +202,15 @@ export function editableParameters(stage: StageName, parameters: JsonObject): Js
     }
   }
   if (stage === "margins") {
-    // Older workers stored automatic canvas dimensions under the request keys.
-    // Recover that common case without discarding a larger, explicitly sized canvas.
-    for (const [axis, before, after] of [
-      ["width", "left", "right"],
-      ["height", "top", "bottom"],
-    ] as const) {
-      const size = positiveNumber(parameters[`input_${axis}`] ?? parameters[`source_${axis}`]);
-      const padding =
-        finiteNumber(parameters[`margin_${before}`], 0) +
-        finiteNumber(parameters[`margin_${after}`], 0);
-      if (
-        !(`resolved_canvas_${axis}` in parameters) &&
-        size &&
-        parameters[`canvas_${axis}`] === size + padding
-      ) {
-        delete editable[`canvas_${axis}`];
-      }
-    }
+    // Millimetres and alignment only (#208): pixel settings and explicit canvases
+    // written before are converted (or dropped) instead of being sent back.
+    const settings = marginSettings(parameters);
+    return {
+      ...(typeof parameters.margins_mode === "string"
+        ? { margins_mode: parameters.margins_mode }
+        : {}),
+      ...settings,
+    };
   }
   return editable;
 }
@@ -429,19 +436,35 @@ export interface StageReadiness {
 
 type ReadinessFields = Pick<
   StageState,
-  "stage" | "status" | "output_sha256" | "applied_input_sha256" | "settings_applied" | "input_sha256"
+  | "stage"
+  | "status"
+  | "output_sha256"
+  | "applied_input_sha256"
+  | "settings_applied"
+  | "input_sha256"
+  | "input_basis_sha256"
+  | "common_size_changed"
 >;
 
 function ownResultCurrent(state: ReadinessFields, previous: ReadinessFields | undefined): boolean {
   if (state.status !== "success" || state.settings_applied !== true) return false;
   // The input fingerprint: the page version's checksum for the first stage, else the
   // predecessor's last output.
-  const input =
+  let input =
     state.stage === STAGE_ORDER[0]
       ? (state.input_sha256 ?? "")
       : previous?.status === "success"
         ? (previous.output_sha256 ?? "")
         : "";
+  if (state.input_basis_sha256) {
+    // An aligned page's Margins (#208): the server's fingerprint includes the common
+    // page size. It holds only while the predecessor output it was built from is
+    // still the one on this page; a newer predecessor output means "input changed".
+    input =
+      previous?.status === "success" && previous.output_sha256 === state.input_basis_sha256
+        ? (state.input_sha256 ?? "")
+        : "";
+  }
   return input === (state.applied_input_sha256 ?? "");
 }
 
@@ -465,7 +488,13 @@ export function stageReadiness(
       let staleReason = "";
       if (state?.status === "success" && !current) {
         staleReason =
-          state.settings_applied === true ? "input changed" : "settings changed, not applied";
+          state.settings_applied !== true
+            ? "settings changed, not applied"
+            : upstreamCurrent &&
+                state.common_size_changed === true &&
+                previous?.output_sha256 === state.input_basis_sha256
+              ? "common page size changed"
+              : "input changed";
       }
       return { current, waitingFor, staleReason };
     }
@@ -686,6 +715,11 @@ class WorkspaceController {
   private contentOverlay: ContentBoxOverlay | null = null;
   private dewarpOverlay: DewarpOverlay | null = null;
   private deskewSaveTimer: number | null = null;
+  /** Margins link toggles; null until the member changes them (then equal sides link). */
+  private readonly marginLinks: { horizontal: boolean | null; vertical: boolean | null } = {
+    horizontal: null,
+    vertical: null,
+  };
   private saving = false;
   private saveQueued = false;
 
@@ -1106,6 +1140,11 @@ class WorkspaceController {
         const box = this.contentBox();
         this.setMessage(describeContent(state.parameters, box, this.contentDpi()), "success");
       }
+    } else if (state.stage === "margins") {
+      // A re-run caused by another page (#208) updates the sizes shown here too.
+      const result = this.controls.querySelector<HTMLElement>("[data-margins-result]");
+      if (result) result.textContent = state.status === "success" ? describeMargins(state.parameters) : "";
+      if (justCompleted) this.setMessage(`Completed. ${describeMargins(state.parameters)}`, "success");
     } else if (justCompleted) {
       this.setMessage("Completed. Result preview is ready.", "success");
     }
@@ -1480,10 +1519,123 @@ class WorkspaceController {
     this.contentOverlay.layout(source, display);
   }
 
+  /**
+   * Upstream `page_layout::OptionsWidget` (#208): hard margins in mm with linked
+   * pairs, "Align with other pages" and the 3 × 3 alignment grid. Saved with
+   * "Save and run" or "Apply to…".
+   */
   private renderMarginControls(): void {
-    this.addNumber("All margins (pixels)", "margin", 0, 5000, 1, 0);
-    this.addSelect("Horizontal alignment", "align_x", ["left", "center", "right"], "center");
-    this.addSelect("Vertical alignment", "align_y", ["top", "center", "bottom"], "center");
+    const settings = marginSettings(this.draft);
+    Object.assign(this.draft, settings);
+    const links = {
+      horizontal: this.marginLinks.horizontal ?? settings.left_mm === settings.right_mm,
+      vertical: this.marginLinks.vertical ?? settings.top_mm === settings.bottom_mm,
+    };
+    const fields = new Map<MarginSide, HTMLInputElement>();
+    const margins = document.createElement("fieldset");
+    margins.className = "st-margins";
+    const legend = document.createElement("legend");
+    legend.textContent = "Margins (mm)";
+    margins.append(legend);
+    for (const side of MARGIN_SIDES) {
+      const label = document.createElement("label");
+      label.textContent = side[0]!.toUpperCase() + side.slice(1);
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = "0";
+      input.max = String(MAX_MARGIN_MM);
+      input.step = "0.1";
+      input.value = String(settings[`${side}_mm`]);
+      input.disabled = !this.editable;
+      input.dataset.margin = side;
+      input.addEventListener("input", () => {
+        if (!input.validity.valid || input.value === "") return;
+        const value = Number(input.value);
+        this.draft[`${side}_mm`] = value;
+        const pair = side === "left" || side === "right" ? "horizontal" : "vertical";
+        if (links[pair]) {
+          const other = linkedSide(side);
+          this.draft[`${other}_mm`] = value;
+          const otherField = fields.get(other);
+          if (otherField) otherField.value = input.value;
+        }
+      });
+      fields.set(side, input);
+      label.append(input);
+      margins.append(label);
+    }
+    for (const [pair, text] of [
+      ["vertical", "Link top and bottom"],
+      ["horizontal", "Link left and right"],
+    ] as const) {
+      const label = document.createElement("label");
+      label.className = "checkbox";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = links[pair];
+      box.disabled = !this.editable;
+      box.dataset.marginLink = pair;
+      box.addEventListener("change", () => {
+        links[pair] = box.checked;
+        this.marginLinks[pair] = box.checked;
+      });
+      label.append(box, document.createTextNode(text));
+      margins.append(label);
+    }
+    this.controls.append(margins);
+
+    const alignLabel = document.createElement("label");
+    alignLabel.className = "checkbox";
+    const align = document.createElement("input");
+    align.type = "checkbox";
+    align.checked = settings.align_with_others;
+    align.disabled = !this.editable;
+    align.dataset.alignWithOthers = "";
+    alignLabel.append(align, document.createTextNode("Align with other pages"));
+    this.controls.append(alignLabel);
+
+    const grid = document.createElement("fieldset");
+    grid.className = "st-align-grid";
+    const gridLegend = document.createElement("legend");
+    gridLegend.textContent = "Alignment";
+    grid.append(gridLegend);
+    const cells: HTMLInputElement[] = [];
+    for (const vertical of ["top", "center", "bottom"] as const satisfies readonly AlignY[]) {
+      for (const horizontal of ["left", "center", "right"] as const satisfies readonly AlignX[]) {
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "margins-alignment";
+        radio.value = `${vertical} ${horizontal}`;
+        radio.title = vertical === horizontal ? "centre" : `${vertical} ${horizontal}`;
+        radio.setAttribute("aria-label", radio.title);
+        radio.checked = settings.align_y === vertical && settings.align_x === horizontal;
+        radio.dataset.align = `${vertical}-${horizontal}`;
+        radio.addEventListener("change", () => {
+          if (!radio.checked) return;
+          this.draft.align_x = horizontal;
+          this.draft.align_y = vertical;
+        });
+        cells.push(radio);
+        grid.append(radio);
+      }
+    }
+    const syncGrid = (): void => {
+      for (const cell of cells) cell.disabled = !this.editable || !align.checked;
+    };
+    align.addEventListener("change", () => {
+      this.draft.align_with_others = align.checked;
+      syncGrid();
+    });
+    syncGrid();
+    this.controls.append(grid);
+
+    const result = document.createElement("p");
+    result.className = "st-stage-result";
+    result.dataset.marginsResult = "";
+    const state = this.activeContext()?.state;
+    result.textContent =
+      state?.status === "success" ? describeMargins(state.parameters ?? {}) : "";
+    this.controls.append(result);
   }
 
   private renderDewarpControls(): void {
