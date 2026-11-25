@@ -38,10 +38,16 @@ for (const transport of ["events", "polling"] as const) {
       await expect(result).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
       await expect(image).toHaveAttribute("alt", "Processing-stage result preview");
     };
-    for (const stage of ["deskew", "select_content"]) {
-      await page.locator(`[data-stage-select="${stage}"]`).click();
-      await save();
-    }
+    // Deskew keeps the live input view and says when it leaves a page unchanged.
+    await page.locator('[data-stage-select="deskew"]').click();
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(page.locator("[data-editor-message]")).toContainText("Angle 0.00°, no change", {
+      timeout: 30_000,
+    });
+    await expect(input).toHaveAttribute("aria-pressed", "true");
+
+    await page.locator('[data-stage-select="select_content"]').click();
+    await save();
 
     // Dewarping runs before Margins (#195); on a blank page it explains its fallback.
     await page.locator('[data-stage-select="dewarping"]').click();

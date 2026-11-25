@@ -12,8 +12,12 @@ its input lineage, parameters, algorithm/version, revision, worker job, output a
 preview identifiers, checksums, timestamps, and status. The ordered stages are
 (#195):
 
-1. Deskew — projection-profile estimation with configurable search bounds or a
-   manual angle. It reads the page's active raw version directly.
+1. Deskew — a port of upstream `SkewFinder` (#195 step 4, `core/deskew.py`): Otsu
+   binarisation, removal of horizontal shadows, a coarse search in 1° steps over
+   ±7° and a binary search to 0.1°. Below upstream's confidence threshold (2.0) the
+   page is left unrotated and the editor says so. Manual mode sets the angle
+   directly (±45°). Angles are degrees, **positive = clockwise**. It reads the
+   page's active raw version directly.
 2. Select Content — automatic content detection or a draggable/resizable content
    rectangle.
 3. Dewarping — OpenCV projective correction using detected or draggable control
@@ -264,14 +268,16 @@ Two pages (#195 step 3):
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
     batch processing"), the options of the selected stage with "Save and run" and
-    "Apply to…" (selected or all pages, keeping pages with manual settings), and a
+    "Apply to…" (selected pages, all pages, this page only, this page and the
+    following ones, or every other page counted from this one, optionally keeping
+    pages with manual settings), and a
     status bar with the stage's hint (upstream strings where they exist) and the
     live-update state;
   - *middle*: the preview canvas. The wheel zooms around the cursor, dragging the
     background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
     and pan only translates it, so overlays and their handles keep working at any
-    zoom; handles capture their own pointer events. Ctrl+Wheel is left for stage
-    gestures (deskew rotation, step 4). The image is the stage's working-resolution
+    zoom; handles capture their own pointer events. Ctrl+Wheel is reserved for
+    stage gestures (deskew rotation). The image is the stage's working-resolution
     preview (about 150 dpi); full-resolution tiles are not part of this step;
   - *right*: the page strip. It is virtualised (only the rows in view exist in the
     DOM) and its thumbnails load lazily from tokenised, immutable URLs: the current
@@ -286,6 +292,21 @@ Two pages (#195 step 3):
     toggles, Shift-click selects a range; Home, End, PgUp (or Q), PgDown (or W) and
     the arrow keys move between pages, and "Keep current page in view" scrolls the
     strip along (upstream ThumbnailSequence and MainWindow behaviour).
+
+**Deskew** (upstream `deskew::ImageView` and `OptionsWidget`): the input preview turns
+live in the browser (a CSS rotation about the page centre) while the angle changes;
+nothing is sent per frame. A semi-transparent 20 px grid with a blue cross through the
+centre stays fixed while the page turns ("Keep the grid visible" switches it to
+"only while rotating"; the choice is remembered per browser). Two round handles on
+arcs at the page edges rotate the page by dragging; Ctrl+Wheel turns by 0.1° and
+Ctrl+Shift+Wheel by 0.05° per notch; the angle field accepts typing and the mouse
+wheel. A change switches the page to Manual and is saved 0.6 s after the last
+movement, or when a handle is released, as upstream commits on release. Choosing
+Auto discards the manual angle and detects again. The options show what the stage
+did, for example "Angle 1.30° clockwise (auto, confidence 12.4)" or "Angle 0.00°,
+no change: detection confidence 1.3 is below 2.0". The server applies the same
+rotation the browser previews (`scan_transform.rotate(-angle)`); a fixture shared
+by `tests/test_deskew.py` and `frontend/editor-shell.test.ts` checks both.
 
 The editor also keeps:
 

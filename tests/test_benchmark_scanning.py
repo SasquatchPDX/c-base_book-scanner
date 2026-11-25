@@ -44,3 +44,11 @@ def test_benchmark_flags_regressions_beyond_tolerance(tmp_path: Path) -> None:
     regressions = bench.compare(current, baseline, 0.20)
     assert len(regressions) == 1
     assert regressions[0].startswith("output:")
+
+
+def test_benchmark_flags_stages_over_their_budget() -> None:
+    bench = _load()
+    assert bench.STAGE_BUDGETS_MS["deskew"] == 300.0  # #195 section 8.1
+    assert bench.over_budget({"deskew": {"mean_ms": 120.0}, "output": {"mean_ms": 900.0}}) == []
+    failures = bench.over_budget({"deskew": {"mean_ms": 301.0}})
+    assert failures == ["deskew: 301 ms > budget 300 ms"]

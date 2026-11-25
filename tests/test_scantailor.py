@@ -14,7 +14,7 @@ from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
 from PIL import Image, ImageDraw
 
-from ebook_server.core import scantailor, views
+from ebook_server.core import deskew, scantailor, views
 from ebook_server.core.models import (
     ProcessingJob,
     ScanPage,
@@ -1061,14 +1061,17 @@ def _save(image: Image.Image, path: Path, **kwargs: object) -> Path:
 
 @pytest.mark.parametrize("skew", [3.0, -4.0])
 def test_auto_deskew_straightens_skewed_text(skew: float) -> None:
+    # Pillow turns counter-clockwise by ``skew``; the correction turns clockwise by
+    # the same amount, and positive deskew angles are clockwise (#195 step 4).
     page = _text_page().rotate(skew, expand=True, fillcolor=235)
     result = run_stage(scantailor._run_deskew, _state(), page)
 
-    # applied rotation is the correction (opposite sign of the skew)
-    assert result.parameters["angle"] == pytest.approx(-skew, abs=0.6)
-    assert result.parameters["transform"]["op"] == "rotate"
-    residual = scantailor._estimate_deskew_angle(result.image.convert("L"), {})
-    assert abs(residual) <= 0.5
+    assert result.parameters["angle"] == pytest.approx(skew, abs=0.15)
+    assert result.parameters["deskew_mode"] == "auto"
+    assert result.parameters["confidence_good"] is True
+    assert result.parameters["transform"] == {"op": "rotate", "angle": -result.parameters["angle"]}
+    residual = deskew.detect(np.asarray(result.image.convert("L")), (150, 150))
+    assert abs(residual.detected_angle) <= 0.15
 
 
 def test_manual_angle_matches_auto_angle_semantics() -> None:
@@ -1083,13 +1086,15 @@ def test_manual_angle_matches_auto_angle_semantics() -> None:
     assert np.array_equal(np.asarray(auto.image), np.asarray(manual.image))
 
 
-def test_deskew_prefers_zero_on_blank_and_dim_pages() -> None:
-    assert scantailor._estimate_deskew_angle(Image.new("L", (800, 1000), 235), {}) == 0.0
+def test_deskew_prefers_zero_on_blank_and_speck_pages() -> None:
+    dpi = (150.0, 150.0)
+    assert deskew.detect(np.full((1000, 800), 235, np.uint8), dpi).angle == 0.0
     speck = Image.new("L", (800, 1000), 235)
     ImageDraw.Draw(speck).rectangle((400, 500, 404, 504), fill=20)
-    assert scantailor._estimate_deskew_angle(speck, {}) == 0.0
-    dim = _text_page(paper=70, ink=10)
-    assert scantailor._estimate_deskew_angle(dim, {}) == 0.0
+    found = deskew.detect(np.asarray(speck), dpi)
+    assert found.angle == 0.0 and not found.applied
+    # A dim but straight page is read like any other (Otsu adapts to the contrast).
+    assert deskew.detect(np.asarray(_text_page(paper=70, ink=10)), dpi).angle == 0.0
 
 
 def test_deskew_corners_use_paper_colour_not_red() -> None:
@@ -1323,7 +1328,7 @@ def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> 
         filename="scan.png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
-    original = scantailor._STAGE_RUNNERS["deskew"]["projection_deskew"]
+    original = scantailor._STAGE_RUNNERS["deskew"]["skew_finder"]
 
     def racing_runner(
         state: ScanTailorStageState, stage_input: scantailor.StageInput
@@ -1336,7 +1341,7 @@ def test_edit_during_job_is_not_overwritten(monkeypatch: pytest.MonkeyPatch) -> 
         )
         return original(state, stage_input)
 
-    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "projection_deskew", racing_runner)
+    monkeypatch.setitem(scantailor._STAGE_RUNNERS["deskew"], "skew_finder", racing_runner)
     client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
         data=json.dumps({"parameters": {"manual_angle": 0}}),
@@ -1775,16 +1780,17 @@ def test_page_thumbnail_follows_latest_completed_stage() -> None:
     client.get(_stages_url(str(job.id), str(page.id)))
     response = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
-        data=json.dumps({"parameters": {"manual_angle": 90}}),
+        data=json.dumps({"parameters": {"manual_angle": 45}}),
         content_type="application/json",
     )
     assert response.status_code == 202
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     assert deskew.status == ScanTailorStageState.StageStatus.SUCCESS, deskew.last_error
 
-    # Deskew rotated the page by 90 degrees: the thumbnail now shows landscape.
+    # Deskew turned the 3:4 page by 45 degrees (the manual maximum): the rotated page
+    # fills a square canvas, so the thumbnail is square now.
     stage_size, stage_etag = _thumbnail_size(client, str(page.id))
-    assert stage_size == (400, 300)
+    assert stage_size[0] == stage_size[1] > 300
     assert stage_etag != raw_etag
     revalidated = client.get(f"/scan/pages/{page.id}/image/", HTTP_IF_NONE_MATCH=stage_etag)
     assert revalidated.status_code == 304
