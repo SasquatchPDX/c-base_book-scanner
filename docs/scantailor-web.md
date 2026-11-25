@@ -187,6 +187,9 @@ running, success, failed); there is no stored "invalidated" state.
   before Deskew ran runs once Deskew, Select Content and Dewarping are done. A job
   whose predecessor changed after it was queued does not fail: it is closed as
   superseded (`waiting_for` in its details) and the stage keeps its previous result.
+  After parking, readiness is checked again: with several workers the predecessor
+  may have finished (and skipped the still-queued row) in between, so a stage that
+  can run by then is queued at once instead of waiting forever.
 - **Batch apply** ("Apply to…", ▶) follows the same rules per page; each applied
   page reports its `waiting_for`.
 - A replacement scan page rebinds Deskew to the new active version, which changes

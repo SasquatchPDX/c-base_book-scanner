@@ -2205,7 +2205,13 @@ def _park_waiting_stage_job(
     If the row still waits on this job, it returns to its idle status (its previous
     result, if any, stays as a stale result). The predecessor's next successful run
     queues the stage again (:func:`queue_ready_successor`).
+
+    That run may have finished between this job's readiness check and the park: its
+    chaining then saw the row still QUEUED and skipped it. So after parking, readiness
+    is checked once more against fresh rows; a stage that can run now is queued here
+    instead of waiting for a wake-up that already happened.
     """
+    parked = False
     with transaction.atomic():
         fresh = ScanTailorStageState.objects.select_for_update().filter(id=state.id).first()
         if (
@@ -2215,7 +2221,23 @@ def _park_waiting_stage_job(
         ):
             fresh.status = stage_idle_status(fresh)
             fresh.save(update_fields=["status", "updated_at"])
+            parked = True
     _supersede_stage_job(job, {**details, "waiting_for": waiting_for}, f"waiting for {waiting_for}")
+    if not parked:
+        return
+    current = ScanTailorStageState.objects.filter(id=state.id).first()
+    if current is None or current.status == ScanTailorStageState.StageStatus.QUEUED:
+        return
+    if ScanJob.objects.filter(pk=current.scan_job_id).values_list(
+        "state", flat=True
+    ).first() not in (scan_lifecycle.PROCESSING_STATES):
+        return
+    requested_by = details.get("requested_by_user_id")
+    request_stage_job_if_ready(
+        state=current,
+        requested_by_user_id=requested_by if isinstance(requested_by, int) else None,
+        batch=bool(details.get("batch")),
+    )
 
 
 def _prune_quietly(prune: Callable[..., int], *args: object) -> None:
