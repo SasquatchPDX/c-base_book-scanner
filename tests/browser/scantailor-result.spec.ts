@@ -106,6 +106,13 @@ for (const transport of ["events", "polling"] as const) {
     // Output re-ran on its own with the new margins.
     await page.locator('[data-stage-select="output"]').click();
     await expectResult("output");
+    // Output's own settings: saved, its result pane updates without leaving the stage.
+    const outputBefore = await result.getAttribute("src");
+    await page.getByLabel("Invert output").check();
+    await expect(status).toContainText("Settings not applied");
+    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(result).not.toHaveAttribute("src", outputBefore!, { timeout: 30_000 });
+    await expectResult("output");
 
     // Reopen the stage, as a user does when adjusting an already completed result.
     await page.reload();
@@ -185,4 +192,59 @@ test("a narrow screen shows one pane and brings the result forward after a run",
   await resultButton.click();
   await expect(page.locator("[data-result-status]")).toContainText("Settings not applied");
   await expect(page.locator("[data-result-image]")).toBeHidden();
+});
+
+test("the input and result panes share one zoom and pan", async ({ page }) => {
+  test.setTimeout(60_000);
+  await openNewJob(page, "Result feedback zoom");
+  const input = page.locator("[data-editor-image]");
+  const result = page.locator("[data-result-image]");
+  const inputViewport = page.locator("[data-viewport]");
+  const resultViewport = page.locator("[data-result-viewport]");
+  await page.getByRole("button", { name: "Save and run" }).click();
+  await expect(result).toHaveAttribute("src", /\/stages\/deskew\/preview\/\?v=/, {
+    timeout: 30_000,
+  });
+  await expect.poll(() => naturalWidth(result)).toBeGreaterThan(0);
+  await expect.poll(() => naturalWidth(input)).toBeGreaterThan(0);
+
+  /** Each image's box relative to its own pane. */
+  const placement = async () => {
+    const [i, r, iv, rv] = await Promise.all([
+      input.boundingBox(),
+      result.boundingBox(),
+      inputViewport.boundingBox(),
+      resultViewport.boundingBox(),
+    ]);
+    return {
+      input: { x: i!.x - iv!.x, y: i!.y - iv!.y, width: i!.width },
+      result: { x: r!.x - rv!.x, y: r!.y - rv!.y, width: r!.width },
+    };
+  };
+  const expectAligned = async () => {
+    // The blank page is unchanged by Deskew: both panes show it at the same place.
+    const now = await placement();
+    expect(Math.abs(now.input.width - now.result.width)).toBeLessThanOrEqual(2);
+    expect(Math.abs(now.input.x - now.result.x)).toBeLessThanOrEqual(2);
+    expect(Math.abs(now.input.y - now.result.y)).toBeLessThanOrEqual(2);
+    return now;
+  };
+
+  const fitted = await expectAligned();
+  await page.getByRole("button", { name: "Zoom in" }).click();
+  await expect
+    .poll(async () => (await placement()).result.width)
+    .toBeCloseTo(fitted.result.width * 1.25, 0);
+  const zoomed = await expectAligned();
+  expect(zoomed.input.width).toBeCloseTo(fitted.input.width * 1.25, 0);
+
+  // Panning the result pane moves the input with it.
+  const pane = (await resultViewport.boundingBox())!;
+  await page.mouse.move(pane.x + 10, pane.y + pane.height - 10);
+  await page.mouse.down();
+  await page.mouse.move(pane.x + 50, pane.y + pane.height - 30, { steps: 5 });
+  await page.mouse.up();
+  const panned = await expectAligned();
+  expect(panned.input.x - zoomed.input.x).toBeCloseTo(40, 0);
+  expect(panned.input.y - zoomed.input.y).toBeCloseTo(-20, 0);
 });

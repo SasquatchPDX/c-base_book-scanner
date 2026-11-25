@@ -247,6 +247,43 @@ def test_queued_job_whose_predecessor_changed_waits_instead_of_failing(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_parked_job_requeues_when_its_predecessor_finished_meanwhile(
+    held_queue: _HeldQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two workers: the predecessor's chaining saw the row QUEUED and skipped it, then
+    this job parks on its earlier "waiting" check. No wake-up is lost."""
+    client, job = _create_scan_job("fingerprint-park-race")
+    page = _page(client, str(job.id))
+    _save(client, page, "deskew", {})
+    held_queue.drain()
+
+    _save(client, page, "margins", {"margins_mode": "manual", "margin": 8})  # queued
+    margins_job_id = _states(page)["margins"].worker_job_id
+    real_waiting_for = scantailor.stage_waiting_for
+    calls = {"count": 0}
+
+    def stale_first_check(state: ScanTailorStageState) -> str | None:
+        # The job's readiness check ran while Dewarping was still re-running.
+        calls["count"] += 1
+        return "dewarping" if calls["count"] == 1 else real_waiting_for(state)
+
+    monkeypatch.setattr(scantailor, "stage_waiting_for", stale_first_check)
+    held_queue.run_next()
+    parked = ProcessingJob.objects.get(job_id=margins_job_id)
+    assert parked.details["waiting_for"] == "dewarping"
+    margins = _states(page)["margins"]
+    assert margins.status == Status.QUEUED
+    assert margins.worker_job_id != margins_job_id
+
+    held_queue.drain()
+    margins = _states(page)["margins"]
+    assert scantailor.stage_result_is_current(margins)
+    assert margins.parameters["margin"] == 8
+    _no_failures()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_batch_apply_follows_the_same_rules_per_page() -> None:
     client, job = _create_scan_job("fingerprint-batch")
     page = _page(client, str(job.id))
