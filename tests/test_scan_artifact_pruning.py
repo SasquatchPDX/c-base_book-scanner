@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 import pytest
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.db import transaction
 from django.test import Client, override_settings
 from PIL import Image, ImageDraw
@@ -410,3 +410,58 @@ def test_reopened_job_reruns_stages_whose_files_were_removed(tmp_path: Path) -> 
     assert rerun.status == ScanTailorStageState.StageStatus.SUCCESS
     assert scantailor.stage_result_is_current(rerun)
     assert (_scan_root(tmp_path) / rerun.output_storage_identifier).is_file()
+
+
+def _save_select_content(client: Client, job: ScanJob, page: ScanPage) -> None:
+    response = client.post(
+        _stage_url(job, page, "select_content"),
+        data=json.dumps({"parameters": {}}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202, response.content
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rerun_of_an_invalidated_stage_releases_the_upstream_revision_it_used(
+    tmp_path: Path,
+) -> None:
+    client, job, page = _job_with_page("prune-upstream")
+    _save_deskew(client, job, page, 1.0)
+    _save_select_content(client, job, page)
+    first_deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    held_input = first_deskew.output_storage_identifier
+
+    # A new deskew makes Select Content stale (#205); with its predecessor current it
+    # reruns on its own and binds to the new deskew output, so the old one goes.
+    _save_deskew(client, job, page, 2.0)
+    deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
+    content = ScanTailorStageState.objects.get(scan_page=page, stage="select_content")
+    assert content.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert scantailor.stage_result_is_current(content)
+    assert content.input_storage_identifier == deskew.output_storage_identifier
+    assert held_input != deskew.output_storage_identifier
+    assert not (_scan_root(tmp_path) / held_input).exists()
+    assert _files_under(_stage_dir(tmp_path, job, page, "deskew")) == {
+        f"v{deskew.revision}/work.png",
+        f"v{deskew.revision}/preview.jpg",
+        f"v{deskew.revision}/thumbnail.jpg",
+    }
+    assert _files_under(_stage_dir(tmp_path, job, page, "select_content")) == {
+        f"v{content.revision}/work.png",
+        f"v{content.revision}/preview.jpg",
+        f"v{content.revision}/thumbnail.jpg",
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_sweep_over_the_entry_limit_fails_and_deletes_nothing(tmp_path: Path) -> None:
+    root = _scan_root(tmp_path)
+    orphans = [
+        f"scan-jobs/20260101T000000Z/00000000-0000-4000-8000-000000000000/deskew/v{n}/work.png"
+        for n in range(1, 6)
+    ]
+    for identifier in orphans:
+        _write(root, identifier)
+    with pytest.raises(CommandError, match="nothing deleted"):
+        call_command("prune_scan_artifacts", "--limit", "3", stdout=io.StringIO())
+    assert set(orphans) <= _files_under(root)
