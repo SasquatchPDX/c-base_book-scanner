@@ -185,10 +185,11 @@ running, success, failed); there is no stored "invalidated" state.
   job's common page size, see below).
 - **Waiting** (`scantailor.stage_waiting_for`): the first earlier stage without a
   current result. A stage cannot run before it.
-- **Saving stores settings only.** An edit stores the parameters, bumps the stage's
-  revision and clears its error. It queues a job only if every earlier stage is
-  current and this stage's result is not; otherwise the response has
-  `"job": null` and `"waiting_for": "<stage>"`. Editing settings back to the values
+- **Saving stores settings only.** An edit (autosaved by the editor, #209) stores the
+  parameters, bumps the stage's revision and clears its error. It queues a job only
+  if every earlier stage is current and this stage's result is not; otherwise the
+  response has `"job": null` and `"waiting_for": "<stage>"`. Posting the settings the
+  stage already has is no edit at all (#209, see below). Editing settings back to the values
   of the existing result makes it current again without a job (the result's
   recorded parameters are restored). Other stages' settings and results are never
   touched.
@@ -387,11 +388,78 @@ through the storage backend; a failure is logged and never fails the job.
   references and their applied fingerprint (`applied_*`), and return to status
   `unknown` (not run); then all its stage files are deleted. No result is current
   any more (#205), so a job reopened for a re-finish reruns its stages.
-- **Free-space guard.** A stage save (single page or batch) is refused before
-  anything is saved or queued while the scan storage volume has less than
+- **Free-space guard.** A stage save (single page or batch) or an ensure (#209) is
+  refused before anything is saved or queued while the scan storage volume has less than
   `BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES` free (default 1 GiB, `0` disables). The
   response is `507` with a plain-text sentence starting "Disk almost full", which
   the editor shows as its error message.
+
+## Automatic runs and cancellation (#209)
+
+The editor has no "Save and run" button: the stage being shown runs by itself. All of
+this works on #205's derived state: a stage runs when its result is not current and
+every earlier stage of the page has a current result.
+
+- **Ensure on open.** Selecting a page or stage posts
+  `POST /scan/jobs/{id}/pages/{page}/stages/{stage}/ensure/`
+  (`scantailor.ensure_stage_result`). It returns the stage with #205's derived fields
+  and an `outcome`:
+  - `current`: the result is current (`stage_result_is_current`); nothing is queued.
+  - `waiting`, with `waiting_for` (`stage_waiting_for`): an earlier stage has no
+    current result; nothing is queued. That stage's successful run queues this one
+    (chaining, `queue_ready_successor`).
+  - `queued` or `running`: a job of the current revision exists and is returned. A
+    second request, or a second editor, gets the same job.
+  - `failed`: the current settings already failed on this input and are not run again
+    by opening the stage. Editing the settings, or a new result of the predecessor
+    (chaining), runs it again.
+  - Otherwise the stale result is queued once, through `request_stage_job_if_ready`,
+    at the front of the queue.
+
+  The page's rows are read under the stage row's lock and linked in memory
+  (`link_page_states`), with the job's common page size (#208) computed at most once.
+  Like a save, the request is refused with `507` while the scan volume is almost full.
+- **Autosave.** Every stage's options are saved 0.6 s after the last change. This
+  includes the content box, the dewarping curves, the margins in millimetres and
+  "Align with other pages" (#208), and the output zones. A drag is saved when it is
+  released. Only a draft that differs from the saved settings is sent, so view toggles
+  (keep grid, link margins) save nothing. Opening another page or stage before the
+  autosave ran saves the change for the page and stage it was made on, after any save
+  still in flight. "Revert to saved" drops a change that has not been saved yet; pressed
+  while a save is in flight, it shows the settings that save stores once it is done. A
+  concurrent edit is still detected by `expected_revision` (409). The conflict reloads
+  the latest values and drops any pending change.
+- **No-op saves.** A post whose settings equal the stored ones is compared on
+  `stage_settings` (`STAGE_SETTING_KEYS`), not on the raw `parameters`. Worker-recorded
+  keys therefore never make it a change. It returns the stage with `unchanged: true`
+  and status 200, with no new revision and no job. Settings edited back to the values
+  of the existing result are a new revision that is current at once, without a job
+  (#205).
+- **One job per stage.** The row's `worker_job_id` names the only job that may run and
+  commit the stage. Queueing a new job (an edit, an ensure, chaining, a batch)
+  replaces it there. The job it replaces is closed as superseded at once if it is
+  still queued. A running one stops at its next cancellation check, and in any case
+  #205's claim check at start and commit discards it.
+- **Cancellation.** A running job checks, under the same rule as its commit
+  (`_locked_if_current`: same revision, status `running`, same `worker_job_id`),
+  whether it is still the stage's current run. It checks between input load, run,
+  encode, hash and publish, between tiles of Output's thresholding, after Output's
+  full-resolution render and zone detection, and every 64 columns of the
+  full-resolution dewarp sampling (`core/stage_cancel.py`). A superseded run stops with
+  a superseded job result. Its temporary files are deleted, and #204's closed-job
+  cleanup deletes whatever its revision folder holds that no row refers to.
+- **Status line and result pane.** While a change waits for its autosave or is being
+  saved, both say "Saving…", or "Restarting with new settings…" if a run of the older
+  settings is active. The previous result stays in the result pane, dimmed under the
+  spinner (#206). While the stage runs, they say "Running…" or "Restarting with new
+  settings…" (status line) and "Queued" or "Running" (result pane). "Settings not
+  applied yet." only appears when a change could not be saved (the error is shown
+  first).
+- **Merge order.** Save replies, ensure replies and live updates can arrive in any
+  order. For example, the live "success" of a run can come before the save request's
+  reply, which still says "queued". The editor never replaces a stage row with an
+  older one: the higher revision wins, then the later `updated_at` (set on every
+  write), then the further status for equal timestamps (`isOlderStageState`).
 
 ## Page Split removed (#195)
 
@@ -424,24 +492,27 @@ Two pages (#195 step 3):
   fills the browser viewport (no site header, no page scrolling) with three columns:
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
-    batch processing"), the options of the selected stage with "Save and run" and
-    "Apply to…" (selected pages, all pages, this page only, this page and the
+    batch processing"), the options of the selected stage with "Revert to saved"
+    (there is no save button: edits are autosaved, see "Automatic runs and cancellation") and "Apply to…" (selected pages, all pages, this page only, this page and the
     following ones, or every other page counted from this one, optionally keeping
     pages with manual settings), and a
     status bar with the stage's hint (upstream strings where they exist) and the
-    live-update state. Edits in the options are a draft until saved: the status
-    line says "Settings not applied" and no result is shown for them. The status
-    line is derived from the stage's state (#205): "Waiting for Select Content",
-    "stale: input changed", "Failed: …";
+    live-update state. Edits in the options are saved by themselves 0.6 s after the
+    last change (#209); until then the status line says "Saving…" (or "Restarting
+    with new settings…" while a run of the older settings is active). Otherwise the
+    status line is derived from the stage's state (#205): "Waiting for Select
+    Content", "Running…", "stale: input changed", "Failed: …". "Settings not applied
+    yet." only remains when a change could not be saved;
   - *middle*: the preview canvas, in two panes (#206): on the left the stage's
     *input* with its editable overlay (deskew grid, content box, dewarp curves,
     output zones), on the right this stage's *result*. After a run the result pane
     updates in place without leaving the stage. Only a current result is shown
-    (#205); otherwise the pane gives the status line's reason: "Settings not
-    applied", "Queued"/"Running", "Waiting for Deskew", "Stale: input changed",
-    "Failed: …" or "Not run yet". While the stage is queued or running the result
-    the pane was showing stays, dimmed under a spinner, until the new one arrives;
-    a stale result that is not being recomputed is never shown. The input pane is
+    (#205); otherwise the pane gives the status line's reason: "Saving…",
+    "Queued"/"Running", "Waiting for Deskew", "Stale: input changed", "Failed: …",
+    "Not run yet" or, after a failed save, "Settings not applied yet". While a change
+    is being saved and while the stage is queued or running, the result the pane was
+    showing stays, dimmed under a spinner, until the new one arrives (#209); a stale
+    result that is not being recomputed is never shown. The input pane is
     not reloaded while an overlay is being dragged. Both panes share zoom and pan,
     the result centred where the input is. Below 900 px width only one pane fits:
     an Input/Result toggle picks it, keeps the choice across pages and stages,

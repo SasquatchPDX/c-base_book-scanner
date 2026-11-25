@@ -56,11 +56,10 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
-  // Each stage's own result line: the status line moves on to the stages that the
-  // run queues after it (#205 chaining).
+  // Opening a stage runs it (#209), and each finished stage runs the next one (#205).
+  // Each stage's own result line: the status line moves on to the chained stages.
   const runStage = async (stage: string, resultLine: string, expected: string): Promise<void> => {
     await page.locator(`[data-stage-select="${stage}"]`).click();
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expect(page.locator(`[data-stage-controls] ${resultLine}`)).toContainText(expected, {
       timeout: 30_000,
     });

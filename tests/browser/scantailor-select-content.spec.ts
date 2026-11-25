@@ -56,8 +56,8 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
-  // Deskew first: Select Content reads its result and then runs on its own (#205).
-  await page.getByRole("button", { name: "Save and run" }).click();
+  // Opening the editor runs Deskew (#209); Select Content reads its result and then
+  // runs on its own (#205).
   await expect(page.locator("[data-deskew-result]")).toContainText("Angle", {
     timeout: 30_000,
   });
@@ -65,7 +65,6 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await page.locator('[data-stage-select="select_content"]').click();
   const controls = page.locator("[data-stage-controls]");
   await expect(controls.getByRole("radio", { name: "Auto" })).toBeChecked();
-  await page.getByRole("button", { name: "Save and run" }).click();
   // The stage's own result line: the status line moves on to the chained stages.
   const contentResult = controls.locator("[data-content-result]");
   await expect(contentResult).toContainText("mm", { timeout: 30_000 });

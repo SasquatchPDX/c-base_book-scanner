@@ -363,14 +363,18 @@ def test_concurrent_edit_conflict_is_reported() -> None:
 
     first = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
-        data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "first"}}),
+        data=json.dumps(
+            {"expected_revision": expected_revision, "parameters": {"manual_angle": 1.0}}
+        ),
         content_type="application/json",
     )
     assert first.status_code == 202
 
     second = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
-        data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "second"}}),
+        data=json.dumps(
+            {"expected_revision": expected_revision, "parameters": {"manual_angle": 2.0}}
+        ),
         content_type="application/json",
     )
     assert second.status_code == 409
@@ -533,12 +537,21 @@ def test_deskew_reproducible_with_manual_angle() -> None:
     first_angle = deskew_state.parameters.get("angle")
     assert first_angle == 2.25
 
-    second = client.post(
+    unchanged = client.post(
         deskew_url,
         data=json.dumps({"parameters": {"manual_angle": 2.25}}),
         content_type="application/json",
     )
-    assert second.status_code == 202
+    assert unchanged.status_code == 200
+    assert unchanged.json()["unchanged"] is True
+
+    for angle in (1.0, 2.25):
+        rerun = client.post(
+            deskew_url,
+            data=json.dumps({"parameters": {"manual_angle": angle}}),
+            content_type="application/json",
+        )
+        assert rerun.status_code == 202
 
     deskew_state.refresh_from_db()
     assert deskew_state.output_sha256 == first_hash
@@ -646,12 +659,13 @@ def test_margin_pipeline_reproducible_with_same_parameters() -> None:
     first_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     first_hash = first_state.output_sha256
 
-    second = client.post(
-        _stage_url(str(job.id), str(page.id), "margins"),
-        data=json.dumps(payload),
-        content_type="application/json",
-    )
-    assert second.status_code == 202
+    for margin in (25, 24):
+        second = client.post(
+            _stage_url(str(job.id), str(page.id), "margins"),
+            data=json.dumps({"parameters": {**payload["parameters"], "margin": margin}}),
+            content_type="application/json",
+        )
+        assert second.status_code == 202
     second_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     assert second_state.output_sha256 == first_hash
 

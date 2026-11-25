@@ -17,6 +17,7 @@
       data-workspace-url="{% url 'scan-job-workspace' job.id %}"
       data-workspace-state-url="{% url 'scan-job-workspace-state' job.id %}"
       data-stage-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/"
+      data-ensure-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/ensure/"
       data-preview-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/preview/"
       data-stage-thumbnail-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/thumbnail/"
       data-page-thumbnail-template="/scan/pages/__PAGE__/thumbnail/"
@@ -42,7 +43,7 @@
           <h2 id="workspace-editor-title" data-editor-title>Choose a page and stage</h2>
           <div class="editor-stage-controls" data-stage-controls></div>
           <div class="st-option-actions">
-            <button type="button" data-save-stage>Save and run</button>
+            <button type="button" class="secondary" data-revert-stage title="Discard changes that have not been saved yet">Revert to saved</button>
           </div>
           <fieldset class="st-apply">
             <legend>Apply to…</legend>

@@ -43,6 +43,7 @@ from .models import (
     ScanTailorStageState,
     StorageLocation,
 )
+from .stage_cancel import StageSuperseded, cancellable, checkpoint
 from .storage_registry import filesystem_backend_for_location
 
 logger = structlog.get_logger(__name__)
@@ -1782,6 +1783,7 @@ def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any])
     cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
     for top in range(0, source.height, OUTPUT_TILE_EDGE):
         for left in range(0, source.width, OUTPUT_TILE_EDGE):
+            checkpoint()  # a newer edit stops the run between tiles (#209)
             right, bottom = (
                 min(source.width, left + OUTPUT_TILE_EDGE),
                 min(source.height, top + OUTPUT_TILE_EDGE),
@@ -1853,9 +1855,11 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
     zones: list[dict[str, Any]] = []
     warning = None
     source = stage_input.render_full()
+    checkpoint(force=True)
     try:
         if zone_mode == "auto":
             zones = _zones_to_full(output_zones.detect_zones(stage_input.image), stage_input)
+            checkpoint(force=True)
         elif zone_mode == "manual":
             zones = _output_zones(parameters, source.size)
         # With Keep color, unclassified areas remain source pixels too; only
@@ -1880,6 +1884,8 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
                 processed = _threshold_tiles(region, algorithm, parameters)
                 result.paste(processed, box)
         applied = "zoned" if zones else "whole_page"
+    except StageSuperseded:
+        raise
     except Exception as exc:
         # Uncertain layout or processing must not silently destroy pictures.
         warning = str(exc)
@@ -1970,6 +1976,127 @@ def _resolve_stage_algorithm(state: ScanTailorStageState) -> StageRunner:
     return runner
 
 
+def _active_stage_job(state: ScanTailorStageState) -> ProcessingJob | None:
+    """The queued or running job of ``state``'s current revision, if there is one."""
+    try:
+        job_id = uuid.UUID(state.worker_job_id)
+    except ValueError:
+        return None
+    job = ProcessingJob.objects.filter(
+        job_id=job_id,
+        state__in=[ProcessingJob.JobState.QUEUED, ProcessingJob.JobState.RUNNING],
+    ).first()
+    if job is None:
+        return None
+    details = job.details if isinstance(job.details, dict) else {}
+    return job if details.get("stage_revision") == state.revision else None
+
+
+@dataclass(frozen=True)
+class EnsureResult:
+    """What :func:`ensure_stage_result` found or did for one page and stage (#209).
+
+    ``outcome`` is ``current`` (the result matches the settings and input, #205),
+    ``waiting`` (an earlier stage has no current result: ``waiting_for`` names it),
+    ``queued`` or ``running`` (a job of the current revision exists, or was queued now;
+    ``job`` is it), or ``failed`` (the current settings already failed on this input;
+    editing them, or a new result of the predecessor, runs the stage again).
+    """
+
+    outcome: str
+    state: ScanTailorStageState
+    waiting_for: str | None = None
+    job: ProcessingJob | None = None
+
+
+def _linked_page_state(state_id: int, *, lock: bool) -> ScanTailorStageState:
+    """Read a stage row linked with its page's other rows (#205, #208).
+
+    With ``lock`` the row is locked (inside ``transaction.atomic()``). The derived-state
+    functions then follow the linked rows in memory, and the job's common page size is
+    computed at most once (:func:`page_margins_aggregate`), not once per call.
+    """
+    rows = ScanTailorStageState.objects.select_related("input_scan_page_version")
+    if lock:
+        rows = rows.select_for_update(of=("self",))
+    row = rows.get(pk=state_id)
+    states = {
+        other.stage: other
+        for other in ScanTailorStageState.objects.filter(
+            scan_job_id=row.scan_job_id, scan_page_id=row.scan_page_id
+        )
+        .exclude(pk=row.pk)
+        .select_related("input_scan_page_version")
+    }
+    states[row.stage] = row
+    link_page_states(states, aggregate=page_margins_aggregate(states))
+    return row
+
+
+def ensure_stage_result(
+    state: ScanTailorStageState,
+    *,
+    requested_by_user_id: int | None = None,
+) -> EnsureResult:
+    """Make sure ``state`` gets a current result, queueing its stage at most once (#209).
+
+    On #205's derived state: nothing is queued when the result is current, when an
+    earlier stage has no current result (the predecessor's successful run queues this
+    stage, :func:`queue_ready_successor`), when a job of the current revision is
+    already queued or running (that job is returned), or when the current settings
+    already failed. Otherwise the stage is queued through
+    :func:`request_stage_job_if_ready` at the front of the queue: the page someone has
+    open runs first. The row lock makes concurrent calls (two editors opening the same
+    page, an autosave and an open) queue one job.
+    """
+    with transaction.atomic():
+        locked = _linked_page_state(state.pk, lock=True)
+        if stage_result_is_current(locked):
+            return EnsureResult("current", locked)
+        waiting_for = stage_waiting_for(locked)
+        if waiting_for is not None:
+            return EnsureResult("waiting", locked, waiting_for=waiting_for)
+        active = _active_stage_job(locked)
+        if active is not None:
+            running = locked.status == ScanTailorStageState.StageStatus.RUNNING
+            return EnsureResult("running" if running else "queued", locked, job=active)
+        if locked.status == ScanTailorStageState.StageStatus.FAILED and _failed_on_current_input(
+            locked
+        ):
+            return EnsureResult("failed", locked)
+        job, waiting_for = request_stage_job_if_ready(
+            state=locked, requested_by_user_id=requested_by_user_id, dispatch=False
+        )
+    if job is None:  # checked above under the same lock; kept for the type checker
+        return EnsureResult("waiting" if waiting_for else "current", locked, waiting_for)
+    if (job.details or {}).get("superseded"):
+        return EnsureResult("queued", locked, job=job)
+    dispatch_stage_job(str(job.job_id))
+    # Without a queue the job ran inline: report the row as it is now.
+    return EnsureResult("queued", _linked_page_state(locked.pk, lock=False), job=job)
+
+
+def _failed_on_current_input(state: ScanTailorStageState) -> bool:
+    """Whether ``state``'s failed run read the input the stage would read now (#209).
+
+    The failed job records the input fingerprint it ran on. A failure on an older input
+    (a replacement scan, a predecessor that changed without chaining here) is worth
+    running again; the same failure on the same input is not. A failure without a
+    recorded fingerprint counts as current, so opening a page never loops on it.
+    """
+    try:
+        job_id = uuid.UUID(state.worker_job_id)
+    except ValueError:
+        return True
+    details = ProcessingJob.objects.filter(job_id=job_id).values_list("details", flat=True).first()
+    if not isinstance(details, dict) or details.get("stage_revision") != state.revision:
+        return True
+    recorded = details.get("input_fingerprint")
+    if not isinstance(recorded, str):
+        return True
+    return recorded == stage_input_fingerprint(state)
+
+
 def request_stage_job(
     *,
     state: ScanTailorStageState,
@@ -1986,8 +2113,14 @@ def request_stage_job(
     superseded right away and never dispatched, so it cannot replace the newer
     edit's artifact; :func:`process_stage_job` repeats the check on execution.
     ``batch`` marks work from "apply to pages"; stages it chains to queue at the back.
+
+    The row's ``worker_job_id`` names the one job that may run and commit the stage.
+    The job it replaces is closed as superseded right away if it is still waiting in
+    the queue (#209); if it is already running it stops at its next cancellation
+    checkpoint (:func:`process_stage_job`).
     """
     revision = state.revision
+    previous_job_id = state.worker_job_id
     details: dict[str, Any] = {
         "scan_job_id": str(state.scan_job_id),
         "scan_tailor_stage_state_id": state.id,
@@ -2021,6 +2154,8 @@ def request_stage_job(
     if not claimed:
         _supersede_stage_job(job, dict(job.details), "stage revision changed before dispatch")
         return job
+    if previous_job_id and previous_job_id != str(job.job_id):
+        _drop_queued_stage_job(previous_job_id)
     state.worker_job_id = str(job.job_id)
     state.status = ScanTailorStageState.StageStatus.QUEUED
     state.last_error = ""
@@ -2101,6 +2236,18 @@ def queue_ready_successor(
 # Pages per batch job: big enough to amortise the per-job overhead, small enough that
 # an interactive edit queued at the front never waits long behind a running chunk.
 STAGE_BATCH_CHUNK: Final[int] = 8
+
+
+def _drop_queued_stage_job(job_id: str) -> None:
+    """Close an older, not yet started job of a stage as superseded (#209)."""
+    try:
+        key = uuid.UUID(job_id)
+    except ValueError:
+        return
+    older = ProcessingJob.objects.filter(job_id=key, state=ProcessingJob.JobState.QUEUED).first()
+    if older is not None:
+        details = older.details if isinstance(older.details, dict) else {}
+        _supersede_stage_job(older, details, "replaced by a newer run of the stage")
 
 
 def dispatch_stage_job(job_id: str, *, at_front: bool = True) -> None:
@@ -2339,6 +2486,18 @@ def process_stage_job(job_id: str) -> None:
         stage=state.stage,
     )
 
+    def still_current() -> bool:
+        # The same rule as the commit (_locked_if_current): a newer edit bumps the
+        # revision, and a newer job for the same revision (#205) takes over
+        # ``worker_job_id``. Either way this run's result would be discarded (#209).
+        return ScanTailorStageState.objects.filter(
+            id=state.id,
+            revision=started_revision,
+            status=ScanTailorStageState.StageStatus.RUNNING,
+            worker_job_id=str(job.job_id),
+        ).exists()
+
+    input_fingerprint: str | None = None
     try:
         storage = _scan_storage()
         storage_location = _scan_storage_location()
@@ -2353,10 +2512,15 @@ def process_stage_job(job_id: str) -> None:
         if state.stage == ScanTailorStageState.Stage.MARGINS.value:
             attach_margins_aggregate([state], margins_aggregate(state.scan_job_id))
         input_fingerprint = stage_input_fingerprint(state)
-        stage_input = _stage_input(state, storage)
-        input_done = time.perf_counter()
-        result = runner(state, stage_input)
-        run_done = time.perf_counter()
+        # Cooperative cancellation (#209): between the steps below, and between tiles
+        # or column blocks inside long steps, a superseded run stops.
+        with cancellable(still_current):
+            stage_input = _stage_input(state, storage)
+            input_done = time.perf_counter()
+            checkpoint(force=True)
+            result = runner(state, stage_input)
+            run_done = time.perf_counter()
+            checkpoint(force=True)
         with tempfile.TemporaryDirectory(prefix="stages-") as tempdir:
             staged_output = Path(tempdir) / _build_output_name(state)
             staged_preview = Path(tempdir) / _build_output_name(state, preview=True)
@@ -2365,6 +2529,8 @@ def process_stage_job(job_id: str) -> None:
                 result, stage_input, staged_output, staged_preview, staged_thumbnail
             )
             encode_done = time.perf_counter()
+            if not still_current():
+                raise StageSuperseded("stage edited during encoding")
             merged = dict(state.parameters or {})
             merged.update(result.parameters)
             merged.update(
@@ -2379,6 +2545,8 @@ def process_stage_job(job_id: str) -> None:
             output_size = staged_output.stat().st_size
             output_sha = _compute_sha256(staged_output)
             hash_done = time.perf_counter()
+            if not still_current():
+                raise StageSuperseded("stage edited during hashing")
             if not _publish_stage_artifacts(
                 state,
                 started_revision,
@@ -2423,6 +2591,10 @@ def process_stage_job(job_id: str) -> None:
             hash_ms=round((hash_done - encode_done) * 1000, 1),
             store_db_ms=round((publish_done - hash_done) * 1000, 1),
         )
+    except StageSuperseded as exc:
+        # Stopped early for a newer revision (#209); the temporary files are gone and
+        # nothing was staged in scan storage yet. The stage row belongs to the new run.
+        _supersede_stage_job(job, details, str(exc))
     except Exception as exc:
         with transaction.atomic():
             if _locked_if_current(state.id, started_revision, str(job.job_id)) is not None:
@@ -2430,7 +2602,7 @@ def process_stage_job(job_id: str) -> None:
                 state.last_error = str(exc)
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
-        _fail_stage_job(job, str(exc))
+        _fail_stage_job(job, str(exc), input_fingerprint=input_fingerprint)
         return
 
     # Chaining (#205): the next stage of the page runs now if its result is stale.
@@ -2666,11 +2838,16 @@ def _supersede_stage_job(job: ProcessingJob, details: dict[str, Any], reason: st
     _discard_job_artifacts(details)
 
 
-def _fail_stage_job(job: ProcessingJob, message: str) -> None:
+def _fail_stage_job(
+    job: ProcessingJob, message: str, *, input_fingerprint: str | None = None
+) -> None:
     details = job.details if isinstance(job.details, dict) else {}
     job.state = ProcessingJob.JobState.FAILED
     job.finished_at = timezone.now()
     job.details = {**details, "error": message}
+    if input_fingerprint is not None:
+        # What the failed run read: opening the stage retries it on a new input (#209).
+        job.details["input_fingerprint"] = input_fingerprint
     job.save(update_fields=["state", "finished_at", "details"])
     logger.error(
         "scantailor_stage_failed",

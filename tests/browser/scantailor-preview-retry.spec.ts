@@ -42,9 +42,13 @@ test("first open of a page migrated without a working image shows its Deskew inp
   expect(statuses.at(-1)).toBe(200);
   expect(statuses.every((status) => status === 200 || status === 503)).toBe(true);
   await expect(page.locator("[data-editor-message]")).not.toHaveClass(/editor-message-error/);
-  // Deskew has not run: the result pane beside the input says so (#206).
-  await expect(page.locator("[data-result-status]")).toContainText("Not run yet");
-  await expect(page.locator("[data-result-image]")).toBeHidden();
+  // Opening the page runs Deskew (#209); its result appears beside the input (#206).
+  await expect(page.locator("[data-result-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/deskew\/preview\/\?v=/,
+    { timeout: 30_000 },
+  );
+  await expect(page.locator("[data-result-status]")).toBeHidden();
 });
 
 test("an upload whose working image is still queued appears once it is ready", async ({
@@ -86,6 +90,11 @@ test("an upload whose working image is still queued appears once it is ready", a
   await expect(message).toContainText("still being prepared");
   await expect.poll(() => naturalWidth(page), { timeout: 30_000 }).toBe(100);
   expect(held).toBe(3);
-  await expect(page.locator("[data-editor-image]")).toHaveAttribute("src", /retry=\d+/);
+  // The image arrives by a retry or, as opening the editor also runs Deskew (#209),
+  // by the reload its status change brings; either way it is the Deskew input.
+  await expect(page.locator("[data-editor-image]")).toHaveAttribute(
+    "src",
+    /\/stages\/deskew\/preview\/\?input=true/,
+  );
   await expect(message).not.toContainText("still being prepared");
 });

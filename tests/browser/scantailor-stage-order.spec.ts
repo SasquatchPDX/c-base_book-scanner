@@ -49,27 +49,29 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   await page.getByLabel("Sequence").fill("1");
   await page.getByRole("button", { name: "Upload page" }).click();
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  // Open the editor on Margins: opening a stage runs it (#209), and Deskew must not
+  // have run yet.
+  const editor = await page.getByRole("link", { name: "Open ScanTailor editor" }).getAttribute("href");
+  await page.goto(`${editor!}${editor!.includes("?") ? "&" : "?"}stage=margins`);
 
   const message = page.locator("[data-editor-message]");
   const icon = (stage: string) =>
     page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first();
 
-  // 1. Margins first: an edit is a draft until it is saved.
-  await page.locator('[data-stage-select="margins"]').click();
-  // Millimetres (#208); the right margin follows the left (linked).
+  // 1. Margins first: opening it queues nothing, it waits for Deskew.
+  await expect(page.locator('[data-stage-select="margins"]')).toHaveClass(/active/);
+  await expect(message).toContainText("Waiting for Deskew");
+  // Millimetres (#208); the right margin follows the left (linked). The edit is saved
+  // by itself after a short pause (#209); until then the editor says it is saving.
   const margin = page.locator("[data-stage-controls]").getByLabel("Left", { exact: true });
+  const saved = stagePost(page, "margins");
   await margin.fill("1.7");
-  await expect(message).toContainText("Settings not applied");
-  // The result pane beside the input gives the same reason (#206).
+  await expect(message).toContainText("Saving");
   const result = page.locator("[data-result-image]");
   const resultStatus = page.locator("[data-result-status]");
-  await expect(resultStatus).toContainText("Settings not applied");
   await expect(result).toBeHidden();
 
   // Saving stores the settings; nothing runs and nothing fails.
-  const saved = stagePost(page, "margins");
-  await page.getByRole("button", { name: "Save and run" }).click();
   const response = await saved;
   expect(response.status()).toBe(202);
   const body = (await response.json()) as { job: unknown; waiting_for: string | null };
@@ -81,9 +83,9 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   await expect(icon("margins")).toHaveAttribute("data-kind", "waiting");
   await expect(page.locator(".st-status-failed")).toHaveCount(0);
 
-  // 2. Deskew runs; Select Content, Dewarping and then Margins follow without a click.
+  // 2. Opening Deskew runs it (#209); Select Content, Dewarping and then Margins follow
+  // without a click (#205).
   await page.locator('[data-stage-select="deskew"]').click();
-  await page.getByRole("button", { name: "Save and run" }).click();
   for (const stage of ["deskew", "select_content", "dewarping", "margins", "output"]) {
     await expect(icon(stage)).toHaveAttribute("data-status", "success", { timeout: 30_000 });
     await expect(icon(stage)).toHaveAttribute("data-kind", /^(done|manual)$/);

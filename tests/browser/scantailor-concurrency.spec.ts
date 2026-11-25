@@ -36,14 +36,8 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
   await expect(page).toHaveURL(/\/editor\/$/);
   for (const stage of SCANTAILOR_STAGES) {
+    // Opening a stage runs it, and each finished stage runs the next one (#209).
     await page.locator(`[data-stage-select="${stage}"]`).click();
-    const queued = page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        response.url().endsWith(`/stages/${stage}/`),
-    );
-    await page.getByRole("button", { name: "Save and run" }).click();
-    await expect((await queued).status()).toBe(202);
     // The page strip's status icon for this stage (#195 step 3).
     await expect(
       page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
@@ -68,6 +62,8 @@ async function waitForTextAcrossReloads(
 test("two LDAP members receive a visible conflict instead of overwriting a stage", async ({
   browser,
 }) => {
+  // Two sign-ins, an upload and a stage run that waits up to 30 s for its result.
+  test.setTimeout(90_000);
   const firstContext = await browser.newContext();
   const secondContext = await browser.newContext();
 
@@ -96,8 +92,14 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     const bundleLoaded = secondEditor.waitForResponse(
       (response) => response.url().endsWith("/static/core/dist/scantailor-workspace.js"),
     );
+    // Opening the editor asks the server to run the stage (#209); let that answer
+    // arrive before the first editor changes the stage.
+    const secondEnsured = secondEditor.waitForResponse((response) =>
+      response.url().endsWith("/stages/deskew/ensure/"),
+    );
     await secondEditor.goto(workspaceUrl);
     await expect((await bundleLoaded).status()).toBe(200);
+    await expect((await secondEnsured).status()).toBe(200);
 
     const firstControls = firstEditor.locator("[data-stage-controls]");
     const secondControls = secondEditor.locator("[data-stage-controls]");
@@ -111,13 +113,15 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
     );
     await firstControls.getByRole("radio", { name: "Manual" }).check();
     await expect((await saved).status()).toBe(202);
-    await expect(firstEditor.locator("[data-editor-message]")).toContainText("Saved.");
+    await expect(firstControls.locator("[data-deskew-result]")).toContainText("(manual).", {
+      timeout: 30_000,
+    });
 
-    // The second editor still holds the old revision; saving it must not overwrite.
+    // The second editor still holds the old revision; its autosave must not overwrite.
     const conflict = secondEditor.waitForResponse(
       (response) => response.request().method() === "POST" && /\/stages\/deskew\/$/.test(response.url()),
     );
-    await secondEditor.getByRole("button", { name: "Save and run" }).click();
+    await secondControls.getByRole("radio", { name: "Manual" }).check();
     await expect((await conflict).status()).toBe(409);
     await expect(secondEditor.locator("[data-editor-message]")).toContainText(
       "Conflict detected: another editor changed this stage",

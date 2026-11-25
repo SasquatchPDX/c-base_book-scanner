@@ -59,19 +59,11 @@ for (const transport of ["events", "polling"] as const) {
       await expect(page.locator(`[data-stage-select="${stage}"]`)).toHaveClass(/active/);
     };
 
-    // Before a run the result pane says why it is empty.
-    await expect(status).toContainText("Not run yet");
-    await expect(result).toBeHidden();
-    // A later stage waits for Deskew; the pane gives the status line's reason (#205).
-    await page.locator('[data-stage-select="select_content"]').click();
-    await expect(message).toContainText("Waiting for Deskew");
-    await expect(status).toContainText("Waiting for Deskew");
-    await expect(result).toBeHidden();
-
-    // Deskew says when it leaves a page unchanged. Its run queues the later stages,
-    // which run with their defaults (#205 chaining).
+    // No button: opening the editor runs Deskew (#209). It says when it leaves a page
+    // unchanged, and its run queues the later stages, which run with their defaults
+    // (#205 chaining).
+    await expect(page.getByRole("button", { name: "Save and run" })).toHaveCount(0);
     await page.locator('[data-stage-select="deskew"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expectResult("deskew");
     await expect(page.locator("[data-deskew-result]")).toContainText("Angle 0.00°, no change");
 
@@ -86,19 +78,20 @@ for (const transport of ["events", "polling"] as const) {
     await expect(page.locator("[data-dewarp-result]")).toContainText("No text lines");
     await expect(page.locator("[data-stage-warnings]")).toContainText("the page is unchanged");
 
-    // Margins: an edit is a draft, and no result is shown for it until it is saved.
+    // Margins: an edit is saved by itself after a short pause and the stage re-runs
+    // (#209). Meanwhile the previous result stays, dimmed, and the panes say that the
+    // settings are being saved or run, never "Settings not applied".
     await page.locator('[data-stage-select="margins"]').click();
     await expectResult("margins");
     // Margins are millimetres (#208): 1.7 mm is 20 px at 300 dpi; right follows (linked).
     // The page is blank, so no content is found: the page is just its margins
     // (adaptContentRect), 2 × 20 px wide.
     await page.getByLabel("Left", { exact: true }).fill("1.7");
-    await expect(message).toContainText("Settings not applied");
-    await expect(status).toContainText("Settings not applied");
-    await expect(result).toBeHidden();
-    // Saved, the result updates in place: the input stays the 100 px page, the
-    // result is the margins' page.
-    await page.getByRole("button", { name: "Save and run" }).click();
+    await expect(status).toContainText(/Saving|Restarting|Queued|Running/);
+    await expect(result).toBeVisible();
+    await expect(message).not.toContainText("Settings not applied");
+    // The result updates in place: the input stays the 100 px page, the result is the
+    // margins' page.
     await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
     await expectResult("margins");
     await expect.poll(() => naturalWidth(input)).toBe(100);
@@ -109,8 +102,8 @@ for (const transport of ["events", "polling"] as const) {
     // Output's own settings: saved, its result pane updates without leaving the stage.
     const outputBefore = await result.getAttribute("src");
     await page.getByLabel("Invert output").check();
-    await expect(status).toContainText("Settings not applied");
-    await page.getByRole("button", { name: "Save and run" }).click();
+    // Autosaved and rerun without a button (#209).
+    await expect(status).toContainText(/Saving|Restarting|Queued|Running/);
     await expect(result).not.toHaveAttribute("src", outputBefore!, { timeout: 30_000 });
     await expectResult("output");
 
@@ -120,7 +113,6 @@ for (const transport of ["events", "polling"] as const) {
     await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(40);
     // 3.4 mm is 40 px a side.
     await page.getByLabel("Left", { exact: true }).fill("3.4");
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expect.poll(() => naturalWidth(result), { timeout: 30_000 }).toBe(80);
     await expectResult("margins");
 
@@ -146,11 +138,8 @@ test("a narrow screen shows one pane and brings the result forward after a run",
   const resultButton = page.getByRole("button", { name: "Result", exact: true });
   const inputPane = page.locator("[data-input-pane]");
   const resultPane = page.locator("[data-result-pane]");
-  await expect(inputButton).toHaveAttribute("aria-pressed", "true");
-  await expect(inputPane).toBeVisible();
-  await expect(resultPane).toBeHidden();
 
-  await page.getByRole("button", { name: "Save and run" }).click();
+  // Opening the editor runs Deskew (#209); its finished run brings the result forward.
   await expect(resultButton).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
   await expect(resultPane).toBeVisible();
   await expect(inputPane).toBeHidden();
@@ -174,8 +163,8 @@ test("a narrow screen shows one pane and brings the result forward after a run",
   await expect(resultPane).toBeHidden();
   await expect(page.locator("[data-editor-image]")).toBeVisible();
 
-  // Editing a setting brings the input forward; the result pane then says why it
-  // shows no result.
+  // Editing a setting brings the input forward; once the autosaved settings have run
+  // (#209), the result comes forward again.
   await page.locator('[data-stage-select="margins"]').click();
   await resultButton.click();
   await expect(resultPane).toBeVisible();
@@ -189,9 +178,11 @@ test("a narrow screen shows one pane and brings the result forward after a run",
   await expect(inputButton).toHaveAttribute("aria-pressed", "true");
   await expect(inputPane).toBeVisible();
   await expect(resultPane).toBeHidden();
-  await resultButton.click();
-  await expect(page.locator("[data-result-status]")).toContainText("Settings not applied");
-  await expect(page.locator("[data-result-image]")).toBeHidden();
+  await expect(resultButton).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  await expect(resultPane).toBeVisible();
+  await expect.poll(() => naturalWidth(page.locator("[data-result-image]")), {
+    timeout: 30_000,
+  }).toBe(40);
 });
 
 test("the input and result panes share one zoom and pan", async ({ page }) => {
@@ -201,7 +192,7 @@ test("the input and result panes share one zoom and pan", async ({ page }) => {
   const result = page.locator("[data-result-image]");
   const inputViewport = page.locator("[data-viewport]");
   const resultViewport = page.locator("[data-result-viewport]");
-  await page.getByRole("button", { name: "Save and run" }).click();
+  // Opening the editor runs Deskew (#209); no button.
   await expect(result).toHaveAttribute("src", /\/stages\/deskew\/preview\/\?v=/, {
     timeout: 30_000,
   });
