@@ -5564,6 +5564,8 @@ var wt = class {
 	};
 	saving = !1;
 	saveQueued = !1;
+	leftDrafts = [];
+	revertAfterSave = !1;
 	restartingRevision = null;
 	ensuring = Promise.resolve();
 	constructor(e, t) {
@@ -5652,7 +5654,7 @@ var wt = class {
 	activate(e, t) {
 		let n = this.pages.get(e), r = n ? X(n, t) : void 0;
 		if (!n || !r) return;
-		this.commitTimer !== null && this.commitDraft();
+		(this.commitTimer !== null || this.saveQueued) && this.leaveDraft();
 		let i = t !== this.activeStage;
 		(e !== this.activePageId || i) && (this.fitPending = !0), this.activePageId = e, this.activeStage = t, this.selectedPages.has(e) || (this.selectedPages.clear(), this.selectedPages.add(e), this.selectionAnchor = e), this.draft = Ke(t, r.parameters ?? {});
 		let a = this.root.querySelector(`[data-stage-select="${t}"]`)?.dataset.hint;
@@ -5678,7 +5680,20 @@ var wt = class {
 		} catch {}
 	}
 	revertDraft() {
-		this.commitTimer !== null && window.clearTimeout(this.commitTimer), this.commitTimer = null, this.activePageId && this.activate(this.activePageId, this.activeStage);
+		this.commitTimer !== null && window.clearTimeout(this.commitTimer), this.commitTimer = null, this.saveQueued = !1, this.saving ? this.revertAfterSave = !0 : this.activePageId && this.activate(this.activePageId, this.activeStage);
+	}
+	activeSnapshot() {
+		return this.activePageId ? {
+			pageId: this.activePageId,
+			stage: this.activeStage,
+			draft: structuredClone(this.draft),
+			sent: ft(this.draft)
+		} : null;
+	}
+	leaveDraft() {
+		this.commitTimer !== null && window.clearTimeout(this.commitTimer), this.commitTimer = null, this.saveQueued = !1;
+		let e = this.settingsNotApplied() ? this.activeSnapshot() : null;
+		e && this.editable && (this.leftDrafts.push(e), this.saving || this.commitDraft());
 	}
 	settingsNotApplied() {
 		return ft(this.draft) !== this.appliedDraft;
@@ -5863,7 +5878,13 @@ var wt = class {
 		}, 600));
 	}
 	async commitDraft() {
-		this.editable && (this.commitTimer !== null && (window.clearTimeout(this.commitTimer), this.commitTimer = null), this.saving ? this.saveQueued = !0 : (await this.saveActiveStage(), this.saveQueued && (this.saveQueued = !1, await this.commitDraft())));
+		if (!this.editable) return;
+		if (this.commitTimer !== null && (window.clearTimeout(this.commitTimer), this.commitTimer = null), this.saving) {
+			this.saveQueued = !0;
+			return;
+		}
+		let e = this.leftDrafts.shift();
+		e ? await this.saveDraft(e) : await this.saveActiveStage(), this.leftDrafts.length > 0 || this.saveQueued ? (this.saveQueued = !1, await this.commitDraft()) : this.revertAfterSave && (this.revertAfterSave = !1, this.activePageId && this.activate(this.activePageId, this.activeStage));
 	}
 	syncDeskewControls() {
 		if (this.activeStage !== "deskew") return;
@@ -6386,19 +6407,16 @@ var wt = class {
 		};
 	}
 	async saveActiveStage() {
-		let e = this.activeContext();
-		if (!e || !this.activePageId || !this.editable) return;
-		let t = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
-		if (!t) return;
-		let n = ft(this.draft);
-		if (n === this.appliedDraft) {
-			this.syncDeskewControls(), this.showStatus(), this.refreshResultPane();
-			return;
-		}
-		let r = this.activePageId, i = this.activeStage, a = e.state.status === "queued" || e.state.status === "running";
-		this.saving = !0, this.setMessage(ut(a), "info");
+		let e = this.activeSnapshot();
+		e && this.activeContext() && this.editable && (e.sent === this.appliedDraft ? (this.syncDeskewControls(), this.showStatus(), this.refreshResultPane()) : await this.saveDraft(e));
+	}
+	async saveDraft(e) {
+		let t = this.pages.get(e.pageId), n = t ? X(t, e.stage) : void 0, r = this.url("stageUrlTemplate", e.pageId, e.stage);
+		if (!t || !n || !r || !this.editable) return;
+		let { pageId: i, stage: a, sent: o } = e, s = () => this.activePageId === i && this.activeStage === a, c = n.status === "queued" || n.status === "running";
+		this.saving = !0, s() && this.setMessage(ut(c), "info");
 		try {
-			let o = await fetch(t, {
+			let i = await fetch(r, {
 				method: "POST",
 				credentials: "same-origin",
 				headers: {
@@ -6406,34 +6424,38 @@ var wt = class {
 					"X-CSRFToken": Z()
 				},
 				body: JSON.stringify({
-					expected_revision: e.state.revision,
-					algorithm: e.state.algorithm,
-					parameters: this.draft
+					expected_revision: n.revision,
+					algorithm: n.algorithm,
+					parameters: e.draft
 				})
 			});
-			if (o.status === 409) {
-				this.commitTimer !== null && window.clearTimeout(this.commitTimer), this.commitTimer = null, this.saveQueued = !1, await this.refreshPage(t), await this.ensuring, this.setMessage("Conflict detected: another editor changed this stage. Latest values loaded; review before changing them again.", "conflict");
+			if (i.status === 409 && !s()) {
+				await this.reloadPageData(r), this.setMessage(`Conflict detected: another editor changed page ${t.logical_sequence_number} · ${z[a]}. Your last change there was not saved.`, "conflict");
 				return;
 			}
-			if (!o.ok) throw Error(await o.text());
-			let s = await o.json(), c = this.activePageId === r && this.activeStage === i;
-			if (c && (this.appliedDraft = n, this.restartingRevision = a && s.stage.status !== "success" ? s.stage.revision : null), this.mergeStage(s.stage), !c) return;
-			let l = s.waiting_for;
-			if (l && bt(l)) {
-				this.setMessage(`Saved. Waiting for ${z[l]}; this stage runs when it is done.`, "success");
+			if (i.status === 409) {
+				this.commitTimer !== null && window.clearTimeout(this.commitTimer), this.commitTimer = null, this.saveQueued = !1, await this.refreshPage(r), await this.ensuring, this.setMessage("Conflict detected: another editor changed this stage. Latest values loaded; review before changing them again.", "conflict");
 				return;
 			}
-			let u = this.activeContext()?.state ?? s.stage;
-			if (u.status !== "success") {
-				let e = this.pages.get(u.scan_page_id), t = ot(u, e ? q(e, u.stage) : void 0, !1, this.restartingRevision === u.revision);
+			if (!i.ok) throw Error(await i.text());
+			let l = await i.json(), u = s();
+			if (u && (this.appliedDraft = o, this.restartingRevision = c && l.stage.status !== "success" ? l.stage.revision : null), this.mergeStage(l.stage), !u) return;
+			let d = l.waiting_for;
+			if (d && bt(d)) {
+				this.setMessage(`Saved. Waiting for ${z[d]}; this stage runs when it is done.`, "success");
+				return;
+			}
+			let f = this.activeContext()?.state ?? l.stage;
+			if (f.status !== "success") {
+				let e = this.pages.get(f.scan_page_id), t = ot(f, e ? q(e, f.stage) : void 0, !1, this.restartingRevision === f.revision);
 				this.setMessage(t.text, t.tone);
 				return;
 			}
-			this.setMessage(u.stage === "deskew" ? `Saved. ${xe(u.parameters)}` : u.stage === "dewarping" ? `Saved. ${ce(u.parameters)}` : u.stage === "select_content" ? `Saved. ${y(u.parameters, this.contentBox(), this.contentDpi())}` : "Saved. Result preview is ready.", "success");
+			this.setMessage(f.stage === "deskew" ? `Saved. ${xe(f.parameters)}` : f.stage === "dewarping" ? `Saved. ${ce(f.parameters)}` : f.stage === "select_content" ? `Saved. ${y(f.parameters, this.contentBox(), this.contentDpi())}` : "Saved. Result preview is ready.", "success");
 		} catch (e) {
 			this.setMessage(e instanceof Error ? e.message : "Stage update failed.", "error");
 		} finally {
-			this.saving = !1, this.saveQueued || (this.syncDeskewControls(), this.refreshResultPane(), (this.activePageId !== r || this.activeStage !== i) && this.showStatus());
+			this.saving = !1, this.saveQueued || (this.syncDeskewControls(), this.refreshResultPane(), (this.activePageId !== i || this.activeStage !== a) && this.showStatus());
 		}
 	}
 	async applyBatch() {
@@ -6473,10 +6495,14 @@ var wt = class {
 		}
 	}
 	async refreshPage(e) {
+		let t = await this.reloadPageData(e);
+		this.activate(t.id, this.activeStage);
+	}
+	async reloadPageData(e) {
 		let t = await fetch(e, { credentials: "same-origin" });
 		if (!t.ok) throw Error("Could not load the latest stage revision.");
 		let n = await t.json();
-		this.pages.set(n.id, n), this.activate(n.id, this.activeStage);
+		return this.pages.set(n.id, n), n;
 	}
 	mergeStage(e) {
 		let t = this.pages.get(e.scan_page_id);

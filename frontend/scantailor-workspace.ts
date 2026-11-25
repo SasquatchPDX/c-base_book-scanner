@@ -84,6 +84,15 @@ interface StageState {
   updated_at?: string;
 }
 
+/** A stage draft to save for the page and stage it was edited on (#209). */
+interface DraftSnapshot {
+  pageId: string;
+  stage: StageName;
+  draft: JsonObject;
+  /** ``stableJson(draft)``: what becomes the applied draft once it is saved. */
+  sent: string;
+}
+
 interface WorkspacePage {
   id: string;
   active_version?: { id?: string; original_filename?: string };
@@ -796,6 +805,13 @@ class WorkspaceController {
   };
   private saving = false;
   private saveQueued = false;
+  /**
+   * Drafts of pages or stages the editor left while a save was in flight (#209): they
+   * are saved, for the page and stage they belong to, before the active draft again.
+   */
+  private leftDrafts: DraftSnapshot[] = [];
+  /** "Revert to saved" was pressed while a save was in flight: reload after it. */
+  private revertAfterSave = false;
   /** Revision saved while an older run was active: it restarts with the new settings. */
   private restartingRevision: number | null = null;
   /** The ensure request of the stage last opened (#209). */
@@ -1016,8 +1032,9 @@ class WorkspaceController {
     const page = this.pages.get(pageId);
     const state = page ? stageFor(page, stage) : undefined;
     if (!page || !state) return;
-    // A change still waiting for its autosave is saved before the editor moves on.
-    if (this.commitTimer !== null) void this.commitDraft();
+    // A change still waiting for its autosave is saved before the editor moves on, for
+    // the page and stage it was made on (#209).
+    if (this.commitTimer !== null || this.saveQueued) this.leaveDraft();
     const stageChanged = stage !== this.activeStage;
     if (pageId !== this.activePageId || stageChanged) this.fitPending = true;
     this.activePageId = pageId;
@@ -1078,7 +1095,36 @@ class WorkspaceController {
   private revertDraft(): void {
     if (this.commitTimer !== null) window.clearTimeout(this.commitTimer);
     this.commitTimer = null;
+    this.saveQueued = false;
+    if (this.saving) {
+      // The settings being saved are the saved ones once the reply is in: show them then.
+      this.revertAfterSave = true;
+      return;
+    }
     if (this.activePageId) this.activate(this.activePageId, this.activeStage);
+  }
+
+  /** The active draft, to save it for the page and stage it was made on. */
+  private activeSnapshot(): DraftSnapshot | null {
+    if (!this.activePageId) return null;
+    return {
+      pageId: this.activePageId,
+      stage: this.activeStage,
+      draft: structuredClone(this.draft),
+      sent: stableJson(this.draft),
+    };
+  }
+
+  /** The editor moves on with an edit not saved yet: keep it and save it (#209). */
+  private leaveDraft(): void {
+    if (this.commitTimer !== null) window.clearTimeout(this.commitTimer);
+    this.commitTimer = null;
+    this.saveQueued = false;
+    const snapshot = this.settingsNotApplied() ? this.activeSnapshot() : null;
+    if (!snapshot || !this.editable) return;
+    this.leftDrafts.push(snapshot);
+    // A save in flight saves it next (commitDraft); otherwise save it now.
+    if (!this.saving) void this.commitDraft();
   }
 
   /** Whether the editor holds edits that were not saved (applied) yet (#205). */
@@ -1479,10 +1525,17 @@ class WorkspaceController {
       this.saveQueued = true;
       return;
     }
-    await this.saveActiveStage();
-    if (this.saveQueued) {
+    const left = this.leftDrafts.shift();
+    if (left) await this.saveDraft(left);
+    else await this.saveActiveStage();
+    if (this.leftDrafts.length > 0 || this.saveQueued) {
       this.saveQueued = false;
       await this.commitDraft();
+      return;
+    }
+    if (this.revertAfterSave) {
+      this.revertAfterSave = false;
+      if (this.activePageId) this.activate(this.activePageId, this.activeStage);
     }
   }
 
@@ -2313,12 +2366,9 @@ class WorkspaceController {
    * older settings is cancelled. An unchanged draft is not sent.
    */
   private async saveActiveStage(): Promise<void> {
-    const context = this.activeContext();
-    if (!context || !this.activePageId || !this.editable) return;
-    const url = this.url("stageUrlTemplate", this.activePageId, this.activeStage);
-    if (!url) return;
-    const sent = stableJson(this.draft);
-    if (sent === this.appliedDraft) {
+    const snapshot = this.activeSnapshot();
+    if (!snapshot || !this.activeContext() || !this.editable) return;
+    if (snapshot.sent === this.appliedDraft) {
       // Nothing changed (or changed back): nothing to save or run. A run that finished
       // while the previous save was in flight was not shown yet: show it now.
       this.syncDeskewControls();
@@ -2326,11 +2376,23 @@ class WorkspaceController {
       this.refreshResultPane();
       return;
     }
-    const pageId = this.activePageId;
-    const stage = this.activeStage;
-    const restarting = context.state.status === "queued" || context.state.status === "running";
+    await this.saveDraft(snapshot);
+  }
+
+  /**
+   * Save ``target``'s draft for its page and stage, which may no longer be the ones
+   * shown (#209: the editor moved on while the autosave was pending).
+   */
+  private async saveDraft(target: DraftSnapshot): Promise<void> {
+    const page = this.pages.get(target.pageId);
+    const current = page ? stageFor(page, target.stage) : undefined;
+    const url = this.url("stageUrlTemplate", target.pageId, target.stage);
+    if (!page || !current || !url || !this.editable) return;
+    const { pageId, stage, sent } = target;
+    const isActive = (): boolean => this.activePageId === pageId && this.activeStage === stage;
+    const restarting = current.status === "queued" || current.status === "running";
     this.saving = true;
-    this.setMessage(savingMessage(restarting), "info");
+    if (isActive()) this.setMessage(savingMessage(restarting), "info");
     try {
       const response = await fetch(url, {
         method: "POST",
@@ -2340,11 +2402,21 @@ class WorkspaceController {
           "X-CSRFToken": csrfToken(),
         },
         body: JSON.stringify({
-          expected_revision: context.state.revision,
-          algorithm: context.state.algorithm,
-          parameters: this.draft,
+          expected_revision: current.revision,
+          algorithm: current.algorithm,
+          parameters: target.draft,
         }),
       });
+      if (response.status === 409 && !isActive()) {
+        // Left before its autosave and changed by someone else meanwhile: the other
+        // editor's values stay; load them without leaving the stage shown now.
+        await this.reloadPageData(url);
+        this.setMessage(
+          `Conflict detected: another editor changed page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}. Your last change there was not saved.`,
+          "conflict",
+        );
+        return;
+      }
       if (response.status === 409) {
         // The latest values replace the edits: none of them is saved after all.
         if (this.commitTimer !== null) window.clearTimeout(this.commitTimer);
@@ -2366,7 +2438,7 @@ class WorkspaceController {
         waiting_for?: string | null;
       };
       // The editor may have moved on to another page or stage while this was saved.
-      const stillActive = this.activePageId === pageId && this.activeStage === stage;
+      const stillActive = isActive();
       if (stillActive) {
         // The saved settings are the applied ones now (#205).
         this.appliedDraft = sent;
@@ -2471,11 +2543,17 @@ class WorkspaceController {
   }
 
   private async refreshPage(stageUrl: string): Promise<void> {
+    const page = await this.reloadPageData(stageUrl);
+    this.activate(page.id, this.activeStage);
+  }
+
+  /** Load a page's latest stage rows into the editor's model, without opening it. */
+  private async reloadPageData(stageUrl: string): Promise<WorkspacePage> {
     const response = await fetch(stageUrl, { credentials: "same-origin" });
     if (!response.ok) throw new Error("Could not load the latest stage revision.");
     const page = (await response.json()) as WorkspacePage;
     this.pages.set(page.id, page);
-    this.activate(page.id, this.activeStage);
+    return page;
   }
 
   private mergeStage(incoming: StageState): void {

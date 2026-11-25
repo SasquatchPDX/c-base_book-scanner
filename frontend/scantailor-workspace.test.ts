@@ -492,6 +492,100 @@ describe("automatic runs (#209)", () => {
     expect(message.textContent).not.toMatch(/Running|Restarting|queued/);
     expect(root.querySelector("[data-result-status]")?.textContent ?? "").not.toMatch(/Queued/);
   });
+
+  it("saves an edit for the stage it was made on when the editor moves on mid-save", async () => {
+    vi.useFakeTimers();
+    const replies: (() => void)[] = [];
+    let revision = 1;
+    const fetcher = vi.fn((url: string, init?: RequestInit) => {
+      const reply = (stage: unknown) => ({ ok: true, status: 202, json: async () => ({ stage }) });
+      if (url.endsWith("/ensure/")) return Promise.resolve(reply({ ...margins, revision }));
+      revision += 1;
+      const saved = {
+        ...margins,
+        revision,
+        status: "queued",
+        parameters: JSON.parse(String(init?.body)).parameters,
+        updated_at: `2026-11-24T10:00:0${revision}+00:00`,
+      };
+      // Each save's reply is held until the test releases it.
+      return new Promise((resolve) => replies.push(() => resolve(reply(saved))));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins));
+    const deskew = document.createElement("button");
+    deskew.dataset.stageSelect = "deskew";
+    root.append(deskew);
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    const posts = () =>
+      fetcher.mock.calls.filter(([url]) => !String(url).endsWith("/ensure/")) as unknown as [
+        string,
+        RequestInit,
+      ][];
+    const top = root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    top.value = "20";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    expect(posts()).toHaveLength(1); // in flight
+    // A second change, then the member opens Deskew before its autosave ran.
+    top.value = "40";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    deskew.click();
+    await flush();
+    replies.shift()!();
+    await flush();
+    // The second change is saved for Margins, not dropped and not sent to Deskew.
+    expect(posts()).toHaveLength(2);
+    const [url, init] = posts()[1]!;
+    expect(url).toBe("/pages/page/stages/margins/");
+    const body = JSON.parse(String(init.body));
+    expect(body.parameters.top_mm).toBe(40);
+    expect(body.expected_revision).toBe(2); // the revision the first save produced
+    replies.shift()!();
+    await flush();
+    expect(posts()).toHaveLength(2);
+    expect(root.querySelector("[data-editor-title]")?.textContent).toContain("Deskew");
+  });
+
+  it("reverts to the settings a save in flight stores, not to older ones", async () => {
+    vi.useFakeTimers();
+    const replies: (() => void)[] = [];
+    const fetcher = vi.fn((url: string, init?: RequestInit) => {
+      const reply = (stage: unknown) => ({ ok: true, status: 202, json: async () => ({ stage }) });
+      if (url.endsWith("/ensure/")) return Promise.resolve(reply({ ...margins }));
+      const saved = {
+        ...margins,
+        revision: 2,
+        status: "queued",
+        parameters: JSON.parse(String(init?.body)).parameters,
+        updated_at: "2026-11-24T10:00:02+00:00",
+      };
+      return new Promise((resolve) => replies.push(() => resolve(reply(saved))));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins));
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    const posts = () => fetcher.mock.calls.filter(([url]) => !String(url).endsWith("/ensure/"));
+    const field = () => root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    field().value = "20";
+    field().dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    field().value = "40";
+    field().dispatchEvent(new Event("input", { bubbles: true }));
+    root.querySelector<HTMLButtonElement>("[data-revert-stage]")!.click();
+    replies.shift()!();
+    await flush();
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    expect(posts()).toHaveLength(1); // the reverted change is not saved
+    expect(field().value).toBe("20"); // the stored settings are shown
+  });
 });
 
 describe("merge order of stage updates (#209)", () => {

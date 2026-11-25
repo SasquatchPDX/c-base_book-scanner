@@ -417,9 +417,12 @@ every earlier stage of the page has a current result.
   includes the content box, the dewarping curves, the margins in millimetres and
   "Align with other pages" (#208), and the output zones. A drag is saved when it is
   released. Only a draft that differs from the saved settings is sent, so view toggles
-  (keep grid, link margins) save nothing. "Revert to saved" drops a change that has not
-  been saved yet. A concurrent edit is still detected by `expected_revision` (409). The
-  conflict reloads the latest values and drops any pending change.
+  (keep grid, link margins) save nothing. Opening another page or stage before the
+  autosave ran saves the change for the page and stage it was made on, after any save
+  still in flight. "Revert to saved" drops a change that has not been saved yet; pressed
+  while a save is in flight, it shows the settings that save stores once it is done. A
+  concurrent edit is still detected by `expected_revision` (409). The conflict reloads
+  the latest values and drops any pending change.
 - **No-op saves.** A post whose settings equal the stored ones is compared on
   `stage_settings` (`STAGE_SETTING_KEYS`), not on the raw `parameters`. Worker-recorded
   keys therefore never make it a change. It returns the stage with `unchanged: true`
