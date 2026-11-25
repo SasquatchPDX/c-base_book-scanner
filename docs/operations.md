@@ -1544,6 +1544,102 @@ are treated as failures. Cover failure is logged and does not fail or alter the
 original import. Generated JPEG covers record their source variant and extractor
 tool versions and are included in storage consistency checks.
 
+### Site OCR quality acceptance (#170)
+
+The OCR browser fixture only proves orchestration. Recognition quality is measured
+on site, against the hackerspace AI server, with `scripts/measure_site_ocr.py`. No
+OCR model has been chosen yet and the test instance cannot reach the AI server, so
+**no quality figures or thresholds exist yet**; this lane is ready to run once both
+are in place. Everything that does not need the server (CER/WER arithmetic,
+threshold handling, the degraded-result failure, unavailable reporting and exit
+codes) is covered by `tests/test_site_ocr_quality.py` and `tests/test_ocr.py` in
+the ordinary suite.
+
+Prerequisites:
+
+- An OCR model is chosen and served by the AI server behind the HTTP OCR contract
+  (`POST /v1/ocr/jobs`, `GET /v1/ocr/jobs/<id>`). The server must report the
+  engine, model and language it actually used in its completed poll response;
+  the measurement refuses results without a reported model.
+- `BOOK_SCANNER_OCR_SERVICE_URL` on the staging workers points at that server and
+  the worker network policy allows the connection.
+- Scans whose images, transcriptions and OCR processing are permitted. Keep the
+  corpus (images, transcriptions, manifest) in approved storage, not in the
+  repository.
+
+Procedure:
+
+1. Prepare **one scan job per labelled page**. Include flat and physically curved
+   pages (both classes are required) and every language represented in the
+   acceptance set. Transcribe the printed text of each page in reading order into
+   a UTF-8 file. Record the permission covering the material.
+2. Run the normal ScanTailor stages for each job, then finish it with cleaned
+   output and OCR enabled, for example
+   `POST /scan/jobs/<id>/finish/` with
+   `{"auto_ocr": true, "language": "deu", "engine": "<engine>", "model": "<model>", "target_formats": ["txt", "pdf"]}`.
+   `target_formats` must include `txt`. Raw pages (`allow_raw_pages`) are refused
+   by the measurement. Record the returned finalization job ID, the raw image
+   SHA-256 (the page's `active_version.checksum_sha256`), the OCR language code
+   and the transcription path. A replacement page needs a fresh finalization.
+3. Write `corpus.json` next to the transcriptions (paths in `reference` are
+   relative to the manifest):
+
+   ```json
+   {
+     "source_permission": "Record the licence or site permission here",
+     "engine": "site-reported-engine",
+     "pages": [
+       {"finalization_id": "00000000-0000-0000-0000-000000000001", "image_sha256": "<flat page sha256>", "page_class": "flat", "reference": "flat.en.txt", "language": "eng"},
+       {"finalization_id": "00000000-0000-0000-0000-000000000002", "image_sha256": "<curved page sha256>", "page_class": "curved", "reference": "curved.de.txt", "language": "deu"}
+     ]
+   }
+   ```
+
+   `engine` must equal the engine the server reports; the contract fixture engine
+   `synthetic-contract-ocr` is always rejected.
+4. Log in to the staging portal as a member and copy the `sessionid` cookie value.
+   Run, from a checkout of this repository:
+
+   ```sh
+   export OCR_ACCEPTANCE_ORIGIN=https://<staging host>/
+   export OCR_ACCEPTANCE_SESSION=<sessionid value from the credential store>
+   uv run python scripts/measure_site_ocr.py /path/to/corpus.json
+   ```
+
+   The origin must be a bare HTTPS origin (no path, query or credentials). The
+   tool is read-only: it reads each finalization receipt, checks the single raw
+   page digest and the cleaned-variant lineage, checks that the OCR job processed
+   that cleaned variant and reported engine/model/language, then downloads the
+   member-visible TXT variant and scores it. It can be rerun after a processing
+   or model change.
+5. **Calibration.** Without `thresholds` the run exits 3 and prints per-page CER
+   and WER plus reference-weighted rates grouped by page class, language, model
+   and engine. Unicode is normalized to NFC and whitespace collapsed; case and
+   punctuation count. Agree the limits from these measured figures, then add
+   them to the manifest, one pair per page class:
+
+   ```json
+   "thresholds": {"flat": {"cer": 0.02, "wer": 0.05}, "curved": {"cer": 0.05, "wer": 0.10}}
+   ```
+
+   (The numbers above are placeholders, not agreed values.) A graded run fails
+   if any single page exceeds either limit of its class. Record the calibration
+   report, the agreed thresholds, and the engine/model in issue #170.
+
+Exit codes and statuses (printed as JSON on stdout):
+
+| Exit | `status` | Meaning |
+|---|---|---|
+| 0 | `passed` | Graded run, every page within its class limits. |
+| 1 | `failed` | A page exceeded a limit, or the receipts/lineage/provenance/download did not check out, or the portal answered with an error (e.g. 403/404). |
+| 3 | `calibration` | No thresholds in the manifest; figures only. |
+| 77 | `unavailable` | Skipped: origin/session not set, staging unreachable or answering 502/503/504, a finalization or OCR job still queued/running, or the OCR job failed because the OCR service was unreachable (`service_unavailable` in `GET /ocr/<job-id>/`). |
+
+An unavailable run is never a pass. The OCR job payload sets `service_unavailable`
+when submission hit a transport error or 5xx/408/425/429, or when polling exhausted
+its consecutive transient-error budget; an error *result* from a reachable server
+stays `false` and makes the measurement fail.
+
 ### Covers from review decisions
 
 Resolving an import in review (accept candidate, merge, manual entry, batch accept,
