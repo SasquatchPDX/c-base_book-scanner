@@ -102,8 +102,8 @@ for (const transport of ["events", "polling"] as const) {
     // Output's own settings: saved, its result pane updates without leaving the stage.
     const outputBefore = await result.getAttribute("src");
     await page.getByLabel("Invert output").check();
-    await expect(status).toContainText("Settings not applied");
-    await page.getByRole("button", { name: "Save and run" }).click();
+    // Autosaved and rerun without a button (#209).
+    await expect(status).toContainText(/Saving|Restarting|Queued|Running/);
     await expect(result).not.toHaveAttribute("src", outputBefore!, { timeout: 30_000 });
     await expectResult("output");
 
@@ -192,7 +192,7 @@ test("the input and result panes share one zoom and pan", async ({ page }) => {
   const result = page.locator("[data-result-image]");
   const inputViewport = page.locator("[data-viewport]");
   const resultViewport = page.locator("[data-result-viewport]");
-  await page.getByRole("button", { name: "Save and run" }).click();
+  // Opening the editor runs Deskew (#209); no button.
   await expect(result).toHaveAttribute("src", /\/stages\/deskew\/preview\/\?v=/, {
     timeout: 30_000,
   });

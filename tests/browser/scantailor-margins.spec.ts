@@ -81,8 +81,8 @@ test("aligned pages share the largest page's size; an unaligned page keeps its o
   // Margins with upstream's 10/5/10/5 mm, aligned with the other pages.
   for (const index of [0, 1]) {
     await strip(index).click();
+    // Opening the page runs Deskew (#209 ensure-on-open); the rest chain from it.
     await page.locator('[data-stage-select="deskew"]').click();
-    await page.getByRole("button", { name: "Save and run" }).click();
     await expect(
       strip(index).locator('.st-status-icon[data-stage="output"]'),
     ).toHaveAttribute("data-status", "success", { timeout: 45_000 });
@@ -128,7 +128,7 @@ test("aligned pages share the largest page's size; an unaligned page keeps its o
   // Not aligned: the grid is disabled and the page keeps its own (smaller) size.
   await align.uncheck();
   await expect(cells.first()).toBeDisabled();
-  await page.getByRole("button", { name: "Save and run" }).click();
+  // The change autosaves and reruns (#209).
   await expect(resultLine).toContainText("not aligned with other pages", { timeout: 30_000 });
   await expect
     .poll(async () => {
