@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from django.core.management import CommandError, call_command
+from django.db import transaction
 from django.test import Client, override_settings
 from PIL import Image, ImageDraw
 
@@ -118,7 +119,7 @@ def test_saving_many_edits_keeps_only_the_current_revision(tmp_path: Path) -> No
 
 @pytest.mark.django_db(transaction=True)
 def test_closed_job_removes_its_revision_but_keeps_referenced_files(tmp_path: Path) -> None:
-    client, job, page = _job_with_page("prune-invalidated")
+    client, job, page = _job_with_page("prune-closed-job")
     _save_deskew(client, job, page, 1.0)
     state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     current = state.output_storage_identifier
@@ -280,8 +281,13 @@ def test_cancelled_job_loses_its_stage_files_but_keeps_raw_pages(tmp_path: Path)
     state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
     assert state.output_storage_identifier == ""
     assert state.preview_storage_identifier == ""
-    assert state.status == ScanTailorStageState.StageStatus.INVALIDATED
-    assert state.invalidated_reason == scan_artifact_pruning.JOB_END_REASON
+    # No result any more in #205's terms: idle status, no applied fingerprint.
+    assert state.status == ScanTailorStageState.StageStatus.UNKNOWN
+    assert state.applied_revision is None
+    assert state.applied_input_sha256 == ""
+    assert state.applied_parameters == {}
+    assert scantailor.stage_idle_status(state) == ScanTailorStageState.StageStatus.UNKNOWN
+    assert not scantailor.stage_result_is_current(state)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -321,6 +327,91 @@ def test_finished_job_loses_its_stage_files_once_the_book_file_exists(tmp_path: 
     assert (_scan_root(tmp_path) / version.storage_identifier).is_file()
 
 
+@pytest.mark.django_db(transaction=True)
+def test_stale_result_kept_for_edit_back_is_not_pruned(tmp_path: Path) -> None:
+    """A stale-but-kept result (#205) keeps its files while its row refers to them."""
+    client, job, page = _job_with_page("prune-stale-kept")
+    _save_deskew(client, job, page, 1.0)
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
+    applied = dict(state.applied_parameters)
+    root = _scan_root(tmp_path)
+    kept = {
+        state.output_storage_identifier,
+        state.preview_storage_identifier,
+        scantailor.stage_thumbnail_identifier(state),
+    }
+    for identifier in kept:
+        old = (root / identifier).stat().st_mtime - ONE_DAY
+        os.utime(root / identifier, (old, old))
+
+    # New settings that are stored but not applied: the row keeps the old result.
+    with transaction.atomic():
+        locked = ScanTailorStageState.objects.select_for_update().get(pk=state.pk)
+        locked.parameters = {**applied, "manual_angle": 2.0}
+        locked.revision += 1
+        locked.save(update_fields=["parameters", "revision", "updated_at"])
+    stale = ScanTailorStageState.objects.get(pk=state.pk)
+    assert scantailor.stage_stale_reason(stale) == "settings changed, not applied"
+    # A job of the new revision closed without a result (superseded / failed).
+    closed = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.STAGE,
+        state=ProcessingJob.JobState.QUEUED,
+        details={"scan_tailor_stage_state_id": stale.id, "stage_revision": stale.revision},
+    )
+    scantailor._supersede_stage_job(closed, dict(closed.details), "edited")
+    scan_artifact_pruning.prune_superseded_revisions(stale)
+    report = scan_artifact_pruning.sweep()
+
+    assert report.files == 0
+    assert kept <= _files_under(root)
+
+    # Editing back to the applied settings makes the kept result current without a job.
+    jobs_before = ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE).count()
+    response = client.post(
+        _stage_url(job, page, "deskew"),
+        data=json.dumps({"parameters": scantailor.stage_settings("deskew", applied)}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202, response.content
+    assert response.json()["job"] is None
+    back = ScanTailorStageState.objects.get(pk=state.pk)
+    assert back.output_storage_identifier == state.output_storage_identifier
+    assert scantailor.stage_result_is_current(back)
+    assert ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE).count() == jobs_before
+    preview = client.get(_stage_url(job, page, "deskew") + "preview/")
+    assert preview.status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reopened_job_reruns_stages_whose_files_were_removed(tmp_path: Path) -> None:
+    book = Book.objects.create(title="Reopened after finish")
+    client, job = _create_scan_job_with_book("prune-reopen", book_id=book.id)
+    _upload_scan_page(
+        client, str(job.id), sequence=1, side="single", payload=_page_png(), filename="p.png"
+    )
+    page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _save_deskew(client, job, page, 1.0)
+    finish = client.post(
+        f"/scan/jobs/{job.id}/finish/",
+        data={"create_cleaned_variant": "true", "allow_raw_pages": "true"},
+    )
+    assert finish.status_code == 202, finish.content.decode()
+    state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="deskew")
+    assert state.status == ScanTailorStageState.StageStatus.UNKNOWN
+    assert not scantailor.stage_result_is_current(state)
+
+    with transaction.atomic():
+        locked = ScanJob.objects.select_for_update().get(pk=job.pk)
+        assert scan_lifecycle.reopen_for_refinish(locked)
+
+    # The same settings as before the cleanup still run: there is no result to reuse.
+    _save_deskew(client, job, page, 1.0)
+    rerun = ScanTailorStageState.objects.get(pk=state.pk)
+    assert rerun.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert scantailor.stage_result_is_current(rerun)
+    assert (_scan_root(tmp_path) / rerun.output_storage_identifier).is_file()
+
+
 def _save_select_content(client: Client, job: ScanJob, page: ScanPage) -> None:
     response = client.post(
         _stage_url(job, page, "select_content"),
@@ -340,20 +431,16 @@ def test_rerun_of_an_invalidated_stage_releases_the_upstream_revision_it_used(
     first_deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
     held_input = first_deskew.output_storage_identifier
 
-    # A new deskew invalidates Select Content, which still names the old deskew output.
+    # A new deskew makes Select Content stale (#205); with its predecessor current it
+    # reruns on its own and binds to the new deskew output, so the old one goes.
     _save_deskew(client, job, page, 2.0)
-    content = ScanTailorStageState.objects.get(scan_page=page, stage="select_content")
-    assert content.status == ScanTailorStageState.StageStatus.INVALIDATED
-    assert content.input_storage_identifier == held_input
-    root = _scan_root(tmp_path)
-    assert (root / held_input).is_file()  # referenced by another row: kept
-
-    # Rerunning Select Content binds it to the new deskew output; the old one goes.
-    _save_select_content(client, job, page)
     deskew = ScanTailorStageState.objects.get(scan_page=page, stage="deskew")
-    content.refresh_from_db()
+    content = ScanTailorStageState.objects.get(scan_page=page, stage="select_content")
     assert content.status == ScanTailorStageState.StageStatus.SUCCESS
+    assert scantailor.stage_result_is_current(content)
     assert content.input_storage_identifier == deskew.output_storage_identifier
+    assert held_input != deskew.output_storage_identifier
+    assert not (_scan_root(tmp_path) / held_input).exists()
     assert _files_under(_stage_dir(tmp_path, job, page, "deskew")) == {
         f"v{deskew.revision}/work.png",
         f"v{deskew.revision}/preview.jpg",

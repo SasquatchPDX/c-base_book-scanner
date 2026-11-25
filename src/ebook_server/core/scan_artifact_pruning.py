@@ -60,7 +60,6 @@ STAGE_FILE: Final = re.compile(
 )
 DEFAULT_SWEEP_MIN_AGE_SECONDS: Final[int] = 3600
 DEFAULT_SWEEP_LIMIT: Final[int] = 2_000_000
-JOB_END_REASON: Final[str] = "stage files removed when the scan job ended"
 
 
 def _storage() -> LocalFilesystemStorage:
@@ -369,8 +368,10 @@ def sweep_job() -> dict[str, int | bool]:
 def prune_scan_job_stage_artifacts(scan_job_id: str) -> int:
     """Remove every stage artifact of a finished or cancelled scan job.
 
-    The stage rows lose their output/preview references first (status
-    ``invalidated``), so a job reopened for a re-finish reruns its stages instead of
+    The stage rows lose their output/preview references and their applied
+    fingerprint (``applied_*``, #205) first and return to status ``unknown`` (no
+    result), so :func:`~ebook_server.core.scantailor.stage_result_is_current` is
+    False for them and a job reopened for a re-finish reruns its stages instead of
     pointing at deleted files; then the now unreferenced files go. Raw pages and
     other originals in the job folder are not stage files and stay. Returns the
     number of files deleted.
@@ -382,19 +383,28 @@ def prune_scan_job_stage_artifacts(scan_job_id: str) -> int:
     ).exists():
         return 0
     ScanTailorStageState.objects.filter(scan_job_id=scan_job_id).exclude(
-        output_storage_identifier="", preview_storage_identifier=""
+        output_storage_identifier="",
+        preview_storage_identifier="",
+        applied_revision__isnull=True,
     ).update(
         output_storage_identifier="",
         preview_storage_identifier="",
         output_sha256="",
         output_size_bytes=None,
-        status=ScanTailorStageState.StageStatus.INVALIDATED,
-        invalidated_reason=JOB_END_REASON,
+        applied_input_sha256="",
+        applied_parameters={},
+        applied_revision=None,
+        status=ScanTailorStageState.StageStatus.UNKNOWN,
         last_error="",
         updated_at=timezone.now(),
     )
-    storage = _storage()
     prefix = f"{STAGE_NAMESPACE}/{scan_job_id}/"
+    # Inputs that name an upstream stage's output go with it; the stage rebinds its
+    # input when it runs again. Inputs naming raw page images are outside ``prefix``.
+    ScanTailorStageState.objects.filter(
+        scan_job_id=scan_job_id, input_storage_identifier__startswith=prefix
+    ).update(input_storage_identifier="", updated_at=timezone.now())
+    storage = _storage()
     listed = _list(storage, prefix)
     held = references(prefix)
     deleted = 0

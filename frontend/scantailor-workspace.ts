@@ -54,7 +54,13 @@ interface StageState {
   preview_storage_identifier: string;
   output_sha256?: string;
   last_error: string;
-  invalidated_reason?: string;
+  /** Input fingerprint of the result (#205): what it was computed from. */
+  applied_input_sha256?: string;
+  applied_revision?: number | null;
+  /** Whether the result was computed with the stage's current settings. */
+  settings_applied?: boolean;
+  /** First stage only: the checksum of the page version it reads now. */
+  input_sha256?: string;
   manual?: boolean;
 }
 
@@ -273,7 +279,7 @@ export function previewErrorMessage(stage: StageName, failure: PreviewFailure): 
     if (previous === null) {
       return "The scanned page image is not available yet. Wait for the upload to finish processing, then reopen this page.";
     }
-    return `The input preview is not ready. Run the ${STAGE_LABELS[previous]} stage first.`;
+    return `Waiting for ${STAGE_LABELS[previous]}: its result is not ready yet.`;
   }
   if (status === 404 && body === "preview not ready") {
     return "The preview for this stage has not been generated yet. It will appear once the worker finishes.";
@@ -372,7 +378,7 @@ export function fillUrl(template: string, pageId: string, stage = ""): string {
 
 /**
  * The stage whose output the page strip shows for ``stage``: that stage when it has
- * a result, else the last completed stage before it (unbroken from the first).
+ * a current result, else the last current stage before it (unbroken from the first).
  */
 export function stripSourceStage(
   page: Pick<WorkspacePage, "stages">,
@@ -381,7 +387,7 @@ export function stripSourceStage(
   let latest: StageState | undefined;
   for (const name of STAGE_ORDER) {
     const state = page.stages.find((candidate) => candidate.stage === name);
-    if (!state || state.status !== "success" || !artifactToken(state)) break;
+    if (!state || !stageReadiness(page, name).current || !artifactToken(state)) break;
     latest = state;
     if (name === stage) break;
   }
@@ -411,17 +417,93 @@ export function stageStatusLabel(state: Pick<StageState, "status">): string {
   return state.status;
 }
 
-/** Editor status line for a stage: errors only for failures, invalidation is informational. */
+/** Derived state of a stage (#205), computed from its page's rows like ``scantailor.py``. */
+export interface StageReadiness {
+  /** A successful result that matches the stage's settings and current input. */
+  current: boolean;
+  /** The first earlier stage without a current result; the stage cannot run before it. */
+  waitingFor: StageName | null;
+  /** Why a successful result is not current ("input changed", "settings changed, not applied"). */
+  staleReason: string;
+}
+
+type ReadinessFields = Pick<
+  StageState,
+  "stage" | "status" | "output_sha256" | "applied_input_sha256" | "settings_applied" | "input_sha256"
+>;
+
+function ownResultCurrent(state: ReadinessFields, previous: ReadinessFields | undefined): boolean {
+  if (state.status !== "success" || state.settings_applied !== true) return false;
+  // The input fingerprint: the page version's checksum for the first stage, else the
+  // predecessor's last output.
+  const input =
+    state.stage === STAGE_ORDER[0]
+      ? (state.input_sha256 ?? "")
+      : previous?.status === "success"
+        ? (previous.output_sha256 ?? "")
+        : "";
+  return input === (state.applied_input_sha256 ?? "");
+}
+
+/**
+ * Whether ``stage`` of ``page`` is current, which earlier stage it waits for, and why
+ * its result is stale. Rows arrive one by one over live updates, so this is derived
+ * from all of the page's rows every time instead of being stored per row.
+ */
+export function stageReadiness(
+  page: { stages: readonly ReadinessFields[] },
+  stage: StageName,
+): StageReadiness {
+  let upstreamCurrent = true;
+  let waitingFor: StageName | null = null;
+  let previous: ReadinessFields | undefined;
+  for (const name of STAGE_ORDER) {
+    const state = page.stages.find((candidate) => candidate.stage === name);
+    const current: boolean =
+      upstreamCurrent && state !== undefined && ownResultCurrent(state, previous);
+    if (name === stage) {
+      let staleReason = "";
+      if (state?.status === "success" && !current) {
+        staleReason =
+          state.settings_applied === true ? "input changed" : "settings changed, not applied";
+      }
+      return { current, waitingFor, staleReason };
+    }
+    if (!current && waitingFor === null) waitingFor = name;
+    upstreamCurrent = current;
+    previous = state;
+  }
+  return { current: false, waitingFor, staleReason: "" };
+}
+
+/**
+ * Editor status line for a stage, derived from its state (#205): failures are errors;
+ * unsaved edits, waiting for an earlier stage and stale results are information.
+ */
 export function stageStatusMessage(
-  state: Pick<StageState, "status" | "last_error" | "revision" | "invalidated_reason">,
+  state: Pick<StageState, "status" | "last_error" | "revision">,
+  readiness?: StageReadiness,
+  settingsNotApplied = false,
 ): { text: string; tone: "info" | "error" } {
   const error = stageErrorText(state);
-  if (error) return { text: error, tone: "error" };
-  const base = `Revision ${state.revision} · ${state.status}`;
-  if (state.status === "invalidated" && state.invalidated_reason) {
-    return { text: `${base} (${state.invalidated_reason})`, tone: "info" };
+  if (error) return { text: `Failed: ${error}`, tone: "error" };
+  if (settingsNotApplied) {
+    return { text: "Settings not applied. Save them to run this stage.", tone: "info" };
   }
-  return { text: base, tone: "info" };
+  const base = `Revision ${state.revision}`;
+  if (state.status === "queued" || state.status === "running") {
+    return { text: `${base} · ${state.status}`, tone: "info" };
+  }
+  if (readiness?.waitingFor) {
+    return { text: `Waiting for ${STAGE_LABELS[readiness.waitingFor]}.`, tone: "info" };
+  }
+  if (state.status === "success") {
+    if (readiness?.staleReason) {
+      return { text: `${base} · stale: ${readiness.staleReason}`, tone: "info" };
+    }
+    return { text: `${base} · success`, tone: "info" };
+  }
+  return { text: `${base} · not run yet`, tone: "info" };
 }
 
 export function normalizeBox(value: unknown, fallback: Box): Box {
@@ -533,6 +615,8 @@ class WorkspaceController {
   private activePageId: string | null = null;
   private activeStage: StageName = STAGE_ORDER[0];
   private draft: JsonObject = {};
+  /** The draft as last loaded or saved; a different draft is "settings not applied" (#205). */
+  private appliedDraft = "";
   private interactions: InteractableHandle[] = [];
   private eventSource: EventSource | null = null;
   private pollingTimer: number | null = null;
@@ -634,6 +718,8 @@ class WorkspaceController {
       });
     });
     this.saveButton.addEventListener("click", () => void this.saveActiveStage());
+    this.controls.addEventListener("input", () => this.draftEdited());
+    this.controls.addEventListener("change", () => this.draftEdited());
     this.batchButton.addEventListener("click", () => void this.applyBatch());
     this.bindCanvas();
     this.bindStrip();
@@ -649,11 +735,7 @@ class WorkspaceController {
       if (this.previewRetry !== INITIAL_PREVIEW_RETRY) {
         // Recovered after a retry: replace the "being prepared" note.
         this.previewRetry = INITIAL_PREVIEW_RETRY;
-        const state = this.activeContext()?.state;
-        if (state) {
-          const message = stageStatusMessage(state);
-          this.setMessage(message.text, message.tone);
-        }
+        this.showStatus();
       }
     });
     window.addEventListener("resize", () => {
@@ -676,7 +758,7 @@ class WorkspaceController {
    */
   private async explainPreviewFailure(source: string, stage: StageName): Promise<void> {
     if (!source) return;
-    if (this.previewRetry === INITIAL_PREVIEW_RETRY) {
+    if (this.previewRetry === INITIAL_PREVIEW_RETRY && !this.settingsNotApplied()) {
       this.setMessage("Loading the preview failed; checking why…", "error");
     }
     let failure: PreviewFailure;
@@ -696,16 +778,45 @@ class WorkspaceController {
     const retry = nextPreviewRetry(failure, this.previewRetry);
     if (retry) {
       this.previewRetry = retry.state;
-      if (retry.delay > 0) this.setMessage(previewErrorMessage(stage, failure), "info");
+      if (retry.delay > 0) {
+        this.showInputFailure(stage, failure, previewErrorMessage(stage, failure), "info");
+      }
       this.schedulePreviewReload(retry.delay);
       return;
     }
-    this.setMessage(
+    this.showInputFailure(
+      stage,
+      failure,
       previewIsBeingPrepared(failure)
         ? PREVIEW_RETRY_EXHAUSTED_MESSAGE
         : previewErrorMessage(stage, failure),
       "error",
     );
+  }
+
+  /**
+   * Show why the input pane is empty. A missing input only means an earlier stage
+   * has no current result: name the stage the page actually waits for (#205), and
+   * leave "Settings not applied" in place while the member has unsaved edits.
+   */
+  private showInputFailure(
+    stage: StageName,
+    failure: PreviewFailure,
+    text: string,
+    kind: "info" | "error",
+  ): void {
+    const inputNotReady =
+      failure.status === 404 && failure.body.trim().toLowerCase() === "input preview not ready";
+    if (inputNotReady) {
+      if (this.settingsNotApplied()) return;
+      const page = this.activeContext()?.page;
+      const waiting = page ? stageReadiness(page, stage).waitingFor : null;
+      if (waiting) {
+        this.setMessage(`Waiting for ${STAGE_LABELS[waiting]}: its result is not ready yet.`, kind);
+        return;
+      }
+    }
+    this.setMessage(text, kind);
   }
 
   private schedulePreviewReload(delay: number): void {
@@ -746,19 +857,56 @@ class WorkspaceController {
     this.title.textContent = `Page ${page.logical_sequence_number} · ${STAGE_LABELS[stage]}`;
     this.markActiveControls();
     this.renderControls();
+    // Rendering fills in control defaults; the result is what "unchanged" means.
+    this.appliedDraft = JSON.stringify(this.draft);
     this.showPreview("input");
     this.saveButton.disabled = !this.editable;
-    const message = stageStatusMessage(state);
+    this.showStatus();
+  }
+
+  /** Whether the editor holds edits that were not saved (applied) yet (#205). */
+  private settingsNotApplied(): boolean {
+    return JSON.stringify(this.draft) !== this.appliedDraft;
+  }
+
+  /** The status line derived from the active stage's state (#205). */
+  private showStatus(): void {
+    const context = this.activeContext();
+    if (!context) return;
+    const message = stageStatusMessage(
+      context.state,
+      stageReadiness(context.page, context.state.stage),
+      this.settingsNotApplied(),
+    );
     this.setMessage(message.text, message.tone);
+  }
+
+  /** A control changed the draft: no result is shown for settings that are not applied. */
+  private draftEdited(): void {
+    if (this.saving) return;
+    if (this.settingsNotApplied() && this.previewMode === "result") this.showPreview("input");
+    else this.resultButton.disabled = !this.resultAvailable();
+    this.showStatus();
+  }
+
+  /** The active stage has a current result for the settings in the editor. */
+  private resultAvailable(): boolean {
+    const context = this.activeContext();
+    if (!context) return false;
+    const state = context.state;
+    return (
+      stageReadiness(context.page, state.stage).current &&
+      !this.settingsNotApplied() &&
+      Boolean(state.preview_storage_identifier || state.output_storage_identifier)
+    );
   }
 
   private showPreview(mode: "input" | "result"): void {
     const context = this.activeContext();
     if (!context) return;
     const state = context.state;
-    const hasResult =
-      state.status === "success" &&
-      Boolean(state.preview_storage_identifier || state.output_storage_identifier);
+    // Only a current result is shown (#205): not one of older settings or input.
+    const hasResult = this.resultAvailable();
     this.resultButton.disabled = !hasResult;
     this.previewMode = mode === "result" && hasResult ? "result" : "input";
     this.inputButton.setAttribute("aria-pressed", String(this.previewMode === "input"));
@@ -797,7 +945,7 @@ class WorkspaceController {
       this.previewUrl = url;
       if (url) this.image.src = url;
     }
-    const warning = state.status === "success" ? stageWorkerWarnings(state.parameters) : "";
+    const warning = hasResult ? stageWorkerWarnings(state.parameters) : "";
     this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
     this.warnings.hidden = !warning;
     this.geometryLayer.hidden = this.previewMode === "result";
@@ -1740,7 +1888,8 @@ class WorkspaceController {
     if (!url) return;
     this.saving = true;
     this.saveButton.disabled = true;
-    this.setMessage("Saving revision and queueing a preview…", "info");
+    this.setMessage("Saving the settings…", "info");
+    const sent = JSON.stringify(this.draft);
     try {
       const response = await fetch(url, {
         method: "POST",
@@ -1764,8 +1913,25 @@ class WorkspaceController {
         return;
       }
       if (!response.ok) throw new Error(await response.text());
-      const payload = (await response.json()) as { stage: StageState };
+      const payload = (await response.json()) as {
+        stage: StageState;
+        job: unknown;
+        waiting_for?: string | null;
+      };
+      // The saved settings are the applied ones now (#205).
+      if (this.activePageId === payload.stage.scan_page_id && this.activeStage === payload.stage.stage)
+        this.appliedDraft = sent;
       this.mergeStage(payload.stage);
+      const waitingFor = payload.waiting_for;
+      if (waitingFor && isStageName(waitingFor)) {
+        // Saving only stored the settings; the stage runs once that stage is done.
+        this.setMessage(
+          `Saved. Waiting for ${STAGE_LABELS[waitingFor]}; this stage runs when it is done.`,
+          "success",
+        );
+        return;
+      }
+      // Without a job the result was already current for these settings: describe it.
       const done = payload.stage.status === "success";
       this.setMessage(
         done && payload.stage.stage === "deskew"
@@ -1818,13 +1984,16 @@ class WorkspaceController {
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as {
-        applied: { page_id: string; stage: StageState }[];
+        applied: { page_id: string; stage: StageState; waiting_for?: string | null }[];
+        jobs: unknown[];
         applied_count: number;
         skipped_count: number;
       };
       for (const item of payload.applied) this.mergeStage(item.stage);
+      const waiting = payload.applied.filter((item) => item.waiting_for).length;
       this.setMessage(
-        `Queued ${payload.applied_count} page(s); preserved ${payload.skipped_count} manual exception(s).`,
+        `Saved for ${payload.applied_count} page(s): ${payload.jobs.length} queued, ` +
+          `${waiting} waiting for an earlier stage; preserved ${payload.skipped_count} manual exception(s).`,
         "success",
       );
     } catch (error) {
@@ -1851,6 +2020,28 @@ class WorkspaceController {
     else page.stages.push(incoming);
     this.updateStageDom(incoming);
     this.updateActivePreview(incoming, previous);
+    if (incoming.scan_page_id !== this.activePageId || this.saving) return;
+    // Another stage of the open page changed: what this stage waits for, whether its
+    // result is current and its input preview all derive from that (#205).
+    const justCompleted =
+      incoming.status === "success" &&
+      (previous?.status !== "success" || previous.revision !== incoming.revision);
+    if (incoming.stage !== this.activeStage) {
+      if (incoming.stage === previousStageName(this.activeStage) && !this.isDragging())
+        this.showPreview(this.previewMode);
+      else this.resultButton.disabled = !this.resultAvailable();
+      this.showStatus();
+    } else if (!justCompleted) {
+      this.showStatus();
+    }
+  }
+
+  private isDragging(): boolean {
+    return (
+      this.deskewOverlay?.isDragging() === true ||
+      this.contentOverlay?.isDragging() === true ||
+      this.dewarpOverlay?.isDragging() === true
+    );
   }
 
   private updateStageDom(state: StageState): void {
@@ -1886,13 +2077,15 @@ class WorkspaceController {
       height: size.height,
       stages: STAGE_ORDER.map((name) => {
         const state = stageFor(page, name);
+        const readiness = stageReadiness(page, name);
         return {
           stage: name,
           label: STAGE_LABELS[name],
           status: state?.status ?? "unknown",
           manual: state?.manual ?? false,
           last_error: state?.last_error ?? "",
-          invalidated_reason: state?.invalidated_reason ?? "",
+          waiting_for: readiness.waitingFor ? STAGE_LABELS[readiness.waitingFor] : "",
+          stale_reason: readiness.staleReason,
         };
       }),
     };
@@ -2084,11 +2277,18 @@ class WorkspaceController {
       });
       if (!response.ok) throw new Error(await response.text());
       const payload = (await response.json()) as {
-        applied: { page_id: string; stage: StageState }[];
+        applied: { page_id: string; stage: StageState; waiting_for?: string | null }[];
+        jobs: unknown[];
         applied_count: number;
       };
       for (const item of payload.applied) this.mergeStage(item.stage);
-      this.setMessage(`Queued ${STAGE_LABELS[stage]} for ${payload.applied_count} page(s).`, "success");
+      // Pages with a current result or a stage still to finish before it get no job (#205).
+      const waiting = payload.applied.filter((item) => item.waiting_for).length;
+      this.setMessage(
+        `Queued ${STAGE_LABELS[stage]} for ${payload.jobs.length} of ${payload.applied_count} ` +
+          `page(s); ${waiting} waiting for an earlier stage.`,
+        "success",
+      );
     } catch (error) {
       this.setMessage(error instanceof Error ? error.message : "Batch run failed.", "error");
     } finally {
