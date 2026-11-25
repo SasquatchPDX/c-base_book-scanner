@@ -201,6 +201,17 @@ def test_all_pages_get_the_largest_content_plus_margins() -> None:
     fingerprints = {_state(page, "margins").parameters["aggregate_fingerprint"] for page in pages}
     assert fingerprints == {scantailor.margins_aggregate(job).fingerprint}
     assert scantailor.margins_aggregate(job).width_mm == pytest.approx(expected[0] * 25.4 / 300)
+    # The final Output pages come out at one size too.
+    for page in pages:
+        _post(client, job, page, "output", {"output_mode": "otsu"})
+    output_sizes = set()
+    for page in pages:
+        output = _state(page, "output")
+        assert output.status == SUCCESS
+        output_sizes.add(
+            (int(output.parameters["output_width"]), int(output.parameters["output_height"]))
+        )
+    assert len(output_sizes) == 1, output_sizes
     _assert_nothing_failed(job)
 
 
