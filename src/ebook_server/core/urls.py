@@ -93,6 +93,11 @@ urlpatterns = [
         name="scan-job-page-stage",
     ),
     path(
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/ensure/",
+        views.scan_page_stage_ensure,
+        name="scan-job-page-stage-ensure",
+    ),
+    path(
         "scan/jobs/<scan_job_id:job_id>/stages/<str:stage>/batch/",
         views.scan_job_stage_batch,
         name="scan-job-stage-batch",

@@ -4,7 +4,7 @@
  * thumbnails, one small status icon per stage, sortable, multi-selectable.
  */
 
-export type StatusKind = "idle" | "working" | "done" | "manual" | "failed";
+export type StatusKind = "idle" | "waiting" | "working" | "done" | "stale" | "manual" | "failed";
 
 export interface StripStage {
   stage: string;
@@ -12,7 +12,10 @@ export interface StripStage {
   status: string;
   manual?: boolean;
   last_error?: string;
-  invalidated_reason?: string;
+  /** Label of the first earlier stage without a current result (#205). */
+  waiting_for?: string;
+  /** Why a successful result is not current: "input changed", "settings changed, not applied". */
+  stale_reason?: string;
 }
 
 export interface StripItem {
@@ -32,33 +35,38 @@ export const ROW_HEIGHT = 196;
 export const OVERSCAN = 4;
 
 /** Colour class of a stage's status icon. */
-export function statusKind(stage: Pick<StripStage, "status" | "manual">): StatusKind {
+export function statusKind(
+  stage: Pick<StripStage, "status" | "manual" | "waiting_for" | "stale_reason">,
+): StatusKind {
   switch (stage.status) {
     case "queued":
     case "running":
       return "working";
-    case "success":
-      return stage.manual ? "manual" : "done";
     case "failed":
       return "failed";
     default:
-      return "idle";
+      // Derived from input fingerprints (#205): waiting beats an old result.
+      if (stage.waiting_for) return "waiting";
+      if (stage.status !== "success") return "idle";
+      if (stage.stale_reason) return "stale";
+      return stage.manual ? "manual" : "done";
   }
 }
 
 export function statusTooltip(stage: StripStage): string {
   const kind = statusKind(stage);
   const text: Record<StatusKind, string> = {
-    idle: stage.status === "invalidated" ? "needs re-run" : "not started",
+    idle: "not started",
+    waiting: `waiting for ${stage.waiting_for ?? ""}`,
     working: stage.status === "running" ? "working" : "queued",
     done: "done",
+    stale: "stale",
     manual: "done (manual settings)",
     failed: "failed",
   };
   let detail = "";
   if (kind === "failed" && stage.last_error) detail = `: ${stage.last_error}`;
-  else if (stage.status === "invalidated" && stage.invalidated_reason)
-    detail = ` (${stage.invalidated_reason})`;
+  else if (kind === "stale" && stage.stale_reason) detail = ` (${stage.stale_reason})`;
   return `${stage.label}: ${text[kind]}${detail}`;
 }
 
@@ -276,6 +284,7 @@ export class PageStrip {
           icon.className = `st-status-icon st-status-${kind}`;
           icon.dataset.stage = stage.stage;
           icon.dataset.status = stage.status;
+          icon.dataset.kind = kind;
           icon.textContent = String(index + 1);
           icon.title = statusTooltip(stage);
           return icon;

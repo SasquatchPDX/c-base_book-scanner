@@ -221,7 +221,7 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
 
     from ebook_server.core.models import ScanPage
     from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
-    from tests.test_scantailor import _stage_url
+    from tests.test_scantailor import _run_pipeline, _stage_url
 
     client, job = _create_scan_job("scan-user-cylindrical")
     page_image = Image.new("L", (400, 600), 235)
@@ -231,6 +231,7 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
         client, str(job.id), sequence=1, side="single", payload=payload.getvalue(), filename="p.png"
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1)
+    _run_pipeline(client, str(job.id), str(page.id))  # Dewarping reads Select Content (#205)
     url = _stage_url(str(job.id), str(page.id), "dewarping")
     manual = {
         "dewarp_mode": "manual",
@@ -239,11 +240,15 @@ def test_manual_model_replays_through_the_worker_and_auto_returns() -> None:
         "depth_perception": 2.5,
     }
     transforms = []
-    for _ in range(2):  # the same manual model replays to the same result
+    # The same manual model replays to the same result (after another run in between:
+    # posting identical settings is a no-op, #209).
+    for parameters in (manual, {**manual, "depth_perception": 2.0}, manual):
         response = client.post(
-            url, data=json.dumps({"parameters": manual}), content_type="application/json"
+            url, data=json.dumps({"parameters": parameters}), content_type="application/json"
         )
         assert response.status_code == 202, response.content
+        if parameters is not manual:
+            continue
         state = ScanTailorStageState.objects.get(scan_page=page, stage="dewarping")
         assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
         assert state.algorithm == "cylindrical_dewarp"

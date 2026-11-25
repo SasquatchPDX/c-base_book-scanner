@@ -23,7 +23,7 @@ import pytest
 from PIL import Image
 
 from ebook_server.core import curvature, cylindrical, scan_transform, scantailor
-from ebook_server.core.models import ScanPage, ScanTailorStageState
+from ebook_server.core.models import ProcessingJob, ScanPage, ScanTailorStageState
 from tests.curvature_fixtures import CALIBRATION_ROWS, cylinder_page
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "measure_dewarping.py"
@@ -186,17 +186,24 @@ def test_manual_curves_survive_worker_replay_batch_apply_and_upstream_edits() ->
 
     def post(url: str, body: dict[str, Any]) -> None:
         response = client.post(url, data=json.dumps(body), content_type="application/json")
-        assert response.status_code == 202, response.content
+        # 202 when the edit was stored; 200 when it equals the stored settings (#209).
+        assert response.status_code in (200, 202), response.content
 
     def dewarping(page: ScanPage) -> ScanTailorStageState:
         state = ScanTailorStageState.objects.get(scan_page=page, stage="dewarping")
         assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
         return state
 
-    # Curves in the dewarping input's (full-resolution) coordinates, inside the page.
+    # Stages run in order (#205): Deskew on each page chains into Dewarping (auto).
+    for page in (manual_page, auto_page):
+        post(
+            _stage_url(str(job.id), str(page.id), "deskew"),
+            {"parameters": {"mode": "manual", "manual_angle": 0.5}},
+        )
     url = _stage_url(str(job.id), str(manual_page.id), "dewarping")
     post(url, {"parameters": {"dewarp_mode": "auto"}})
     assert dewarping(manual_page).parameters["output_width"] >= 240
+    # Curves in the dewarping input's (full-resolution) coordinates, inside the page.
     top = [[10.0, 40.0], [60.0, 55.0], [120.0, 60.0], [180.0, 55.0], [230.0, 40.0]]
     bottom = [[10.0, 300.0], [60.0, 308.0], [120.0, 310.0], [180.0, 308.0], [230.0, 300.0]]
     manual: dict[str, Any] = {"dewarp_mode": "manual", "top_curve": top, "bottom_curve": bottom}
@@ -204,9 +211,11 @@ def test_manual_curves_survive_worker_replay_batch_apply_and_upstream_edits() ->
 
     post(url, {"parameters": manual})
     first = dewarping(manual_page)
-    post(url, {"parameters": manual})
+    # Replay: the worker runs the stored settings again and gets identical pixels.
+    replay_job = scantailor.request_stage_job(state=first)
+    replay_job.refresh_from_db()
+    assert replay_job.state == ProcessingJob.JobState.SUCCESS, replay_job.details
     replay = dewarping(manual_page)
-    assert replay.revision > first.revision
     assert replay.output_sha256 == first.output_sha256  # identical pixels on replay
     assert replay.parameters["transform"] == first.parameters["transform"]
     assert replay.parameters["transform"]["op"] == "cylindrical"
@@ -218,12 +227,15 @@ def test_manual_curves_survive_worker_replay_batch_apply_and_upstream_edits() ->
     assert kept.parameters["top_curve"] == top
     assert dewarping(auto_page).parameters["dewarp_mode"] == "auto"
 
-    # An upstream edit invalidates the stage; re-running it keeps the manual model.
+    # An upstream edit makes the stage stale; it reruns on its own (#205 chaining)
+    # and keeps the manual model.
     post(
-        _stage_url(str(job.id), str(manual_page.id), "deskew"), {"parameters": {"manual_angle": 0}}
+        _stage_url(str(job.id), str(manual_page.id), "deskew"),
+        {"parameters": {"mode": "manual", "manual_angle": 0}},
     )
-    post(url, {})
     rerun = dewarping(manual_page)
+    assert scantailor.stage_result_is_current(rerun)
+    assert rerun.output_sha256 != replay.output_sha256
     assert rerun.parameters["dewarp_mode"] == "manual"
     assert rerun.parameters["top_curve"] == top
     assert rerun.parameters["bottom_curve"] == bottom

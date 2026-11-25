@@ -15,13 +15,20 @@ import {
   previewIsBeingPrepared,
   previewRetryUrl,
   previousStageName,
+  resultPaneMessage,
   sourceBoxToDisplay,
   stageErrorText,
+  stageReadiness,
   stageStatusLabel,
+  AUTOSAVE_DELAY_MS,
+  isOlderStageState,
+  savingMessage,
+  stableJson,
   stageStatusMessage,
   stageWorkerWarnings,
   STAGE_ORDER,
 } from "./scantailor-workspace";
+import { describeMargins } from "./margins-view";
 
 describe("ScanTailor geometry coordinates", () => {
   it("round-trips a source box through a reduced preview", () => {
@@ -100,7 +107,7 @@ describe("editable stage parameters", () => {
       },
     };
     document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script>
-      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
+      <div id="zones-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="output">Output</button></div>`;
     const fetcher = vi.fn().mockResolvedValue({
       ok: true,
       status: 202,
@@ -116,8 +123,10 @@ describe("editable stage parameters", () => {
     click("Add picture region");
     expect(host.textContent).toContain("Remove region 3");
     click("Remove region 2");
-    host.querySelector<HTMLButtonElement>("[data-save-stage]")!.click();
-    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled());
+    // No button: the edits are saved together after a short pause (#209).
+    expect(fetcher).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalled(), { timeout: 3000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
     const posted = JSON.parse(fetcher.mock.calls[0]![1].body);
     expect(posted.parameters.zone_mode).toBe("manual");
     expect(posted.parameters.zones.map((z: { kind: string }) => z.kind)).toEqual([
@@ -128,34 +137,65 @@ describe("editable stage parameters", () => {
     vi.unstubAllGlobals();
     document.body.replaceChildren();
   });
-  it("does not resubmit a legacy computed margin canvas as a fixed request", () => {
+  it("sends margins in millimetres, never legacy pixels or canvases (#208)", () => {
+    // Pixel settings written before #208 are converted with the recorded dpi.
     expect(
       editableParameters("margins", {
-        margin: 20,
-        input_width: 100,
-        input_height: 200,
-        margin_left: 20,
-        margin_right: 20,
-        margin_top: 20,
-        margin_bottom: 20,
+        margin: 59,
+        dpi: [300, 300],
         canvas_width: 140,
         canvas_height: 240,
+        margin_left: 20,
       }),
-    ).toEqual({ margin: 20 });
-    // A larger fixed canvas, and new explicit requests, remain intentional settings.
+    ).toEqual({
+      left_mm: 5,
+      top_mm: 5,
+      right_mm: 5,
+      bottom_mm: 5,
+      align_x: "center",
+      align_y: "top",
+      align_with_others: true,
+    });
+    // A page never edited gets upstream's defaults; explicit values are kept.
+    expect(editableParameters("margins", {})).toMatchObject({
+      left_mm: 10,
+      top_mm: 5,
+      right_mm: 10,
+      bottom_mm: 5,
+    });
     expect(
       editableParameters("margins", {
-        input_width: 100,
-        canvas_width: 300,
+        margins_mode: "manual",
+        left_mm: 12.5,
+        align_with_others: false,
+        align_x: "right",
+        align_y: "bottom",
       }),
-    ).toEqual({ canvas_width: 300 });
+    ).toEqual({
+      margins_mode: "manual",
+      left_mm: 12.5,
+      top_mm: 5,
+      right_mm: 10,
+      bottom_mm: 5,
+      align_x: "right",
+      align_y: "bottom",
+      align_with_others: false,
+    });
+  });
+  it("describes the common page size and the soft margins (#208)", () => {
     expect(
-      editableParameters("margins", {
-        input_width: 100,
-        canvas_width: 100,
-        resolved_canvas_width: 100,
+      describeMargins({
+        page_size_mm: { width: 148, height: 210 },
+        aggregate_size_mm: { width: 148, height: 210 },
+        soft_margins_mm: { left: 3, top: 0, right: 3, bottom: 12.5 },
       }),
-    ).toEqual({ canvas_width: 100 });
+    ).toBe(
+      "Page 148.0 × 210.0 mm (common size 148.0 × 210.0 mm). Soft margins left 3.0, top 0.0, right 3.0, bottom 12.5 mm.",
+    );
+    expect(
+      describeMargins({ page_size_mm: { width: 100, height: 50 }, align_with_others: false }),
+    ).toBe("Page 100.0 × 50.0 mm: not aligned with other pages, it keeps its own size.");
+    expect(describeMargins({})).toBe("");
   });
   it("keeps manual geometry while excluding worker-derived provenance", () => {
     expect(
@@ -218,7 +258,7 @@ describe("preview error messages", () => {
 
   it("names the actual predecessor when the input preview is missing", () => {
     expect(previewErrorMessage("margins", { status: 404, body: "input preview not ready" })).toBe(
-      "The input preview is not ready. Run the Dewarping stage first.",
+      "Waiting for Dewarping: its result is not ready yet.",
     );
     expect(previousStageName("deskew")).toBeNull();
     expect(previousStageName("dewarping")).toBe("select_content");
@@ -253,19 +293,24 @@ describe("preview error messages", () => {
 });
 
 describe("stage status presentation", () => {
-  it("treats routine invalidation as information, not an error", () => {
-    const invalidated = {
-      status: "invalidated",
-      revision: 3,
-      last_error: "deskew updated via batch",
-      invalidated_reason: "deskew updated via batch",
-    };
+  it("derives waiting and stale messages from the state, not a stored flag (#205)", () => {
+    const success = { status: "success", revision: 3, last_error: "" };
+    const unknown = { status: "unknown", revision: 2, last_error: "" };
 
-    expect(stageErrorText(invalidated)).toBe("");
-    expect(stageStatusMessage(invalidated)).toEqual({
-      text: "Revision 3 · invalidated (deskew updated via batch)",
-      tone: "info",
-    });
+    expect(
+      stageStatusMessage(unknown, { current: false, waitingFor: "deskew", staleReason: "" }),
+    ).toEqual({ text: "Waiting for Deskew.", tone: "info" });
+    expect(
+      stageStatusMessage(success, {
+        current: false,
+        waitingFor: null,
+        staleReason: "settings changed, not applied",
+      }),
+    ).toEqual({ text: "Revision 3 · stale: settings changed, not applied", tone: "info" });
+    expect(
+      stageStatusMessage(success, { current: true, waitingFor: null, staleReason: "" }, true),
+    ).toEqual({ text: "Settings not applied yet.", tone: "info" });
+    expect(stageStatusMessage(unknown)).toEqual({ text: "Revision 2 · not run yet", tone: "info" });
   });
 
   it("shows the error only for failed stages", () => {
@@ -277,13 +322,480 @@ describe("stage status presentation", () => {
 
     expect(stageErrorText(failed)).toBe("cannot read image");
     expect(stageStatusMessage(failed)).toEqual({
-      text: "cannot read image",
+      text: "Failed: cannot read image",
       tone: "error",
     });
     expect(stageStatusMessage({ status: "success", revision: 1, last_error: "" })).toEqual({
       text: "Revision 1 · success",
       tone: "info",
     });
+  });
+});
+
+describe("automatic runs (#209)", () => {
+  const flush = async (): Promise<void> => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  };
+  const done = (stage: string) => ({
+    stage,
+    status: "success",
+    revision: 1,
+    parameters: {},
+    output_sha256: `${stage}-out`,
+    applied_input_sha256: stage === "deskew" ? "v1" : "",
+    settings_applied: true,
+    input_sha256: stage === "deskew" ? "v1" : "",
+    updated_at: "2026-11-24T10:00:00+00:00",
+  });
+  /** Deskew to Dewarping current, so ``stage`` can run. */
+  const readyPage = (state: Record<string, unknown>) => {
+    const earlier = ["deskew", "select_content", "dewarping"].map(done);
+    earlier[1]!.applied_input_sha256 = "deskew-out";
+    earlier[2]!.applied_input_sha256 = "select_content-out";
+    return [{ id: "page", logical_sequence_number: 1, side: "single", stages: [...earlier, state] }];
+  };
+  const host = (pages: unknown, extra = ""): HTMLElement => {
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify(pages)}</script>
+      <div id="auto-host" data-editable="true" data-stage-url-template="/pages/__PAGE__/stages/__STAGE__/" data-ensure-url-template="/pages/__PAGE__/stages/__STAGE__/ensure/" ${extra}><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-stage-select="margins">Margins</button></div>`;
+    return document.querySelector<HTMLElement>("#auto-host")!;
+  };
+  const margins = {
+    id: 4,
+    scan_page_id: "page",
+    stage: "margins",
+    stage_label: "Margins",
+    revision: 1,
+    status: "unknown",
+    algorithm: "margin_pad",
+    parameters: {},
+    last_error: "",
+    updated_at: "2026-11-24T10:00:00+00:00",
+  };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    document.body.replaceChildren();
+  });
+
+  it("says that a stage runs, or that it restarts with new settings", () => {
+    const state = { status: "running", revision: 2, last_error: "" };
+    const ready = { current: false, waitingFor: null, staleReason: "" };
+    expect(stageStatusMessage(state, ready).text).toBe("Running…");
+    expect(stageStatusMessage({ ...state, status: "queued" }, ready).text).toBe("Running…");
+    expect(stageStatusMessage(state, ready, false, true).text).toBe(
+      "Restarting with new settings…",
+    );
+    expect(savingMessage(false)).toBe("Saving…");
+    expect(savingMessage(true)).toBe("Restarting with new settings…");
+  });
+
+  it("runs the opened stage and saves a changed setting without a button", async () => {
+    vi.useFakeTimers();
+    const fetcher = vi.fn(async (url: string, init?: RequestInit) => ({
+      ok: true,
+      status: 202,
+      json: async () => ({
+        stage: url.endsWith("/ensure/")
+          ? { ...margins, status: "queued", updated_at: "2026-11-24T10:00:01+00:00" }
+          : {
+              ...margins,
+              revision: 2,
+              status: "queued",
+              parameters: JSON.parse(String(init?.body)).parameters,
+              updated_at: "2026-11-24T10:00:02+00:00",
+            },
+      }),
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins));
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    // Opening the stage asks the server to run it (once; the server deduplicates).
+    expect(fetcher.mock.calls.some(([url]) => url === "/pages/page/stages/margins/ensure/")).toBe(
+      true,
+    );
+    const posts = () => fetcher.mock.calls.filter(([url]) => url === "/pages/page/stages/margins/");
+    const top = root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    const message = root.querySelector("[data-editor-message]")!;
+    top.value = "20";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    top.value = "24";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    // While the autosave waits, the status line says so instead of "Settings not applied".
+    expect(message.textContent).toBe("Restarting with new settings…");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS - 1);
+    expect(posts()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(posts()).toHaveLength(1);
+    const sent = JSON.parse(String(posts()[0]![1]!.body)).parameters;
+    // The millimetre fields (#208) autosave like every other control; top and bottom
+    // are linked while they are equal.
+    expect([sent.top_mm, sent.bottom_mm]).toEqual([24, 24]);
+    // Saved while queued: the old run restarts with the new settings.
+    expect(message.textContent).toBe("Restarting with new settings…");
+    // The same value again is not saved again.
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    expect(posts()).toHaveLength(1);
+  });
+
+  it("keeps a live result that arrived before the save's own reply", async () => {
+    vi.useFakeTimers();
+    const listeners = new Map<string, (event: MessageEvent<string>) => void>();
+    class FakeEventSource {
+      constructor(readonly url: string) {}
+      addEventListener(name: string, listener: (event: MessageEvent<string>) => void): void {
+        listeners.set(name, listener);
+      }
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let replySave: () => void = () => undefined;
+    const queued = { ...margins, revision: 2, status: "queued", updated_at: "2026-11-24T10:00:02+00:00" };
+    const succeeded = {
+      ...queued,
+      status: "success",
+      output_sha256: "m2",
+      applied_input_sha256: "dewarping-out",
+      settings_applied: true,
+      preview_storage_identifier: "m2.jpg",
+      updated_at: "2026-11-24T10:00:03.250000+00:00",
+    };
+    const fetcher = vi.fn((url: string) => {
+      const reply = (stage: unknown) => ({ ok: true, status: 202, json: async () => ({ stage }) });
+      if (url.endsWith("/ensure/")) return Promise.resolve(reply({ ...margins }));
+      // The save's reply is held back until the run's live update has arrived.
+      return new Promise((resolve) => {
+        replySave = () => resolve(reply(queued));
+      });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins), 'data-events-url="/events/"');
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    const top = root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    top.value = "30";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    listeners.get("workspace")!(
+      new MessageEvent("workspace", { data: JSON.stringify({ stages: [succeeded] }) }),
+    );
+    replySave();
+    await flush();
+    const message = root.querySelector("[data-editor-message]")!;
+    // Not "stuck on queued": the older reply did not replace the newer success.
+    expect(message.textContent).not.toMatch(/Running|Restarting|queued/);
+    expect(root.querySelector("[data-result-status]")?.textContent ?? "").not.toMatch(/Queued/);
+  });
+
+  it("saves an edit for the stage it was made on when the editor moves on mid-save", async () => {
+    vi.useFakeTimers();
+    const replies: (() => void)[] = [];
+    let revision = 1;
+    const fetcher = vi.fn((url: string, init?: RequestInit) => {
+      const reply = (stage: unknown) => ({ ok: true, status: 202, json: async () => ({ stage }) });
+      if (url.endsWith("/ensure/")) return Promise.resolve(reply({ ...margins, revision }));
+      revision += 1;
+      const saved = {
+        ...margins,
+        revision,
+        status: "queued",
+        parameters: JSON.parse(String(init?.body)).parameters,
+        updated_at: `2026-11-24T10:00:0${revision}+00:00`,
+      };
+      // Each save's reply is held until the test releases it.
+      return new Promise((resolve) => replies.push(() => resolve(reply(saved))));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins));
+    const deskew = document.createElement("button");
+    deskew.dataset.stageSelect = "deskew";
+    root.append(deskew);
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    const posts = () =>
+      fetcher.mock.calls.filter(([url]) => !String(url).endsWith("/ensure/")) as unknown as [
+        string,
+        RequestInit,
+      ][];
+    const top = root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    top.value = "20";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    expect(posts()).toHaveLength(1); // in flight
+    // A second change, then the member opens Deskew before its autosave ran.
+    top.value = "40";
+    top.dispatchEvent(new Event("input", { bubbles: true }));
+    deskew.click();
+    await flush();
+    replies.shift()!();
+    await flush();
+    // The second change is saved for Margins, not dropped and not sent to Deskew.
+    expect(posts()).toHaveLength(2);
+    const [url, init] = posts()[1]!;
+    expect(url).toBe("/pages/page/stages/margins/");
+    const body = JSON.parse(String(init.body));
+    expect(body.parameters.top_mm).toBe(40);
+    expect(body.expected_revision).toBe(2); // the revision the first save produced
+    replies.shift()!();
+    await flush();
+    expect(posts()).toHaveLength(2);
+    expect(root.querySelector("[data-editor-title]")?.textContent).toContain("Deskew");
+  });
+
+  it("reverts to the settings a save in flight stores, not to older ones", async () => {
+    vi.useFakeTimers();
+    const replies: (() => void)[] = [];
+    const fetcher = vi.fn((url: string, init?: RequestInit) => {
+      const reply = (stage: unknown) => ({ ok: true, status: 202, json: async () => ({ stage }) });
+      if (url.endsWith("/ensure/")) return Promise.resolve(reply({ ...margins }));
+      const saved = {
+        ...margins,
+        revision: 2,
+        status: "queued",
+        parameters: JSON.parse(String(init?.body)).parameters,
+        updated_at: "2026-11-24T10:00:02+00:00",
+      };
+      return new Promise((resolve) => replies.push(() => resolve(reply(saved))));
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const root = host(readyPage(margins));
+    initializeScanTailorWorkspace(root);
+    root.querySelector<HTMLButtonElement>('[data-stage-select="margins"]')!.click();
+    await flush();
+    const posts = () => fetcher.mock.calls.filter(([url]) => !String(url).endsWith("/ensure/"));
+    const field = () => root.querySelector<HTMLInputElement>('[data-margin="top"]')!;
+    field().value = "20";
+    field().dispatchEvent(new Event("input", { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    field().value = "40";
+    field().dispatchEvent(new Event("input", { bubbles: true }));
+    root.querySelector<HTMLButtonElement>("[data-revert-stage]")!.click();
+    replies.shift()!();
+    await flush();
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_DELAY_MS);
+    await flush();
+    expect(posts()).toHaveLength(1); // the reverted change is not saved
+    expect(field().value).toBe("20"); // the stored settings are shown
+  });
+});
+
+describe("merge order of stage updates (#209)", () => {
+  const at = (revision: number, status: string, updated_at: string) => ({
+    revision,
+    status,
+    updated_at,
+  });
+
+  it("never lets an older revision replace a newer one", () => {
+    expect(isOlderStageState(at(1, "success", "b"), at(2, "queued", "a"))).toBe(true);
+    expect(isOlderStageState(at(3, "queued", "a"), at(2, "success", "b"))).toBe(false);
+  });
+
+  it("orders updates of the same revision by updated_at, to the microsecond", () => {
+    const queued = at(2, "queued", "2026-11-24T10:00:02.000100+00:00");
+    const success = at(2, "success", "2026-11-24T10:00:02.000200+00:00");
+    expect(isOlderStageState(queued, success)).toBe(true);
+    expect(isOlderStageState(success, queued)).toBe(false);
+    // Python omits a zero fraction.
+    expect(
+      isOlderStageState(
+        at(2, "queued", "2026-11-24T10:00:02+00:00"),
+        at(2, "success", "2026-11-24T10:00:02.5+00:00"),
+      ),
+    ).toBe(true);
+    // A newer job for the same revision (#205) is a newer state, though less advanced.
+    expect(
+      isOlderStageState(
+        at(2, "queued", "2026-11-24T10:00:05+00:00"),
+        at(2, "success", "2026-11-24T10:00:03+00:00"),
+      ),
+    ).toBe(false);
+  });
+
+  it("falls back to how far the run got when the timestamps are equal or missing", () => {
+    const same = "2026-11-24T10:00:02+00:00";
+    expect(isOlderStageState(at(2, "queued", same), at(2, "running", same))).toBe(true);
+    expect(isOlderStageState(at(2, "success", same), at(2, "running", same))).toBe(false);
+    expect(isOlderStageState(at(2, "running", ""), at(2, "success", ""))).toBe(true);
+  });
+});
+
+describe("drafts (#209)", () => {
+  it("compares drafts regardless of key order", () => {
+    expect(stableJson({ b: 1, a: { d: [1, 2], c: true } })).toBe(
+      stableJson({ a: { c: true, d: [1, 2] }, b: 1 }),
+    );
+    expect(stableJson({ a: 1 })).not.toBe(stableJson({ a: 2 }));
+  });
+});
+
+describe("stage readiness from input fingerprints (#205)", () => {
+  const row = (
+    stage: string,
+    status: string,
+    output: string,
+    appliedInput: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    stage,
+    status,
+    output_sha256: output,
+    applied_input_sha256: appliedInput,
+    settings_applied: true,
+    input_sha256: stage === "deskew" ? "v1" : "",
+    ...extra,
+  });
+
+  it("is current when every result matches its input and settings", () => {
+    const page = {
+      stages: [
+        row("deskew", "success", "d1", "v1"),
+        row("select_content", "success", "s1", "d1"),
+        row("dewarping", "success", "w1", "s1"),
+        row("margins", "success", "m1", "w1"),
+        row("output", "success", "o1", "m1"),
+      ],
+    } as never;
+    for (const stage of STAGE_ORDER) {
+      expect(stageReadiness(page, stage)).toEqual({
+        current: true,
+        waitingFor: null,
+        staleReason: "",
+      });
+    }
+  });
+
+  it("waits for the first earlier stage without a current result", () => {
+    const page = {
+      stages: [
+        row("deskew", "unknown", "", ""),
+        row("margins", "unknown", "", "", { settings_applied: false }),
+      ],
+    } as never;
+    expect(stageReadiness(page, "margins")).toEqual({
+      current: false,
+      waitingFor: "deskew",
+      staleReason: "",
+    });
+    expect(stageReadiness(page, "deskew").waitingFor).toBeNull();
+  });
+
+  it("marks a result stale when its input or its settings changed", () => {
+    const page = {
+      stages: [
+        row("deskew", "success", "d2", "v1"),
+        row("select_content", "success", "s1", "d1"),
+        row("dewarping", "success", "w1", "s1", { settings_applied: false }),
+      ],
+    } as never;
+    expect(stageReadiness(page, "deskew")).toEqual({
+      current: true,
+      waitingFor: null,
+      staleReason: "",
+    });
+    expect(stageReadiness(page, "select_content")).toEqual({
+      current: false,
+      waitingFor: null,
+      staleReason: "input changed",
+    });
+    expect(stageReadiness(page, "dewarping")).toEqual({
+      current: false,
+      waitingFor: "select_content",
+      staleReason: "settings changed, not applied",
+    });
+    // A replacement scan changes the first stage's input.
+    const rescanned = {
+      stages: [{ ...row("deskew", "success", "d1", "v1"), input_sha256: "v2" }],
+    } as never;
+    expect(stageReadiness(rescanned, "deskew").staleReason).toBe("input changed");
+  });
+
+  it("uses the server's Margins fingerprint, which includes the common page size (#208)", () => {
+    const upstream = [
+      row("deskew", "success", "d1", "v1"),
+      row("select_content", "success", "s1", "d1"),
+      row("dewarping", "success", "w1", "s1"),
+    ];
+    const margins = (extra: Record<string, unknown>) =>
+      ({ stages: [...upstream, row("margins", "success", "m1", "w1+a1", extra)] }) as never;
+    // Current: the fingerprint for the predecessor output on this page matches.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w1" }), "margins"),
+    ).toEqual({ current: true, waitingFor: null, staleReason: "" });
+    // Another page changed the common size.
+    expect(
+      stageReadiness(
+        margins({ input_sha256: "w1+a2", input_basis_sha256: "w1", common_size_changed: true }),
+        "margins",
+      ),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "common page size changed" });
+    // Dewarping produced a newer output than the one the server's fingerprint used.
+    expect(
+      stageReadiness(margins({ input_sha256: "w1+a1", input_basis_sha256: "w0" }), "margins"),
+    ).toEqual({ current: false, waitingFor: null, staleReason: "input changed" });
+  });
+});
+
+describe("result pane message (#206, from #205's derived state)", () => {
+  const state = (status: string, extra: Record<string, string> = {}) => ({
+    status,
+    last_error: "",
+    preview_storage_identifier: "",
+    output_storage_identifier: "",
+    ...extra,
+  });
+  const current = { current: true, waitingFor: null, staleReason: "" };
+  const notCurrent = { current: false, waitingFor: null, staleReason: "" };
+
+  it("is empty when the stage has a current result", () => {
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), current),
+    ).toBe("");
+    expect(resultPaneMessage(state("success"), current)).toMatch(/no result preview/);
+  });
+
+  it("gives the status line's reason when there is no current result", () => {
+    expect(resultPaneMessage(state("unknown"), notCurrent)).toMatch(/^Not run yet/);
+    expect(resultPaneMessage(state("queued"), notCurrent)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("running"), notCurrent)).toMatch(/^Running/);
+    expect(
+      resultPaneMessage(state("failed", { last_error: "cannot read image" }), notCurrent),
+    ).toBe("Failed: cannot read image");
+    expect(
+      resultPaneMessage(state("unknown"), { ...notCurrent, waitingFor: "deskew" }),
+    ).toBe("Waiting for Deskew. This stage runs when it is done.");
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), {
+        ...notCurrent,
+        staleReason: "input changed",
+      }),
+    ).toBe("Stale: input changed. It runs again by itself.");
+  });
+
+  it("never shows a result for settings that are not applied", () => {
+    const done = state("success", { preview_storage_identifier: "p.jpg" });
+    expect(resultPaneMessage(done, current, true)).toBe(
+      "Settings not applied yet. The result appears once they are saved.",
+    );
+    // A failure is still reported first, as on the status line.
+    expect(resultPaneMessage(state("failed", { last_error: "boom" }), notCurrent, true)).toBe(
+      "Failed: boom",
+    );
+  });
+
+  it("puts a running job before waiting and stale", () => {
+    const stale = { current: false, waitingFor: "deskew" as const, staleReason: "input changed" };
+    expect(resultPaneMessage(state("queued"), stale)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("success"), stale)).toMatch(/^Waiting for Deskew/);
   });
 });
 
@@ -387,7 +899,7 @@ describe("editor preview recovery (#195)", () => {
       status: "unknown",
       parameters: {},
     };
-    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-save-stage>Save</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
+    document.body.innerHTML = `<script id="scantailor-workspace-data" type="application/json">${JSON.stringify([{ id: "page", logical_sequence_number: 1, side: "single", stages: [state] }])}</script><div id="retry-host" data-editable="true" data-preview-url-template="/__PAGE__/preview/"><div data-stage-controls></div><img data-editor-image><div data-geometry-layer></div><span data-editor-message></span><span data-live-status></span><h2 data-editor-title></h2><button data-revert-stage>Revert to saved</button><button data-batch-stage></button><select data-batch-scope></select><input data-preserve-exceptions type="checkbox"><span data-selection-count></span><button data-select-all></button><button data-clear-selection></button><button data-preview-input>Input</button><button data-preview-result>Result</button><p data-stage-warnings></p><button data-stage-select="deskew">Deskew</button></div>`;
     const host = document.querySelector<HTMLElement>("#retry-host")!;
     initializeScanTailorWorkspace(host);
     return {
@@ -423,7 +935,7 @@ describe("editor preview recovery (#195)", () => {
 
     // Generation finished: this load succeeds and the stage status returns.
     image.dispatchEvent(new Event("load"));
-    expect(message.textContent).toBe("Revision 1 · unknown");
+    expect(message.textContent).toBe("Revision 1 · not run yet");
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 

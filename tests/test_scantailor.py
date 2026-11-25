@@ -39,6 +39,21 @@ def _stages_url(job_id: str, page_id: str) -> str:
     return f"/scan/jobs/{job_id}/pages/{page_id}/stages/"
 
 
+def _run_pipeline(client: Client, job_id: str, page_id: str) -> None:
+    """Run every stage of the page: Deskew chains the later stages (#205)."""
+    response = client.post(
+        _stage_url(job_id, page_id, "deskew"),
+        data=json.dumps({}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202
+    for state in ScanTailorStageState.objects.filter(scan_page_id=page_id):
+        assert state.status == ScanTailorStageState.StageStatus.SUCCESS, (
+            state.stage,
+            state.last_error,
+        )
+
+
 def test_margin_results_do_not_become_fixed_canvas_requests() -> None:
     source = Image.new("RGB", (100, 100), "black")
     first = run_stage(
@@ -58,13 +73,14 @@ def test_margin_results_do_not_become_fixed_canvas_requests() -> None:
     assert second.image.tobytes() == source.tobytes()
     assert second.parameters["resolved_canvas_width"] == 100
     assert second.parameters["resolved_canvas_height"] == 100
+    # Explicit pixel canvases (before #208) give way to the common page size.
     fixed = run_stage(
         scantailor._run_margins,
         ScanTailorStageState(parameters={"margin": 0, "canvas_width": 200}),
         source,
     )
-    assert fixed.parameters["canvas_width"] == fixed.parameters["resolved_canvas_width"] == 200
-    assert fixed.full_size == (200, 100)
+    assert "canvas_width" not in fixed.parameters
+    assert fixed.full_size == (100, 100)
 
 
 def _facing_page_bytes(
@@ -347,14 +363,18 @@ def test_concurrent_edit_conflict_is_reported() -> None:
 
     first = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
-        data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "first"}}),
+        data=json.dumps(
+            {"expected_revision": expected_revision, "parameters": {"manual_angle": 1.0}}
+        ),
         content_type="application/json",
     )
     assert first.status_code == 202
 
     second = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
-        data=json.dumps({"expected_revision": expected_revision, "parameters": {"pass": "second"}}),
+        data=json.dumps(
+            {"expected_revision": expected_revision, "parameters": {"manual_angle": 2.0}}
+        ),
         content_type="application/json",
     )
     assert second.status_code == 409
@@ -365,7 +385,7 @@ def test_concurrent_edit_conflict_is_reported() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_upstream_change_invalidates_downstream_stages() -> None:
+def test_failed_upstream_leaves_later_stages_waiting_not_failed() -> None:
     client, job = _create_scan_job("scan-user-invalidation")
     _upload_scan_page(
         client,
@@ -379,6 +399,7 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
 
     workspace = client.get(_stages_url(str(job.id), str(page.id))).json()
     assert len(workspace["stages"]) == len(list(scantailor.stage_order()))
+    _corrupt_page_source(page)
 
     update = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
@@ -388,27 +409,35 @@ def test_upstream_change_invalidates_downstream_stages() -> None:
     assert update.status_code == 202
 
     latest = client.get(_stages_url(str(job.id), str(page.id))).json()["stages"]
-    status_by_stage = {entry["stage"]: entry["status"] for entry in latest}
     by_stage = {entry["stage"]: entry for entry in latest}
+    assert by_stage["deskew"]["status"] == ScanTailorStageState.StageStatus.FAILED
     for stage_name in ("select_content", "dewarping", "margins", "output"):
-        assert status_by_stage[stage_name] == ScanTailorStageState.StageStatus.INVALIDATED
-        # Routine invalidation is not an error (#53).
+        # Nothing ran after the failure, and nothing failed with it (#205).
+        assert by_stage[stage_name]["status"] == ScanTailorStageState.StageStatus.UNKNOWN
         assert by_stage[stage_name]["last_error"] == ""
-        assert by_stage[stage_name]["invalidated_reason"] == "deskew updated"
+        assert by_stage[stage_name]["waiting_for"] == "deskew"
+        assert by_stage[stage_name]["current"] is False
 
-    # Re-running a stage clears its invalidation note.
-    rerun = client.post(
+    # Saving a later stage stores its settings and waits; no job is created.
+    jobs_before = ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE).count()
+    waiting = client.post(
         _stage_url(str(job.id), str(page.id), "select_content"),
-        data=json.dumps({"parameters": {}}),
+        data=json.dumps({"parameters": {"content_mode": "disabled"}}),
         content_type="application/json",
     )
-    assert rerun.status_code == 202
+    assert waiting.status_code == 202
+    assert waiting.json()["job"] is None
+    assert waiting.json()["waiting_for"] == "deskew"
+    assert ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE).count() == (
+        jobs_before
+    )
     content = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="select_content")
-    assert content.invalidated_reason == ""
+    assert content.parameters == {"content_mode": "disabled"}
+    assert content.status == ScanTailorStageState.StageStatus.UNKNOWN
 
 
 @pytest.mark.django_db(transaction=True)
-def test_failed_stage_that_is_invalidated_clears_stale_error() -> None:
+def test_editing_a_failed_waiting_stage_clears_its_error() -> None:
     client, job = _create_scan_job("scan-user-invalidation-failed")
     _upload_scan_page(
         client,
@@ -424,13 +453,16 @@ def test_failed_stage_that_is_invalidated_clears_stale_error() -> None:
         status=ScanTailorStageState.StageStatus.FAILED,
         last_error="cannot read image",
     )
-    scantailor.invalidate_downstream_states(
-        page, from_stage="dewarping", reason="dewarping updated"
+    response = client.post(
+        _stage_url(str(job.id), str(page.id), "output"),
+        data=json.dumps({"parameters": {"output_mode": "sauvola"}}),
+        content_type="application/json",
     )
+    assert response.status_code == 202
+    assert response.json()["waiting_for"] == "deskew"
     output = ScanTailorStageState.objects.get(scan_page=page, stage="output")
-    assert output.status == ScanTailorStageState.StageStatus.INVALIDATED
+    assert output.status == ScanTailorStageState.StageStatus.UNKNOWN
     assert output.last_error == ""
-    assert output.invalidated_reason == "dewarping updated"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -505,12 +537,21 @@ def test_deskew_reproducible_with_manual_angle() -> None:
     first_angle = deskew_state.parameters.get("angle")
     assert first_angle == 2.25
 
-    second = client.post(
+    unchanged = client.post(
         deskew_url,
         data=json.dumps({"parameters": {"manual_angle": 2.25}}),
         content_type="application/json",
     )
-    assert second.status_code == 202
+    assert unchanged.status_code == 200
+    assert unchanged.json()["unchanged"] is True
+
+    for angle in (1.0, 2.25):
+        rerun = client.post(
+            deskew_url,
+            data=json.dumps({"parameters": {"manual_angle": angle}}),
+            content_type="application/json",
+        )
+        assert rerun.status_code == 202
 
     deskew_state.refresh_from_db()
     assert deskew_state.output_sha256 == first_hash
@@ -530,6 +571,7 @@ def test_select_content_detects_text_area() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
 
     response = client.post(
         _stage_url(str(job.id), str(page.id), "select_content"),
@@ -566,6 +608,7 @@ def test_select_content_manual_box_is_preserved() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
 
     manual_box = [70, 120, 280, 420]
     response = client.post(
@@ -616,12 +659,13 @@ def test_margin_pipeline_reproducible_with_same_parameters() -> None:
     first_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     first_hash = first_state.output_sha256
 
-    second = client.post(
-        _stage_url(str(job.id), str(page.id), "margins"),
-        data=json.dumps(payload),
-        content_type="application/json",
-    )
-    assert second.status_code == 202
+    for margin in (25, 24):
+        second = client.post(
+            _stage_url(str(job.id), str(page.id), "margins"),
+            data=json.dumps({"parameters": {**payload["parameters"], "margin": margin}}),
+            content_type="application/json",
+        )
+        assert second.status_code == 202
     second_state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="margins")
     assert second_state.output_sha256 == first_hash
 
@@ -694,7 +738,7 @@ def test_batch_stage_avoids_manual_exceptions_by_default() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_content_change_invalidates_downstream_artifacts() -> None:
+def test_content_change_reruns_downstream_stages() -> None:
     client, job = _create_scan_job("scan-user-content-invalidation")
     _upload_scan_page(
         client,
@@ -706,34 +750,16 @@ def test_content_change_invalidates_downstream_artifacts() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
-
-    client.post(
-        _stage_url(str(job.id), str(page.id), "select_content"),
-        data=json.dumps({}),
-        content_type="application/json",
-    )
+    _run_pipeline(client, str(job.id), str(page.id))
     client.post(
         _stage_url(str(job.id), str(page.id), "margins"),
         data=json.dumps({"parameters": {"margin": 16}}),
         content_type="application/json",
     )
-    client.post(
-        _stage_url(str(job.id), str(page.id), "dewarping"),
-        data=json.dumps({}),
-        content_type="application/json",
-    )
-    client.post(
-        _stage_url(str(job.id), str(page.id), "output"),
-        data=json.dumps({}),
-        content_type="application/json",
-    )
-
-    selected = ScanTailorStageState.objects.get(
-        scan_job=job,
-        scan_page=page,
-        stage="select_content",
-    )
-    assert selected.status == ScanTailorStageState.StageStatus.SUCCESS
+    before = {
+        state.stage: state.output_sha256
+        for state in ScanTailorStageState.objects.filter(scan_page=page)
+    }
 
     update = client.post(
         _stage_url(str(job.id), str(page.id), "select_content"),
@@ -742,9 +768,14 @@ def test_content_change_invalidates_downstream_artifacts() -> None:
     )
     assert update.status_code == 202
 
-    for stage in ("margins", "dewarping", "output"):
+    # Every later stage re-ran on the new input (#205); Margins kept its settings.
+    for stage in ("dewarping", "margins", "output"):
         state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage=stage)
-        assert state.status == ScanTailorStageState.StageStatus.INVALIDATED
+        assert state.status == ScanTailorStageState.StageStatus.SUCCESS, state.last_error
+        assert state.output_sha256 != before[stage]
+        assert scantailor.stage_result_is_current(state)
+    margins = ScanTailorStageState.objects.get(scan_page=page, stage="margins")
+    assert margins.parameters["margin"] == 16
 
 
 @pytest.mark.django_db(transaction=True)
@@ -760,6 +791,7 @@ def test_output_default_otsu_is_reproducible() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
 
     first = client.post(
         _stage_url(str(job.id), str(page.id), "output"),
@@ -798,6 +830,7 @@ def test_each_documented_output_algorithm_produces_an_artifact(output_mode: str)
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
 
     response = client.post(
         _stage_url(str(job.id), str(page.id), "output"),
@@ -826,6 +859,13 @@ def test_output_manual_zone_controls_are_preserved() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
+    # The zones below are in whole-page coordinates: keep the whole page.
+    client.post(
+        _stage_url(str(job.id), str(page.id), "select_content"),
+        data=json.dumps({"parameters": {"content_mode": "disabled"}}),
+        content_type="application/json",
+    )
 
     payload = {
         "parameters": {
@@ -1247,6 +1287,7 @@ def test_stage_run_records_current_algorithm_version() -> None:
         content_type="image/png",
     )
     page = ScanPage.objects.get(scan_job=job, logical_sequence_number=1, side="single")
+    _run_pipeline(client, str(job.id), str(page.id))
     url = _stage_url(str(job.id), str(page.id), "dewarping")
     points = [[18, 14], [392, 28], [412, 286], [10, 270]]
     payload = json.dumps({"parameters": {"dewarp_mode": "manual", "dewarp_points": points}})
@@ -1255,6 +1296,8 @@ def test_stage_run_records_current_algorithm_version() -> None:
     ScanTailorStageState.objects.filter(scan_page=page, stage="dewarping").update(
         algorithm_version="opencv-v1"
     )
+    # Changed settings: the stage runs again and records the current version.
+    payload = json.dumps({"parameters": {"dewarp_mode": "off"}})
     assert client.post(url, data=payload, content_type="application/json").status_code == 202
     state = ScanTailorStageState.objects.get(scan_job=job, scan_page=page, stage="dewarping")
     assert state.status == ScanTailorStageState.StageStatus.SUCCESS
@@ -1273,7 +1316,7 @@ def _thumbnail_size(client: Client, page_id: str) -> tuple[tuple[int, int], str]
 
 
 @pytest.mark.django_db(transaction=True)
-def test_page_thumbnail_follows_latest_completed_stage() -> None:
+def test_page_thumbnail_follows_latest_completed_stage(monkeypatch: pytest.MonkeyPatch) -> None:
     """#58: the overview thumbnail shows the latest completed stage, not the raw scan."""
     client, job = _create_scan_job("scan-user-thumbnail-stage")
     portrait = io.BytesIO()
@@ -1291,6 +1334,8 @@ def test_page_thumbnail_follows_latest_completed_stage() -> None:
     raw_size, raw_etag = _thumbnail_size(client, str(page.id))
     assert raw_size == (300, 400)
 
+    # Only Deskew runs here; the later stages would otherwise follow it (#205).
+    monkeypatch.setattr(scantailor, "queue_ready_successor", lambda *args, **kwargs: None)
     client.get(_stages_url(str(job.id), str(page.id)))
     response = client.post(
         _stage_url(str(job.id), str(page.id), "deskew"),
@@ -1310,9 +1355,11 @@ def test_page_thumbnail_follows_latest_completed_stage() -> None:
     assert revalidated.status_code == 304
     assert "max-age=0" in revalidated["Cache-Control"]
 
-    # A stale (invalidated) stage is never shown; fall back to the raw page.
+    # A stale stage (settings changed, not applied, #205) is never shown; fall back to
+    # the raw page.
     ScanTailorStageState.objects.filter(pk=deskew.pk).update(
-        status=ScanTailorStageState.StageStatus.INVALIDATED,
+        parameters={"manual_angle": 10},
+        revision=deskew.revision + 1,
     )
     fallback_size, fallback_etag = _thumbnail_size(client, str(page.id))
     assert fallback_size == (300, 400)

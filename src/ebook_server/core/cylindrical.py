@@ -45,6 +45,8 @@ from typing import Final
 import cv2
 import numpy as np
 
+from .stage_cancel import checkpoint
+
 type Point = tuple[float, float]
 
 DEFAULT_DEPTH_PERCEPTION: Final[float] = 2.0
@@ -588,6 +590,8 @@ def dewarp_image(
     hb = np.empty(out_w, dtype=np.float64)
     hc = np.empty(out_w, dtype=np.float64)
     for dst_x in range(out_w):
+        if dst_x % 64 == 0:
+            checkpoint()  # a newer edit of the stage stops a long full-resolution run (#209)
         g = dewarper.map_generatrix((dst_x + 0.5 - left) / (right - left))
         x0[dst_x], y0[dst_x] = g.p1
         dx[dst_x], dy[dst_x] = g.p2[0] - g.p1[0], g.p2[1] - g.p1[1]
@@ -601,6 +605,7 @@ def dewarp_image(
     map_x = np.empty((strip, out_w), dtype=np.float32)
     map_y = np.empty((strip, out_w), dtype=np.float32)
     for row in range(0, out_h, strip):
+        checkpoint()  # also between strips: the remap is the long part (#209)
         rows = min(strip, out_h - row)
         model_y = (np.arange(row, row + rows, dtype=np.float64)[:, None] + 0.5 - top) / (
             bottom - top

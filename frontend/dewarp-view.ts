@@ -579,6 +579,9 @@ export class DewarpOverlay {
     host.append(this.element);
   }
 
+  /** Points per curve as drawn ("top:bottom"): the point elements are reused while it holds. */
+  private drawnShape = "";
+
   isDragging(): boolean {
     return this.drag !== null;
   }
@@ -625,6 +628,22 @@ export class DewarpOverlay {
     this.grid.setAttribute("d", gridPath);
     this.margins.setAttribute("d", this.marginPath(top, bottom, sx, sy));
     this.hit.setAttribute("d", `${pathOf(top, sx, sy)} ${pathOf(bottom, sx, sy)}`);
+    // Live updates redraw often (#209): move the existing points instead of replacing
+    // them, so a point being hovered or grabbed stays the same element.
+    const shape = `${this.top.points.length}:${this.bottom.points.length}`;
+    const existing = [...this.points.children] as SVGCircleElement[];
+    if (shape === this.drawnShape && existing.length > 0) {
+      let at = 0;
+      for (const spline of [this.top, this.bottom]) {
+        for (const [x, y] of spline.points) {
+          const dot = existing[at++]!;
+          dot.setAttribute("cx", String(x * sx));
+          dot.setAttribute("cy", String(y * sy));
+        }
+      }
+      return;
+    }
+    this.drawnShape = shape;
     this.points.replaceChildren();
     ([this.top, this.bottom] as const).forEach((spline, curve) => {
       spline.points.forEach(([x, y], index) => {

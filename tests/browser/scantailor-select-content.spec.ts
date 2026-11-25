@@ -56,28 +56,31 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
-  const message = page.locator("[data-editor-message]");
-  // Deskew first: Select Content reads its result.
-  await page.getByRole("button", { name: "Save and run" }).click();
-  await expect(message).toContainText("Angle", { timeout: 30_000 });
+  // Opening the editor runs Deskew (#209); Select Content reads its result and then
+  // runs on its own (#205).
+  await expect(page.locator("[data-deskew-result]")).toContainText("Angle", {
+    timeout: 30_000,
+  });
 
   await page.locator('[data-stage-select="select_content"]').click();
   const controls = page.locator("[data-stage-controls]");
   await expect(controls.getByRole("radio", { name: "Auto" })).toBeChecked();
-  await page.getByRole("button", { name: "Save and run" }).click();
-  await expect(message).toContainText("mm", { timeout: 30_000 });
-  await expect(message).toContainText("auto");
+  // The stage's own result line: the status line moves on to the chained stages.
+  const contentResult = controls.locator("[data-content-result]");
+  await expect(contentResult).toContainText("mm", { timeout: 30_000 });
+  await expect(contentResult).toContainText("auto");
   await expect(
     page.locator('[data-strip-page] .st-status-icon[data-stage="select_content"]').first(),
-  ).toHaveAttribute("data-status", "success");
+  ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
 
-  // The auto result is drawn and stays on the input view.
+  // The auto box is drawn on the input; the result pane beside it shows the run (#206).
   const box = page.locator("[data-content-box]");
   await expect(box).toBeVisible();
-  await expect(page.getByRole("button", { name: "Input", exact: true })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
+  const result = page.locator("[data-result-image]");
+  await expect(result).toBeVisible();
+  await expect(result).toHaveAttribute("src", /\/stages\/select_content\/preview\/\?v=/);
+  const autoResult = await result.getAttribute("src");
+  const inputSource = await page.locator("[data-editor-image]").getAttribute("src");
   const before = (await box.boundingBox())!;
   // The box sits on the detected text: x 90..512 of the 600 px wide page.
   const shown = (await page.locator("[data-editor-image]").boundingBox())!;
@@ -109,5 +112,9 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   await page.mouse.up();
   expect((await saved).status()).toBe(202);
   await expect(controls.getByRole("radio", { name: "Manual" })).toBeChecked();
-  await expect(message).toContainText("manual", { timeout: 30_000 });
+  await expect(contentResult).toContainText("manual", { timeout: 30_000 });
+  // The manual run replaces the result; the input under the box was never reloaded.
+  await expect(result).not.toHaveAttribute("src", autoResult!);
+  await expect(result).toHaveAttribute("src", /\/stages\/select_content\/preview\/\?v=/);
+  await expect(page.locator("[data-editor-image]")).toHaveAttribute("src", inputSource!);
 });
