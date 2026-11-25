@@ -248,6 +248,43 @@ times the `page_image` step and each stage on this pipeline.
   working images make a stage's decode cheap instead (about 10 ms in
   `scripts/benchmark_scanning.py`).
 
+## Disk use: superseded revisions are deleted (#204)
+
+Every saved edit gives a stage a new revision, and each revision writes its own
+`scan-jobs/<job>/<page>/<stage>/v<revision>/` folder (working image or full-resolution
+output, preview, strip thumbnail). These files are derived and regenerable, so only
+the revision a `ScanTailorStageState` row points at is kept
+(`core/scan_artifact_pruning.py`). A file stays whenever any stage row names it in
+`input_storage_identifier`, `output_storage_identifier` or
+`preview_storage_identifier` (a thumbnail stays with the output beside it). Only
+files in the stage layout are ever deleted: the raw scanner pages, covers and logs in
+the same `scan-jobs/<job>/` folder are originals and are never touched. Deletion goes
+through the storage backend; a failure is logged and never fails the job.
+
+- **Commit.** When a stage run commits, the files of the stage's earlier revisions
+  are deleted. A lower revision is never written again, so this needs no lock. The
+  run also rebinds the stage to its upstream stage's current output, so earlier
+  upstream revisions only this row still named are deleted as well.
+- **Closed jobs.** A stage job closed as superseded or failed deletes the files of
+  its own revision folder, under the stage row's lock (the lock a commit takes),
+  unless a row refers to them.
+- **Sweep.** `manage.py prune_scan_artifacts` deletes every unreferenced stage file
+  under `scan-jobs/` older than an hour (`--min-age-seconds`), including crashed
+  workers' `.partial` copies and the folders of deleted jobs. `--dry-run` prints the
+  file and byte count and deletes nothing. A listing failure (more than `--limit`
+  entries, unreadable folder) exits with an error before anything is deleted. `deploy/systemd/book-scanner-scan-prune.timer`
+  runs it hourly with `--enqueue`, so a worker does the work.
+- **Job end.** When a finish has put the cleaned PDF into the library, and when a
+  job is cancelled (in a worker), the job's stage rows lose their output and preview
+  references (status `invalidated`, reason "stage files removed when the scan job
+  ended") and all its stage files are deleted. A job reopened for a re-finish
+  therefore reruns its stages.
+- **Free-space guard.** A stage save (single page or batch) is refused before
+  anything is saved or queued while the scan storage volume has less than
+  `BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES` free (default 1 GiB, `0` disables). The
+  response is `507` with a plain-text sentence starting "Disk almost full", which
+  the editor shows as its error message.
+
 ## Page Split removed (#195)
 
 Page Split and `ScanJob.capture_layout` (#55) were removed in #195. Migration 0049
@@ -259,7 +296,8 @@ cancelled jobs keep their stage statuses, revisions and outputs: the lifecycle
 refuses stage re-runs in those states, and the outputs are the history behind
 the published book. When a replacement page reopens a complete job (raw scan,
 re-finish needed), that page is invalidated as usual and the re-finish reuses
-the other pages' recorded outputs. Raw page versions are untouched. The
+the other pages' recorded outputs. (Since #204 a successful finish deletes the stage
+files, so a job finished after that reruns its stages for a re-finish.) Raw page versions are untouched. The
 migration rehearsal's integrity check expects exactly the deleted `page_split`
 rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
@@ -399,6 +437,10 @@ them with:
 
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_INTERVAL_SECONDS`
 - `BOOK_SCANNER_SCANTAILOR_EVENT_STREAM_MAX_EVENTS`
+
+Enable `book-scanner-scan-prune.timer` (see `deploy/systemd/README.md`) so stage files
+left behind by crashed workers or deleted jobs are swept; the free-space guard is
+`BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES`.
 
 The infrastructure suite verifies authentication, prompt initial and updated
 events, unbuffered Nginx proxying, and client disconnect recovery against a real

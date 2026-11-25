@@ -810,6 +810,17 @@ also holds PostgreSQL or Redis data.
   storage root. The storage status becomes `degraded` (not `down`, so readiness
   stays green) while free space is below the reserve.
 
+ScanTailor-Web keeps only the current revision of each stage's files and sweeps the
+rest (#204, see "Disk use" in [scantailor-web.md](scantailor-web.md)). A stage save
+is refused with "Disk almost full" while the scan storage volume has less than
+`BOOK_SCANNER_SCANTAILOR_MIN_FREE_BYTES` free (default 1 GiB; `0` disables). To free
+space by hand, check first and then sweep:
+
+```bash
+python manage.py prune_scan_artifacts --dry-run   # files and bytes that would go
+python manage.py prune_scan_artifacts
+```
+
 Confirmed book deletion is available only to local application admins. It checks
 artifact hashes, moves files into backend-local quarantine, commits the database
 deletion, and purges quarantine. A failed database operation restores moved files.

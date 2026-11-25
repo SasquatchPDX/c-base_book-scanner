@@ -640,12 +640,19 @@ class LocalFilesystemStorage:
             info.st_mode,
         )
 
-    def inventory(self, *, limit: int = 10000) -> Iterator[StorageEntry]:
-        """Read-only bounded walk; never descend into symlinks or quarantine."""
+    def inventory(self, *, limit: int = 10000, prefix: str = "") -> Iterator[StorageEntry]:
+        """Read-only bounded walk; never descend into symlinks or quarantine.
+
+        ``prefix`` limits the walk to one folder below the root; identifiers stay
+        relative to the root.
+        """
         base = Path(self.root).resolve()
         if not base.is_dir():
             raise StorageUnavailableError("inventory root is unavailable")
-        pending = [(base, 0)]
+        start = self.resolve_location(prefix) if prefix else base
+        if not start.is_dir():
+            raise StorageUnavailableError("inventory folder is unavailable")
+        pending = [(start, 1 if prefix else 0)]
         visited = 0
         while pending:
             directory, depth = pending.pop()
