@@ -556,6 +556,11 @@ def trivial_curves(width: float, height: float) -> tuple[list[Point], list[Point
     return [(0.0, 0.0), (width, 0.0)], [(0.0, height), (width, height)]
 
 
+#: Rows of coordinate maps built at a time by :func:`dewarp_image` (#171: bounded worker
+#: memory on full-resolution pages; a 4000 px wide strip needs 6 MiB of maps and scratch).
+MAP_STRIP_ROWS: Final[int] = 64
+
+
 def dewarp_image(
     image: np.ndarray,
     out_size: tuple[int, int],
@@ -563,27 +568,67 @@ def dewarp_image(
     domain: tuple[float, float, float, float],
     background: int | tuple[int, ...],
 ) -> np.ndarray:
-    """``RasterDewarper::dewarp``: sample the warped image for every output pixel."""
+    """``RasterDewarper::dewarp``: sample the warped image for every output pixel.
+
+    The generatrix of every output column is computed once; the coordinate maps are
+    then built and applied in strips of :data:`MAP_STRIP_ROWS` rows, so their scratch
+    memory does not grow with the page height (upstream maps pixel by pixel and keeps
+    no maps at all). Every output pixel depends only on its own map entry, so the
+    result is the same as one full-size remap.
+    """
     out_w, out_h = out_size
     left, top, right, bottom = domain
     if right <= left or bottom <= top:
         raise DewarpError("empty model domain")
-    model_y = (np.arange(out_h, dtype=np.float64) + 0.5 - top) / (bottom - top)
-    map_x = np.empty((out_h, out_w), dtype=np.float32)
-    map_y = np.empty((out_h, out_w), dtype=np.float32)
+    x0 = np.empty(out_w, dtype=np.float64)
+    y0 = np.empty(out_w, dtype=np.float64)
+    dx = np.empty(out_w, dtype=np.float64)
+    dy = np.empty(out_w, dtype=np.float64)
+    ha = np.empty(out_w, dtype=np.float64)
+    hb = np.empty(out_w, dtype=np.float64)
+    hc = np.empty(out_w, dtype=np.float64)
     for dst_x in range(out_w):
         g = dewarper.map_generatrix((dst_x + 0.5 - left) / (right - left))
-        t = _apply_1d(g.pln2img, model_y)
-        map_x[:, dst_x] = g.p1[0] + (g.p2[0] - g.p1[0]) * t - 0.5
-        map_y[:, dst_x] = g.p1[1] + (g.p2[1] - g.p1[1]) * t - 0.5
+        x0[dst_x], y0[dst_x] = g.p1
+        dx[dst_x], dy[dst_x] = g.p2[0] - g.p1[0], g.p2[1] - g.p1[1]
+        ha[dst_x], hb[dst_x], hc[dst_x] = g.pln2img
     border = background if isinstance(background, tuple) else (background,) * 4
-    return np.asarray(
-        cv2.remap(
-            image,
-            map_x,
-            map_y,
-            cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=border,
+    output = np.empty((out_h, out_w, *image.shape[2:]), dtype=image.dtype)
+    strip = min(MAP_STRIP_ROWS, out_h)
+    # Scratch buffers reused for every strip (fresh large arrays per strip page-fault).
+    t = np.empty((strip, out_w), dtype=np.float64)
+    work = np.empty((strip, out_w), dtype=np.float64)
+    map_x = np.empty((strip, out_w), dtype=np.float32)
+    map_y = np.empty((strip, out_w), dtype=np.float32)
+    for row in range(0, out_h, strip):
+        rows = min(strip, out_h - row)
+        model_y = (np.arange(row, row + rows, dtype=np.float64)[:, None] + 0.5 - top) / (
+            bottom - top
         )
-    )
+        tt, ww, mx, my = t[:rows], work[:rows], map_x[:rows], map_y[:rows]
+        # t = (y * a + b) / (y * c + 1), as _apply_1d
+        np.multiply(model_y, ha, out=tt)
+        tt += hb
+        np.multiply(model_y, hc, out=ww)
+        ww += 1.0
+        tt /= ww
+        # map = p1 + (p2 - p1) * t - 0.5
+        np.multiply(dx, tt, out=ww)
+        ww += x0
+        ww -= 0.5
+        mx[...] = ww
+        np.multiply(dy, tt, out=ww)
+        ww += y0
+        ww -= 0.5
+        my[...] = ww
+        output[row : row + rows] = np.asarray(
+            cv2.remap(
+                image,
+                mx,
+                my,
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=border,
+            )
+        ).reshape(output[row : row + rows].shape)
+    return output

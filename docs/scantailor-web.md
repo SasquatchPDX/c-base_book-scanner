@@ -32,6 +32,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    manual. The output keeps the input's size. Auto detection is not ported yet
    (step 6b): until then it takes the top and bottom baselines found by the earlier
    baseline detector, and a page without text lines stays unchanged and says so.
+   Manual curves are limited to 64 control points each, within one page size of the
+   page; other curves, an invalid model or a failed render leave the page unchanged
+   with a `dewarp_warning`. Measurements: [`measurements/dewarping-acceptance.md`](measurements/dewarping-acceptance.md).
 4. Margins — per-side/canvas padding and horizontal/vertical alignment.
 5. Output/Binarization — Otsu, Sauvola, Wolf, Fox, Window, Grad, and copy modes,
    plus draggable text/picture zones with independent algorithms.

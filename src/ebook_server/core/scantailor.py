@@ -918,6 +918,12 @@ def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageR
 
 
 DEWARP_MODES: Final[tuple[str, ...]] = ("off", "auto", "manual")
+#: Manual curves are bounded (#171: no runaway worker on hostile or mistyped geometry):
+#: at most this many control points per curve ...
+MAX_DEWARP_CONTROL_POINTS: Final[int] = 64
+#: ... each within this many page sizes of the page (upstream's editor keeps the
+#: points near the image; spline sampling time grows with the curve length).
+DEWARP_POINT_REACH: Final[float] = 1.0
 #: Upstream ``DewarpingView`` samples splines like this when drawing the model.
 type Points = list[tuple[float, float]]
 
@@ -938,6 +944,19 @@ def _coerce_points(value: Any) -> Points | None:
             return None
         points.append((x, y))
     return points
+
+
+def _manual_curves_problem(curves: tuple[Points, Points], size: tuple[int, int]) -> str:
+    """Why manual curves are refused before the model is built, or ``""``."""
+    width, height = size
+    reach_x, reach_y = DEWARP_POINT_REACH * width, DEWARP_POINT_REACH * height
+    for points in curves:
+        if len(points) > MAX_DEWARP_CONTROL_POINTS:
+            return f"A curve has more than {MAX_DEWARP_CONTROL_POINTS} control points"
+        for x, y in points:
+            if not (-reach_x <= x <= width + reach_x and -reach_y <= y <= height + reach_y):
+                return "A control point lies too far outside the page"
+    return ""
 
 
 def _depth_perception(parameters: dict[str, Any]) -> float:
@@ -1028,6 +1047,18 @@ def _run_cylindrical_dewarp(state: ScanTailorStageState, stage_input: StageInput
         top_points = _coerce_points(parameters.get("top_curve"))
         bottom_points = _coerce_points(parameters.get("bottom_curve"))
         if top_points is not None and bottom_points is not None:
+            problem = _manual_curves_problem((top_points, bottom_points), (width, height))
+            if problem:
+                # Keep the reviewer's points so the editor shows what is wrong.
+                updates["top_curve"] = [[x, y] for x, y in top_points]
+                updates["bottom_curve"] = [[x, y] for x, y in bottom_points]
+                updates["dewarp_warning"] = f"{problem}; the page is unchanged."
+                return _transform_result(
+                    parameters,
+                    stage_input,
+                    scan_transform.IDENTITY,
+                    {**updates, "dewarp_applied": False},
+                )
             top_spline = cylindrical.XSpline(top_points)
             bottom_spline = cylindrical.XSpline(bottom_points)
         else:
