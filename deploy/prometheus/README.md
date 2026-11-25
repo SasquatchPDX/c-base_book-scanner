@@ -23,3 +23,6 @@ capacity and compliance requirements specify another reviewed value:
 After deployment, verify `up{job="book-scanner"} == 1`, inspect every rule in the
 Prometheus Rules page, and send a test notification through the configured
 Alertmanager receiver. The target-down rule is also the ongoing scrape check.
+`manage.py site_acceptance --check alert --check scrape` sends that test
+notification and records the scrape; see "Version 1 site acceptance" in
+`docs/operations.md`.
