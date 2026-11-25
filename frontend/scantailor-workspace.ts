@@ -506,6 +506,42 @@ export function stageStatusMessage(
   return { text: `${base} · not run yet`, tone: "info" };
 }
 
+/**
+ * Why the result pane shows no current result for a stage (#206); empty when it has one.
+ *
+ * The same derived state as the status line (#205, ``stageStatusMessage``): a failure,
+ * unsaved edits, a queued or running job, an earlier stage to wait for, a stale result.
+ * A stale result is never shown as current; the pane gives the reason instead.
+ */
+export function resultPaneMessage(
+  state: Pick<
+    StageState,
+    "status" | "last_error" | "preview_storage_identifier" | "output_storage_identifier"
+  >,
+  readiness: StageReadiness,
+  settingsNotApplied = false,
+): string {
+  const error = stageErrorText(state);
+  if (error) return `Failed: ${error}`;
+  if (settingsNotApplied) return "Settings not applied. Save them to see this stage's result.";
+  if (state.status === "queued") {
+    return "Queued: the result appears here once the worker has run this stage.";
+  }
+  if (state.status === "running") return "Running: the result appears here when it finishes.";
+  if (readiness.waitingFor) {
+    return `Waiting for ${STAGE_LABELS[readiness.waitingFor]}. This stage runs when it is done.`;
+  }
+  if (state.status === "success") {
+    if (!readiness.current) {
+      return `Stale: ${readiness.staleReason || "input changed"}. Save and run to update the result.`;
+    }
+    return state.preview_storage_identifier || state.output_storage_identifier
+      ? ""
+      : "This run produced no result preview.";
+  }
+  return "Not run yet. Save and run to see this stage's result.";
+}
+
 export function normalizeBox(value: unknown, fallback: Box): Box {
   if (Array.isArray(value) && value.length >= 4) {
     return orderedBox({
@@ -611,7 +647,17 @@ class WorkspaceController {
   private readonly inputButton: HTMLButtonElement;
   private readonly resultButton: HTMLButtonElement;
   private readonly warnings: HTMLElement;
+  /** Pane shown on narrow screens, where only one fits (#206); both show otherwise. */
   private previewMode: "input" | "result" = "input";
+  private readonly panes: HTMLElement | null;
+  private readonly resultPane: HTMLElement | null;
+  private readonly resultViewport: HTMLElement | null;
+  private readonly resultSurface: HTMLElement | null;
+  private readonly resultImage: HTMLImageElement | null;
+  private readonly resultStatus: HTMLElement | null;
+  /** The result URL shown and the page/stage it belongs to. */
+  private resultUrl = "";
+  private resultKey = "";
   private activePageId: string | null = null;
   private activeStage: StageName = STAGE_ORDER[0];
   private draft: JsonObject = {};
@@ -666,6 +712,12 @@ class WorkspaceController {
     this.naturalOrder = pages.map((page) => page.id);
     this.viewport = root.querySelector<HTMLElement>("[data-viewport]");
     this.surface = root.querySelector<HTMLElement>("[data-surface]");
+    this.panes = root.querySelector<HTMLElement>("[data-panes]");
+    this.resultPane = root.querySelector<HTMLElement>("[data-result-pane]");
+    this.resultViewport = root.querySelector<HTMLElement>("[data-result-viewport]");
+    this.resultSurface = root.querySelector<HTMLElement>("[data-result-surface]");
+    this.resultImage = root.querySelector<HTMLImageElement>("[data-result-image]");
+    this.resultStatus = root.querySelector<HTMLElement>("[data-result-status]");
     this.zoomLevel = root.querySelector<HTMLElement>("[data-zoom-level]");
     this.statusHint = root.querySelector<HTMLElement>("[data-status-hint]");
     this.sortSelect = root.querySelector<HTMLSelectElement>("[data-strip-sort]");
@@ -744,6 +796,19 @@ class WorkspaceController {
     this.image.addEventListener("error", () => {
       this.clearGeometry();
       void this.explainPreviewFailure(this.image.src, this.activeStage);
+    });
+    this.resultImage?.addEventListener("load", () => {
+      if (this.fitPending && !this.image.naturalWidth) {
+        this.fitPending = false;
+        this.fitToPane();
+      } else {
+        this.applyResultView();
+      }
+    });
+    this.resultImage?.addEventListener("error", () => {
+      if (!this.resultImage?.getAttribute("src")) return;
+      this.resultImage.hidden = true;
+      this.setResultStatus("The result preview could not be loaded.", false);
     });
     this.updateSelectionCount();
   }
@@ -859,7 +924,7 @@ class WorkspaceController {
     this.renderControls();
     // Rendering fills in control defaults; the result is what "unchanged" means.
     this.appliedDraft = JSON.stringify(this.draft);
-    this.showPreview("input");
+    this.showPreview(this.previewMode);
     this.saveButton.disabled = !this.editable;
     this.showStatus();
   }
@@ -884,8 +949,10 @@ class WorkspaceController {
   /** A control changed the draft: no result is shown for settings that are not applied. */
   private draftEdited(): void {
     if (this.saving) return;
+    // Where only one pane fits, the edit is what to see; the result pane says why it
+    // has no result either way.
     if (this.settingsNotApplied() && this.previewMode === "result") this.showPreview("input");
-    else this.resultButton.disabled = !this.resultAvailable();
+    else this.refreshResultPane();
     this.showStatus();
   }
 
@@ -901,35 +968,29 @@ class WorkspaceController {
     );
   }
 
+  /**
+   * Show the stage: its input (with the editable overlay) and its result side by side
+   * (#206). ``mode`` picks the pane shown where only one fits (narrow screens).
+   */
   private showPreview(mode: "input" | "result"): void {
     const context = this.activeContext();
     if (!context) return;
     const state = context.state;
-    // Only a current result is shown (#205): not one of older settings or input.
+    // Worker warnings describe a current result only (#205).
     const hasResult = this.resultAvailable();
-    this.resultButton.disabled = !hasResult;
-    this.previewMode = mode === "result" && hasResult ? "result" : "input";
+    this.previewMode = mode;
     this.inputButton.setAttribute("aria-pressed", String(this.previewMode === "input"));
     this.resultButton.setAttribute("aria-pressed", String(this.previewMode === "result"));
-    this.image.alt =
-      this.previewMode === "input"
-        ? "Processing-stage input preview"
-        : "Processing-stage result preview";
+    if (this.panes) this.panes.dataset.pane = this.previewMode;
     const preview = this.url("previewUrlTemplate", context.page.id, state.stage);
-    const source = preview
-      ? this.previewMode === "result"
-        ? preview
-        : `${preview}?input=true`
-      : "";
+    const source = preview ? `${preview}?input=true` : "";
     this.image.hidden = !source;
     let url = "";
     if (source) {
       const index = STAGE_ORDER.indexOf(state.stage);
       const previousName = index > 0 ? STAGE_ORDER[index - 1] : undefined;
       let token: string;
-      if (this.previewMode === "result") {
-        token = artifactToken(state);
-      } else if (previousName) {
+      if (previousName) {
         token = artifactToken(stageFor(context.page, previousName));
       } else {
         token = context.page.work_image_token ?? "";
@@ -948,9 +1009,70 @@ class WorkspaceController {
     const warning = hasResult ? stageWorkerWarnings(state.parameters) : "";
     this.warnings.textContent = warning ? `Worker warning: ${warning}` : "";
     this.warnings.hidden = !warning;
-    this.geometryLayer.hidden = this.previewMode === "result";
+    this.updateResultPane(context.page, state);
     this.applyDeskewPreview();
     this.renderGeometry();
+  }
+
+  /**
+   * The result pane: this stage's current result. While the stage is queued or running
+   * the previous result stays, dimmed, under a spinner; without a result it says why.
+   */
+  private updateResultPane(page: WorkspacePage, state: StageState): void {
+    const image = this.resultImage;
+    if (!image) return;
+    const key = `${page.id}:${state.stage}`;
+    // While a save is in flight its settings count as applied: the job it queues
+    // dims the previous result rather than hiding it.
+    const notApplied = !this.saving && this.settingsNotApplied();
+    const message = resultPaneMessage(state, stageReadiness(page, state.stage), notApplied);
+    const busy = !notApplied && (state.status === "queued" || state.status === "running");
+    const preview = this.url("previewUrlTemplate", page.id, state.stage);
+    let url = "";
+    if (preview && !message) {
+      const token = artifactToken(state);
+      const query = token ? `v=${token}` : `revision=${state.revision}-${state.status}`;
+      url = `${preview}?${query}`;
+    }
+    if (url) {
+      this.resultKey = key;
+      if (url !== this.resultUrl) {
+        this.resultUrl = url;
+        image.src = url;
+      }
+      image.hidden = false;
+    } else if (busy && this.resultKey === key && this.resultUrl) {
+      // Being recomputed: the previous result of this page and stage stays, dimmed.
+      image.hidden = false;
+    } else if (notApplied && this.resultKey === key && this.resultUrl) {
+      // Unsaved edits: the result no longer matches them and is hidden, but kept so
+      // that saving can dim it under the spinner while the stage re-runs.
+      image.hidden = true;
+    } else {
+      // Nothing to keep: no earlier result of this page and stage, or it is stale.
+      this.resultUrl = "";
+      this.resultKey = "";
+      image.removeAttribute("src");
+      image.hidden = true;
+    }
+    this.resultPane?.classList.toggle("busy", busy);
+    this.setResultStatus(message, busy);
+  }
+
+  /** Re-derive the active stage's result pane, e.g. after another stage changed. */
+  private refreshResultPane(): void {
+    const context = this.activeContext();
+    if (context) this.updateResultPane(context.page, context.state);
+  }
+
+  private setResultStatus(message: string, busy: boolean): void {
+    const status = this.resultStatus;
+    if (!status) return;
+    status.hidden = !message;
+    const spinner = status.querySelector<HTMLElement>("[data-result-spinner]");
+    if (spinner) spinner.hidden = !busy;
+    const text = status.querySelector<HTMLElement>("[data-result-message]");
+    if (text) text.textContent = message;
   }
 
   private updateActivePreview(state: StageState, previous?: StageState): void {
@@ -958,34 +1080,35 @@ class WorkspaceController {
     const justCompleted =
       state.status === "success" &&
       (previous?.status !== "success" || previous.revision !== state.revision);
-    if (state.stage === "deskew") {
-      // The input view already shows the rotation live; stay there and show the result.
-      this.showPreview(this.previewMode);
-      this.syncDeskewControls();
-      if (justCompleted) this.setMessage(deskewResultText(state.parameters), "success");
+    const page = this.pages.get(state.scan_page_id);
+    // The result pane always follows the stage; the input pane and its overlay are
+    // left alone while the member drags on them.
+    if (
+      this.dewarpOverlay?.isDragging() === true ||
+      this.contentOverlay?.isDragging() === true ||
+      this.deskewOverlay?.isDragging() === true
+    ) {
+      if (page) this.updateResultPane(page, state);
       return;
     }
-    if (state.stage === "dewarping") {
-      if (this.dewarpOverlay?.isDragging()) return;
-      this.showPreview(this.previewMode);
+    // On narrow screens a finished run brings the result pane forward.
+    this.showPreview(justCompleted ? "result" : this.previewMode);
+    if (state.stage === "deskew") {
+      this.syncDeskewControls();
+      if (justCompleted) this.setMessage(deskewResultText(state.parameters), "success");
+    } else if (state.stage === "dewarping") {
       const result = this.controls.querySelector<HTMLElement>("[data-dewarp-result]");
       if (result && state.status === "success") result.textContent = describeDewarp(state.parameters);
       if (justCompleted) this.setMessage(describeDewarp(state.parameters), "success");
-      return;
-    }
-    if (state.stage === "select_content") {
-      // The input view shows the content box; keep it unless a drag is in progress.
-      if (this.contentOverlay?.isDragging()) return;
-      this.showPreview(this.previewMode);
+    } else if (state.stage === "select_content") {
       this.updateContentText();
       if (justCompleted) {
         const box = this.contentBox();
         this.setMessage(describeContent(state.parameters, box, this.contentDpi()), "success");
       }
-      return;
+    } else if (justCompleted) {
+      this.setMessage("Completed. Result preview is ready.", "success");
     }
-    this.showPreview(justCompleted ? "result" : this.previewMode);
-    if (justCompleted) this.setMessage("Completed. Result preview is ready.", "success");
   }
 
   private markActiveControls(): void {
@@ -1122,12 +1245,7 @@ class WorkspaceController {
   }
 
   private deskewEditing(): boolean {
-    return (
-      this.editable &&
-      this.activeStage === "deskew" &&
-      this.previewMode === "input" &&
-      !this.image.hidden
-    );
+    return this.editable && this.activeStage === "deskew" && !this.image.hidden;
   }
 
   /**
@@ -1148,6 +1266,8 @@ class WorkspaceController {
     }
     const result = this.controls.querySelector<HTMLElement>("[data-deskew-result]");
     if (result) result.textContent = `${describeAngle(rounded)} (manual, not saved yet).`;
+    // Where only one pane fits, the page being turned is the one to see.
+    if (this.previewMode === "result") this.showPreview("input");
     this.applyDeskewPreview();
     if (commit) this.scheduleDeskewCommit();
   }
@@ -1198,8 +1318,7 @@ class WorkspaceController {
 
   /** Turn the input preview by the current angle and place the grid and handles. */
   private applyDeskewPreview(): void {
-    const active =
-      this.activeStage === "deskew" && this.previewMode === "input" && !this.image.hidden;
+    const active = this.activeStage === "deskew" && !this.image.hidden;
     if (!active || !this.viewport || !this.image.naturalWidth) {
       this.image.style.transform = "";
       if (this.deskewOverlay) this.deskewOverlay.element.style.display = "none";
@@ -1708,7 +1827,6 @@ class WorkspaceController {
 
   private renderGeometry(): void {
     this.clearGeometry();
-    if (this.previewMode === "result") return;
     if (!this.image.complete || !this.image.naturalWidth || this.image.hidden) return;
     const source = this.sourceSize();
     const display = this.displaySize();
@@ -1768,9 +1886,8 @@ class WorkspaceController {
     for (const interaction of this.interactions) interaction.unset();
     this.interactions = [];
     // Keep the persistent overlays (and any drag on them); renderGeometry updates them.
-    const input = this.previewMode === "input";
-    const keepContent = input && this.activeStage === "select_content" ? this.contentOverlay : null;
-    const keepDewarp = input && this.activeStage === "dewarping" ? this.dewarpOverlay : null;
+    const keepContent = this.activeStage === "select_content" ? this.contentOverlay : null;
+    const keepDewarp = this.activeStage === "dewarping" ? this.dewarpOverlay : null;
     if (!keepContent) this.removeContentOverlay();
     if (!keepDewarp) this.removeDewarpOverlay();
     for (const child of [...this.geometryLayer.children]) {
@@ -2029,7 +2146,7 @@ class WorkspaceController {
     if (incoming.stage !== this.activeStage) {
       if (incoming.stage === previousStageName(this.activeStage) && !this.isDragging())
         this.showPreview(this.previewMode);
-      else this.resultButton.disabled = !this.resultAvailable();
+      else this.refreshResultPane();
       this.showStatus();
     } else if (!justCompleted) {
       this.showStatus();
@@ -2160,12 +2277,40 @@ class WorkspaceController {
     const viewport = this.viewport;
     if (!viewport) return;
     this.image.draggable = false;
+    if (this.resultImage) this.resultImage.draggable = false;
+    // Both panes share one view (#206): zooming or panning either moves both.
+    for (const pane of [viewport, this.resultViewport]) {
+      if (pane) this.bindPanZoom(pane, pane === viewport);
+    }
+    const zoomButton = (selector: string, action: () => void): void => {
+      this.root.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", action);
+    };
+    const centre = (): { x: number; y: number } => {
+      const extent = this.paneExtent();
+      return { x: extent.width / 2, y: extent.height / 2 };
+    };
+    zoomButton("[data-zoom-in]", () => {
+      this.view = zoomAt(this.view, 1.25, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-out]", () => {
+      this.view = zoomAt(this.view, 0.8, centre());
+      this.applyView();
+    });
+    zoomButton("[data-zoom-fit]", () => this.fitToPane());
+    zoomButton("[data-zoom-actual]", () => {
+      this.view = zoomAt(this.view, 1 / this.view.zoom, centre());
+      this.applyView();
+    });
+  }
+
+  private bindPanZoom(viewport: HTMLElement, input: boolean): void {
     viewport.addEventListener(
       "wheel",
       (event) => {
         if (event.ctrlKey) {
           // Upstream deskew: Ctrl+wheel rotates, Ctrl+Shift+wheel rotates finely.
-          if (this.deskewEditing()) {
+          if (input && this.deskewEditing()) {
             event.preventDefault();
             const angle = wheelAngle(this.deskewAngle(), event);
             if (angle !== null) {
@@ -2211,42 +2356,35 @@ class WorkspaceController {
     };
     viewport.addEventListener("pointerup", end);
     viewport.addEventListener("pointercancel", end);
-    const zoomButton = (selector: string, action: () => void): void => {
-      this.root.querySelector<HTMLButtonElement>(selector)?.addEventListener("click", action);
-    };
-    const centre = (): { x: number; y: number } => ({
-      x: viewport.clientWidth / 2,
-      y: viewport.clientHeight / 2,
-    });
-    zoomButton("[data-zoom-in]", () => {
-      this.view = zoomAt(this.view, 1.25, centre());
-      this.applyView();
-    });
-    zoomButton("[data-zoom-out]", () => {
-      this.view = zoomAt(this.view, 0.8, centre());
-      this.applyView();
-    });
-    zoomButton("[data-zoom-fit]", () => this.fitToPane());
-    zoomButton("[data-zoom-actual]", () => {
-      this.view = zoomAt(this.view, 1 / this.view.zoom, centre());
-      this.applyView();
-    });
+  }
+
+  /** Size of a pane; both have the same size, but one may be hidden (narrow screens). */
+  private paneExtent(): { width: number; height: number } {
+    for (const pane of [this.viewport, this.resultViewport]) {
+      if (pane && pane.clientWidth > 0) {
+        return { width: pane.clientWidth, height: pane.clientHeight };
+      }
+    }
+    return { width: 0, height: 0 };
   }
 
   private fitToPane(): void {
-    if (!this.viewport || !this.image.naturalWidth) {
+    // Fit the input; the result alone when the input preview is not available.
+    const image = this.image.naturalWidth ? this.image : this.resultImage;
+    if (!this.viewport || !image?.naturalWidth) {
       this.renderGeometry();
       return;
     }
-    this.view = fitView(
-      { width: this.viewport.clientWidth, height: this.viewport.clientHeight },
-      { width: this.image.naturalWidth, height: this.image.naturalHeight },
-    );
+    this.view = fitView(this.paneExtent(), {
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+    });
     this.applyView();
   }
 
   /** Lay the image out at ``natural * zoom`` and translate it; redraw overlays if resized. */
   private applyView(resized = true): void {
+    this.applyResultView();
     if (!this.surface || !this.image.naturalWidth) {
       if (resized) this.renderGeometry();
       return;
@@ -2257,6 +2395,23 @@ class WorkspaceController {
     if (this.zoomLevel) this.zoomLevel.textContent = `${Math.round(this.view.zoom * 100)} %`;
     this.applyDeskewPreview();
     if (resized) this.renderGeometry();
+  }
+
+  /** The result at the input's zoom, centred where the input is, for comparison. */
+  private applyResultView(): void {
+    const image = this.resultImage;
+    if (!image || !this.resultSurface || !image.naturalWidth) return;
+    const zoom = this.view.zoom;
+    const width = image.naturalWidth * zoom;
+    const height = image.naturalHeight * zoom;
+    const inputWidth = this.image.naturalWidth ? this.image.naturalWidth * zoom : width;
+    const inputHeight = this.image.naturalHeight ? this.image.naturalHeight * zoom : height;
+    const x = this.view.x + (inputWidth - width) / 2;
+    const y = this.view.y + (inputHeight - height) / 2;
+    image.style.width = `${Math.round(width)}px`;
+    image.style.height = `${Math.round(height)}px`;
+    this.resultSurface.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+    if (this.zoomLevel) this.zoomLevel.textContent = `${Math.round(zoom * 100)} %`;
   }
 
   // --- batch: "▶" runs a stage for every page with its own settings ---------------
@@ -2350,6 +2505,7 @@ class WorkspaceController {
 
   private disableEditor(message: string): void {
     this.image.hidden = true;
+    if (this.resultImage) this.resultImage.hidden = true;
     this.controls.replaceChildren();
     this.saveButton.disabled = true;
     this.batchButton.disabled = true;

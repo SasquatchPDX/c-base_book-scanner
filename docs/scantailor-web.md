@@ -203,10 +203,12 @@ live updates of one row update every stage of the page. Migration 0053 records t
 fingerprint of every existing successful result (nothing current re-runs) and turns
 the old `invalidated` rows into "not run".
 
-The editor's **Input** and **Result** buttons distinguish the editable source from
-the processed image. A successful run selects Result automatically, with geometry
-handles hidden; switch to Input to adjust geometry. Worker fallback warnings appear
-beside the preview even when the stage completes successfully. Updates work through
+The editor shows the editable source (**Input**, with the geometry handles) and the
+stage's current result (**Result**) side by side (#206); below 900 px a toggle picks
+one and a successful run selects Result. The result pane never shows a stale result
+as current: without a current result it gives the same reason as the status line.
+Worker fallback warnings appear beside the preview when the stage has a current
+result. Updates work through
 both live events and compatibility polling.
 
 Margins record computed dimensions as `resolved_canvas_width` and
@@ -372,8 +374,21 @@ Two pages (#195 step 3):
     line says "Settings not applied" and no result is shown for them. The status
     line is derived from the stage's state (#205): "Waiting for Select Content",
     "stale: input changed", "Failed: …";
-  - *middle*: the preview canvas. The wheel zooms around the cursor, dragging the
-    background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
+  - *middle*: the preview canvas, in two panes (#206): on the left the stage's
+    *input* with its editable overlay (deskew grid, content box, dewarp curves,
+    output zones), on the right this stage's *result*. After a run the result pane
+    updates in place without leaving the stage. Only a current result is shown
+    (#205); otherwise the pane gives the status line's reason: "Settings not
+    applied", "Queued"/"Running", "Waiting for Deskew", "Stale: input changed",
+    "Failed: …" or "Not run yet". While the stage is queued or running the result
+    the pane was showing stays, dimmed under a spinner, until the new one arrives;
+    a stale result that is not being recomputed is never shown. The input pane is
+    not reloaded while an overlay is being dragged. Both panes share zoom and pan,
+    the result centred where the input is. Below 900 px width only one pane fits:
+    an Input/Result toggle picks it, keeps the choice across pages and stages,
+    switches to the result when a run finishes and back to the input when the
+    deskew angle or another setting is edited. The wheel zooms around the cursor,
+    dragging the background pans, Fit and 1:1 reset the view. Zoom sets the image's layout size
     and pan only translates it, so overlays and their handles keep working at any
     zoom; handles capture their own pointer events. Ctrl+Wheel is reserved for
     stage gestures (deskew rotation). The image is the stage's working-resolution

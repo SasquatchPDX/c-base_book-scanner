@@ -15,6 +15,7 @@ import {
   previewIsBeingPrepared,
   previewRetryUrl,
   previousStageName,
+  resultPaneMessage,
   sourceBoxToDisplay,
   stageErrorText,
   stageReadiness,
@@ -372,6 +373,60 @@ describe("stage readiness from input fingerprints (#205)", () => {
       stages: [{ ...row("deskew", "success", "d1", "v1"), input_sha256: "v2" }],
     } as never;
     expect(stageReadiness(rescanned, "deskew").staleReason).toBe("input changed");
+  });
+});
+
+describe("result pane message (#206, from #205's derived state)", () => {
+  const state = (status: string, extra: Record<string, string> = {}) => ({
+    status,
+    last_error: "",
+    preview_storage_identifier: "",
+    output_storage_identifier: "",
+    ...extra,
+  });
+  const current = { current: true, waitingFor: null, staleReason: "" };
+  const notCurrent = { current: false, waitingFor: null, staleReason: "" };
+
+  it("is empty when the stage has a current result", () => {
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), current),
+    ).toBe("");
+    expect(resultPaneMessage(state("success"), current)).toMatch(/no result preview/);
+  });
+
+  it("gives the status line's reason when there is no current result", () => {
+    expect(resultPaneMessage(state("unknown"), notCurrent)).toMatch(/^Not run yet/);
+    expect(resultPaneMessage(state("queued"), notCurrent)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("running"), notCurrent)).toMatch(/^Running/);
+    expect(
+      resultPaneMessage(state("failed", { last_error: "cannot read image" }), notCurrent),
+    ).toBe("Failed: cannot read image");
+    expect(
+      resultPaneMessage(state("unknown"), { ...notCurrent, waitingFor: "deskew" }),
+    ).toBe("Waiting for Deskew. This stage runs when it is done.");
+    expect(
+      resultPaneMessage(state("success", { preview_storage_identifier: "p.jpg" }), {
+        ...notCurrent,
+        staleReason: "input changed",
+      }),
+    ).toBe("Stale: input changed. Save and run to update the result.");
+  });
+
+  it("never shows a result for settings that are not applied", () => {
+    const done = state("success", { preview_storage_identifier: "p.jpg" });
+    expect(resultPaneMessage(done, current, true)).toBe(
+      "Settings not applied. Save them to see this stage's result.",
+    );
+    // A failure is still reported first, as on the status line.
+    expect(resultPaneMessage(state("failed", { last_error: "boom" }), notCurrent, true)).toBe(
+      "Failed: boom",
+    );
+  });
+
+  it("puts a running job before waiting and stale", () => {
+    const stale = { current: false, waitingFor: "deskew" as const, staleReason: "input changed" };
+    expect(resultPaneMessage(state("queued"), stale)).toMatch(/^Queued/);
+    expect(resultPaneMessage(state("success"), stale)).toMatch(/^Waiting for Deskew/);
   });
 });
 

@@ -60,7 +60,11 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   const margin = page.locator("[data-stage-controls]").getByLabel("All margins (pixels)");
   await margin.fill("20");
   await expect(message).toContainText("Settings not applied");
-  await expect(page.getByRole("button", { name: "Result", exact: true })).toBeDisabled();
+  // The result pane beside the input gives the same reason (#206).
+  const result = page.locator("[data-result-image]");
+  const resultStatus = page.locator("[data-result-status]");
+  await expect(resultStatus).toContainText("Settings not applied");
+  await expect(result).toBeHidden();
 
   // Saving stores the settings; nothing runs and nothing fails.
   const saved = stagePost(page, "margins");
@@ -71,6 +75,8 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   expect(body.job).toBeNull();
   expect(body.waiting_for).toBe("deskew");
   await expect(message).toContainText("Waiting for Deskew");
+  await expect(resultStatus).toContainText("Waiting for Deskew");
+  await expect(result).toBeHidden();
   await expect(icon("margins")).toHaveAttribute("data-kind", "waiting");
   await expect(page.locator(".st-status-failed")).toHaveCount(0);
 
@@ -122,5 +128,12 @@ test("Margins edited before Deskew waits, then runs and re-runs on its own", asy
   await page.locator('[data-stage-select="margins"]').click();
   await expect(margin).toHaveValue("20");
   await expect(message).toContainText("success");
-  await expect(page.getByRole("button", { name: "Result", exact: true })).toBeEnabled();
+  // Only the current result is shown: the re-run one, not the stale one before it.
+  await expect(result).toBeVisible();
+  await expect(result).toHaveAttribute("src", /\/stages\/margins\/preview\/\?v=/);
+  await expect(result).not.toHaveAttribute(
+    "src",
+    new RegExp(`-${String(before.output_sha256).slice(0, 16)}$`),
+  );
+  await expect(resultStatus).toBeHidden();
 });

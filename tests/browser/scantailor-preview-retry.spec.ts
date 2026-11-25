@@ -42,6 +42,9 @@ test("first open of a page migrated without a working image shows its Deskew inp
   expect(statuses.at(-1)).toBe(200);
   expect(statuses.every((status) => status === 200 || status === 503)).toBe(true);
   await expect(page.locator("[data-editor-message]")).not.toHaveClass(/editor-message-error/);
+  // Deskew has not run: the result pane beside the input says so (#206).
+  await expect(page.locator("[data-result-status]")).toContainText("Not run yet");
+  await expect(page.locator("[data-result-image]")).toBeHidden();
 });
 
 test("an upload whose working image is still queued appears once it is ready", async ({
