@@ -242,14 +242,29 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     expect((await device.put(job + "/pages/0", { multipart: {
       metadata: JSON.stringify(raw), image: asImage(SCAN_PAGE_PNG),
     } })).status()).toBe(200);
-    expect((await device.put(job + "/covers/front", { multipart: {
+    // Every device write is retried once: the repeat answers 200 and stores nothing new.
+    const cover = { multipart: {
       metadata: JSON.stringify({ sha256: raw.sha256, captured_at: started }), image: asImage(SCAN_PAGE_PNG),
-    } })).status()).toBe(201);
-    expect((await device.put(job + "/metadata", { multipart: {
+    } };
+    expect((await device.put(job + "/covers/front", cover)).status()).toBe(201);
+    expect((await device.put(job + "/covers/front", cover)).status()).toBe(200);
+    const metadata = { multipart: {
       metadata: JSON.stringify(manifest.metadata_opf), opf: { name: "metadata.opf", mimeType: "application/oebps-package+xml", buffer: opf },
-    } })).status()).toBe(201);
+    } };
+    expect((await device.put(job + "/metadata", metadata)).status()).toBe(201);
+    expect((await device.put(job + "/metadata", metadata)).status()).toBe(200);
     const events = { first_line_no: 1, lines: [JSON.stringify({ type: "job", job_id: jobId })] };
     expect((await (await device.post(job + "/events", { data: events })).json()).sans_last_line_no).toBe(1);
+    expect((await (await device.post(job + "/events", { data: events })).json()).sans_last_line_no).toBe(1);
+    expect((await (await device.get(job)).json()).pages).toEqual([{ sequence_number: 0, sha256: raw.sha256, version: 1 }]);
+
+    // A manifest naming bytes serif does not hold never authorizes local deletion.
+    const wrong = { ...manifest, pages: [{ sequence_number: 0, sha256: digest(RESCAN_PAGE_PNG) }] };
+    const refused = await device.post(job + "/capture-complete", { data: wrong });
+    expect(refused.status()).toBe(409);
+    const refusal = await refused.json();
+    expect(refusal.verified).not.toBe(true);
+    expect(refusal.error).toMatchObject({ code: "incomplete", details: { mismatched: ["page:0"] } });
     const complete = await device.post(job + "/capture-complete", { data: manifest });
     expect(complete.status()).toBe(200);
     const verified = await complete.json();
@@ -267,9 +282,12 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     const finish = async () => {
       await runAllScanTailorStages(member);
       await member.getByRole("button", { name: "Queue finalization" }).click();
+      await expect(member).toHaveURL(/\/scan-finalizations\/[0-9a-f-]+\/$/);
       await expect(member.locator(".status-card .status")).toHaveText("Success", { timeout: 30_000 });
+      const receipt = await (await member.request.get(new URL(member.url()).pathname)).json();
+      return receipt.cleaned_variant_id as number;
     };
-    await finish();
+    const firstPDF = await finish();
     await member.goto(verified.portal_url);
     await member.getByPlaceholder("Why is a rescan needed?").fill("Retake the lower margin");
     await member.getByRole("button", { name: "Request rescan" }).click();
@@ -297,16 +315,26 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     expect(next.active_version.version).toBe(2);
     await member.goto(verified.portal_url);
     await expect(member.locator("[data-raw-scan]")).toContainText("re-finish needed");
-    await finish();
+    const refinishedPDF = await finish();
+    expect(refinishedPDF).toEqual(expect.any(Number));
+    expect(refinishedPDF).not.toBe(firstPDF);
     const finished = await (await member.request.get(detailsURL)).json();
     expect(finished.state).toBe("complete");
     await member.goto("/library/books/" + finished.book_id + "/");
     const downloadable = member.locator(".variant-list > div").filter({ has: member.getByText("PDF", { exact: true }) });
+    const link = downloadable.getByRole("link", { name: "Download" });
+    // The member downloads the re-finished PDF built from the replacement, not the first one.
+    const href = new URL((await link.getAttribute("href"))!, member.url());
+    expect(href.searchParams.get("variant_id")).toBe(String(refinishedPDF));
     const pending = member.waitForEvent("download");
-    await downloadable.getByRole("link", { name: "Download" }).click();
+    await link.click();
     const download = await pending;
     const path = await download.path();
     expect((await readFile(path!)).subarray(0, 5).toString()).toBe("%PDF-");
+    const status = await (await device.get(job)).json();
+    expect(status).toMatchObject({ state: "complete", open_rescans: 0 });
+    expect(status.note).toBeUndefined();
+    expect(status.pages).toEqual([{ sequence_number: 0, sha256: digest(RESCAN_PAGE_PNG), version: 2 }]);
   } finally {
 
     await memberContext.close();
