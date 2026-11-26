@@ -327,6 +327,8 @@ The Margins stage is the pipeline's one cross-page dependency.
   It is not stored on the job. A page counts once its Select Content has a result;
   while that result is re-run, the previous one keeps counting until it is replaced,
   so a re-run on one page does not make every other page stale meanwhile.
+  A page declared blank (#219) never counts: its Margins renders a white page of
+  the common size instead, so a noisy blank page cannot enlarge every other page.
 - **Part of the input fingerprint (#205).** For a page aligned with the others,
   `stage_input_fingerprint` of its Margins row is a sha256 of the predecessor's
   `output_sha256` and the aggregate fingerprint
@@ -611,6 +613,21 @@ cancels open or claimed rescans, and a new raw version clears the declaration.
 Changing a declaration after finalization marks previous library derivatives
 stale and returns the job to **re-finish needed**.
 
+The declaration is stored as `ScanPage.page_disposition` (#219), one of `normal`,
+`blank` and `excluded`. Only `blank` is built: a blank page stays a real page of the
+book, so the PDF keeps it and printed page numbers stay aligned. `excluded` (a
+duplicate shot, a hand, a calibration frame: not part of the book, dropped from the
+PDF) is reserved for later and refused by the API for now. Detection never sets the
+disposition; Select Content's "no content" result only suggests it.
+
+`POST /scan/jobs/{job}/pages/{page}/blank/` takes `{"disposition": "blank" | "normal"}`
+(or the older `{"declared_blank": true | false}`), the `version_id` of the active raw
+version the reviewer saw, and the page's current stage `revisions`. A changed raw
+version or any stale revision answers 409. Each change writes a
+`ScanPageDispositionEvent` (page, raw version, actor, previous and new disposition,
+reason `declared`, or `raw_version_replaced` without an actor when a rescan cleared
+it) and bumps the revision of every stage row of the page.
+
 ## Browser workspace
 
 Two pages (#195 step 3):
@@ -738,6 +755,9 @@ parameters.
 - `POST /scan/jobs/<job_id>/stages/<stage>/batch/` — apply parameters to selected
   page IDs or all pages, optionally preserving manual exceptions; every applied page
   reports its `waiting_for`, and `jobs` lists only the jobs actually queued.
+- `POST /scan/jobs/<job_id>/pages/<page_id>/blank/` — declare or clear a blank page
+  (#219, see [Declared blank pages](#declared-blank-pages)); `409` on a stale
+  revision or raw version, `400` for `excluded`.
 
 Every stage row carries `applied_input_sha256`, `applied_revision`,
 `settings_applied` and, for Deskew, `input_sha256` (the active version's checksum),
