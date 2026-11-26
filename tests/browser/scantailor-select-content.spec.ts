@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { openJobWithPages } from "./scan-helpers";
+
 async function signIn(page: Page): Promise<void> {
   await page.goto("/accounts/login/");
   await page.getByLabel("LDAP username").fill("fry");
@@ -43,18 +45,9 @@ test("auto draws the detected content box and dragging an edge makes it manual",
 }) => {
   test.setTimeout(90_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Content box");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "page.png",
-    mimeType: "image/png",
-    buffer: await textPage(page),
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  await openJobWithPages(page, "Content box", [
+    { name: "page.png", buffer: await textPage(page) },
+  ]);
 
   // Opening the editor runs Deskew (#209); Select Content reads its result and then
   // runs on its own (#205).

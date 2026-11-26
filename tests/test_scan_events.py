@@ -485,7 +485,7 @@ def test_unknown_types_are_stored_only(job: ScanJob, post: Any) -> None:
     ]
 
 
-def test_workspace_shows_completeness_flags_and_printed_numbers(job: ScanJob, post: Any) -> None:
+def test_editor_shows_completeness_flags_and_printed_numbers(job: ScanJob, post: Any) -> None:
     _page(job, 0)
     post(
         1,
@@ -501,12 +501,16 @@ def test_workspace_shows_completeness_flags_and_printed_numbers(job: ScanJob, po
     )
     client = Client()
     client.force_login(get_or_create_profile("member").user)
-    response = client.get(f"/scan/jobs/{JOB_ID}/workspace/", HTTP_ACCEPT="text/html")
+    # The old job overview redirects to the editor (#228), which shows both.
+    overview = client.get(f"/scan/jobs/{JOB_ID}/workspace/", HTTP_ACCEPT="text/html")
+    assert overview.status_code == 302
+    response = client.get(overview["Location"])
     assert response.status_code == 200
     html = response.content.decode()
-    assert "Scanner completeness check" in html
+    assert "Scanner completeness check: 1 possible gap" in html
     assert "expected +1" in html
-    assert "printed xiv" in html
+    # The page strip shows the printed number from the page data.
+    assert '"recognized_page_number": "xiv"' in html
 
 
 # --- serif events and the rendered file ---------------------------------------------------------

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import { openJobWithPages } from "./scan-helpers";
+
 // tests/browser_fixtures.py: seed_migrated_scan_page (a 120×90 page without a working image).
 const MIGRATED_JOB_ID = "6f1d2b3c-0195-4a50-8b7e-000000000050";
 
@@ -73,18 +75,7 @@ test("an upload whose working image is still queued appears once it is ready", a
     }
     await route.continue();
   });
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Delayed working image");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "blank.png",
-    mimeType: "image/png",
-    buffer: PAGE,
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
+  await openJobWithPages(page, "Delayed working image", [{ name: "blank.png", buffer: PAGE }]);
 
   const message = page.locator("[data-editor-message]");
   await expect(message).toContainText("still being prepared");

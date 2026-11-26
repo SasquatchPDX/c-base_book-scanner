@@ -3,6 +3,7 @@ import interact from "interactjs";
 import {
   applyClick,
   neighbour,
+  pageMarkers,
   PageStrip,
   sortItems,
   type SortMode,
@@ -110,11 +111,21 @@ interface WorkspacePage {
   logical_sequence_number: number;
   side: string;
   recognized_page_number?: string | null;
+  /** Open or claimed rescan requests (#228). */
   open_rescan_todos?: number;
+  /** The scanner's page-number check of the active version; false only for a doubtful rescan. */
+  page_number_verified?: boolean | null;
   thumbnail?: string;
   /** Token of the first stage's input (the working image); empty while it is generated. */
   work_image_token?: string;
   stages: StageState[];
+}
+
+/** Rescan markers of one page, sent with live updates when the job's rescans change (#228). */
+export interface PageMarkerUpdate {
+  id: string;
+  open_rescan_todos: number;
+  page_number_verified: boolean | null;
 }
 
 interface WorkspaceEvent {
@@ -123,6 +134,7 @@ interface WorkspaceEvent {
   updated_at: string;
   refinish_needed: boolean;
   stages: StageState[];
+  pages?: PageMarkerUpdate[];
 }
 
 interface WorkspaceStateDelta {
@@ -130,6 +142,72 @@ interface WorkspaceStateDelta {
   state: string;
   refinish_needed: boolean;
   stages: StageState[];
+  pages?: PageMarkerUpdate[];
+}
+
+/** One reason why finish is refused, with the pages it concerns (#228). */
+export interface FinishBlocker {
+  kind: "no_pages" | "open_rescans" | "missing_output";
+  message: string;
+  pageIds: string[];
+}
+
+function pageLabel(page: Pick<WorkspacePage, "logical_sequence_number" | "side">): string {
+  const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
+  return `${page.logical_sequence_number}${side}`;
+}
+
+function pageList(pages: Pick<WorkspacePage, "logical_sequence_number" | "side">[]): string {
+  const shown = pages.slice(0, 10).map(pageLabel).join(", ");
+  return pages.length > 10 ? `${shown} and ${pages.length - 10} more` : shown;
+}
+
+/**
+ * Why finish would be refused, as the server checks it (``scan_pipeline``): no pages,
+ * open or claimed rescans (finish waits for the replacements), or pages without a
+ * current Output result (a page declared blank needs its Margins result). The server
+ * stays authoritative; this only explains the refusal before the request.
+ */
+export function finishBlockers(
+  pages: Pick<
+    WorkspacePage,
+    "id" | "logical_sequence_number" | "side" | "open_rescan_todos" | "stages"
+  >[],
+): FinishBlocker[] {
+  if (pages.length === 0) {
+    return [{ kind: "no_pages", message: "The job has no pages yet.", pageIds: [] }];
+  }
+  const blockers: FinishBlocker[] = [];
+  const rescans = pages.filter((page) => (page.open_rescan_todos ?? 0) > 0);
+  if (rescans.length) {
+    blockers.push({
+      kind: "open_rescans",
+      message: `${rescans.length} page(s) wait for a requested rescan: ${pageList(rescans)}.`,
+      pageIds: rescans.map((page) => page.id),
+    });
+  }
+  const missing = pages.filter((page) => {
+    const blank = page.stages.some(
+      (state) => state.stage === STAGE_ORDER[0] && state.skip_reason === "declared_blank",
+    );
+    return !stageReadiness(page, blank ? "margins" : "output").current;
+  });
+  if (missing.length) {
+    blockers.push({
+      kind: "missing_output",
+      message: `${missing.length} page(s) have no current Output result: ${pageList(missing)}.`,
+      pageIds: missing.map((page) => page.id),
+    });
+  }
+  return blockers;
+}
+
+/** The request body of finish (#228): always a cleaned variant, OCR on request. */
+export function finishRequestBody(autoOcr: boolean, language: string): Record<string, unknown> {
+  const body: Record<string, unknown> = { create_cleaned_variant: true, auto_ocr: autoOcr };
+  const trimmed = language.trim();
+  if (autoOcr && trimmed) body.language = trimmed;
+  return body;
 }
 
 interface PipelineRun {
@@ -901,7 +979,8 @@ class WorkspaceController {
 
   start(): void {
     this.bindWorkspaceControls();
-    // The job overview links "Edit" as ?page=<id>&stage=<stage>.
+    // Links open a page and stage as ?page=<id>&stage=<stage> (the retired job overview
+    // redirects here with ?page=, #228).
     const query = new URLSearchParams(window.location.search);
     const requestedPage = query.get("page") ?? "";
     const requestedStage = query.get("stage") ?? "";
@@ -919,6 +998,7 @@ class WorkspaceController {
 
   private bindWorkspaceControls(): void {
     this.bindPipelineActions();
+    this.bindFinish();
     this.root.querySelector("[data-toggle-blank]")?.addEventListener("click", () => {
       void this.toggleBlank();
     });
@@ -983,6 +1063,142 @@ class WorkspaceController {
       this.setResultStatus("The result preview could not be loaded.", false);
     });
     this.updateSelectionCount();
+  }
+
+  /**
+   * Finish (#228), formerly on the job overview: a confirmation dialog that explains
+   * a refusal (pages without Output, open rescans) before and after the request, then
+   * goes to the finalization status like the overview did. Without a library book the
+   * server starts identification instead, and the editor goes to its review.
+   */
+  private bindFinish(): void {
+    const open = this.root.querySelector<HTMLButtonElement>("[data-finish-open]");
+    const dialog = this.root.querySelector<HTMLDialogElement>("[data-finish-dialog]");
+    const form = dialog?.querySelector<HTMLFormElement>("[data-finish-form]");
+    const endpoint = this.root.dataset.finishUrl;
+    if (!open || !dialog || !form || !endpoint) return;
+    const blockersBox = element<HTMLElement>(dialog, "[data-finish-blockers]");
+    const blockerList = element<HTMLUListElement>(blockersBox, "ul");
+    const error = element<HTMLElement>(dialog, "[data-finish-error]");
+    const confirm = element<HTMLButtonElement>(dialog, "[data-finish-confirm]");
+    const ocr = element<HTMLInputElement>(dialog, "[data-finish-ocr]");
+    const language = element<HTMLInputElement>(dialog, "[data-finish-ocr-language]");
+    let posting = false;
+
+    const showBlockers = (blockers: FinishBlocker[]): void => {
+      blockerList.replaceChildren(
+        ...blockers.map((blocker) => {
+          const item = document.createElement("li");
+          item.dataset.finishBlocker = blocker.kind;
+          item.append(blocker.message);
+          const first = blocker.pageIds[0];
+          if (first) {
+            const go = document.createElement("button");
+            go.type = "button";
+            go.className = "secondary small-button";
+            go.textContent = "Show page";
+            go.addEventListener("click", () => {
+              dialog.close();
+              this.activate(first, blocker.kind === "missing_output" ? "output" : this.activeStage);
+            });
+            item.append(" ", go);
+          }
+          return item;
+        }),
+      );
+      blockersBox.hidden = blockers.length === 0;
+      confirm.disabled = posting || blockers.length > 0;
+    };
+    const showError = (message: string): void => {
+      error.textContent = message;
+      error.hidden = !message;
+    };
+    language.disabled = !ocr.checked;
+    ocr.addEventListener("change", () => {
+      language.disabled = !ocr.checked;
+    });
+
+    open.addEventListener("click", () => {
+      if (!this.editable) return;
+      showError("");
+      showBlockers(finishBlockers([...this.pages.values()]));
+      dialog.showModal();
+    });
+    dialog.querySelector("[data-finish-cancel]")?.addEventListener("click", () => dialog.close());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void submit();
+    });
+
+    const submit = async (): Promise<void> => {
+      if (posting || confirm.disabled) return;
+      posting = true;
+      confirm.disabled = true;
+      showError("");
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrfToken(),
+          },
+          body: JSON.stringify(finishRequestBody(ocr.checked, language.value)),
+        });
+        const text = await response.text();
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          payload = { error: text };
+        }
+        if (!response.ok) {
+          const missing = Array.isArray(payload.missing_pages)
+            ? (payload.missing_pages as unknown[]).map(String)
+            : [];
+          const pages = missing
+            .map((id) => this.pages.get(id))
+            .filter((page): page is WorkspacePage => page !== undefined);
+          if (pages.length) {
+            posting = false;
+            showBlockers([
+              {
+                kind: "missing_output",
+                message: `${pages.length} page(s) have no current Output result: ${pageList(pages)}.`,
+                pageIds: pages.map((page) => page.id),
+              },
+            ]);
+          }
+          showError(
+            typeof payload.error === "string" && payload.error
+              ? `The server refused to finish: ${payload.error}`
+              : `The server refused to finish (HTTP ${response.status}).`,
+          );
+          return;
+        }
+        const finalization = payload.finalization_job as { job_id?: string } | undefined;
+        const identification = payload.identification_job as
+          | { job_id?: string; review_task_id?: number | null }
+          | undefined;
+        let next = "";
+        if (finalization?.job_id) {
+          next = this.url("finalizationUrlTemplate", finalization.job_id);
+        } else if (identification?.review_task_id) {
+          next = this.url("reviewUrlTemplate", String(identification.review_task_id));
+        } else if (identification?.job_id) {
+          next = this.url("identificationUrlTemplate", identification.job_id);
+        }
+        if (next) window.location.assign(next);
+        else dialog.close();
+      } catch (failure) {
+        showError(failure instanceof Error ? failure.message : "Could not finish the scan.");
+      } finally {
+        posting = false;
+        // A refusal with pages to fix keeps the button off; any other failure may be retried.
+        confirm.disabled = !blockersBox.hidden;
+      }
+    };
   }
 
   private bindPipelineActions(): void {
@@ -1313,15 +1529,37 @@ class WorkspaceController {
     const url = this.url("rescanUrlTemplate", page.id);
     const button = this.root.querySelector<HTMLButtonElement>("[data-request-rescan]");
     if (!url || !button || button.disabled) return;
+    // The same request as the scanner's todo list expects (#228): a reason for the
+    // operator, confirmed in a dialog.
+    const dialog = this.root.querySelector<HTMLDialogElement>("[data-rescan-dialog]");
+    const reasonInput = dialog?.querySelector<HTMLTextAreaElement>("[data-rescan-reason]");
+    let reason = "";
+    if (dialog && reasonInput) {
+      const label = dialog.querySelector<HTMLElement>("[data-rescan-page]");
+      if (label) label.textContent = pageLabel(page);
+      reasonInput.value = "";
+      dialog.returnValue = "";
+      dialog.showModal();
+      await new Promise<void>((resolve) =>
+        dialog.addEventListener("close", () => resolve(), { once: true }),
+      );
+      if (dialog.returnValue !== "confirm") return;
+      reason = reasonInput.value.trim();
+    }
     button.disabled = true;
     try {
       const response = await fetch(url, {
         method: "POST",
         credentials: "same-origin",
-        headers: { "X-CSRFToken": csrfToken() },
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken(),
+        },
+        body: JSON.stringify({ reason }),
       });
       if (!response.ok) throw new Error(await response.text());
-      page.open_rescan_todos = 1;
+      page.open_rescan_todos = Math.max(1, page.open_rescan_todos ?? 0);
       this.strip?.update(this.stripItem(page));
       this.showStatus();
       if (this.activePageId === page.id) this.setMessage("Rescan requested.", "info");
@@ -2922,12 +3160,12 @@ class WorkspaceController {
       // Working image still being generated: the full page thumbnail renders the scan.
       thumbnailUrl = page.thumbnail ?? "";
     }
-    const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
     const printed = page.recognized_page_number ? `p. ${page.recognized_page_number}` : "";
     const size = stageSize(page, this.activeStage);
     return {
       id: page.id,
-      label: `${page.logical_sequence_number}${side}`,
+      label: pageLabel(page),
+      markers: pageMarkers(page),
       caption: blank
         ? "Declared blank"
         : (page.open_rescan_todos ?? 0) > 0
@@ -3209,6 +3447,7 @@ class WorkspaceController {
       this.eventSource.addEventListener("workspace", (event) => {
         const payload = JSON.parse((event as MessageEvent<string>).data) as WorkspaceEvent;
         this.updateJobActions(payload.state, payload.refinish_needed);
+        if (payload.pages) this.mergePageMarkers(payload.pages);
         for (const state of payload.stages) this.mergeStage(state);
       });
       this.eventSource.addEventListener("error", () => {
@@ -3234,11 +3473,32 @@ class WorkspaceController {
       if (!response.ok) return;
       const payload = (await response.json()) as WorkspaceStateDelta;
       this.updateJobActions(payload.state, payload.refinish_needed);
+      if (payload.pages) this.mergePageMarkers(payload.pages);
       for (const state of payload.stages) this.mergeStage(state);
       this.pollCursor = payload.cursor;
     } catch {
       this.liveStatus.textContent = "Workspace refresh failed; retrying…";
     }
+  }
+
+  /** Rescan markers from another editor, the scanner or a replacement (#228). */
+  private mergePageMarkers(updates: PageMarkerUpdate[]): void {
+    let activeChanged = false;
+    for (const update of updates) {
+      const page = this.pages.get(update.id);
+      if (!page) continue;
+      if (
+        (page.open_rescan_todos ?? 0) === update.open_rescan_todos &&
+        (page.page_number_verified ?? null) === update.page_number_verified
+      ) {
+        continue;
+      }
+      page.open_rescan_todos = update.open_rescan_todos;
+      page.page_number_verified = update.page_number_verified;
+      this.strip?.update(this.stripItem(page));
+      if (page.id === this.activePageId) activeChanged = true;
+    }
+    if (activeChanged) this.showStatus();
   }
 
   private updateJobActions(state: string, refinish: boolean): void {

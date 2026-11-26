@@ -630,15 +630,17 @@ it) and bumps the revision of every stage row of the page.
 
 ## Browser workspace
 
-Two pages (#195 step 3):
+One page per job (#195 step 3, #228):
 
-- **Job overview** (`/scan/jobs/{id}/workspace/`): metadata, identification,
-  uploads, rescans, finishing, and one card per page with server-rendered stage
-  statuses and Run forms, so it works without JavaScript. "Open ScanTailor editor"
-  and each stage's "Edit" link open the editor (`?page=<id>&stage=<stage>`).
-- **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. It
-  fills the browser viewport with three columns. Use **Request rescan** on a page
-  or **Finish clean page set** to start the existing finalization workflow:
+- **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. The
+  job list, raw scans, the scanner's QR code (`/j/{id}`) and every redirect after a
+  form post open it; `?page=<id>&stage=<stage>` opens a page and stage. It fills the
+  browser viewport with three columns. **Request rescan** and **Finish…** (see
+  "Rescan and finish in the editor" below) replace the old job overview:
+  - *header*: the job title, a link to the library book once one is linked, "Raw
+    scan" for a `captured` job, the scanner's completeness check (gaps in the printed
+    page numbers) when it found any, "Re-finish needed", **Finish…** while the job
+    can be finished, and a link to the last finalization's status;
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
     batch processing"). A stage batch starts only that stage and reruns any
@@ -686,7 +688,70 @@ Two pages (#195 step 3):
     Select Content, output size otherwise). Click selects a page, Ctrl/Cmd-click
     toggles, Shift-click selects a range; Home, End, PgUp (or Q), PgDown (or W) and
     the arrow keys move between pages, and "Keep current page in view" scrolls the
-    strip along (upstream ThumbnailSequence and MainWindow behaviour).
+    strip along (upstream ThumbnailSequence and MainWindow behaviour). Two badges
+    on the thumbnail mark pages that need attention (#228): **Rescan** (a rescan is
+    requested or claimed by the scanner: work on the page is lost when the
+    replacement arrives) and **Page no.?** (the active version is a rescan whose
+    printed page number the scanner's OCR could not confirm and the operator kept
+    anyway, `page_number_verified: false`: check that it is the right page). There is
+    no badge for a verified page number; it calls for no action.
+
+The **old job overview** (`/scan/jobs/{id}/workspace/`) is retired (#228). Its
+per-page stage grid duplicated the editor; its upload form is not needed (the
+scanner uploads pages; generic clients use `POST /scan/jobs/{id}/pages/`); the
+manual "Resolve book identity" form is replaced by the automatic step of #227, and
+the scanner metadata moves to the job list (#227). The URL keeps working: an HTML
+request redirects to the editor (keeping a `?page=` UUID), a JSON request still
+answers the page and stage state.
+
+### Rescan and finish in the editor
+
+**Request rescan** (canvas toolbar) asks for a reason in a dialog and posts it as
+JSON to `POST /scan/pages/{page_id}/rescan/` with the CSRF header: the same
+`ScanTodo` (type `rescan`) the old overview form created, with the same
+permission check (an active member, the job in `open`, `capturing`, `paused`,
+`captured` or `complete`) and, for a scanner job, the `rescan_flag` line in
+`scan.jsonl`. A page with an open request cannot be requested again (the button
+reads "Rescan requested"), and a page declared blank cannot be requested at all.
+Other open editors see the marker without reloading: whenever the job's rescan
+todos change (a request, the scanner's claim, a replacement completing it) the
+workspace event stream, and the polling fallback, carry `pages` with every page's
+`open_rescan_todos` and `page_number_verified`. The todo token is part of the job
+row query, so an idle tick costs no extra query.
+
+**Finish…** (left column, while the job is `open`, `capturing`, `paused` or
+`captured`) opens a confirmation dialog and then posts to
+`POST /scan/jobs/{id}/finish/`, the same view the overview used, with
+`create_cleaned_variant: true`, `auto_ocr` from "Submit cleaned PDF to OCR" and an
+optional OCR `language` (engine and model stay the server's defaults). The dialog
+says what happens to the library book: it is the linked Book, or the Book linked or
+created from the scanner's OPF, or, when neither exists, finish starts the
+bibliographic identification and the editor goes to its review (finish again once
+the book is identified). It says why finish is refused before sending anything,
+from the editor's live page data:
+
+- pages without a current Output result (a page declared blank needs its Margins
+  result); a stale result does not count, as on the server;
+- pages with an open or claimed rescan;
+- no pages at all.
+
+Each reason names the pages (the first ten) and has a "Show page" button. The
+server stays authoritative: its refusal (`400` with `error` and, for missing
+output, `missing_pages`) is shown in the dialog. On success the editor goes to the
+finalization status page (`/scan-finalizations/{id}/`), where packaging and the
+optional OCR run in workers; the editor header links the last finalization.
+
+*Decision: finish is blocked while rescans are open.* `scan_pipeline` refuses
+finish while any `ScanTodo` is `open` or `claimed` ("outstanding scan todos must be
+resolved"), and #228 keeps that. A requested rescan says the page is wrong;
+finishing would put the wrong page into the library and the replacement would
+immediately make the book stale again (re-finish needed). To finish without the
+replacement, cancel the rescan (`POST /scan/todos/{id}/cancel/`) or declare the page
+blank, which cancels it.
+
+What finish should ultimately trigger (OCR with a local AI model on the c-base
+production machine, and which OCR options are the defaults) is not designed yet;
+#228 only moves today's finalization into the editor.
 
 **Deskew** (upstream `deskew::ImageView` and `OptionsWidget`): the input preview turns
 live in the browser (a CSS rotation about the page centre) while the angle changes;
@@ -740,10 +805,15 @@ parameters.
 
 ## HTTP contracts
 
-- `GET /scan/jobs/<job_id>/workspace/` — HTML workspace or JSON page/stage state.
+- `GET /scan/jobs/<job_id>/editor/` — the editor (HTML).
+- `GET /scan/jobs/<job_id>/workspace/` — JSON page/stage state; an HTML request
+  redirects to the editor (the job overview is retired, #228).
+- `GET /scan/jobs/<job_id>/workspace/state/?since=<cursor>` — polling fallback:
+  changed stage rows plus `pages` (rescan markers of every page).
 - `GET /scan/jobs/<job_id>/workspace/events/` — authenticated SSE state stream.
   The first event (including reconnects) contains all stages; later events contain
-  changed stages only. Unchanged ticks send periodic keep-alive comments without
+  changed stages only. `pages` (rescan markers) is sent on the first event and
+  whenever the job's rescan todos change (#228). Unchanged ticks send periodic keep-alive comments without
   reloading full stage models or serializing JSON. See the [300-page event polling
   measurements](measurements/scantailor-workspace-events.md) for the PostgreSQL
   fingerprint path, portable token fallback, and remaining database scan cost.

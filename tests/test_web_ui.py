@@ -113,19 +113,25 @@ def test_scan_job_list_create_and_workspace_render() -> None:
 
     assert created.status_code == 302
     job = ScanJob.objects.get(operator=profile.user)
-    assert created["Location"] == f"/scan/jobs/{job.id}/workspace/"
+    # A new job opens in the editor; the job overview is retired (#228).
+    assert created["Location"] == f"/scan/jobs/{job.id}/editor/"
 
     jobs = client.get("/scan/jobs/?view=html")
-    workspace = client.get(f"/scan/jobs/{job.id}/workspace/?view=html")
-
     assert jobs.status_code == 200
     assert b"Bench scan" in jobs.content
-    assert workspace.status_code == 200
-    assert b"ScanTailor workspace" in workspace.content
-    assert b"Upload the first page" in workspace.content
-    # The overview links the full-viewport editor (#195 step 3) instead of embedding it.
-    assert f'href="/scan/jobs/{job.id}/editor/"'.encode() in workspace.content
-    assert b"data-stage-controls" not in workspace.content
+    assert f'href="/scan/jobs/{job.id}/editor/"'.encode() in jobs.content
+    # Old overview links and bookmarks land in the editor, keeping a requested page.
+    workspace = client.get(f"/scan/jobs/{job.id}/workspace/?view=html")
+    assert workspace.status_code == 302
+    assert workspace["Location"] == f"/scan/jobs/{job.id}/editor/"
+    page_id = "6f1c1c39-1a8e-4e5e-9b8a-2a8f3f1f5e10"
+    assert (
+        client.get(f"/scan/jobs/{job.id}/workspace/?view=html&page={page_id}")["Location"]
+        == f"/scan/jobs/{job.id}/editor/?page={page_id}"
+    )
+    assert client.get(f"/scan/jobs/{job.id}/workspace/?view=html&page=../x")["Location"] == (
+        f"/scan/jobs/{job.id}/editor/"
+    )
 
     editor = client.get(f"/scan/jobs/{job.id}/editor/")
     assert editor.status_code == 200
@@ -141,3 +147,14 @@ def test_scan_job_list_create_and_workspace_render() -> None:
     assert b"core/dist/scantailor-workspace.js" in editor.content
     # Full viewport: the editor page has no site header.
     assert b'class="site-header"' not in editor.content
+    # What the overview did (#228): rescan with a reason, finish with confirmation.
+    html = editor.content.decode()
+    assert "data-rescan-dialog" in html and "data-rescan-reason" in html
+    assert "data-finish-dialog" in html and "data-finish-ocr" in html
+    assert f'data-finish-url="/scan/jobs/{job.id}/finish/"' in html
+    assert "Adds the cleaned pages to the library book “Physical Book”." in html
+    assert f'href="/library/books/{book.id}/?view=html"' in html
+    assert 'href="/scan/jobs/?view=html"' in html
+    assert "/workspace/?view=html" not in html
+    assert "data-finalization-link" not in html  # never finished
+    assert "No pages yet." in html
