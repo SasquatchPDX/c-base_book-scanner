@@ -262,7 +262,8 @@ def test_auto_records_the_box_its_physical_size_and_crops_to_it() -> None:
     params = result.parameters
     assert params["content_mode"] == "auto" and params["content_found"] is True
     box = params["content_box"]
-    assert abs(box["x1"] - 180) <= 2 and abs(box["y2"] - 1613) <= 2
+    # Auto mode pads the found box by 5 px at 150 dpi (#222).
+    assert abs(box["x1"] - 175) <= 2 and abs(box["y2"] - 1618) <= 2
     # PhysSizeCalc: pixels at 150 dpi in millimetres.
     assert params["content_size_mm"]["width"] == pytest.approx(box["width"] * 25.4 / 150, abs=0.1)
     assert params["transform"]["op"] == "crop"
