@@ -26,18 +26,34 @@
       data-page-thumbnail-template="/scan/pages/__PAGE__/thumbnail/"
       data-batch-url-template="/scan/jobs/{{ job.id }}/stages/__STAGE__/batch/"
       data-run-all-url="{% url 'scan-job-run-all' job.id %}"
+      data-finish-url="{% url 'scan-job-finish' job.id %}"
+      data-finalization-url-template="/scan-finalizations/__PAGE__/?view=html"
+      data-identification-url-template="/scan-identifications/__PAGE__/?view=html"
+      data-review-url-template="/reviews/__PAGE__/?view=html"
     >
       {% csrf_token %}
       <aside class="st-left" aria-label="Stages and options">
         <header class="st-left-header">
-          <a class="st-back" href="{% url 'scan-job-workspace' job.id %}?view=html">← Job overview</a>
+          <a class="st-back" href="{% url 'scan-jobs' %}?view=html">← Scan jobs</a>
           <h1 title="{{ job.provisional_title }}">{{ job.provisional_title|default:"Untitled scan" }}</h1>
+          {% if job.book %}<p class="st-job-line">Library book: <a href="{% url 'library-book-detail' job.book_id %}?view=html">{{ job.book.title }}</a></p>{% endif %}
+          {% if job.state == 'captured' %}<p class="st-job-line" data-raw-scan>Raw scan: joins the library after finish.</p>{% endif %}
+          {% if job.completeness_flags %}
+            <details class="st-job-line" data-completeness>
+              <summary>Scanner completeness check: {{ job.completeness_flags|length }} possible gap{{ job.completeness_flags|length|pluralize }}</summary>
+              <ul>
+                {% for flag in job.completeness_flags %}
+                  <li>{% if flag.sequence_number_range %}Captures {{ flag.sequence_number_range|join:"–" }}: {% endif %}{{ flag.detail|default:"anomaly" }}{% if flag.missing_page_numbers %} (missing {{ flag.missing_page_numbers|join:", " }}){% endif %}</li>
+                {% endfor %}
+              </ul>
+            </details>
+          {% endif %}
           <p class="review-notice" data-refinish-notice {% if not job.refinish_needed %}hidden{% endif %}>Re-finish needed</p>
-          {% if can_declare_blank %}
-            <form method="post" action="{% url 'scan-job-finish' job.id %}?view=html" data-finish-scan {% if not editable %}hidden{% endif %}>
-              {% csrf_token %}
-              <button type="submit" class="secondary">Finish clean page set</button>
-            </form>
+          <div class="st-finish" data-finish-scan {% if not editable %}hidden{% endif %}>
+            <button type="button" class="secondary" data-finish-open>Finish…</button>
+          </div>
+          {% if latest_finalization %}
+            <p class="st-job-line"><a href="{% url 'scan-finalization-job-status' latest_finalization.job_id %}?view=html" data-finalization-link>Last finish: {{ latest_finalization.get_state_display|lower }}</a></p>
           {% endif %}
         </header>
         <ol class="st-stages" aria-label="Processing stages">
@@ -101,6 +117,31 @@
             <button type="button" data-zoom-actual>1:1</button>
           </div>
         </div>
+        <dialog data-rescan-dialog aria-labelledby="rescan-dialog-title">
+          <form method="dialog">
+            <h2 id="rescan-dialog-title">Request a rescan of page <span data-rescan-page></span>?</h2>
+            <p>The scanner lists this page for its operator to capture again. The replacement keeps this page's place and settings, and its stages run again.</p>
+            <label>Reason <textarea data-rescan-reason rows="3" placeholder="Why is a rescan needed?"></textarea></label>
+            <button value="cancel" class="secondary">Cancel</button>
+            <button value="confirm" data-confirm-rescan>Request rescan</button>
+          </form>
+        </dialog>
+        <dialog data-finish-dialog aria-labelledby="finish-dialog-title">
+          <form data-finish-form>
+            <h2 id="finish-dialog-title">Finish this scan?</h2>
+            <p>{{ finish_book_hint }}</p>
+            <p>Finish builds the cleaned book from every page's Output result (a blank page from its Margins result). Packaging and the optional OCR run in workers; the next page shows their progress.</p>
+            <div class="editor-message editor-message-error" data-finish-blockers role="alert" hidden>
+              <p>Finish is not possible yet:</p>
+              <ul></ul>
+            </div>
+            <label class="checkbox"><input type="checkbox" data-finish-ocr>Submit cleaned PDF to OCR</label>
+            <label>OCR language <input data-finish-ocr-language placeholder="Server default, e.g. eng"></label>
+            <p class="editor-message editor-message-error" data-finish-error role="alert" hidden></p>
+            <button type="button" class="secondary" data-finish-cancel>Cancel</button>
+            <button type="submit" data-finish-confirm>Finish</button>
+          </form>
+        </dialog>
         <dialog data-blank-dialog>
           <form method="dialog">
             <h2>Mark this page as blank?</h2>

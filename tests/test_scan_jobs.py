@@ -302,7 +302,7 @@ def test_scan_job_html_list_counts_pages_without_serializing_them(
     def unexpected(*args: Any, **kwargs: Any) -> None:
         pytest.fail("HTML scan job list performed per-page serialization")
 
-    monkeypatch.setattr(views, "_scan_job_payload_with_open_todos", unexpected)
+    monkeypatch.setattr(views, "_scan_job_list_item", unexpected)
     monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
     response = client.get("/scan/jobs/?view=html&with_open_todos=true")
     assert response.status_code == 200
@@ -417,11 +417,9 @@ def test_pipeline_status_derivation(kwargs: dict[str, Any], label: str) -> None:
 @pytest.mark.django_db
 def test_job_pages_offer_no_manual_upload_or_identification() -> None:
     client, job = _create_scan_job("scanner-no-manual-actions")
-    overview = client.get(f"/scan/jobs/{job.pk}/workspace/?view=html").content.decode()
-    assert "Resolve book identity" not in overview
-    assert "Upload page" not in overview
-    assert "Upload the first page" not in overview
     editor = client.get(f"/scan/jobs/{job.pk}/editor/").content.decode()
+    assert "Resolve book identity" not in editor
+    assert "Upload page" not in editor
     assert "Upload the first page" not in editor
     assert "The scanner uploads the pages" in editor
 
@@ -470,6 +468,68 @@ def test_scan_job_list_query_count_does_not_grow_with_jobs_or_pages() -> None:
         _populated_job(index)
     assert count() == few
     assert few <= 12
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("with_open_todos", [False, True])
+def test_scan_job_json_list_query_count_does_not_grow_with_pages(
+    monkeypatch: pytest.MonkeyPatch, with_open_todos: bool
+) -> None:
+    """#226: the JSON list uses its prefetches and never checks page files on disk."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    client, job = _create_scan_job("scanner-list-json")
+    location, _ = StorageLocation.objects.get_or_create(
+        identifier="list-test", defaults={"base_path": "list-test"}
+    )
+
+    def add_pages(first: int, count: int) -> None:
+        for number in range(first, first + count):
+            page = ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+            for version in (1, 2):
+                ScanPageVersion.objects.create(
+                    scan_page=page,
+                    version=version,
+                    is_active=version == 2,
+                    storage_location=location,
+                    storage_identifier=f"p{number}-v{version}",
+                    checksum_sha256=f"{number:032x}{version:032x}",
+                    mime_type="image/png",
+                    size_bytes=1,
+                )
+            ScanTodo.objects.create(
+                scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN
+            )
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("JSON scan job list checked page files")
+
+    monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
+    url = "/scan/jobs/?with_open_todos=true" if with_open_todos else "/scan/jobs/"
+
+    def list_queries() -> tuple[int, dict[str, Any]]:
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(url, HTTP_ACCEPT="application/json")
+        assert response.status_code == 200
+        return len(queries), response.json()
+
+    add_pages(1, 2)
+    small, payload = list_queries()
+    add_pages(3, 8)
+    large, payload = list_queries()
+    assert large == small
+
+    item = next(item for item in payload["items"] if item["id"] == str(job.pk))
+    assert "pipeline" not in item
+    assert [page["logical_sequence_number"] for page in item["pages"]] == list(range(1, 11))
+    first = item["pages"][0]
+    assert first["active_version"]["version"] == 2
+    assert [version["version"] for version in first["available_versions"]] == [2, 1]
+    assert first["open_rescan_todos"] == 1
+    assert first["thumbnail"] == f"/scan/pages/{first['id']}/image/"
+    if with_open_todos:
+        assert item["open_rescan_todo_count"] == 10
 
 
 @pytest.mark.django_db(transaction=True)
@@ -524,9 +584,13 @@ def test_blank_page_is_audited_preserved_in_pdf_and_reset_on_replacement(
     assert all(row["skip_reason"] == "declared_blank" for row in skipped)
     assert page.todos.get().state == ScanTodo.State.CANCELLED
     assert client.post(f"/scan/pages/{page.pk}/rescan/").status_code == 400
-    event = page.blank_events.get()
+    event = page.disposition_events.get()
     assert event.actor_id == job.operator_id
-    assert not event.previous_value and event.declared_blank
+    assert (event.previous_disposition, event.disposition) == ("normal", "blank")
+    assert event.reason == "declared" and event.version_id == version.pk
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.BLANK
+    assert response.json()["page_disposition"] == "blank"
     assert (
         client.post(f"{page_url}/blank/", payload, content_type="application/json").status_code
         == 409
@@ -597,14 +661,113 @@ def test_blank_page_is_audited_preserved_in_pdf_and_reset_on_replacement(
     job.refresh_from_db()
     assert not page.declared_blank and page.versions.count() == 2
     assert job.refinish_needed
-    assert list(
-        page.blank_events.order_by("created_at").values_list("declared_blank", flat=True)
-    ) == [
-        True,
-        False,
-        True,
-        False,
-    ]
+    events = list(page.disposition_events.order_by("created_at", "pk"))
+    assert [event.disposition for event in events] == ["blank", "normal", "blank", "normal"]
+    # The rescan cleared the declaration: a system event (no actor) with its reason.
+    assert events[-1].reason == "raw_version_replaced" and events[-1].actor_id is None
+    # ...and re-queued the page's stages: nothing is skipped any more.
+    assert not page.stage_states.filter(status=ScanTailorStageState.StageStatus.SKIPPED).exists()
+    margins_after = page.stage_states.get(stage="margins")
+    assert "declared_blank" not in margins_after.parameters
+
+
+@pytest.mark.django_db(transaction=True)
+def test_blank_declaration_conflicts_with_concurrent_edits_and_reaches_other_editors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#219 criteria 1 and 7: the declaration uses the stage revisions and live events."""
+    from ebook_server.core.models import get_or_create_profile
+    from ebook_server.core.workspace_events import WorkspaceEventPoller
+
+    client, job = _create_scan_job_with_book("blank-page-editor-a")
+    other = Client()
+    other.force_login(get_or_create_profile("blank-page-editor-b").user)
+    monkeypatch.setattr(scantailor, "get_queue", lambda: None)
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="1.png")
+    assert upload.status_code == 201
+    page = job.pages.get()
+    version = page.active_version()
+    assert version is not None
+    page_url = f"/scan/jobs/{job.pk}/pages/{page.pk}"
+    assert client.get(f"{page_url}/stages/deskew/").status_code == 200
+    stale = dict(page.stage_states.values_list("stage", "revision"))
+
+    # Only "blank" is built; "excluded" is modelled but refused (open question 1).
+    for disposition in ("excluded", "bogus"):
+        refused = client.post(
+            f"{page_url}/blank/",
+            {"disposition": disposition, "version_id": str(version.pk), "revisions": stale},
+            content_type="application/json",
+        )
+        assert refused.status_code == 400
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.NORMAL
+
+    # Editor B saves a Deskew change first: editor A's declaration was made against
+    # the old revisions and must conflict instead of overwriting B's edit.
+    saved = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 1.0},
+            "expected_revision": stale["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert saved.status_code in {200, 202}, saved.content
+    conflict = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": stale},
+        content_type="application/json",
+    )
+    assert conflict.status_code == 409
+    assert not page.disposition_events.exists()
+
+    poller = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state)
+    poller.poll()
+    current = dict(page.stage_states.values_list("stage", "revision"))
+    declared = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": current},
+        content_type="application/json",
+    )
+    assert declared.status_code == 200, declared.content
+    # Editor B's open workspace receives every row of the page with the new state.
+    update = poller.poll()
+    assert update.payload is not None
+    rows = {row["stage"]: row for row in update.payload["stages"]}
+    assert {stage for stage, row in rows.items() if row["skip_reason"] == "declared_blank"} == {
+        "deskew",
+        "select_content",
+        "dewarping",
+        "output",
+    }
+    assert rows["margins"]["parameters"].get("declared_blank") is True
+    # ...and B's next save with its old revision conflicts; editing a skipped stage
+    # is refused until the declaration is cleared.
+    late = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": current["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert late.status_code == 409
+    refused_edit = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": rows["deskew"]["revision"],
+        },
+        content_type="application/json",
+    )
+    assert refused_edit.status_code == 400
+
+    # The job payload (read by the editor's page strip) reports the disposition.
+    detail = client.get(f"/scan/jobs/{job.pk}/")
+    assert detail.status_code == 200
+    assert {p["page_disposition"] for p in detail.json()["pages"]} >= {"blank"}
 
 
 @pytest.mark.django_db(transaction=True)

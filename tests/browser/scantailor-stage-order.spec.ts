@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
-import { createWebScanJob } from "./scan-jobs";
+
+import { openJobWithPages } from "./scan-helpers";
 
 /** Stages are edited in any order; results follow from input fingerprints (#205). */
 
@@ -39,14 +40,14 @@ const stagePost = (page: Page, stage: string) =>
 test("Margins edited before Deskew waits, then runs and re-runs on its own", async ({ page }) => {
   test.setTimeout(120_000);
   await signIn(page);
-  await createWebScanJob(page, "Stage order", [
-    { name: "page.png", buffer: await textPage(page), sequence: 1 },
-  ]);
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
   // Open the editor on Margins: opening a stage runs it (#209), and Deskew must not
   // have run yet.
-  const editor = await page.getByRole("link", { name: "Open ScanTailor editor" }).getAttribute("href");
-  await page.goto(`${editor!}${editor!.includes("?") ? "&" : "?"}stage=margins`);
+  await openJobWithPages(
+    page,
+    "Stage order",
+    [{ name: "page.png", buffer: await textPage(page) }],
+    "stage=margins",
+  );
 
   const message = page.locator("[data-editor-message]");
   const icon = (stage: string) =>

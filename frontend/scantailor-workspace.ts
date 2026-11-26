@@ -3,6 +3,7 @@ import interact from "interactjs";
 import {
   applyClick,
   neighbour,
+  pageMarkers,
   PageStrip,
   sortItems,
   type SortMode,
@@ -34,6 +35,16 @@ import {
   marginSettings,
   MAX_MARGIN_MM,
 } from "./margins-view";
+import {
+  describeHistogram,
+  guidanceText,
+  OUTPUT_ALGORITHM_NAMES,
+  outputAlgorithm,
+  outputParametersFor,
+  outputParameterValue,
+  type OutputParameterSpec,
+  parseParameterInput,
+} from "./output-algorithms";
 import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
 
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
@@ -100,11 +111,21 @@ interface WorkspacePage {
   logical_sequence_number: number;
   side: string;
   recognized_page_number?: string | null;
+  /** Open or claimed rescan requests (#228). */
   open_rescan_todos?: number;
+  /** The scanner's page-number check of the active version; false only for a doubtful rescan. */
+  page_number_verified?: boolean | null;
   thumbnail?: string;
   /** Token of the first stage's input (the working image); empty while it is generated. */
   work_image_token?: string;
   stages: StageState[];
+}
+
+/** Rescan markers of one page, sent with live updates when the job's rescans change (#228). */
+export interface PageMarkerUpdate {
+  id: string;
+  open_rescan_todos: number;
+  page_number_verified: boolean | null;
 }
 
 interface WorkspaceEvent {
@@ -113,6 +134,7 @@ interface WorkspaceEvent {
   updated_at: string;
   refinish_needed: boolean;
   stages: StageState[];
+  pages?: PageMarkerUpdate[];
 }
 
 interface WorkspaceStateDelta {
@@ -120,6 +142,72 @@ interface WorkspaceStateDelta {
   state: string;
   refinish_needed: boolean;
   stages: StageState[];
+  pages?: PageMarkerUpdate[];
+}
+
+/** One reason why finish is refused, with the pages it concerns (#228). */
+export interface FinishBlocker {
+  kind: "no_pages" | "open_rescans" | "missing_output";
+  message: string;
+  pageIds: string[];
+}
+
+function pageLabel(page: Pick<WorkspacePage, "logical_sequence_number" | "side">): string {
+  const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
+  return `${page.logical_sequence_number}${side}`;
+}
+
+function pageList(pages: Pick<WorkspacePage, "logical_sequence_number" | "side">[]): string {
+  const shown = pages.slice(0, 10).map(pageLabel).join(", ");
+  return pages.length > 10 ? `${shown} and ${pages.length - 10} more` : shown;
+}
+
+/**
+ * Why finish would be refused, as the server checks it (``scan_pipeline``): no pages,
+ * open or claimed rescans (finish waits for the replacements), or pages without a
+ * current Output result (a page declared blank needs its Margins result). The server
+ * stays authoritative; this only explains the refusal before the request.
+ */
+export function finishBlockers(
+  pages: Pick<
+    WorkspacePage,
+    "id" | "logical_sequence_number" | "side" | "open_rescan_todos" | "stages"
+  >[],
+): FinishBlocker[] {
+  if (pages.length === 0) {
+    return [{ kind: "no_pages", message: "The job has no pages yet.", pageIds: [] }];
+  }
+  const blockers: FinishBlocker[] = [];
+  const rescans = pages.filter((page) => (page.open_rescan_todos ?? 0) > 0);
+  if (rescans.length) {
+    blockers.push({
+      kind: "open_rescans",
+      message: `${rescans.length} page(s) wait for a requested rescan: ${pageList(rescans)}.`,
+      pageIds: rescans.map((page) => page.id),
+    });
+  }
+  const missing = pages.filter((page) => {
+    const blank = page.stages.some(
+      (state) => state.stage === STAGE_ORDER[0] && state.skip_reason === "declared_blank",
+    );
+    return !stageReadiness(page, blank ? "margins" : "output").current;
+  });
+  if (missing.length) {
+    blockers.push({
+      kind: "missing_output",
+      message: `${missing.length} page(s) have no current Output result: ${pageList(missing)}.`,
+      pageIds: missing.map((page) => page.id),
+    });
+  }
+  return blockers;
+}
+
+/** The request body of finish (#228): always a cleaned variant, OCR on request. */
+export function finishRequestBody(autoOcr: boolean, language: string): Record<string, unknown> {
+  const body: Record<string, unknown> = { create_cleaned_variant: true, auto_ocr: autoOcr };
+  const trimmed = language.trim();
+  if (autoOcr && trimmed) body.language = trimmed;
+  return body;
 }
 
 interface PipelineRun {
@@ -421,6 +509,18 @@ export function stripSourceStage(
     }
   }
   return undefined;
+}
+
+/**
+ * How many page stages Run all would process (#224): every stage of every page
+ * without a current result. Current results are kept, so they are not counted.
+ */
+export function runAllEstimate(pages: Iterable<{ stages: readonly ReadinessFields[] }>): number {
+  let steps = 0;
+  for (const page of pages) {
+    for (const name of STAGE_ORDER) if (!stageReadiness(page, name).current) steps += 1;
+  }
+  return steps;
 }
 
 /** Full-resolution size of a page at ``stage`` for the width/height orders. */
@@ -879,7 +979,8 @@ class WorkspaceController {
 
   start(): void {
     this.bindWorkspaceControls();
-    // The job overview links "Edit" as ?page=<id>&stage=<stage>.
+    // Links open a page and stage as ?page=<id>&stage=<stage> (the retired job overview
+    // redirects here with ?page=, #228).
     const query = new URLSearchParams(window.location.search);
     const requestedPage = query.get("page") ?? "";
     const requestedStage = query.get("stage") ?? "";
@@ -897,6 +998,7 @@ class WorkspaceController {
 
   private bindWorkspaceControls(): void {
     this.bindPipelineActions();
+    this.bindFinish();
     this.root.querySelector("[data-toggle-blank]")?.addEventListener("click", () => {
       void this.toggleBlank();
     });
@@ -961,6 +1063,142 @@ class WorkspaceController {
       this.setResultStatus("The result preview could not be loaded.", false);
     });
     this.updateSelectionCount();
+  }
+
+  /**
+   * Finish (#228), formerly on the job overview: a confirmation dialog that explains
+   * a refusal (pages without Output, open rescans) before and after the request, then
+   * goes to the finalization status like the overview did. Without a library book the
+   * server starts identification instead, and the editor goes to its review.
+   */
+  private bindFinish(): void {
+    const open = this.root.querySelector<HTMLButtonElement>("[data-finish-open]");
+    const dialog = this.root.querySelector<HTMLDialogElement>("[data-finish-dialog]");
+    const form = dialog?.querySelector<HTMLFormElement>("[data-finish-form]");
+    const endpoint = this.root.dataset.finishUrl;
+    if (!open || !dialog || !form || !endpoint) return;
+    const blockersBox = element<HTMLElement>(dialog, "[data-finish-blockers]");
+    const blockerList = element<HTMLUListElement>(blockersBox, "ul");
+    const error = element<HTMLElement>(dialog, "[data-finish-error]");
+    const confirm = element<HTMLButtonElement>(dialog, "[data-finish-confirm]");
+    const ocr = element<HTMLInputElement>(dialog, "[data-finish-ocr]");
+    const language = element<HTMLInputElement>(dialog, "[data-finish-ocr-language]");
+    let posting = false;
+
+    const showBlockers = (blockers: FinishBlocker[]): void => {
+      blockerList.replaceChildren(
+        ...blockers.map((blocker) => {
+          const item = document.createElement("li");
+          item.dataset.finishBlocker = blocker.kind;
+          item.append(blocker.message);
+          const first = blocker.pageIds[0];
+          if (first) {
+            const go = document.createElement("button");
+            go.type = "button";
+            go.className = "secondary small-button";
+            go.textContent = "Show page";
+            go.addEventListener("click", () => {
+              dialog.close();
+              this.activate(first, blocker.kind === "missing_output" ? "output" : this.activeStage);
+            });
+            item.append(" ", go);
+          }
+          return item;
+        }),
+      );
+      blockersBox.hidden = blockers.length === 0;
+      confirm.disabled = posting || blockers.length > 0;
+    };
+    const showError = (message: string): void => {
+      error.textContent = message;
+      error.hidden = !message;
+    };
+    language.disabled = !ocr.checked;
+    ocr.addEventListener("change", () => {
+      language.disabled = !ocr.checked;
+    });
+
+    open.addEventListener("click", () => {
+      if (!this.editable) return;
+      showError("");
+      showBlockers(finishBlockers([...this.pages.values()]));
+      dialog.showModal();
+    });
+    dialog.querySelector("[data-finish-cancel]")?.addEventListener("click", () => dialog.close());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void submit();
+    });
+
+    const submit = async (): Promise<void> => {
+      if (posting || confirm.disabled) return;
+      posting = true;
+      confirm.disabled = true;
+      showError("");
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-CSRFToken": csrfToken(),
+          },
+          body: JSON.stringify(finishRequestBody(ocr.checked, language.value)),
+        });
+        const text = await response.text();
+        let payload: Record<string, unknown> = {};
+        try {
+          payload = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          payload = { error: text };
+        }
+        if (!response.ok) {
+          const missing = Array.isArray(payload.missing_pages)
+            ? (payload.missing_pages as unknown[]).map(String)
+            : [];
+          const pages = missing
+            .map((id) => this.pages.get(id))
+            .filter((page): page is WorkspacePage => page !== undefined);
+          if (pages.length) {
+            posting = false;
+            showBlockers([
+              {
+                kind: "missing_output",
+                message: `${pages.length} page(s) have no current Output result: ${pageList(pages)}.`,
+                pageIds: pages.map((page) => page.id),
+              },
+            ]);
+          }
+          showError(
+            typeof payload.error === "string" && payload.error
+              ? `The server refused to finish: ${payload.error}`
+              : `The server refused to finish (HTTP ${response.status}).`,
+          );
+          return;
+        }
+        const finalization = payload.finalization_job as { job_id?: string } | undefined;
+        const identification = payload.identification_job as
+          | { job_id?: string; review_task_id?: number | null }
+          | undefined;
+        let next = "";
+        if (finalization?.job_id) {
+          next = this.url("finalizationUrlTemplate", finalization.job_id);
+        } else if (identification?.review_task_id) {
+          next = this.url("reviewUrlTemplate", String(identification.review_task_id));
+        } else if (identification?.job_id) {
+          next = this.url("identificationUrlTemplate", identification.job_id);
+        }
+        if (next) window.location.assign(next);
+        else dialog.close();
+      } catch (failure) {
+        showError(failure instanceof Error ? failure.message : "Could not finish the scan.");
+      } finally {
+        posting = false;
+        // A refusal with pages to fix keeps the button off; any other failure may be retried.
+        confirm.disabled = !blockersBox.hidden;
+      }
+    };
   }
 
   private bindPipelineActions(): void {
@@ -1028,8 +1266,10 @@ class WorkspaceController {
 
     start.addEventListener("click", () => {
       const pages = this.pages.size;
+      const steps = runAllEstimate(this.pages.values());
       if (window.confirm(
-        `Check ${pages} pages through ${STAGE_ORDER.length} stages? Up to ${pages * STAGE_ORDER.length} stages may run. Current results and saved manual settings are kept.`,
+        `Run all: ${pages} pages, ${STAGE_ORDER.length} stages: about ${steps} stage job${steps === 1 ? "" : "s"} ` +
+          `(${pages * STAGE_ORDER.length - steps} already current). Current results and saved manual settings are kept.`,
       )) void refresh("start");
     });
     cancel.addEventListener("click", () => void refresh("cancel"));
@@ -1289,15 +1529,37 @@ class WorkspaceController {
     const url = this.url("rescanUrlTemplate", page.id);
     const button = this.root.querySelector<HTMLButtonElement>("[data-request-rescan]");
     if (!url || !button || button.disabled) return;
+    // The same request as the scanner's todo list expects (#228): a reason for the
+    // operator, confirmed in a dialog.
+    const dialog = this.root.querySelector<HTMLDialogElement>("[data-rescan-dialog]");
+    const reasonInput = dialog?.querySelector<HTMLTextAreaElement>("[data-rescan-reason]");
+    let reason = "";
+    if (dialog && reasonInput) {
+      const label = dialog.querySelector<HTMLElement>("[data-rescan-page]");
+      if (label) label.textContent = pageLabel(page);
+      reasonInput.value = "";
+      dialog.returnValue = "";
+      dialog.showModal();
+      await new Promise<void>((resolve) =>
+        dialog.addEventListener("close", () => resolve(), { once: true }),
+      );
+      if (dialog.returnValue !== "confirm") return;
+      reason = reasonInput.value.trim();
+    }
     button.disabled = true;
     try {
       const response = await fetch(url, {
         method: "POST",
         credentials: "same-origin",
-        headers: { "X-CSRFToken": csrfToken() },
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-CSRFToken": csrfToken(),
+        },
+        body: JSON.stringify({ reason }),
       });
       if (!response.ok) throw new Error(await response.text());
-      page.open_rescan_todos = 1;
+      page.open_rescan_todos = Math.max(1, page.open_rescan_todos ?? 0);
       this.strip?.update(this.stripItem(page));
       this.showStatus();
       if (this.activePageId === page.id) this.setMessage("Rescan requested.", "info");
@@ -1500,19 +1762,19 @@ class WorkspaceController {
     plot.clearRect(0, 0, canvas.width, canvas.height);
     const marker = (value: number) => Math.min(255, Math.max(0, value));
     const threshold = histogram.threshold;
-    let description = "Grayscale input · no threshold";
     if (isObject(threshold) && typeof threshold.median === "number") {
-      const middle = threshold.median;
-      const interval = typeof threshold.low === "number" && typeof threshold.high === "number"
-        ? [threshold.low, threshold.high] as const : null;
-      if (interval) {
+      // Per-pixel algorithms (#225): T is a distribution, drawn as its 10–90 % band.
+      if (typeof threshold.low === "number" && typeof threshold.high === "number") {
         plot.fillStyle = "rgba(244,178,91,.34)";
-        plot.fillRect(marker(interval[0]), 0, marker(interval[1]) - marker(interval[0]) + 1, canvas.height);
-        description = `Median T ${Math.round(middle)} · 10–90% ${interval.map(Math.round).join("–")}`;
-      } else {
-        description = `${threshold.kind === "intensity" ? "Intensity" : "Global"} T ${Math.round(middle)}`;
+        plot.fillRect(
+          marker(threshold.low),
+          0,
+          marker(threshold.high) - marker(threshold.low) + 1,
+          canvas.height,
+        );
       }
     }
+    const description = describeHistogram(histogram);
     plot.fillStyle = "#d8e0da";
     for (const [index, value] of bins.entries()) {
       const height = value / peak * canvas.height;
@@ -1522,7 +1784,7 @@ class WorkspaceController {
       plot.fillStyle = "#ffba67";
       plot.fillRect(marker(threshold.median), 0, 2, canvas.height);
     }
-    caption.textContent = `${histogram.zoned ? "Unzoned preview · " : "Input preview · "}${description}`;
+    caption.textContent = `${histogram.zoned ? "Unzoned preview" : "Input preview"} · ${description}`;
     figure.hidden = false;
   }
 
@@ -2226,8 +2488,9 @@ class WorkspaceController {
   }
 
   private renderOutputControls(): void {
-    const algorithms = ["otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"];
+    const algorithms = OUTPUT_ALGORITHM_NAMES;
     this.addSelect("Output algorithm", "output_mode", algorithms, "otsu", true);
+    this.addAlgorithmNote(this.draft.output_mode);
     this.addCheckbox("Keep color", "keep_color", false, true);
     this.addCheckbox("Invert output", "invert", false);
     this.addSelect("Text / picture zones", "zone_mode", ["auto", "manual", "off"], "auto", true);
@@ -2248,22 +2511,12 @@ class WorkspaceController {
       modes.add(this.draft.text_algorithm);
       if (!this.draft.keep_color) modes.add(this.draft.picture_algorithm);
     }
-    if (["sauvola", "wolf", "fox", "window"].some((mode) => modes.has(mode))) {
-      this.addNumber("Local window size (full-resolution pixels)", "window_size", 3, 501, 2, 35);
-      const coefficients =
-        modes.has("sauvola") || modes.has("fox") ? "Threshold k" : "Threshold k (0–1 effective)";
-      this.addNumber(coefficients, "k", -2, 2, 0.01, 0.33);
-      const hint = document.createElement("small");
-      hint.className = "muted";
-      hint.textContent = [
-        modes.has("sauvola") && "Sauvola uses k to weight local contrast.",
-        modes.has("wolf") && "Wolf uses k to weight the page-wide minimum and local contrast.",
-        modes.has("fox") && "Fox uses the magnitude of k above a minimum noise offset.",
-        modes.has("window") && "Window uses k to lower the local mean threshold.",
-      ].filter(Boolean).join(" ");
-      this.controls.append(hint);
+    if (zoned) {
+      this.addAlgorithmNote(this.draft.text_algorithm, "Text zones");
+      if (!this.draft.keep_color) this.addAlgorithmNote(this.draft.picture_algorithm, "Picture zones");
     }
-    if (modes.has("sauvola")) this.addNumber("Sauvola contrast range (r)", "r", 1, 512, 1, 128);
+    // Only the settings the selected algorithm(s) read (#225).
+    for (const spec of outputParametersFor(modes)) this.addOutputParameter(spec);
     if (zoned && this.draft.zone_mode === "manual") {
       if (!("zones" in this.draft)) this.draft.zones = detected;
       const zones = outputZonesForEditing(this.draft);
@@ -2323,6 +2576,58 @@ class WorkspaceController {
     }
   }
 
+  /** What an Output algorithm does and where it comes from (#225). */
+  private addAlgorithmNote(name: unknown, prefix = ""): void {
+    const algorithm = outputAlgorithm(name);
+    if (!algorithm) return;
+    const note = document.createElement("small");
+    note.className = "muted st-algorithm-note";
+    note.dataset.algorithmNote = algorithm.name;
+    note.textContent = `${prefix ? `${prefix}: ` : ""}${algorithm.summary} Source: ${algorithm.provenance}`;
+    this.controls.append(note);
+  }
+
+  /**
+   * One Output setting (#225): explanation and recommended range next to the field.
+   * The range is guidance only; any typed number is applied (only the technical
+   * limit clamps, and the note says so). No min/max attributes, so the browser's
+   * validity never blocks a value.
+   */
+  private addOutputParameter(spec: OutputParameterSpec): void {
+    const label = document.createElement("label");
+    label.className = "st-output-parameter";
+    label.textContent = spec.label;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.dataset.outputParameter = spec.key;
+    const value = outputParameterValue(this.draft, spec);
+    input.value = String(value);
+    input.disabled = !this.editable;
+    this.draft[spec.key] = value;
+    const help = document.createElement("small");
+    help.className = "muted";
+    help.textContent = `${spec.help} ${guidanceText(spec)}`;
+    const note = document.createElement("small");
+    note.dataset.parameterNote = spec.key;
+    const showNote = (text: string, tone: string) => {
+      note.textContent = text;
+      note.hidden = !text;
+      note.className = tone === "warning" ? "error" : "muted";
+    };
+    const initial = parseParameterInput(input.value, spec);
+    showNote(initial.note, initial.tone);
+    input.addEventListener("input", () => {
+      const parsed = parseParameterInput(input.value, spec);
+      showNote(parsed.note, parsed.tone);
+      if (parsed.value === null) return;
+      // The controls' input listener schedules the autosave.
+      this.draft[spec.key] = parsed.value;
+    });
+    label.append(input, help, note);
+    this.controls.append(label);
+  }
+
   private addZoneButton(label: string, action: () => void): void {
     const button = document.createElement("button");
     button.type = "button";
@@ -2364,39 +2669,12 @@ class WorkspaceController {
     for (const value of options) {
       const option = document.createElement("option");
       option.value = value;
-      option.textContent = value.replaceAll("_", " ");
+      option.textContent = outputAlgorithm(value)?.label ?? value.replaceAll("_", " ");
       option.selected = value === current;
       select.append(option);
     }
     select.addEventListener("change", () => change(select.value));
     label.append(select);
-    this.controls.append(label);
-  }
-
-  private addNumber(
-    labelText: string,
-    key: string,
-    minimum?: number,
-    maximum?: number,
-    step = 1,
-    fallback = 0,
-  ): void {
-    const label = document.createElement("label");
-    label.textContent = labelText;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.value = String(finiteNumber(this.draft[key], fallback));
-    input.step = String(step);
-    if (minimum !== undefined) input.min = String(minimum);
-    if (maximum !== undefined) input.max = String(maximum);
-    this.draft[key] = Number(input.value);
-    input.addEventListener("input", () => {
-      if (input.validity.valid && input.value !== "") {
-        this.draft[key] = Number(input.value);
-        this.renderGeometry();
-      }
-    });
-    label.append(input);
     this.controls.append(label);
   }
 
@@ -2882,12 +3160,12 @@ class WorkspaceController {
       // Working image still being generated: the full page thumbnail renders the scan.
       thumbnailUrl = page.thumbnail ?? "";
     }
-    const side = page.side && page.side !== "single" ? ` ${page.side}` : "";
     const printed = page.recognized_page_number ? `p. ${page.recognized_page_number}` : "";
     const size = stageSize(page, this.activeStage);
     return {
       id: page.id,
-      label: `${page.logical_sequence_number}${side}`,
+      label: pageLabel(page),
+      markers: pageMarkers(page),
       caption: blank
         ? "Declared blank"
         : (page.open_rescan_todos ?? 0) > 0
@@ -3169,6 +3447,7 @@ class WorkspaceController {
       this.eventSource.addEventListener("workspace", (event) => {
         const payload = JSON.parse((event as MessageEvent<string>).data) as WorkspaceEvent;
         this.updateJobActions(payload.state, payload.refinish_needed);
+        if (payload.pages) this.mergePageMarkers(payload.pages);
         for (const state of payload.stages) this.mergeStage(state);
       });
       this.eventSource.addEventListener("error", () => {
@@ -3194,11 +3473,32 @@ class WorkspaceController {
       if (!response.ok) return;
       const payload = (await response.json()) as WorkspaceStateDelta;
       this.updateJobActions(payload.state, payload.refinish_needed);
+      if (payload.pages) this.mergePageMarkers(payload.pages);
       for (const state of payload.stages) this.mergeStage(state);
       this.pollCursor = payload.cursor;
     } catch {
       this.liveStatus.textContent = "Workspace refresh failed; retrying…";
     }
+  }
+
+  /** Rescan markers from another editor, the scanner or a replacement (#228). */
+  private mergePageMarkers(updates: PageMarkerUpdate[]): void {
+    let activeChanged = false;
+    for (const update of updates) {
+      const page = this.pages.get(update.id);
+      if (!page) continue;
+      if (
+        (page.open_rescan_todos ?? 0) === update.open_rescan_todos &&
+        (page.page_number_verified ?? null) === update.page_number_verified
+      ) {
+        continue;
+      }
+      page.open_rescan_todos = update.open_rescan_todos;
+      page.page_number_verified = update.page_number_verified;
+      this.strip?.update(this.stripItem(page));
+      if (page.id === this.activePageId) activeChanged = true;
+    }
+    if (activeChanged) this.showStatus();
   }
 
   private updateJobActions(state: string, refinish: boolean): void {

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
-import { createWebScanJob } from "./scan-jobs";
+
+import { openJobWithPages } from "./scan-helpers";
 
 /** Margins gives aligned pages one common size, like Scan Tailor's page layout (#208). */
 
@@ -44,16 +45,9 @@ test("aligned pages share the largest page's size; an unaligned page keeps its o
   ];
   const uploads = [];
   for (const [index, block] of blocks.entries()) {
-    uploads.push({
-      name: `page${index + 1}.png`,
-      buffer: await textPage(page, block),
-      sequence: index + 1,
-    });
+    uploads.push({ name: `page${index + 1}.png`, buffer: await textPage(page, block) });
   }
-  await createWebScanJob(page, "Common page size", uploads);
-  await expect(page.locator(".scan-page-card")).toHaveCount(2);
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
-  await expect(page.locator("[data-strip-page]")).toHaveCount(2);
+  await openJobWithPages(page, "Common page size", uploads);
 
   const jobId = /\/scan\/jobs\/([^/]+)\/editor\//.exec(page.url())![1];
   const pageIds = await page

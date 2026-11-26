@@ -42,6 +42,7 @@ ADDED_AFTER_0041 = {
     "ScanCover",  # 0044_scanner_page_and_cover_upload (#128)
     "ScanJobOpf",  # 0045_scanner_opf (#130)
     "BookMetadataProvenance",  # 0045_scanner_opf (#130)
+    "ScanTailorRun",  # 0055_scantailor_run_all (#224)
 }
 
 

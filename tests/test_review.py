@@ -159,6 +159,64 @@ def test_review_shows_source_relative_paths_and_escapes_them() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_review_path_row_only_for_source_location_tasks() -> None:
+    """#229: uploads, scan jobs and worker failures show no path row."""
+    from ebook_server.core.review_views import _source_path_display
+
+    profile = get_or_create_profile("source-reviewer-upload")
+    client = Client()
+    client.force_login(profile.user)
+    staging = "/srv/private/staging/uploads/abc123/Upload Title.epub"
+    upload = ImportJob.objects.create(
+        uploader=profile.user,
+        source_path=staging,
+        original_filename="Upload Title.epub",
+    )
+    task = ReviewTask.objects.create(
+        import_job=upload, source_filename="Upload Title.epub", source_path_hint=staging
+    )
+    detail = client.get(f"/reviews/{task.pk}/?view=html")
+    assert detail.status_code == 200
+    assert b"<dt>Path</dt>" not in detail.content
+    assert b"/srv/private" not in detail.content
+    assert client.get(f"/reviews/{task.pk}/").json()["source_path_display"] == {}
+    queue = client.get("/reviews/?view=html")
+    assert queue.status_code == 200 and b"/srv/private" not in queue.content
+
+    source = SourceLocation.objects.create(name="Share", root_path="/srv/share")
+    sourced = ImportJob.objects.create(
+        uploader=profile.user,
+        source_location=source,
+        source_type=ImportJob.SourceType.NETWORK_SOURCE,
+        source_path="/srv/share/Author/Book.txt",
+        original_filename="Book.txt",
+    )
+    scan_task = ReviewTask(source_filename="scan", source_path_hint="scan-job:20261117T143201Z")
+    assert _source_path_display(scan_task) == {}
+    worker_failure = ReviewTask(
+        import_job=sourced,
+        processing_job_id=1,
+        task_type=ReviewTask.TaskType.WORKER_FAILURE,
+        source_path_hint="processing-job:1",
+    )
+    assert _source_path_display(worker_failure) == {}
+    windows = SourceLocation.objects.create(name="Windows share", root_path="D:\\Books\\")
+    windows_job = ImportJob.objects.create(
+        uploader=profile.user,
+        source_location=windows,
+        source_type=ImportJob.SourceType.NETWORK_SOURCE,
+        source_path="D:\\Books\\Grimm, Gebruder\\Crab and Heron.txt",
+        original_filename="Crab and Heron.txt",
+    )
+    windows_task = ReviewTask(import_job=windows_job, source_path_hint=windows_job.source_path)
+    assert _source_path_display(windows_task) == {
+        "source": "Windows share",
+        "path": "Grimm, Gebruder/Crab and Heron.txt",
+        "folder": "Grimm, Gebruder",
+    }
+
+
+@pytest.mark.django_db(transaction=True)
 def test_low_confidence_import_creates_open_review_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

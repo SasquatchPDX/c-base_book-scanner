@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
-import { createWebScanJob } from "./scan-jobs";
+
+import { openJobWithPages } from "./scan-helpers";
 
 async function signIn(page: Page): Promise<void> {
   await page.goto("/accounts/login/");
@@ -44,11 +45,9 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
 }) => {
   test.setTimeout(120_000);
   await signIn(page);
-  await createWebScanJob(page, "Dewarping grid", [
-    { name: "page.png", buffer: await textPage(page), sequence: 1 },
+  await openJobWithPages(page, "Dewarping grid", [
+    { name: "page.png", buffer: await textPage(page) },
   ]);
-  await expect(page.locator(".scan-page-card")).toHaveCount(1);
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 
   // Opening a stage runs it (#209), and each finished stage runs the next one (#205).
   // Each stage's own result line: the status line moves on to the chained stages.
