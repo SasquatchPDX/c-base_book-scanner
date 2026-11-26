@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { createWebScanJob } from "./scan-jobs";
 
 /** Margins gives aligned pages one common size, like Scan Tailor's page layout (#208). */
 
@@ -36,24 +37,21 @@ test("aligned pages share the largest page's size; an unaligned page keeps its o
 }) => {
   test.setTimeout(150_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Common page size");
-  await page.getByRole("button", { name: "Create workspace" }).click();
   // A full text page and a small title block.
   const blocks: [number, number, number, number][] = [
     [90, 120, 510, 640],
     [250, 200, 350, 240],
   ];
+  const uploads = [];
   for (const [index, block] of blocks.entries()) {
-    await page.getByLabel("Page image").setInputFiles({
+    uploads.push({
       name: `page${index + 1}.png`,
-      mimeType: "image/png",
       buffer: await textPage(page, block),
+      sequence: index + 1,
     });
-    await page.getByLabel("Sequence").fill(String(index + 1));
-    await page.getByRole("button", { name: "Upload page" }).click();
-    await expect(page.locator(".scan-page-card")).toHaveCount(index + 1);
   }
+  await createWebScanJob(page, "Common page size", uploads);
+  await expect(page.locator(".scan-page-card")).toHaveCount(2);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
   await expect(page.locator("[data-strip-page]")).toHaveCount(2);
 

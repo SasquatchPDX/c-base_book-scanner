@@ -74,14 +74,16 @@ Limits (§6.12) come from `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` (50 MiB) and
 
 ## API surface (v1)
 
-- `POST /scan/jobs/` -> create job
+- `POST /scan/jobs/` -> create job (session API only; the web form is hidden, "maybe
+  later", #227: the scanner creates jobs over `/api/scanner/v1/`)
 - `GET /scan/jobs/` -> list open jobs for scanner/operator
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
 - `POST /scan/jobs/{job_id}/logs/` -> upload a scanner log file (202, processed by a worker)
 - `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
-- `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
+- `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review (API only:
+  the web UI no longer offers it, identification runs automatically, #227)
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
 - `POST /scan/jobs/{job_id}/ocr/` -> request OCR from scan pages
@@ -396,8 +398,35 @@ version are kept in `ScanJobOpf`. An OPF carrying the application's own marker
 `<meta name="ebook-server:generated" content="true"/>` is stored but never used as metadata.
 
 **While the scan is raw** the current OPF's title, authors, ISBN and language are shown on
-the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`) and in
-**Raw scans** (`/scan/raw/`, `metadata`). No Book is created.
+the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`), in the
+scan job list (`/scan/jobs/?view=html`) and in **Raw scans** (`/scan/raw/`, `metadata`).
+No Book is created.
+
+**Automatic completion of missing fields (#227).** When a new OPF version is stored for a
+job without a Book and it lacks the title, the authors or the ISBN, a background
+scan-identification job (`ProcessingJob` type `scan_identification`, `details.automatic`)
+looks it up on the metadata queue (see "Queues" in `docs/operations.md`), using the OPF's
+own evidence: its ISBN (an ISBN lookup, which also covers an OPF with nothing but an ISBN),
+otherwise its title, authors and language. Fields are completed **only on a strong
+match**, and only fields the OPF leaves empty:
+
+- ISBN lookup: every provider record that itself lists the OPF's ISBN describes the same
+  book, and that record names its authors;
+- text lookup: the intake auto-accept rule (`intake.decide_auto_accept`: score at least
+  `BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`, no tie between different books, author,
+  edition and title checks);
+- in both cases the record agrees with the OPF's title and authors (else `contradicted`).
+
+The result is stored on the job (`ScanJob.notes["opf_completion"]`: status `completed`,
+`no_strong_match` or `contradicted`, the completed fields, the provider record, the
+search) and tied to the OPF version; a newer version makes it obsolete and starts a new
+lookup if fields are still missing. Job page and job list show completed values. At
+finish the OPF plus the completion is used; completed fields get provenance
+`provider_check`, and a later OPF that names such a field replaces it. A weak match
+completes nothing: an OPF with a title stays as the scanner sent it (the provider check
+after finish verifies it); an OPF **without** a title opens the scan-identification
+review, because the Book's identity is unknown. `BOOK_SCANNER_SCAN_METADATA_COMPLETION=false`
+switches the automatic lookup off.
 
 **At finish** (`scan_lifecycle.register_book_linker`, `scanner_opf.link_book_from_opf`):
 
@@ -405,8 +434,9 @@ the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`) 
    variant. The OPF fills that Book's empty fields; a differing field opens a review.
 2. Otherwise a new Book is created from the OPF fields. Every field gets a provenance row
    with source `scanner_opf` (`BookMetadataProvenance`).
-3. No OPF, or an OPF without a title: the existing scan identification and review queue
-   run, with the OPF's authors as hints.
+3. No OPF, or an OPF without a title (and no completed title): the existing scan
+   identification and review queue run, with the OPF's ISBN (ISBN lookup; a unique
+   verified record links automatically) or its authors and language as terms.
 
 Two cases go to scan identification and its review instead of guessing (AGENTS.md):
 an ISBN that **several** Books carry, and an **ISBN-less** OPF whose normalised title and

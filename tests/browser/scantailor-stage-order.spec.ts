@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { createWebScanJob } from "./scan-jobs";
 
 /** Stages are edited in any order; results follow from input fingerprints (#205). */
 
@@ -38,16 +39,9 @@ const stagePost = (page: Page, stage: string) =>
 test("Margins edited before Deskew waits, then runs and re-runs on its own", async ({ page }) => {
   test.setTimeout(120_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Stage order");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "page.png",
-    mimeType: "image/png",
-    buffer: await textPage(page),
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
+  await createWebScanJob(page, "Stage order", [
+    { name: "page.png", buffer: await textPage(page), sequence: 1 },
+  ]);
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   // Open the editor on Margins: opening a stage runs it (#209), and Deskew must not
   // have run yet.

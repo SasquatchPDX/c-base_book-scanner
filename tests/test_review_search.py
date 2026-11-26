@@ -458,7 +458,9 @@ def test_new_terms_update_a_queued_search_and_are_rejected_while_one_runs(
         def enqueue(self, *args: Any, **kwargs: Any) -> None:
             del args, kwargs
 
-    monkeypatch.setattr("ebook_server.core.review_identification.get_queue", DeferredQueue)
+    monkeypatch.setattr(
+        "ebook_server.core.review_identification.get_queue", lambda *_: DeferredQueue()
+    )
     first = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "First"})
     second = client.post(f"/reviews/{task.id}/search-again/", {"inferred_title": "Second"})
     assert first.status_code == second.status_code == 202
@@ -628,7 +630,7 @@ def test_superseded_queue_entry_delivered_late_cannot_publish(
     """The reviewer's probe: Old Terms queued, superseded by New Terms, delivered last."""
     client, task, import_job = _import_review(monkeypatch, tmp_path, "search-fence-queued")
     queue = _CapturingQueue()
-    monkeypatch.setattr("ebook_server.core.review_identification.get_queue", lambda: queue)
+    monkeypatch.setattr("ebook_server.core.review_identification.get_queue", lambda *_: queue)
     cancelled: list[str] = []
     monkeypatch.setattr(
         metadata_search, "cancel_queue_entry", lambda job: cancelled.append(str(job.job_id))
@@ -760,7 +762,7 @@ def test_superseded_scan_queue_entry_cannot_publish(
 ) -> None:
     _client, scan_job = _scan_review(monkeypatch, "scan-fence-queued")
     queue = _CapturingQueue()
-    monkeypatch.setattr("ebook_server.core.scan_identification.get_queue", lambda: queue)
+    monkeypatch.setattr("ebook_server.core.scan_identification.get_queue", lambda *_: queue)
     old_job = scan_identification.request_scan_identification(
         scan_job=scan_job, requested_by_user_id=None, terms={"title": "Old Scan", "authors": []}
     )

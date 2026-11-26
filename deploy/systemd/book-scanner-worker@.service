@@ -1,7 +1,9 @@
 # Example template unit for RQ workers. See deploy/systemd/README.md.
 # Start one or more instances: systemctl enable --now book-scanner-worker@1
-# The --url value must match BOOK_SCANNER_REDIS_URL and the queue name must
-# match BOOK_SCANNER_QUEUE_NAME (default "ebook-server").
+# The --url value must match BOOK_SCANNER_REDIS_URL and the queue names must
+# match BOOK_SCANNER_METADATA_QUEUE_NAME (default "metadata") and
+# BOOK_SCANNER_QUEUE_NAME (default "ebook-server"). RQ serves the queues in the
+# order listed, so metadata lookups never wait behind ScanTailor stage jobs (#227).
 [Unit]
 Description=Book Scanner RQ worker %i
 Wants=network-online.target
@@ -20,7 +22,7 @@ WorkingDirectory=/opt/book-scanner
 Environment=QT_QPA_PLATFORM=offscreen BOOK_SCANNER_WORKER_THREADS=1
 # --with-scheduler is mandatory on at least one worker (delayed retries); it is
 # safe on every instance because only one holds the scheduler lock at a time.
-ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --worker-class ebook_server.recovery_worker.RecoveryWorker --url redis://127.0.0.1:6379/0 ebook-server
+ExecStart=/opt/book-scanner/.venv/bin/rq worker --with-scheduler --config ebook_server.rq_settings --worker-class ebook_server.recovery_worker.RecoveryWorker --url redis://127.0.0.1:6379/0 metadata ebook-server
 Restart=on-failure
 RestartSec=5
 # Give a running job a chance to finish on stop: SIGTERM goes only to the main

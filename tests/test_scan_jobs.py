@@ -18,11 +18,13 @@ from ebook_server.core.models import (
     Book,
     FileVariant,
     ProcessingJob,
+    ReviewTask,
     ScanJob,
     ScanJobOpf,
     ScanPage,
     ScanPageVersion,
     ScanTailorRun,
+    ScanTailorStageState,
     ScanTodo,
     StorageLocation,
 )
@@ -308,10 +310,166 @@ def test_scan_job_html_list_counts_pages_without_serializing_them(
     assert b"Scanner OPF Title" in response.content
     assert b"Generated OPF Title" not in response.content
     assert b"Scanner Author" in response.content
-    assert b"ISBN 9780306406157" in response.content
+    assert b'ISBN <span class="mono">9780306406157</span>' in response.content
     assert b"ScanTailor queued" in response.content
-    assert b"Rescan requested" in response.content
+    assert b'data-badge="rescan"' in response.content
     assert f"/scan/jobs/{job.pk}/editor/".encode() in response.content
+    assert f"/scan/jobs/{job.pk}/workspace/".encode() not in response.content
+    # "Create scan job" is hidden (#227, maybe later); the POST path still works.
+    assert b"Create workspace" not in response.content
+    assert b"Metadata available" in response.content
+
+
+def _stage_rows(job: ScanJob, page: ScanPage, statuses: dict[str, str]) -> None:
+    for stage, status in statuses.items():
+        ScanTailorStageState.objects.create(
+            scan_job=job, scan_page=page, stage=stage, status=status
+        )
+
+
+def _list_job(client: Client, job: ScanJob, query: str = "") -> str:
+    content = client.get(f"/scan/jobs/?view=html{query}").content.decode()
+    marker = f'data-scan-job="{job.pk}"'
+    assert marker in content
+    return content.split(marker, 1)[1].split("</article>", 1)[0]
+
+
+@pytest.mark.django_db
+def test_scan_job_list_derives_pipeline_status_and_badges() -> None:
+    client, job = _create_scan_job("scanner-list-status")
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Capturing<" in row
+
+    pages = [
+        ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+        for number in (1, 2, 3)
+    ]
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Captured<" in row  # a web job has no capture-complete
+
+    _stage_rows(job, pages[0], {"deskew": "success", "output": "success"})
+    _stage_rows(job, pages[1], {"deskew": "failed"})
+    ReviewTask.objects.create(scan_job=job, source_filename="scan")
+    job.refinish_needed = True
+    job.save(update_fields=["refinish_needed"])
+    row = _list_job(client, job)
+    assert "data-pipeline-label>1 / 3 rendered<" in row
+    assert 'data-badge="failed"' in row and "Failed: 1 stage" in row
+    assert 'data-badge="review"' in row
+    assert 'data-badge="refinish"' in row
+
+    _stage_rows(job, pages[1], {"output": "success"})
+    _stage_rows(job, pages[2], {"output": "skipped"})  # a declared blank page counts
+    assert "data-pipeline-label>Rendered<" in _list_job(client, job)
+
+    # A scanner job is capturing until capture-complete, whatever was processed.
+    ScanJob.objects.filter(pk=job.pk).update(
+        source=ScanJob.Source.SCANNER, state=ScanJob.State.CAPTURING
+    )
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Capturing<" in row and "3 / 3 rendered" in row
+
+    ScanJob.objects.filter(pk=job.pk).update(state=ScanJob.State.FINALIZING)
+    assert "data-pipeline-label>Finalizing<" in _list_job(client, job)
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.SCAN_FINALIZATION,
+        state=ProcessingJob.JobState.FAILED,
+        details={"scan_job_id": str(job.pk)},
+    )
+    assert "finalization" in _list_job(client, job)
+
+    ScanJob.objects.filter(pk=job.pk).update(state=ScanJob.State.COMPLETE)
+    assert "data-pipeline-label>Complete<" in _list_job(client, job, "&state=complete")
+    ocr_job = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.OCR,
+        details={"source_type": "scan_job", "scan_job_id": str(job.pk)},
+    )
+    assert "data-pipeline-label>OCR queued<" in _list_job(client, job, "&state=complete")
+    ProcessingJob.objects.filter(pk=ocr_job.pk).update(state=ProcessingJob.JobState.SUCCESS)
+    assert "data-pipeline-label>OCR&#x27;d<" in _list_job(client, job, "&state=complete")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    [
+        ({"state": "cancelled"}, "Cancelled"),
+        ({"state": "paused", "page_count": 3, "rendered": 1}, "Paused"),
+        ({"state": "open", "page_count": 0}, "Capturing"),
+        ({"state": "captured", "page_count": 4, "has_metadata": True}, "Metadata available"),
+        ({"state": "captured", "page_count": 4, "rendered": 4}, "Rendered"),
+        ({"state": "complete", "ocr_state": "running"}, "OCR running"),
+        ({"state": "complete", "ocr_state": "failed"}, "Complete"),
+    ],
+)
+def test_pipeline_status_derivation(kwargs: dict[str, Any], label: str) -> None:
+    from ebook_server.core import scan_job_status
+
+    arguments: dict[str, Any] = {
+        "source": "web",
+        "page_count": 0,
+        "rendered": 0,
+        "has_metadata": False,
+        **kwargs,
+    }
+    assert scan_job_status.derive(**arguments)[1] == label
+
+
+@pytest.mark.django_db
+def test_job_pages_offer_no_manual_upload_or_identification() -> None:
+    client, job = _create_scan_job("scanner-no-manual-actions")
+    overview = client.get(f"/scan/jobs/{job.pk}/workspace/?view=html").content.decode()
+    assert "Resolve book identity" not in overview
+    assert "Upload page" not in overview
+    assert "Upload the first page" not in overview
+    editor = client.get(f"/scan/jobs/{job.pk}/editor/").content.decode()
+    assert "Upload the first page" not in editor
+    assert "The scanner uploads the pages" in editor
+
+
+def _populated_job(index: int) -> ScanJob:
+    job = ScanJob.objects.create(
+        provisional_title=f"Query count {index}", source=ScanJob.Source.SCANNER
+    )
+    for number in (1, 2):
+        page = ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+        _stage_rows(
+            job, page, {"deskew": "success", "output": "success" if number == 1 else "failed"}
+        )
+        ScanTodo.objects.create(scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN)
+    ScanJobOpf.objects.create(
+        scan_job=job,
+        version=1,
+        content=b"",
+        sha256=f"{index:064d}",
+        size_bytes=0,
+        fields={"title": f"OPF {index}", "authors": ["A"], "isbn": None, "language": "en"},
+    )
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.SCAN_FINALIZATION, details={"scan_job_id": str(job.pk)}
+    )
+    ReviewTask.objects.create(scan_job=job, source_filename="scan")
+    return job
+
+
+@pytest.mark.django_db
+def test_scan_job_list_query_count_does_not_grow_with_jobs_or_pages() -> None:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    client, _job = _create_scan_job("scanner-list-queries")
+    _populated_job(0)
+
+    def count() -> int:
+        with CaptureQueriesContext(connection) as queries:
+            assert client.get("/scan/jobs/?view=html").status_code == 200
+        return len(queries)
+
+    client.get("/scan/jobs/?view=html")  # warm the session and profile caches
+    few = count()
+    for index in range(1, 6):
+        _populated_job(index)
+    assert count() == few
+    assert few <= 12
 
 
 @pytest.mark.django_db(transaction=True)

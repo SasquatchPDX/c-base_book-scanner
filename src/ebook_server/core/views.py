@@ -20,7 +20,7 @@ from django.conf import settings as django_settings
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q, Subquery
+from django.db.models import Count, Q
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -47,10 +47,12 @@ from ebook_server.storage import (
 from . import (
     capture_layout,
     intake,
+    metadata_search,
     ocr,
     scan_artifact_pruning,
     scan_identification,
     scan_images,
+    scan_job_status,
     scan_lifecycle,
     scan_logs,
     scan_pipeline,
@@ -63,13 +65,10 @@ from . import (
 from .models import (
     Book,
     ProcessingJob,
-    ReviewTask,
     ScanJob,
-    ScanJobOpf,
     ScanPage,
     ScanPageImage,
     ScanPageVersion,
-    ScanTailorRun,
     ScanTailorStageState,
     ScanTodo,
     StorageLocation,
@@ -2077,34 +2076,16 @@ def scan_jobs(
         if scanner_id:
             queryset = queryset.filter(scanner_id=scanner_id)
         if html:
-            scanner_metadata = ScanJobOpf.objects.filter(
-                scan_job_id=OuterRef("pk"), app_generated=False
-            ).order_by("-version")
-            active_run = ScanTailorRun.objects.filter(
-                scan_job_id=OuterRef("pk"), state__in=scan_run.ACTIVE
-            ).values("state")[:1]
-            open_rescans = ScanTodo.objects.filter(
-                scan_job_id=OuterRef("pk"),
-                state__in=scanner_rescans.OPEN_TODO_STATES,
-                todo_type=ScanTodo.TodoType.RESCAN,
-            )
-            pending_reviews = ReviewTask.objects.filter(
-                scan_job_id=OuterRef("pk"),
-                state__in=[ReviewTask.State.OPEN, ReviewTask.State.CLAIMED],
-            )
+            # Derived pipeline status and scanner metadata with a fixed number of
+            # aggregated queries for the whole list, never per page (#226, #227).
+            # "Create scan job" is hidden in the template (#227, maybe later); the
+            # POST branch below still serves the session API.
             return render(
                 request,
                 "core/scan_jobs.html",
                 {
-                    "jobs": queryset.annotate(
-                        page_count=Count("pages", distinct=True),
-                        scanner_metadata=Subquery(scanner_metadata.values("fields")[:1]),
-                        active_run=Subquery(active_run),
-                        has_open_rescans=Exists(open_rescans),
-                        has_pending_review=Exists(pending_reviews),
-                    ),
+                    "jobs": scan_job_status.list_jobs(queryset),
                     "states": ScanJob.State.choices,
-                    "books": Book.objects.order_by("title")[:500],
                 },
             )
         serializer = _scan_job_payload_with_open_todos if include_open_todos else _scan_job_payload
@@ -2265,6 +2246,12 @@ def scan_job_identification_request(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
+    """Session API: start scan identification by hand.
+
+    The web UI no longer offers this (#227): identification runs automatically when a
+    scanner OPF arrives with missing fields, and at finish. The endpoint stays for API
+    clients and tests.
+    """
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
@@ -2300,7 +2287,10 @@ def scan_job_identification_request(
             scan_job=scan_job,
             requested_by_user_id=profile.user_id,
         )
-    except scan_identification.ScanIdentificationError as exc:
+    except (
+        scan_identification.ScanIdentificationError,
+        metadata_search.SearchInProgressError,
+    ) as exc:
         return HttpResponseBadRequest(str(exc))
     response_payload = scan_identification.job_payload(job)
     if _wants_html(request):
@@ -2968,7 +2958,10 @@ def scan_job_finish(
                 scan_job=job,
                 requested_by_user_id=profile.user_id,
             )
-        except scan_identification.ScanIdentificationError as exc:
+        except (
+            scan_identification.ScanIdentificationError,
+            metadata_search.SearchInProgressError,
+        ) as exc:
             return HttpResponseBadRequest(str(exc))
         identification_payload = scan_identification.job_payload(identification_job)
         if _wants_html(request):

@@ -28,11 +28,12 @@
         <p class="muted">The scanner sent this application's own generated metadata.opf (version {{ opf_metadata.version }}); it is not used as metadata.</p>
       {% else %}
         <dl class="metadata">
-          <div><dt>Title</dt><dd data-opf-title>{{ opf_metadata.title|default:"(none: identification runs at finish)" }}</dd></div>
-          <div><dt>Authors</dt><dd data-opf-authors>{{ opf_metadata.authors|join:", "|default:"Unknown" }}</dd></div>
-          <div><dt>ISBN</dt><dd class="mono" data-opf-isbn>{{ opf_metadata.isbn|default:"None" }}</dd></div>
-          <div><dt>Language</dt><dd data-opf-language>{{ opf_metadata.language|default:"Unknown" }}</dd></div>
+          <div><dt>Title</dt><dd data-opf-title>{% firstof opf_metadata.title opf_metadata.completed.title "(none: looked up automatically)" %}</dd></div>
+          <div><dt>Authors</dt><dd data-opf-authors>{% if opf_metadata.authors %}{{ opf_metadata.authors|join:", " }}{% elif opf_metadata.completed.authors %}{{ opf_metadata.completed.authors|join:", " }}{% else %}Unknown{% endif %}</dd></div>
+          <div><dt>ISBN</dt><dd class="mono" data-opf-isbn>{% firstof opf_metadata.isbn opf_metadata.completed.isbn "None" %}</dd></div>
+          <div><dt>Language</dt><dd data-opf-language>{% firstof opf_metadata.language opf_metadata.completed.language "Unknown" %}</dd></div>
         </dl>
+        {% if opf_metadata.completed %}<p class="muted" data-opf-completed>Completed from a strong provider match: {{ opf_metadata.completed.keys|join:", " }}.</p>{% endif %}
         <p class="muted">From the scanner's metadata.opf, version {{ opf_metadata.version }}.{% if not job.book_id %} No library book exists yet: finish links or creates it.{% endif %}{% if opf_metadata.provider_check.status %} External check: {{ opf_metadata.provider_check.status }}.{% endif %}</p>
       {% endif %}
     </section>
@@ -60,32 +61,12 @@
     </section>
   {% endif %}
 
-  {% if not job.book_id and job.state != 'complete' and job.state != 'cancelled' %}
-    <section class="finish-panel">
-      <div>
-        <h2>Resolve book identity</h2>
-        <p>Search public bibliographic providers and review ranked matches before finalization.</p>
-      </div>
-      <form method="post" action="{% url 'scan-job-identify' job.id %}">
-        {% csrf_token %}
-        <label>Title<input name="provisional_title" value="{{ job.provisional_title }}" required></label>
-        <label>Authors<input name="provisional_authors" value="{{ job.provisional_authors|join:', ' }}"></label>
-        <button type="submit">Search metadata</button>
-      </form>
-    </section>
-  {% endif %}
-
-  {% if job.state == 'open' or job.state == 'capturing' or job.state == 'paused' %}
-    <section class="workspace-tools">
-      <form class="inline-form" method="post" enctype="multipart/form-data" action="{% url 'scan-job-upload-page' job.id %}">
-        {% csrf_token %}
-        <label>Page image<input type="file" name="file" accept="image/*" required></label>
-        <label>Sequence<input type="number" name="logical_sequence_number" min="1" required></label>
-        <label>Side<select name="side"><option value="single">Single</option><option value="left">Left</option><option value="right">Right</option></select></label>
-        <button type="submit">Upload page</button>
-      </form>
-    </section>
-  {% endif %}
+  {% comment %}
+    #227: no manual "Resolve book identity" form (identification runs automatically in
+    the background when a scanner OPF with missing fields arrives, and at finish) and no
+    "Upload page" form (the scanner uploads pages). Both endpoints remain for the
+    session API.
+  {% endcomment %}
 
   <div class="scan-page-grid">
     {% for page in pages %}
@@ -127,12 +108,12 @@
         {% endif %}
       </article>
     {% empty %}
-      <p class="empty-state">Upload the first page to begin processing.</p>
+      <p class="empty-state">No pages yet. The scanner uploads the pages of this job.</p>
     {% endfor %}
   </div>
 
   {% if pages and job.state != 'complete' and job.state != 'finalizing' and job.state != 'cancelled' %}
-    {% if job.book_id or opf_metadata.title and not opf_metadata.ignored %}
+    {% if job.book_id or opf_metadata.title and not opf_metadata.ignored or opf_metadata.completed.title %}
     <section class="finish-panel">
       <div><h2>Finish clean page set</h2><p>Every page needs a successful Output stage. Packaging and optional OCR run in workers.</p></div>
       <form method="post" action="{% url 'scan-job-finish' job.id %}">

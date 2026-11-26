@@ -492,9 +492,45 @@ rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
 `capture_layout: single_page` and ignores it, and rejects `spread`.
 
-The HTML scan-job list opens jobs in the editor and shows available fields from
-the latest scanner OPF. It computes page counts and selects that metadata in
-the list query.
+## Scan job list (#226, #227)
+
+The HTML scan-job list (`/scan/jobs/?view=html`) opens each job in the editor (also
+**Raw scans**). Per job it shows the scanner OPF's title, authors, ISBN and language
+(with values the automatic completion added, see `docs/scanner-protocol.md`), the page
+count and a derived pipeline status. The stored `ScanJob.state` alone cannot say how far a
+scan has come (processing never changes it, a web job never leaves `capturing`), so the
+label is the earliest unfinished step, derived from existing data
+(`core/scan_job_status.py`):
+
+| Label | Condition (first that applies) |
+|---|---|
+| Cancelled | state `cancelled` |
+| OCR queued / OCR running / OCR'd | state `complete` and the newest OCR job for the scan |
+| Complete | state `complete` (no OCR, or OCR failed: see the badge) |
+| Finalizing | state `finalizing` |
+| Paused | state `paused` |
+| Capturing | no pages yet, or a scanner job before `capture-complete` |
+| N / M rendered | some pages, not all, have a successful (or blank-skipped) Output stage |
+| Rendered | every page has one |
+| Metadata available | nothing rendered yet; a scanner OPF or a linked Book exists |
+| Captured | nothing rendered yet and no metadata |
+
+"Rendered" counts recorded Output results; whether each is still current is decided in the
+editor. The status can go backwards (a replaced page re-queues its stages). Badges show
+conditions that can occur at any step: **failed** (a failed stage, finalization or OCR
+job), **waiting for review** (an open review task, e.g. from identification or the
+provider check), **rescan open**, **re-finish needed** and the whole-book run state.
+
+The list never loads pages: one annotated job query (page count, newest scanner OPF, run,
+rescan and review flags as subqueries), one aggregate over stage states, one query for
+finalization jobs and one for OCR jobs, whatever the number of jobs and pages
+(`test_scan_job_list_query_count_does_not_grow_with_jobs_or_pages`).
+
+"Create scan job" is hidden in the list ("maybe later"): the scanner creates jobs. The
+form is kept, commented out, in `scan_jobs.html`, and `POST /scan/jobs/` still creates web
+jobs for the session API. Pages are not uploaded by hand either: the overview has no
+"Upload page" form any more (`POST /scan/jobs/{id}/pages/` remains for the session API),
+and there is no manual "Resolve book identity" form; identification runs automatically.
 
 ## Run all stages
 
@@ -536,8 +572,8 @@ stale and returns the job to **re-finish needed**.
 
 Two pages (#195 step 3):
 
-- **Job overview** (`/scan/jobs/{id}/workspace/`): metadata, identification,
-  uploads, rescans, finishing, and one card per page with server-rendered stage
+- **Job overview** (`/scan/jobs/{id}/workspace/`): scanner metadata (with automatically
+  completed fields), completeness, rescans, finishing, and one card per page with server-rendered stage
   statuses and Run forms, so it works without JavaScript. "Open ScanTailor editor"
   and each stage's "Edit" link open the editor (`?page=<id>&stage=<stage>`).
 - **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. It

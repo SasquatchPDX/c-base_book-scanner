@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
     queue_retry_max: int = 3
     queue_retry_intervals: list[int] = [30, 120, 600]
+    # Metadata lookups (scan identification, scanner-OPF completion and provider check,
+    # review "Search again") run on their own queue so they never wait behind
+    # ScanTailor stage jobs (#227). Workers list it before the main queue.
+    metadata_queue_name: str = "metadata"
+    # Look up missing scanner-OPF fields automatically when an OPF arrives (#227).
+    scan_metadata_completion: bool = True
     ldap_mode: str = "stub"
     ldap_server_uri: str = ""
     ldap_user_dn_template: str = ""
@@ -439,6 +445,8 @@ BOOK_SCANNER_QUEUE_RESULT_TTL_SECONDS = settings.queue_result_ttl_seconds
 BOOK_SCANNER_QUEUE_FAILURE_TTL_SECONDS = settings.queue_failure_ttl_seconds
 BOOK_SCANNER_QUEUE_RETRY_MAX = settings.queue_retry_max
 BOOK_SCANNER_QUEUE_RETRY_INTERVALS = settings.queue_retry_intervals
+BOOK_SCANNER_METADATA_QUEUE_NAME = settings.metadata_queue_name
+BOOK_SCANNER_SCAN_METADATA_COMPLETION = settings.scan_metadata_completion
 BOOK_SCANNER_LDAP_MODE = settings.ldap_mode
 BOOK_SCANNER_LDAP_SERVER_URI = settings.ldap_server_uri
 BOOK_SCANNER_LDAP_USER_DN_TEMPLATE = settings.ldap_user_dn_template

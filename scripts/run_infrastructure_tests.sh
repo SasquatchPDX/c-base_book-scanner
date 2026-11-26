@@ -200,7 +200,7 @@ uv run rq worker \
   --config ebook_server.rq_settings \
   --worker-class ebook_server.recovery_worker.RecoveryWorker \
   --url "${BOOK_SCANNER_REDIS_URL}" \
-  ebook-server \
+  metadata ebook-server \
   >"${book_scanner_worker_log}" 2>&1 &
 book_scanner_worker_pid=$!
 

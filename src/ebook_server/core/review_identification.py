@@ -11,7 +11,7 @@ from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, metadata_queue_name
 
 from . import identification, intake, metadata_search, review_accept
 from .models import ImportJob, MetadataSearch, ProcessingJob, ReviewTask
@@ -138,7 +138,7 @@ def request_review_identification(
         metadata_search.make_current(source, processing_job)
 
     try:
-        queue = get_queue()
+        queue = get_queue(metadata_queue_name())
         if queue is None:
             process_review_identification_job(str(processing_job.job_id))
         else:

@@ -122,7 +122,9 @@ def test_scan_job_list_create_and_workspace_render() -> None:
     assert b"Bench scan" in jobs.content
     assert workspace.status_code == 200
     assert b"ScanTailor workspace" in workspace.content
-    assert b"Upload the first page" in workspace.content
+    # The scanner uploads pages; the overview offers no manual upload (#227).
+    assert b"The scanner uploads the pages of this job" in workspace.content
+    assert b"Upload page" not in workspace.content
     # The overview links the full-viewport editor (#195 step 3) instead of embedding it.
     assert f'href="/scan/jobs/{job.id}/editor/"'.encode() in workspace.content
     assert b"data-stage-controls" not in workspace.content

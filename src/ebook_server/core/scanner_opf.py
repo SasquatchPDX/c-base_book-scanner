@@ -6,6 +6,9 @@ Per contract decision D3 it is the primary metadata source:
 * Every upload with a new checksum is stored as a new immutable :class:`ScanJobOpf`
   version; the newest is current. While the scan is raw it creates **no** Book: the job
   page and the "Raw scans" list only *show* its title, authors, ISBN and language.
+* While no Book is linked, a version that lacks the title, authors or ISBN starts an
+  automatic background lookup (:mod:`.scan_metadata_completion`, #227). Only a strong
+  match completes the empty fields; finish then uses the OPF plus that completion.
 * At finish (:func:`link_book_from_opf`, a :mod:`.scan_lifecycle` book linker):
 
   - the OPF's ISBN matches exactly one Book -> the job is linked to that Book (it gains a
@@ -50,7 +53,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, metadata_queue_name
 
 from . import identification, intake, metadata_search, review_accept, scan_lifecycle, scan_manifest
 from .languages import normalize_language
@@ -268,6 +271,10 @@ def store_opf(
         book = Book.objects.select_for_update().get(pk=job.book_id)
         apply_opf_to_book(book, opf, job)
         request_provider_check(job=job, book=book, opf=opf)
+    else:
+        from . import scan_metadata_completion
+
+        scan_metadata_completion.schedule(str(job.pk), opf.pk)
     return StoreResult(opf, True)
 
 
@@ -280,10 +287,14 @@ def display_metadata(job: ScanJob) -> dict[str, Any] | None:
             return None
         return {"version": newest.version, "sha256": newest.sha256, "ignored": True}
     fields = opf.fields if isinstance(opf.fields, dict) else {}
+    from . import scan_metadata_completion
+
     return {
         "version": opf.version,
         "sha256": opf.sha256,
         "received_at": opf.received_at.isoformat(),
+        # Values a strong provider match supplied for fields this OPF leaves empty (#227).
+        "completed": scan_metadata_completion.merged_fields(job, opf)[1],
         "title": fields.get("title"),
         "authors": list(fields.get("authors") or []),
         "isbn": fields.get("isbn"),
@@ -568,9 +579,12 @@ def apply_opf_to_book(book: Book, opf: ScanJobOpf, job: ScanJob) -> dict[str, An
         elif _is_empty(current):
             owned = True
         else:
+            # A value the automatic completion filled (#227) only stood in for the
+            # scanner's: a later OPF that names the field replaces it.
             owned = (
                 owner is not None
-                and owner.source == PROVENANCE_SOURCE
+                and owner.source
+                in (PROVENANCE_SOURCE, BookMetadataProvenance.Source.PROVIDER_CHECK)
                 and same_value(field_name, owner.value, current)
             )
         if owned:
@@ -662,8 +676,18 @@ def duplicate_books(title: str, authors: list[str]) -> list[Book]:
 
 
 def create_book_from_opf(job: ScanJob, opf: ScanJobOpf, *, user: Any = None) -> Book:
-    """A new Book from the OPF's fields, each recorded with provenance ``scanner_opf``."""
-    fields = opf.fields if isinstance(opf.fields, dict) else {}
+    """A new Book from the OPF's fields, each recorded with provenance ``scanner_opf``.
+
+    Fields the OPF leaves empty are taken from the job's automatic completion of this
+    OPF version, if a strong provider match supplied them (provenance
+    ``provider_check``, #227).
+    """
+    from . import scan_metadata_completion
+
+    fields, completed = scan_metadata_completion.merged_fields(job, opf)
+    completion_record = (
+        (job.notes or {}).get(scan_metadata_completion.NOTES_KEY) if completed else None
+    )
     isbn13 = fields.get("isbn")
     forms = metadata_search.isbn_forms(isbn13) if isbn13 else []
     book = intake._provision_book_from_manual_metadata(
@@ -679,13 +703,25 @@ def create_book_from_opf(job: ScanJob, opf: ScanJobOpf, *, user: Any = None) -> 
         value = opf_value(fields, field_name)
         if value is None:
             continue
+        from_completion = field_name in completed
+        details: dict[str, Any] = {"opf_version": opf.version, "created": True}
+        if from_completion and isinstance(completion_record, dict):
+            details["completion"] = {
+                "candidate": completion_record.get("candidate"),
+                "search_id": completion_record.get("search_id"),
+                "processing_job_id": completion_record.get("processing_job_id"),
+            }
         _record(
             book,
             field_name=field_name,
-            source=PROVENANCE_SOURCE,
+            source=(
+                BookMetadataProvenance.Source.PROVIDER_CHECK
+                if from_completion
+                else PROVENANCE_SOURCE
+            ),
             action=BookMetadataProvenance.Action.SET,
             value=value,
-            details={"opf_version": opf.version, "created": True},
+            details=details,
             job=job,
             opf=opf,
             user=user,
@@ -730,7 +766,10 @@ def link_book_from_opf(job: ScanJob) -> Book | None:
         opf = effective_opf(locked)
         if opf is None:
             return None
-        fields = opf.fields if isinstance(opf.fields, dict) else {}
+        from . import scan_metadata_completion
+
+        # The OPF plus what a strong provider match completed (#227).
+        fields, _completed = scan_metadata_completion.merged_fields(locked, opf)
         title = fields.get("title")
         if not title:
             _hand_to_identification(locked, opf, reason="no_title")
@@ -797,7 +836,7 @@ def request_provider_check(*, job: ScanJob, book: Book, opf: ScanJobOpf) -> Proc
 
 def _dispatch_provider_check(job_id: str) -> None:
     try:
-        queue = get_queue()
+        queue = get_queue(metadata_queue_name())
         if queue is None:
             process_provider_check_job(job_id)
         else:

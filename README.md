@@ -71,7 +71,7 @@ Run the web process and an RQ worker:
 
 ```bash
 uv run python manage.py runserver
-uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
+uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 metadata ebook-server
 ```
 
 `--with-scheduler` is required: job retries use delays, and in rq 2.x a delayed

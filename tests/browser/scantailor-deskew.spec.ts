@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { createWebScanJob } from "./scan-jobs";
 
 // Pillow-generated 100×100 white page (same fixture as scantailor-preview-retry.spec.ts).
 const PAGE = Buffer.from(
@@ -21,16 +22,9 @@ test("deskew turns the page live in the browser and saves when the handle is rel
 }) => {
   test.setTimeout(60_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Deskew handles");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "page.png",
-    mimeType: "image/png",
-    buffer: PAGE,
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
+  await createWebScanJob(page, "Deskew handles", [
+    { name: "page.png", buffer: PAGE, sequence: 1 },
+  ]);
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 

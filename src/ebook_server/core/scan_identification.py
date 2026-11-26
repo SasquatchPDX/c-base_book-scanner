@@ -11,12 +11,16 @@ from django.db import transaction
 from django.utils import timezone
 from rq import get_current_job
 
-from ebook_server.jobs import get_queue
+from ebook_server.jobs import get_queue, metadata_queue_name
 
 from . import identification, metadata_search, review_accept
-from .models import MetadataSearch, ProcessingJob, ReviewTask, ScanJob
+from .models import MetadataSearch, ProcessingJob, ReviewTask, ScanJob, ScanJobOpf
 
 logger = structlog.get_logger(__name__)
+
+# Finish handed the scan to identification because its OPF ISBN is not a safe key: an
+# ISBN lookup would pick one of several Books (or a likely duplicate) silently.
+_TEXT_ONLY_REASONS = frozenset({"ambiguous_isbn", "possible_duplicate"})
 
 
 class ScanIdentificationError(RuntimeError):
@@ -40,19 +44,41 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
         "search_id": details.get("search_id"),
         "attempt_count": details.get("attempt_count", 0),
         "error": details.get("error", ""),
+        "automatic": bool(details.get("automatic")),
+        "completion": details.get("completion"),
         "scheduled_at": job.scheduled_at.isoformat(),
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
     }
 
 
+def _opf_fields(scan_job: ScanJob) -> dict[str, Any]:
+    """Fields of the scanner OPF behind the lookup: the version finish handed over,
+    else the newest scanner OPF (one query)."""
+    handed = _scanner_opf_evidence(scan_job).get("scanner_opf")
+    if isinstance(handed, dict):
+        return handed
+    fields = (
+        ScanJobOpf.objects.filter(scan_job=scan_job, app_generated=False)
+        .order_by("-version")
+        .values_list("fields", flat=True)
+        .first()
+    )
+    return fields if isinstance(fields, dict) else {}
+
+
 def _provisional_terms(scan_job: ScanJob) -> dict[str, Any]:
-    opf = _scanner_opf_evidence(scan_job).get("scanner_opf", {})
-    if opf.get("reason") == "no_title":
-        isbn = metadata_search.canonical_isbn13(opf.get("isbn"))
-        if isbn is not None:
-            return {"isbn": isbn}
-    return {
+    """Lookup terms from the scan's own evidence (#227).
+
+    The scanner OPF's ISBN makes it an ISBN lookup (also for an OPF with nothing but
+    an ISBN), unless finish found that ISBN ambiguous. Otherwise the provisional title
+    and authors, with the OPF's language.
+    """
+    opf = _opf_fields(scan_job)
+    isbn = metadata_search.canonical_isbn13(opf.get("isbn"))
+    if isbn is not None and opf.get("reason") not in _TEXT_ONLY_REASONS:
+        return {"isbn": isbn}
+    terms: dict[str, Any] = {
         "title": scan_job.provisional_title.strip(),
         "authors": [
             str(author).strip()
@@ -60,6 +86,10 @@ def _provisional_terms(scan_job: ScanJob) -> dict[str, Any]:
             if isinstance(author, str) and author.strip()
         ],
     }
+    language = opf.get("language")
+    if isinstance(language, str) and language.strip():
+        terms["language"] = language.strip()
+    return terms
 
 
 def _signals(terms: dict[str, Any]) -> identification.IdentificationInput:
@@ -71,12 +101,14 @@ def _signals(terms: dict[str, Any]) -> identification.IdentificationInput:
         for author in (raw_authors if isinstance(raw_authors, list) else [])
         if isinstance(author, str) and author.strip()
     ]
+    raw_language = terms.get("language")
+    language = raw_language.strip() if isinstance(raw_language, str) else ""
     return identification.IdentificationInput(
         title_hints=[title] if title else [],
         author_hints=authors,
         isbns=[],
         folder_hints=[],
-        language=None,
+        language=language or None,
         publisher=None,
         description=None,
     )
@@ -156,12 +188,18 @@ def request_scan_identification(
     scan_job: ScanJob,
     requested_by_user_id: int | None,
     terms: dict[str, Any] | None = None,
+    automatic: dict[str, Any] | None = None,
 ) -> ProcessingJob:
     """Persist and dispatch metadata lookup outside the request process.
 
     ``terms`` defaults to the scan job's provisional hints. An already queued
     search takes new terms; a running one with different terms raises
     :class:`metadata_search.SearchInProgressError`; a stale one is replaced.
+
+    ``automatic`` (``{"opf_id", "opf_version"}``) marks the background completion of a
+    scanner OPF (:mod:`.scan_metadata_completion`): its result completes the OPF on a
+    strong match instead of opening a review. A person's request that reuses such a
+    queued job turns it into an ordinary one.
     """
     if scan_job.book_id is not None:
         raise ScanIdentificationError("scan job is already linked to a book")
@@ -189,6 +227,10 @@ def request_scan_identification(
         )
         reused = metadata_search.reuse_or_replace_active_job(active, search_terms)
         if reused is not None:
+            reused_details = _details(reused)
+            if automatic is None and reused_details.get("automatic"):
+                reused.details = {**reused_details, "automatic": None}
+                reused.save(update_fields=["details"])
             metadata_search.make_current(locked, reused)
             return reused
         open_task_id = (
@@ -208,6 +250,7 @@ def request_scan_identification(
                 "open_review_task_id": open_task_id,
                 "requested_by_user_id": requested_by_user_id,
                 "terms": search_terms,
+                "automatic": automatic,
                 "attempt_count": 0,
                 "candidate_count": 0,
                 "error": "",
@@ -216,7 +259,7 @@ def request_scan_identification(
         metadata_search.make_current(locked, processing_job)
 
     try:
-        queue = get_queue()
+        queue = get_queue(metadata_queue_name())
         if queue is None:
             process_scan_identification_job(str(processing_job.job_id))
         else:
@@ -329,26 +372,49 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
                 current=not reason,
             )
             task_id: int | None = None
+            # Re-read under the lock: a person's request may have taken over an
+            # automatic job meanwhile (``request_scan_identification``).
+            automatic = _details(locked_job).get("automatic")
+            completion: dict[str, Any] | None = None
             if reason:
                 metadata_search.finish_discarded_job(
                     locked_job, attempt=attempt_count, reason=reason, search_id=search.id
                 )
             else:
-                task = _create_or_refresh_review(locked_scan, candidates)
-                task_id = task.id
+                if isinstance(automatic, dict):
+                    from . import scan_metadata_completion
+
+                    completion = scan_metadata_completion.publish(
+                        locked_scan,
+                        automatic,
+                        mode=mode,
+                        signals=signals,
+                        candidates=candidates,
+                        processing_job_id=str(locked_job.job_id),
+                        search_id=str(search.id),
+                    )
+                if completion is None or completion.get("needs_review"):
+                    task = _create_or_refresh_review(locked_scan, candidates)
+                    task_id = task.id
                 locked_job.state = ProcessingJob.JobState.SUCCESS
                 locked_job.finished_at = timezone.now()
                 locked_job.details = {
                     **details,
+                    "automatic": automatic,
                     "candidate_count": len(candidates),
-                    "review_task_id": task.id,
+                    "review_task_id": task_id,
                     "search_id": str(search.id),
                     "published": True,
+                    "completion": (
+                        {key: value for key, value in completion.items() if key != "needs_review"}
+                        if completion is not None
+                        else None
+                    ),
                     "error": "",
                 }
                 locked_job.save(update_fields=["state", "finished_at", "details"])
         auto_accepted = None
-        if not reason and mode == "isbn" and task_id is not None:
+        if not reason and mode == "isbn" and task_id is not None and not automatic:
             auto_accepted = _auto_accept_isbn_match(
                 processing_job=processing_job,
                 scan_job=scan_job,

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { createWebScanJob } from "./scan-jobs";
 
 // Pillow-generated 100×100 white page: automatic dewarping must explain its fallback.
 const PAGE = Buffer.from(
@@ -14,14 +15,9 @@ async function openNewJob(page: Page, title: string): Promise<void> {
   await page.getByLabel("LDAP username").fill("fry");
   await page.getByLabel("Password").fill("fry");
   await page.getByRole("button", { name: "Sign in" }).click();
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill(title);
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "blank.png", mimeType: "image/png", buffer: PAGE,
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
+  await createWebScanJob(page, title, [
+    { name: "blank.png", buffer: PAGE, sequence: 1 },
+  ]);
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
   await expect(page.locator("[data-scantailor-editor]")).toBeVisible();

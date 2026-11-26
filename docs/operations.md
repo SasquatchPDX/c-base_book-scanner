@@ -1552,7 +1552,7 @@ unreferenced temporary artifacts; Python cleanup cannot run after `SIGKILL`.
 ```bash
 uv run rq worker --with-scheduler --config ebook_server.rq_settings \
   --worker-class ebook_server.recovery_worker.RecoveryWorker \
-  --url redis://localhost:6379/0 ebook-server
+  --url redis://localhost:6379/0 metadata ebook-server
 ```
 
 **`--with-scheduler` is mandatory on at least one worker.** Failed jobs retry
@@ -1573,6 +1573,23 @@ server or starve OCR. Run one or two workers for it, for example
 `rq worker --config ebook_server.rq_settings --url redis://localhost:6379/0 llm`,
 or add `llm` to an existing worker's queue list. Without such a worker, LLM jobs
 stay queued and `recover_stale_jobs` reports them.
+
+### Queues
+
+| Queue (setting, default) | Jobs |
+|---|---|
+| `BOOK_SCANNER_QUEUE_NAME` (`ebook-server`) | everything else: imports, conversions, OCR, ScanTailor stage jobs, finalization |
+| `BOOK_SCANNER_METADATA_QUEUE_NAME` (`metadata`) | metadata lookups: scan identification (including the automatic completion of a scanner OPF), the scanner-OPF provider check, a review's "Search again" (#227) |
+| `BOOK_SCANNER_LLM_QUEUE_NAME` (`llm`) | LLM identification assist (above) |
+
+Metadata lookups are a few HTTP requests each; on the shared queue they waited behind
+hundreds of ScanTailor stage jobs (#227). The `deploy/systemd` worker template lists
+`metadata ebook-server`: RQ serves the queues in that order, so every free worker takes a
+waiting lookup before the next stage job, and no extra worker is needed. **When upgrading,
+copy the new unit (or add `metadata` before the main queue name in your own worker
+command) and restart the workers**; without a worker on `metadata`, lookups stay queued
+and `recover_stale_jobs` reports them. `GET /metrics` reports the queue's depth as
+`ebook_server_queue{queue="metadata"}`.
 
 ### Worker concurrency (ScanTailor-Web batches)
 

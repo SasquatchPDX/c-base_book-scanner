@@ -1,4 +1,5 @@
 import { expect, test, type BrowserContext, type Locator, type Page } from "@playwright/test";
+import { createWebScanJob, uploadScanPage } from "./scan-jobs";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
@@ -69,19 +70,13 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
 
   try {
     const firstEditor = await signIn(firstContext, "fry");
-    await firstEditor.goto("/scan/jobs/?view=html");
-    await firstEditor.getByLabel("Title hint").fill("Browser Concurrency Fixture");
-    await firstEditor.getByLabel("Author hints").fill("Ada Lovelace");
-    await firstEditor.getByRole("button", { name: "Create workspace" }).click();
+    await createWebScanJob(
+      firstEditor,
+      "Browser Concurrency Fixture",
+      [{ name: "page-0001.png", buffer: SCAN_PAGE_PNG, sequence: 1 }],
+      ["Ada Lovelace"],
+    );
     await expect(firstEditor).toHaveURL(/\/scan\/jobs\/[0-9a-f-]+\/workspace\/$/);
-
-    await firstEditor.getByLabel("Page image").setInputFiles({
-      name: "page-0001.png",
-      mimeType: "image/png",
-      buffer: SCAN_PAGE_PNG,
-    });
-    await firstEditor.getByLabel("Sequence").fill("1");
-    await firstEditor.getByRole("button", { name: "Upload page" }).click();
     await expect(firstEditor.locator(".scan-page-card")).toHaveCount(1);
 
     await firstEditor.getByRole("link", { name: "Open ScanTailor editor" }).click();
@@ -140,20 +135,14 @@ test("a member completes the physical-book pipeline through the browser", async 
 
   try {
     const member = await signIn(context, "fry");
-    await member.goto("/scan/jobs/?view=html");
-    await member.getByLabel("Title hint").fill(title);
-    await member.getByLabel("Author hints").fill("Grace Hopper");
-    await member.getByRole("button", { name: "Create workspace" }).click();
+    const jobId = await createWebScanJob(
+      member,
+      title,
+      [{ name: "physical-page-0001.png", buffer: SCAN_PAGE_PNG, sequence: 1 }],
+      ["Grace Hopper"],
+    );
     await expect(member).toHaveURL(/\/scan\/jobs\/[0-9a-f-]+\/workspace\/$/);
     const workspaceUrl = member.url();
-
-    await member.getByLabel("Page image").setInputFiles({
-      name: "physical-page-0001.png",
-      mimeType: "image/png",
-      buffer: SCAN_PAGE_PNG,
-    });
-    await member.getByLabel("Sequence").fill("1");
-    await member.getByRole("button", { name: "Upload page" }).click();
     await expect(member.locator(".scan-page-card")).toHaveCount(1);
     await runAllScanTailorStages(member);
 
@@ -161,13 +150,13 @@ test("a member completes the physical-book pipeline through the browser", async 
     await member.getByRole("button", { name: "Request rescan" }).click();
     await expect(member.locator(".scan-page-card")).toContainText("Rescan requested");
 
-    await member.getByLabel("Page image").setInputFiles({
+    // The replacement arrives like the scanner's (#227: no manual upload form).
+    await uploadScanPage(member, jobId, {
       name: "physical-page-0001-rescan.png",
-      mimeType: "image/png",
       buffer: RESCAN_PAGE_PNG,
+      sequence: 1,
     });
-    await member.getByLabel("Sequence").fill("1");
-    await member.getByRole("button", { name: "Upload page" }).click();
+    await member.goto(workspaceUrl);
     await expect(member.locator(".scan-page-card")).not.toContainText("Rescan requested");
     // The replacement changed Deskew's input; later results are stale until it re-runs (#205).
     await expect(
@@ -175,8 +164,14 @@ test("a member completes the physical-book pipeline through the browser", async 
     ).toHaveText("waiting for Deskew");
     await runAllScanTailorStages(member);
 
-    await member.getByRole("button", { name: "Search metadata" }).click();
-    await expect(member).toHaveURL(/\/scan-identifications\/[0-9a-f-]+\/$/);
+    // A web job without scanner metadata has no automatic lookup; start it through
+    // the session API (#227: the UI has no "Resolve book identity" form any more).
+    const csrf = (await context.cookies()).find((cookie) => cookie.name === "csrftoken");
+    const identify = await member.request.post(`/scan/jobs/${jobId}/identify/`, {
+      headers: { "X-CSRFToken": csrf!.value, Referer: member.url() },
+    });
+    expect(identify.status()).toBe(202);
+    await member.goto(`/scan-identifications/${(await identify.json()).job_id}/`);
     await expect(member.locator(".status-card .status")).toHaveText("Success", {
       timeout: 30_000,
     });
@@ -286,7 +281,9 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     const member = await signIn(memberContext, "fry");
     const detailsURL = "/scan/jobs/" + jobId + "/";
     await member.goto("/scan/raw/");
-    await member.locator('a[href*="' + jobId + '/workspace/"]').click();
+    // Raw scans open the editor (#227); its back link leads to the overview.
+    await member.locator('a[href*="' + jobId + '/editor/"]').click();
+    await member.locator(".st-back").click();
     await expect(member.locator("[data-opf-title]")).toHaveText(title);
     const first = (await (await member.request.get(detailsURL)).json()).pages[0];
     expect(first.available_versions).toHaveLength(1);

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { createWebScanJob } from "./scan-jobs";
 
 async function signIn(page: Page): Promise<void> {
   await page.goto("/accounts/login/");
@@ -43,16 +44,9 @@ test("dewarping shows the model grid and a dragged point saves a manual model", 
 }) => {
   test.setTimeout(120_000);
   await signIn(page);
-  await page.goto("/scan/jobs/?view=html");
-  await page.getByLabel("Title hint").fill("Dewarping grid");
-  await page.getByRole("button", { name: "Create workspace" }).click();
-  await page.getByLabel("Page image").setInputFiles({
-    name: "page.png",
-    mimeType: "image/png",
-    buffer: await textPage(page),
-  });
-  await page.getByLabel("Sequence").fill("1");
-  await page.getByRole("button", { name: "Upload page" }).click();
+  await createWebScanJob(page, "Dewarping grid", [
+    { name: "page.png", buffer: await textPage(page), sequence: 1 },
+  ]);
   await expect(page.locator(".scan-page-card")).toHaveCount(1);
   await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
 

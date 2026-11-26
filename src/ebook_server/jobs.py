@@ -147,6 +147,16 @@ def llm_queue_name() -> str:
     return str(tunable_setting("BOOK_SCANNER_LLM_QUEUE_NAME", "llm"))
 
 
+def metadata_queue_name() -> str:
+    """RQ queue for metadata lookups, kept off the ScanTailor stage queue (#227)."""
+    return str(tunable_setting("BOOK_SCANNER_METADATA_QUEUE_NAME", "metadata"))
+
+
+def get_metadata_queue() -> QueueLike | None:
+    """The queue metadata lookups are enqueued on (inline or none like :func:`get_queue`)."""
+    return get_queue(metadata_queue_name())
+
+
 def job_timeout_seconds(job_type: str) -> int:
     if job_type == "ocr":
         return ocr_job_timeout_seconds()
@@ -197,11 +207,13 @@ def rq_pending_job_args() -> tuple[set[str] | None, bool | None]:
     rq_queue = getattr(queue, "queue", None)
     if rq_queue is None:
         return None, None
-    # LLM identification jobs run on their own queue (#26); inspect it too.
+    # LLM identification (#26) and metadata lookups (#227) run on their own queues;
+    # inspect them too.
     rq_queues = [rq_queue]
-    llm_queue = getattr(get_queue(llm_queue_name()), "queue", None)
-    if llm_queue is not None and llm_queue.name != rq_queue.name:
-        rq_queues.append(llm_queue)
+    for extra_name in (llm_queue_name(), metadata_queue_name()):
+        extra = getattr(get_queue(extra_name), "queue", None)
+        if extra is not None and all(extra.name != known.name for known in rq_queues):
+            rq_queues.append(extra)
     try:
         jobs: list[Any] = []
         for inspected in rq_queues:

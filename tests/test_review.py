@@ -444,7 +444,7 @@ def test_search_again_dispatch_failure_is_durable_and_reopens_task(
         username="review-search-dispatch-failure",
         candidate_title="Initial Candidate",
     )
-    monkeypatch.setattr(review_identification, "get_queue", lambda: FailingQueue())
+    monkeypatch.setattr(review_identification, "get_queue", lambda *_: FailingQueue())
 
     response = client.post(f"/reviews/{task.id}/search-again/")
 
@@ -478,7 +478,7 @@ def test_completed_repeat_search_never_reopens_task_resolved_while_queued(
         username="review-search-resolution-race",
         candidate_title="Initial Candidate",
     )
-    monkeypatch.setattr(review_identification, "get_queue", lambda: queue)
+    monkeypatch.setattr(review_identification, "get_queue", lambda *_: queue)
     response = client.post(f"/reviews/{task.id}/search-again/")
     assert response.status_code == 202
     assert queue.call is not None
