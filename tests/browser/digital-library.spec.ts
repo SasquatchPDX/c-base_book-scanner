@@ -77,8 +77,8 @@ test("a member completes digital intake, review, search, download, and conversio
 
     await member.getByRole("link", { name: "Resolve metadata" }).click();
     await member.getByRole("link", { name: title }).click();
-    // Title, author and language match, but the file names another publisher than the
-    // provider's edition, so the import was held for review instead of auto-accepted.
+    // Title, author and publisher match, but the provider's edition is in another
+    // language than the file, so the import was held for review instead of auto-accepted.
     await expect(member.locator('[data-block-reason="edition_conflict"]')).toContainText(
       "describes another edition than the file",
     );

@@ -131,6 +131,17 @@ class Settings(BaseSettings):
     metadata_rate_limits: dict[str, float] = {"openlibrary": 1.0}
     metadata_rate_limit_default: float = 1.0
     metadata_rate_limit_max_wait_seconds: float = 60.0
+    # Provider lookup costs (#220, docs/intake-evaluation.md): wall-clock budget per
+    # provider, circuit breaker after repeated failures, reuse of identical queries
+    # (0 disables), and stopping early once a finished provider is decisive.
+    metadata_provider_timeout_seconds: float = 20.0
+    metadata_provider_breaker_failures: int = 3
+    metadata_provider_breaker_cooldown_seconds: float = 120.0
+    metadata_provider_cache_seconds: float = 900.0
+    identification_early_exit: bool = True
+    # Additive score weights; title + author alone stay below auto-accept by design.
+    identification_title_weight: float = 0.55
+    identification_author_weight: float = 0.3
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
@@ -432,6 +443,15 @@ BOOK_SCANNER_METADATA_USER_AGENT = (
 BOOK_SCANNER_METADATA_RATE_LIMITS = settings.metadata_rate_limits
 BOOK_SCANNER_METADATA_RATE_LIMIT_DEFAULT = settings.metadata_rate_limit_default
 BOOK_SCANNER_METADATA_RATE_LIMIT_MAX_WAIT_SECONDS = settings.metadata_rate_limit_max_wait_seconds
+BOOK_SCANNER_METADATA_PROVIDER_TIMEOUT_SECONDS = settings.metadata_provider_timeout_seconds
+BOOK_SCANNER_METADATA_PROVIDER_BREAKER_FAILURES = settings.metadata_provider_breaker_failures
+BOOK_SCANNER_METADATA_PROVIDER_BREAKER_COOLDOWN_SECONDS = (
+    settings.metadata_provider_breaker_cooldown_seconds
+)
+BOOK_SCANNER_METADATA_PROVIDER_CACHE_SECONDS = settings.metadata_provider_cache_seconds
+BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT = settings.identification_early_exit
+BOOK_SCANNER_IDENTIFICATION_TITLE_WEIGHT = settings.identification_title_weight
+BOOK_SCANNER_IDENTIFICATION_AUTHOR_WEIGHT = settings.identification_author_weight
 BOOK_SCANNER_QUEUE_URL = settings.redis_url
 BOOK_SCANNER_QUEUE_NAME = settings.queue_name
 BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS = settings.queue_job_timeout_seconds

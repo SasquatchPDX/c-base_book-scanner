@@ -72,8 +72,10 @@ if **all** of the following hold:
 - **No ambiguity:** the runner-up is more than
   `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_TIE_MARGIN` (default 0.05) below the top
   candidate, and no other candidate also passes the rule. Two near-identical records
-  (two works titled "Poems" by the same author, or the same book returned twice)
-  therefore go to review.
+  (two works titled "Poems" by the same author) therefore go to review. Records of
+  the same work are no rivals (#220): other editions, repeats of one provider record
+  (collapsed before ranking), and a same-title record that only adds a contributor
+  beside the same author (`["SparkNotes", "Aldous Huxley"]`).
 
 `BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED` (default true) turns the rule
 off. Whenever the rule is evaluated, the decision is stored on the top candidate's
@@ -96,7 +98,8 @@ why the accept was blocked anyway.
 
 Author names are compared per name, not by exact string. Case, punctuation,
 spacing, and "Last, First" order are ignored, so "H P Lovecraft" equals
-"H. P. Lovecraft". A name variant counts as a partial match
+"H. P. Lovecraft". The same name tokens in another order match too (#220: Google
+Books' "Stross Charles" equals "Stross, Charles"). A name variant counts as a partial match
 (`AUTHOR_VARIANT_MATCH_SCORE`, 0.9) when the surname is the same and the given
 names line up in order. Given names line up when they are equal, when one is the
 other's initial, or when they are close spellings, so a missing middle name or
@@ -205,6 +208,17 @@ normalised file evidence with the candidate's edition, and `intake.decide_auto_a
 - `edition_publisher_mismatch`: the file's publisher does not match the edition's,
   and no file ISBN confirms the edition (with a confirmed ISBN a differing publisher
   is usually an imprint or distributor and is tolerated).
+
+A publisher mismatch alone is an *edition mismatch*, not a work conflict (#220, E1):
+when the exact title and a strong author identify the work (the strong-match rule's
+title/author checks), it does not block. The work is accepted without that
+printing's ISBN, publisher and year, and the mismatch is recorded in the import
+evidence as `auto_accept_edition_mismatch`. ISBN and language mismatches still block.
+
+A provider record that lists no authors at all may take the authors of another
+record of the same title when the file's own (embedded or sidecar) authors match
+them; the import evidence records this as `auto_accept_authors_completed`. A
+placeholder such as "Multiple Authors" is never completed.
 
 Missing values on either side are no conflict. Among equally scored candidates, one
 without edition conflicts ranks first, so an `/isbn/` edition record wins a tie with

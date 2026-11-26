@@ -224,7 +224,10 @@ def process_review_identification_job(job_id: str, *, raise_on_error: bool = Fal
             signals = metadata_search.isbn_signals(str(terms["isbn"]))
         else:
             signals = _review_signals(task, import_job, terms)
-        candidates, outcomes = identification.resolve_candidates_with_report(signals)
+        # A reviewer asked for this search: always ask the providers afresh (#220).
+        candidates, outcomes = identification.resolve_candidates_with_report(
+            signals, reuse_results=False
+        )
         discard_reason = _publish(
             processing_job=processing_job,
             task=task,
