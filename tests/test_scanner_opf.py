@@ -271,16 +271,15 @@ def test_capture_complete_checks_the_opf_checksum(key: str) -> None:
 
 
 @pytest.mark.django_db
-def test_raw_scan_shows_opf_on_job_page_and_raw_scans(key: str, admin_client: Client) -> None:
+def test_raw_scan_shows_opf_in_editor_finish_and_raw_scans(key: str, admin_client: Client) -> None:
     _register(key)
     assert _put_opf(key, _opf(language="ger")).status_code == 201
     assert _capture_complete(key, _manifest({})).status_code == 200
 
-    page = admin_client.get(f"/scan/jobs/{JOB_ID}/workspace/?view=html").content.decode()
-    assert "The Physical Book" in page
-    assert "Ada Scanner" in page
-    assert ISBN in page
-    assert "data-opf-language>de<" in page
+    # The editor's finish dialog says the book comes from the scanner's OPF (#228).
+    page = admin_client.get(f"/scan/jobs/{JOB_ID}/editor/").content.decode()
+    assert "from the scanner&#x27;s metadata (“The Physical Book”)" in page
+    assert "data-raw-scan" in page
 
     item = admin_client.get("/scan/raw/").json()["items"][0]
     assert item["title"] == "The Physical Book"

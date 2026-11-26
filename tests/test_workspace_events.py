@@ -18,7 +18,14 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from ebook_server.core import scantailor, views
-from ebook_server.core.models import ScanJob, ScanPage, ScanTailorStageState, get_or_create_profile
+from ebook_server.core.models import (
+    ScanJob,
+    ScanPage,
+    ScanPageVersion,
+    ScanTailorStageState,
+    ScanTodo,
+    get_or_create_profile,
+)
 from ebook_server.core.workspace_events import WorkspaceEventPoller
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -114,6 +121,69 @@ def test_changes_during_payload_fetch_are_seen_again_on_the_next_tick(
     following = poller.poll()
     assert following.payload is not None
     assert following.payload["stages"][0]["revision"] == 3
+
+
+def test_rescan_requests_reach_other_editors_as_page_markers() -> None:
+    """#228: a rescan request, a claim and a replacement each send the page markers."""
+    job, states = workspace()
+    other, other_states = workspace()
+    page = states[0].scan_page
+    poller = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state)
+    initial = poller.poll().payload
+    assert initial is not None
+    assert [
+        (row["open_rescan_todos"], row["page_number_verified"]) for row in initial["pages"]
+    ] == [
+        (0, None),
+        (0, None),
+    ]
+    assert poller.poll().payload is None
+
+    todo = ScanTodo.objects.create(scan_job=job, scan_page=page, reason="blurred")
+    requested = poller.poll().payload
+    assert requested is not None and requested["stages"] == []
+    assert requested["pages"][0] == {
+        "id": str(page.pk),
+        "open_rescan_todos": 1,
+        "page_number_verified": None,
+    }
+    assert poller.poll().payload is None
+    # Another job's rescans are not this job's change.
+    ScanTodo.objects.create(scan_job=other, scan_page=other_states[0].scan_page)
+    assert poller.poll().payload is None
+
+    todo.state = ScanTodo.State.CLAIMED
+    todo.save()
+    claimed = poller.poll().payload
+    assert claimed is not None and claimed["pages"][0]["open_rescan_todos"] == 1
+
+    # The replacement: a new active version whose page number the scanner doubted.
+    ScanPageVersion.objects.create(
+        scan_page=page,
+        version=1,
+        storage_location=views._default_scan_storage_location(),
+        storage_identifier="scans/replacement.png",
+        checksum_sha256="a" * 64,
+        mime_type="image/png",
+        size_bytes=1,
+        is_active=True,
+        page_number_verified=False,
+    )
+    todo.state = ScanTodo.State.COMPLETED
+    todo.save()
+    replaced = poller.poll().payload
+    assert replaced is not None
+    assert replaced["pages"][0] == {
+        "id": str(page.pk),
+        "open_rescan_todos": 0,
+        "page_number_verified": False,
+    }
+    # Stage changes alone do not resend the markers.
+    ScanTailorStageState.objects.filter(pk=states[0].pk).update(
+        revision=9, updated_at=timezone.now()
+    )
+    stage_only = poller.poll().payload
+    assert stage_only is not None and "pages" not in stage_only
 
 
 def test_creation_deletion_job_state_reconnect_and_job_isolation() -> None:

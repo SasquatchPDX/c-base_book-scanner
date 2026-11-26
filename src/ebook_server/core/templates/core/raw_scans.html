@@ -12,7 +12,7 @@
     {% for summary in summaries %}
       <article class="review-row" data-raw-scan-job="{{ summary.job.id }}">
         <div class="grow">
-          <h2><a href="{% url 'scan-job-workspace' summary.job.id %}?view=html">{{ summary.title|default:"Untitled scan" }}</a></h2>
+          <h2><a href="{% url 'scan-job-editor' summary.job.id %}">{{ summary.title|default:"Untitled scan" }}</a></h2>
           <p>
             {{ summary.page_count }} page{{ summary.page_count|pluralize }}
             · {{ summary.open_rescans }} open rescan{{ summary.open_rescans|pluralize }}

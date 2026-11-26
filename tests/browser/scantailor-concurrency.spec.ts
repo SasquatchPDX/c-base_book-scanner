@@ -2,6 +2,8 @@ import { expect, test, type BrowserContext, type Locator, type Page } from "@pla
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
+import { createScanJob, openJobWithPages, uploadPage } from "./scan-helpers";
+
 const SCAN_PAGE_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAGAAAACACAIAAAB7vvvtAAAA80lEQVR42u3YsQkEIRRFUZVpxsT+6zCxjUnMrUA0Ez7nxZvs4QuXyXP+yfYrCAABAgQIECBAgAwQIECAAAGKte/mR7W2qP9/jO6CPDFAD5d9k3ZBgADpIB3kiQHSQeaCAAHSQTrIEwOkg8wFAQKkg3SQJwZIB5kLAgRIB+kgTwyQDnJBBgiQDtJBnhggHeSCDBAgHaSDPDFAOsgFGSBAOkgHeWKAdJALAmSAdJAO8sQA6SAXBMgA6SAd5IkB0kEuCJAB0kE6yBMDpINcECBAFqCDjs3igjwxQDrIBQEyQIAAAQIECBAgAwQIECBAgAABAmSbLV6uSh6FE6P0AAAAAElFTkSuQmCC",
   "base64",
@@ -30,11 +32,9 @@ const SCANTAILOR_STAGES = [
   "output",
 ] as const;
 
-/** Run every stage of the job's first page in the editor, then return to the overview. */
+/** Run every stage of the job's first page in the editor (the job's only page, #228). */
 async function runAllScanTailorStages(page: Page): Promise<void> {
-  const overviewUrl = page.url();
-  await page.getByRole("link", { name: "Open ScanTailor editor" }).click();
-  await expect(page).toHaveURL(/\/editor\/$/);
+  await expect(page).toHaveURL(/\/editor\/(\?.*)?$/);
   for (const stage of SCANTAILOR_STAGES) {
     // Opening a stage runs it, and each finished stage runs the next one (#209).
     await page.locator(`[data-stage-select="${stage}"]`).click();
@@ -43,7 +43,25 @@ async function runAllScanTailorStages(page: Page): Promise<void> {
       page.locator(`[data-strip-page] .st-status-icon[data-stage="${stage}"]`).first(),
     ).toHaveAttribute("data-status", "success", { timeout: 30_000 });
   }
-  await page.goto(overviewUrl);
+}
+
+/** Request a rescan of the open page from the editor's dialog, with a reason (#228). */
+async function requestRescan(page: Page, reason: string): Promise<void> {
+  await page.locator("[data-request-rescan]").click();
+  const dialog = page.locator("[data-rescan-dialog]");
+  await dialog.getByLabel("Reason").fill(reason);
+  await dialog.getByRole("button", { name: "Request rescan" }).click();
+  await expect(page.locator("[data-strip-page] [data-marker='rescan']")).toBeVisible();
+  await expect(page.locator("[data-request-rescan]")).toHaveText("Rescan requested");
+}
+
+/** Confirm finish in the editor (#228); it goes on to the identification or finalization. */
+async function finishInEditor(page: Page, options: { ocr?: boolean } = {}): Promise<void> {
+  await page.getByRole("button", { name: "Finish…" }).click();
+  const dialog = page.locator("[data-finish-dialog]");
+  await expect(dialog.locator("[data-finish-blockers]")).toBeHidden();
+  if (options.ocr) await dialog.getByLabel("Submit cleaned PDF to OCR").check();
+  await dialog.getByRole("button", { name: "Finish", exact: true }).click();
 }
 
 async function waitForTextAcrossReloads(
@@ -69,24 +87,9 @@ test("two LDAP members receive a visible conflict instead of overwriting a stage
 
   try {
     const firstEditor = await signIn(firstContext, "fry");
-    await firstEditor.goto("/scan/jobs/?view=html");
-    await firstEditor.getByLabel("Title hint").fill("Browser Concurrency Fixture");
-    await firstEditor.getByLabel("Author hints").fill("Ada Lovelace");
-    await firstEditor.getByRole("button", { name: "Create workspace" }).click();
-    await expect(firstEditor).toHaveURL(/\/scan\/jobs\/[0-9a-f-]+\/workspace\/$/);
-
-    await firstEditor.getByLabel("Page image").setInputFiles({
-      name: "page-0001.png",
-      mimeType: "image/png",
-      buffer: SCAN_PAGE_PNG,
-    });
-    await firstEditor.getByLabel("Sequence").fill("1");
-    await firstEditor.getByRole("button", { name: "Upload page" }).click();
-    await expect(firstEditor.locator(".scan-page-card")).toHaveCount(1);
-
-    await firstEditor.getByRole("link", { name: "Open ScanTailor editor" }).click();
-    await expect(firstEditor).toHaveURL(/\/editor\/$/);
-    const workspaceUrl = firstEditor.url();
+    const workspaceUrl = await openJobWithPages(firstEditor, "Browser Concurrency Fixture", [
+      { name: "page-0001.png", buffer: SCAN_PAGE_PNG },
+    ]);
     const secondEditor = await signIn(secondContext, "leela");
     await secondEditor.route("**/workspace/events/", (route) => route.abort());
     const bundleLoaded = secondEditor.waitForResponse(
@@ -140,43 +143,34 @@ test("a member completes the physical-book pipeline through the browser", async 
 
   try {
     const member = await signIn(context, "fry");
-    await member.goto("/scan/jobs/?view=html");
-    await member.getByLabel("Title hint").fill(title);
-    await member.getByLabel("Author hints").fill("Grace Hopper");
-    await member.getByRole("button", { name: "Create workspace" }).click();
-    await expect(member).toHaveURL(/\/scan\/jobs\/[0-9a-f-]+\/workspace\/$/);
-    const workspaceUrl = member.url();
-
-    await member.getByLabel("Page image").setInputFiles({
-      name: "physical-page-0001.png",
-      mimeType: "image/png",
-      buffer: SCAN_PAGE_PNG,
-    });
-    await member.getByLabel("Sequence").fill("1");
-    await member.getByRole("button", { name: "Upload page" }).click();
-    await expect(member.locator(".scan-page-card")).toHaveCount(1);
+    const workspaceUrl = await createScanJob(member, title, "Grace Hopper");
+    await uploadPage(member, workspaceUrl, { name: "physical-page-0001.png", buffer: SCAN_PAGE_PNG });
+    await member.goto(workspaceUrl);
     await runAllScanTailorStages(member);
 
-    await member.getByPlaceholder("Why is a rescan needed?").fill("Blurred lower margin");
-    await member.getByRole("button", { name: "Request rescan" }).click();
-    await expect(member.locator(".scan-page-card")).toContainText("Rescan requested");
+    // Finish waits for requested rescans (#228): the dialog says why.
+    await requestRescan(member, "Blurred lower margin");
+    await member.getByRole("button", { name: "Finish…" }).click();
+    const finishDialog = member.locator("[data-finish-dialog]");
+    await expect(finishDialog.locator("[data-finish-blockers]")).toContainText(
+      "1 page(s) wait for a requested rescan: 1.",
+    );
+    await expect(finishDialog.getByRole("button", { name: "Finish", exact: true })).toBeDisabled();
+    await finishDialog.getByRole("button", { name: "Cancel" }).click();
 
-    await member.getByLabel("Page image").setInputFiles({
+    // The replacement reaches the open editor: the marker goes away without a reload.
+    await uploadPage(member, workspaceUrl, {
       name: "physical-page-0001-rescan.png",
-      mimeType: "image/png",
       buffer: RESCAN_PAGE_PNG,
     });
-    await member.getByLabel("Sequence").fill("1");
-    await member.getByRole("button", { name: "Upload page" }).click();
-    await expect(member.locator(".scan-page-card")).not.toContainText("Rescan requested");
-    // The replacement changed Deskew's input; later results are stale until it re-runs (#205).
-    await expect(
-      member.locator('[data-stage-row][data-stage="output"] [data-stage-readiness]'),
-    ).toHaveText("waiting for Deskew");
+    await expect(member.locator("[data-strip-page] [data-marker='rescan']")).toHaveCount(0);
+    // The replacement changed Deskew's input; every stage runs again (#205).
+    await member.reload();
     await runAllScanTailorStages(member);
 
-    await member.getByRole("button", { name: "Search metadata" }).click();
-    await expect(member).toHaveURL(/\/scan-identifications\/[0-9a-f-]+\/$/);
+    // No library book yet: finish starts the identification first.
+    await finishInEditor(member);
+    await expect(member).toHaveURL(/\/scan-identifications\/[0-9a-f-]+\/(\?view=html)?$/);
     await expect(member.locator(".status-card .status")).toHaveText("Success", {
       timeout: 30_000,
     });
@@ -188,9 +182,8 @@ test("a member completes the physical-book pipeline through the browser", async 
 
     await member.goto(workspaceUrl);
     await expect(member.getByRole("link", { name: title })).toBeVisible();
-    await member.getByLabel("Submit cleaned PDF to OCR").check();
-    await member.getByRole("button", { name: "Queue finalization" }).click();
-    await expect(member).toHaveURL(/\/scan-finalizations\/[0-9a-f-]+\/$/);
+    await finishInEditor(member, { ocr: true });
+    await expect(member).toHaveURL(/\/scan-finalizations\/[0-9a-f-]+\/(\?view=html)?$/);
     await expect(member.locator(".status-card .status")).toHaveText("Success", {
       timeout: 30_000,
     });
@@ -286,23 +279,23 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     const member = await signIn(memberContext, "fry");
     const detailsURL = "/scan/jobs/" + jobId + "/";
     await member.goto("/scan/raw/");
-    await member.locator('a[href*="' + jobId + '/workspace/"]').click();
-    await expect(member.locator("[data-opf-title]")).toHaveText(title);
+    await member.locator('a[href*="' + jobId + '/editor/"]').click();
+    // Finish takes the book from the scanner's OPF (#228: the editor's finish dialog says so).
+    await expect(member.locator("[data-finish-dialog]")).toContainText(title);
     const first = (await (await member.request.get(detailsURL)).json()).pages[0];
     expect(first.available_versions).toHaveLength(1);
     expect(first.active_version.checksum_sha256).toBe(raw.sha256);
     const finish = async () => {
       await runAllScanTailorStages(member);
-      await member.getByRole("button", { name: "Queue finalization" }).click();
-      await expect(member).toHaveURL(/\/scan-finalizations\/[0-9a-f-]+\/$/);
+      await finishInEditor(member);
+      await expect(member).toHaveURL(/\/scan-finalizations\/[0-9a-f-]+\/(\?view=html)?$/);
       await expect(member.locator(".status-card .status")).toHaveText("Success", { timeout: 30_000 });
       const receipt = await (await member.request.get(new URL(member.url()).pathname)).json();
       return receipt.cleaned_variant_id as number;
     };
     const firstPDF = await finish();
     await member.goto(verified.portal_url);
-    await member.getByPlaceholder("Why is a rescan needed?").fill("Retake the lower margin");
-    await member.getByRole("button", { name: "Request rescan" }).click();
+    await requestRescan(member, "Retake the lower margin");
     const todos = (await (await device.get(job + "/rescans")).json()).todos;
     expect(todos).toHaveLength(1);
     expect(todos[0].sequence_number).toBe(0);
@@ -326,7 +319,8 @@ test("a scanner capture survives a lost acknowledgement and a member re-finishes
     expect(next.available_versions.map((v: { checksum_sha256: string }) => v.checksum_sha256)).toEqual([digest(RESCAN_PAGE_PNG), raw.sha256]);
     expect(next.active_version.version).toBe(2);
     await member.goto(verified.portal_url);
-    await expect(member.locator("[data-raw-scan]")).toContainText("re-finish needed");
+    await expect(member.locator("[data-refinish-notice]")).toBeVisible();
+    await expect(member.locator("[data-raw-scan]")).toBeVisible();
     const refinishedPDF = await finish();
     expect(refinishedPDF).toEqual(expect.any(Number));
     expect(refinishedPDF).not.toBe(firstPDF);
