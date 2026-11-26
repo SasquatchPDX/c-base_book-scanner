@@ -342,7 +342,13 @@ def process_scan_identification_job(job_id: str, *, raise_on_error: bool = False
             signals = metadata_search.isbn_signals(str(terms["isbn"]))
         else:
             signals = _signals(terms if isinstance(terms, dict) else _provisional_terms(scan_job))
-        candidates, outcomes = identification.resolve_candidates_with_report(signals)
+        # A person's request (search again, finish) asks the providers afresh (#220);
+        # the automatic OPF completion (#227) may reuse recent answers.
+        candidates, outcomes = identification.resolve_candidates_with_report(
+            signals,
+            reuse_results=bool(details.get("automatic"))
+            or details.get("requested_by_user_id") is None,
+        )
         with transaction.atomic():
             # Same lock order as request_scan_identification and review resolution.
             locked_scan = ScanJob.objects.select_for_update().get(pk=scan_job.pk)
