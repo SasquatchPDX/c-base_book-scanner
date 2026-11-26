@@ -604,6 +604,38 @@ def test_auto_content_padding_clamps_to_image_and_page_mask() -> None:
     assert scantailor._pad_content_box((10, 10, 20, 25), (40, 50), mask) == (5, 8, 25, 30)
 
 
+def test_select_content_pads_only_the_automatic_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#222: auto grows by 5 px at 150 dpi (also the mm size); manual/disabled do not."""
+    from ebook_server.core import content_box
+
+    source = Image.new("L", (300, 400), color=255)
+    source.info["dpi"] = (300, 300)  # full resolution = 2 x the 150 dpi working image
+    monkeypatch.setattr(content_box, "find_content_box", lambda gray, mask: (50, 60, 100, 120))
+
+    def run(parameters: dict[str, object]) -> dict[str, object]:
+        state = ScanTailorStageState(stage="select_content", parameters=parameters)
+        result = run_stage(scantailor._run_select_content, state, source)
+        return result.parameters
+
+    def box(parameters: dict[str, object]) -> tuple[int, int, int, int]:
+        value = cast(dict[str, int], parameters["content_box"])
+        return value["x1"], value["y1"], value["x2"], value["y2"]
+
+    assert scantailor._dpi_of(source) == (300, 300)
+    auto = run({"content_mode": "auto"})
+    # (50, 60, 100, 120) at 150 dpi, padded to (45, 55, 105, 125), back to 300 dpi.
+    assert box(auto) == (90, 110, 212, 252)
+    manual_box = {"x1": 100, "y1": 120, "x2": 202, "y2": 242}
+    manual = run({"content_mode": "manual", "content_box": manual_box})
+    assert box(manual) == (100, 120, 202, 242)
+    assert box(run({"content_mode": "disabled"})) == (0, 0, 300, 400)
+    # PhysSizeCalc: the millimetre size is that of the padded automatic box.
+    assert auto["content_size_mm"] == {
+        "width": round(122 * 25.4 / 300, 1),
+        "height": round(142 * 25.4 / 300, 1),
+    }
+
+
 def test_wolf_uses_page_wide_statistics_across_tiles() -> None:
     source = Image.new("L", (1600, 100), color=255)
     draw = ImageDraw.Draw(source)
@@ -652,6 +684,76 @@ def test_deskew_batch_leaves_never_run_successors_idle() -> None:
     assert page.stage_states.get(stage="deskew").status == "success"
     assert page.stage_states.get(stage="select_content").status == "unknown"
     assert not ProcessingJob.objects.filter(details__stage="select_content").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deskew_batch_reruns_only_existing_downstream_results_it_made_stale() -> None:
+    """#224 criterion 2: the same-page rule for pages that already ran later stages."""
+    client, job = _create_scan_job("batch-same-page-rule")
+    for number in (1, 2):
+        upload = _upload_scan_page(
+            client,
+            str(job.pk),
+            number,
+            "single",
+            _text_heavy_bytes(width=360, height=240),
+            filename=f"page{number}.png",
+        )
+        assert upload.status_code == 201
+    processed, fresh = job.pages.order_by("logical_sequence_number")
+    assert client.get(_stages_url(str(job.pk), str(fresh.pk))).status_code == 200
+    # Page 1 runs Deskew and Select Content; a single-page edit chains its successor.
+    for stage, parameters in (
+        ("deskew", {"manual_angle": 0}),
+        ("select_content", {"content_mode": "auto"}),
+    ):
+        response = client.post(
+            _stage_url(str(job.pk), str(processed.pk), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code in {200, 202}
+    content = processed.stage_states.get(stage="select_content")
+    assert content.status == "success" and scantailor.stage_result_is_current(content)
+
+    def select_content_jobs(page: ScanPage) -> int:
+        state = page.stage_states.get(stage="select_content")
+        return ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.STAGE,
+            details__stage="select_content",
+            details__scan_tailor_stage_state_id=state.pk,
+        ).count()
+
+    before = select_content_jobs(processed)
+    same = {
+        "parameters": {"manual_angle": 0},
+        "preserve_exceptions": False,
+    }
+    assert (
+        client.post(
+            _batch_stage_url(str(job.pk), "deskew"), same, content_type="application/json"
+        ).status_code
+        == 202
+    )
+    assert select_content_jobs(processed) == before
+    assert select_content_jobs(fresh) == 0
+
+    turned = {
+        "parameters": {"manual_angle": 3},
+        "preserve_exceptions": False,
+    }
+    assert (
+        client.post(
+            _batch_stage_url(str(job.pk), "deskew"), turned, content_type="application/json"
+        ).status_code
+        == 202
+    )
+    assert select_content_jobs(processed) == before + 1
+    content = processed.stage_states.get(stage="select_content")
+    assert scantailor.stage_result_is_current(content)
+    # The other page never ran Select Content, so the batch did not start it there.
+    assert select_content_jobs(fresh) == 0
+    assert fresh.stage_states.get(stage="select_content").status == "unknown"
 
 
 @pytest.mark.django_db(transaction=True)

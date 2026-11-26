@@ -300,7 +300,7 @@ def test_scan_job_html_list_counts_pages_without_serializing_them(
     def unexpected(*args: Any, **kwargs: Any) -> None:
         pytest.fail("HTML scan job list performed per-page serialization")
 
-    monkeypatch.setattr(views, "_scan_job_payload_with_open_todos", unexpected)
+    monkeypatch.setattr(views, "_scan_job_list_item", unexpected)
     monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
     response = client.get("/scan/jobs/?view=html&with_open_todos=true")
     assert response.status_code == 200
@@ -312,6 +312,68 @@ def test_scan_job_html_list_counts_pages_without_serializing_them(
     assert b"ScanTailor queued" in response.content
     assert b"Rescan requested" in response.content
     assert f"/scan/jobs/{job.pk}/editor/".encode() in response.content
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("with_open_todos", [False, True])
+def test_scan_job_json_list_query_count_does_not_grow_with_pages(
+    monkeypatch: pytest.MonkeyPatch, with_open_todos: bool
+) -> None:
+    """#226: the JSON list uses its prefetches and never checks page files on disk."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    client, job = _create_scan_job("scanner-list-json")
+    location, _ = StorageLocation.objects.get_or_create(
+        identifier="list-test", defaults={"base_path": "list-test"}
+    )
+
+    def add_pages(first: int, count: int) -> None:
+        for number in range(first, first + count):
+            page = ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+            for version in (1, 2):
+                ScanPageVersion.objects.create(
+                    scan_page=page,
+                    version=version,
+                    is_active=version == 2,
+                    storage_location=location,
+                    storage_identifier=f"p{number}-v{version}",
+                    checksum_sha256=f"{number:032x}{version:032x}",
+                    mime_type="image/png",
+                    size_bytes=1,
+                )
+            ScanTodo.objects.create(
+                scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN
+            )
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("JSON scan job list checked page files")
+
+    monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
+    url = "/scan/jobs/?with_open_todos=true" if with_open_todos else "/scan/jobs/"
+
+    def list_queries() -> tuple[int, dict[str, Any]]:
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(url, HTTP_ACCEPT="application/json")
+        assert response.status_code == 200
+        return len(queries), response.json()
+
+    add_pages(1, 2)
+    small, payload = list_queries()
+    add_pages(3, 8)
+    large, payload = list_queries()
+    assert large == small
+
+    item = next(item for item in payload["items"] if item["id"] == str(job.pk))
+    assert "pipeline" not in item
+    assert [page["logical_sequence_number"] for page in item["pages"]] == list(range(1, 11))
+    first = item["pages"][0]
+    assert first["active_version"]["version"] == 2
+    assert [version["version"] for version in first["available_versions"]] == [2, 1]
+    assert first["open_rescan_todos"] == 1
+    assert first["thumbnail"] == f"/scan/pages/{first['id']}/image/"
+    if with_open_todos:
+        assert item["open_rescan_todo_count"] == 10
 
 
 @pytest.mark.django_db(transaction=True)

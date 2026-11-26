@@ -75,7 +75,9 @@ Limits (§6.12) come from `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` (50 MiB) and
 ## API surface (v1)
 
 - `POST /scan/jobs/` -> create job
-- `GET /scan/jobs/` -> list open jobs for scanner/operator
+- `GET /scan/jobs/` -> list open jobs for scanner/operator (pages with versions and open
+  todo counts; the per-page `pipeline` progress, which checks page files in scan storage,
+  is only in the job detail)
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently

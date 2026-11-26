@@ -499,7 +499,9 @@ the list query.
 ## Run all stages
 
 Use **Run all** below the stage list to check every page through Output.
-Confirmation shows the page count and the maximum number of steps. The worker
+Confirmation shows the page and stage counts and about how many stage jobs it will
+run: every page stage without a current result. The button is disabled, with the
+reason, while the scan storage free-space guard refuses new work. The worker
 keeps current results and uses each page's saved settings, including manual
 settings. It checks the whole book at each stage before moving on, so Margins
 sees the current content sizes. Each chunk goes to the back of the queue so an
