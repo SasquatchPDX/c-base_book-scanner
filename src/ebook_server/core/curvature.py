@@ -16,6 +16,8 @@ from PIL import Image
 
 VERSION: Final = "baseline-curvature-v1"
 DETECTION_EDGE: Final = 1200
+INNER_BAND_TOP: Final = 0.10
+INNER_BAND_BOTTOM: Final = 0.90
 TILE_EDGE: Final = 512
 MAX_CURVES: Final = 32
 MAX_POINTS: Final = 17
@@ -97,11 +99,14 @@ def _ordered_candidates(
     return [candidates[index][1] for index in selected]
 
 
-def detect_curves(source: Image.Image) -> list[list[list[float]]]:
+def detect_curves(source: Image.Image, *, inner_band: bool = False) -> list[list[list[float]]]:
     scale = min(1.0, DETECTION_EDGE / max(source.size))
     reduced = reduced_image(source, DETECTION_EDGE)
     gray = np.asarray(reduced.convert("L"))
     height, width = gray.shape
+    first_row, last_row = (
+        (height * INNER_BAND_TOP, height * INNER_BAND_BOTTOM) if inner_band else (0, height)
+    )
     _, ink = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     xs = np.linspace(width * 0.08, width * 0.92, 25)
     radius = max(5, width // 65)
@@ -116,7 +121,7 @@ def detect_curves(source: Image.Image) -> list[list[list[float]]]:
             [
                 float((a + b - 1) / 2)
                 for a, b in zip(starts, ends, strict=True)
-                if 3 <= b - a <= height * 0.045
+                if 3 <= b - a <= height * 0.045 and first_row <= (a + b - 1) / 2 <= last_row
             ]
         )
     seed = max(range(len(bands)), key=lambda i: len(bands[i]))
