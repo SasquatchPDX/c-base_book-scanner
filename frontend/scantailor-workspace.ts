@@ -34,6 +34,16 @@ import {
   marginSettings,
   MAX_MARGIN_MM,
 } from "./margins-view";
+import {
+  describeHistogram,
+  guidanceText,
+  OUTPUT_ALGORITHM_NAMES,
+  outputAlgorithm,
+  outputParametersFor,
+  outputParameterValue,
+  type OutputParameterSpec,
+  parseParameterInput,
+} from "./output-algorithms";
 import { fitView, panBy, type View, wheelFactor, zoomAt } from "./pan-zoom";
 
 /** Pipeline order (#195). There is no Fix Orientation and no Page Split stage. */
@@ -1514,19 +1524,19 @@ class WorkspaceController {
     plot.clearRect(0, 0, canvas.width, canvas.height);
     const marker = (value: number) => Math.min(255, Math.max(0, value));
     const threshold = histogram.threshold;
-    let description = "Grayscale input · no threshold";
     if (isObject(threshold) && typeof threshold.median === "number") {
-      const middle = threshold.median;
-      const interval = typeof threshold.low === "number" && typeof threshold.high === "number"
-        ? [threshold.low, threshold.high] as const : null;
-      if (interval) {
+      // Per-pixel algorithms (#225): T is a distribution, drawn as its 10–90 % band.
+      if (typeof threshold.low === "number" && typeof threshold.high === "number") {
         plot.fillStyle = "rgba(244,178,91,.34)";
-        plot.fillRect(marker(interval[0]), 0, marker(interval[1]) - marker(interval[0]) + 1, canvas.height);
-        description = `Median T ${Math.round(middle)} · 10–90% ${interval.map(Math.round).join("–")}`;
-      } else {
-        description = `${threshold.kind === "intensity" ? "Intensity" : "Global"} T ${Math.round(middle)}`;
+        plot.fillRect(
+          marker(threshold.low),
+          0,
+          marker(threshold.high) - marker(threshold.low) + 1,
+          canvas.height,
+        );
       }
     }
+    const description = describeHistogram(histogram);
     plot.fillStyle = "#d8e0da";
     for (const [index, value] of bins.entries()) {
       const height = value / peak * canvas.height;
@@ -1536,7 +1546,7 @@ class WorkspaceController {
       plot.fillStyle = "#ffba67";
       plot.fillRect(marker(threshold.median), 0, 2, canvas.height);
     }
-    caption.textContent = `${histogram.zoned ? "Unzoned preview · " : "Input preview · "}${description}`;
+    caption.textContent = `${histogram.zoned ? "Unzoned preview" : "Input preview"} · ${description}`;
     figure.hidden = false;
   }
 
@@ -2240,8 +2250,9 @@ class WorkspaceController {
   }
 
   private renderOutputControls(): void {
-    const algorithms = ["otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"];
+    const algorithms = OUTPUT_ALGORITHM_NAMES;
     this.addSelect("Output algorithm", "output_mode", algorithms, "otsu", true);
+    this.addAlgorithmNote(this.draft.output_mode);
     this.addCheckbox("Keep color", "keep_color", false, true);
     this.addCheckbox("Invert output", "invert", false);
     this.addSelect("Text / picture zones", "zone_mode", ["auto", "manual", "off"], "auto", true);
@@ -2262,22 +2273,12 @@ class WorkspaceController {
       modes.add(this.draft.text_algorithm);
       if (!this.draft.keep_color) modes.add(this.draft.picture_algorithm);
     }
-    if (["sauvola", "wolf", "fox", "window"].some((mode) => modes.has(mode))) {
-      this.addNumber("Local window size (full-resolution pixels)", "window_size", 3, 501, 2, 35);
-      const coefficients =
-        modes.has("sauvola") || modes.has("fox") ? "Threshold k" : "Threshold k (0–1 effective)";
-      this.addNumber(coefficients, "k", -2, 2, 0.01, 0.33);
-      const hint = document.createElement("small");
-      hint.className = "muted";
-      hint.textContent = [
-        modes.has("sauvola") && "Sauvola uses k to weight local contrast.",
-        modes.has("wolf") && "Wolf uses k to weight the page-wide minimum and local contrast.",
-        modes.has("fox") && "Fox uses the magnitude of k above a minimum noise offset.",
-        modes.has("window") && "Window uses k to lower the local mean threshold.",
-      ].filter(Boolean).join(" ");
-      this.controls.append(hint);
+    if (zoned) {
+      this.addAlgorithmNote(this.draft.text_algorithm, "Text zones");
+      if (!this.draft.keep_color) this.addAlgorithmNote(this.draft.picture_algorithm, "Picture zones");
     }
-    if (modes.has("sauvola")) this.addNumber("Sauvola contrast range (r)", "r", 1, 512, 1, 128);
+    // Only the settings the selected algorithm(s) read (#225).
+    for (const spec of outputParametersFor(modes)) this.addOutputParameter(spec);
     if (zoned && this.draft.zone_mode === "manual") {
       if (!("zones" in this.draft)) this.draft.zones = detected;
       const zones = outputZonesForEditing(this.draft);
@@ -2337,6 +2338,58 @@ class WorkspaceController {
     }
   }
 
+  /** What an Output algorithm does and where it comes from (#225). */
+  private addAlgorithmNote(name: unknown, prefix = ""): void {
+    const algorithm = outputAlgorithm(name);
+    if (!algorithm) return;
+    const note = document.createElement("small");
+    note.className = "muted st-algorithm-note";
+    note.dataset.algorithmNote = algorithm.name;
+    note.textContent = `${prefix ? `${prefix}: ` : ""}${algorithm.summary} Source: ${algorithm.provenance}`;
+    this.controls.append(note);
+  }
+
+  /**
+   * One Output setting (#225): explanation and recommended range next to the field.
+   * The range is guidance only; any typed number is applied (only the technical
+   * limit clamps, and the note says so). No min/max attributes, so the browser's
+   * validity never blocks a value.
+   */
+  private addOutputParameter(spec: OutputParameterSpec): void {
+    const label = document.createElement("label");
+    label.className = "st-output-parameter";
+    label.textContent = spec.label;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "any";
+    input.dataset.outputParameter = spec.key;
+    const value = outputParameterValue(this.draft, spec);
+    input.value = String(value);
+    input.disabled = !this.editable;
+    this.draft[spec.key] = value;
+    const help = document.createElement("small");
+    help.className = "muted";
+    help.textContent = `${spec.help} ${guidanceText(spec)}`;
+    const note = document.createElement("small");
+    note.dataset.parameterNote = spec.key;
+    const showNote = (text: string, tone: string) => {
+      note.textContent = text;
+      note.hidden = !text;
+      note.className = tone === "warning" ? "error" : "muted";
+    };
+    const initial = parseParameterInput(input.value, spec);
+    showNote(initial.note, initial.tone);
+    input.addEventListener("input", () => {
+      const parsed = parseParameterInput(input.value, spec);
+      showNote(parsed.note, parsed.tone);
+      if (parsed.value === null) return;
+      // The controls' input listener schedules the autosave.
+      this.draft[spec.key] = parsed.value;
+    });
+    label.append(input, help, note);
+    this.controls.append(label);
+  }
+
   private addZoneButton(label: string, action: () => void): void {
     const button = document.createElement("button");
     button.type = "button";
@@ -2378,39 +2431,12 @@ class WorkspaceController {
     for (const value of options) {
       const option = document.createElement("option");
       option.value = value;
-      option.textContent = value.replaceAll("_", " ");
+      option.textContent = outputAlgorithm(value)?.label ?? value.replaceAll("_", " ");
       option.selected = value === current;
       select.append(option);
     }
     select.addEventListener("change", () => change(select.value));
     label.append(select);
-    this.controls.append(label);
-  }
-
-  private addNumber(
-    labelText: string,
-    key: string,
-    minimum?: number,
-    maximum?: number,
-    step = 1,
-    fallback = 0,
-  ): void {
-    const label = document.createElement("label");
-    label.textContent = labelText;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.value = String(finiteNumber(this.draft[key], fallback));
-    input.step = String(step);
-    if (minimum !== undefined) input.min = String(minimum);
-    if (maximum !== undefined) input.max = String(maximum);
-    this.draft[key] = Number(input.value);
-    input.addEventListener("input", () => {
-      if (input.validity.valid && input.value !== "") {
-        this.draft[key] = Number(input.value);
-        this.renderGeometry();
-      }
-    });
-    label.append(input);
     this.controls.append(label);
   }
 

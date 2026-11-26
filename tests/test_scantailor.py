@@ -4,8 +4,9 @@ import io
 import json
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import cv2
 import numpy as np
 import pytest
 from asgiref.sync import async_to_sync
@@ -669,6 +670,185 @@ def test_output_histogram_reports_global_and_local_thresholds() -> None:
     assert "threshold" not in scantailor._output_histogram(stage_input, "copy", {})
 
 
+# --- #225: Output algorithms, settings and threshold feedback -----------------
+
+
+def _text_with_blank_bottom(width: int = 1600, height: int = 1800) -> Image.Image:
+    """Text lines on top, an empty lower part bigger than a 768 px tile (#225)."""
+    rng = np.random.default_rng(225)
+    gray = rng.normal(232, 4, (height, width)).clip(0, 255)
+    for y in range(60, 700, 45):
+        for x in range(80, width - 80, 70):
+            gray[y : y + 14, x : x + 40] = rng.normal(40, 6, (14, 40)).clip(0, 255)
+    gray[1000:, :] = 255  # a pure-white strip, as after Margins
+    return Image.fromarray(gray.astype(np.uint8))
+
+
+@pytest.mark.parametrize("mode", ["wolf", "su", "sauvola", "fox", "window"])
+def test_tiled_output_equals_whole_page_and_white_tiles_stay_white(mode: str) -> None:
+    page = _text_with_blank_bottom()
+    parameters = {"window_size": 35}
+    tiled = scantailor._threshold_tiles(page, mode, parameters)
+    coefficients = scantailor.output_coefficients(parameters, mode)
+    whole = scantailor._binarize_with_cv2(
+        np.asarray(page),
+        page,
+        mode,
+        window_size=35,
+        k=coefficients.k,
+        r=coefficients.r,
+        invert=False,
+        min_edge_ratio=coefficients.min_edge_ratio,
+    )
+    assert np.array_equal(np.asarray(tiled), np.asarray(whole))
+    # Issue #225 finding 1: a white tile used to turn solid black with Wolf.
+    assert np.asarray(tiled)[1100:, :].min() == 255
+    assert (np.asarray(tiled)[60:700] == 0).mean() > 0.05
+
+
+@pytest.mark.parametrize("mode", ["wolf", "su", "sauvola", "fox", "window", "otsu"])
+def test_completely_white_page_stays_white(mode: str) -> None:
+    page = Image.new("L", (900, 900), 255)
+    assert scantailor._threshold_tiles(page, mode, {}).getextrema() == (255, 255)
+
+
+def test_wolf_bounds_and_strict_threshold() -> None:
+    gray = np.full((40, 40), 200, dtype=np.uint8)
+    gray[10:30, 10:30] = 60
+    image = Image.fromarray(gray)
+
+    def black(**kwargs: Any) -> float:
+        result = scantailor._binarize_with_cv2(
+            gray, image, "wolf", window_size=15, k=0.3, invert=False, **kwargs
+        )
+        return float((np.asarray(result) == 0).mean())
+
+    assert 0 < black() < 1
+    # Above the upper bound always white, below the lower bound always black.
+    assert black(upper_bound=50) == 0.0
+    assert black(lower_bound=201) == 1.0
+    # Flat image: T equals the gray value, equality stays white (upstream: gray < T).
+    flat = np.full((20, 20), 120, dtype=np.uint8)
+    result = scantailor._binarize_with_cv2(
+        flat, Image.fromarray(flat), "wolf", window_size=5, k=0.3, invert=False
+    )
+    assert result.getextrema() == (255, 255)
+    # The bounds are settings; the tiled path reads them.
+    assert (
+        np.asarray(
+            scantailor._threshold_tiles(image, "wolf", {"window_size": 15, "wolf_upper_bound": 50})
+        ).min()
+        == 255
+    )
+
+
+def _black_share(page: Image.Image, mode: str, **settings: Any) -> float:
+    result = scantailor._threshold_tiles(page, mode, {"window_size": 35, **settings})
+    return float((np.asarray(result) == 0).mean())
+
+
+def test_fox_k_is_monotonic_without_dead_zone() -> None:
+    # Blurred strokes, as photographed: the threshold position matters at their edges.
+    page = Image.fromarray(
+        cv2.GaussianBlur(np.asarray(_text_with_blank_bottom(800, 900)), (7, 7), 2)
+    )
+    shares = [_black_share(page, "fox", fox_k=k) for k in (-0.5, 0, 0.1, 0.2, 0.33, 0.5, 1, 2)]
+    assert shares == sorted(shares, reverse=True)
+    # Issue #225 finding 5: 0, 0.1, 0.2 and 0.33 all gave the same output before.
+    assert len(set(shares[1:5])) == 4
+
+
+def test_typed_coefficients_outside_the_guidance_are_applied() -> None:
+    page = _text_with_blank_bottom(800, 900)
+    # Window and Wolf used to clamp k to 0..1.
+    assert _black_share(page, "window", window_k=1.5) < _black_share(page, "window", window_k=1)
+    assert _black_share(page, "window", window_k=-0.2) > _black_share(page, "window", window_k=0)
+    assert _black_share(page, "wolf", wolf_k=1.5) <= _black_share(page, "wolf", wolf_k=1)
+    assert _black_share(page, "wolf", wolf_k=-0.2) > _black_share(page, "wolf", wolf_k=0)
+    assert _black_share(page, "fox", fox_k=10) < _black_share(page, "fox", fox_k=1)
+
+
+def test_output_parameters_resolve_per_algorithm_with_legacy_k() -> None:
+    assert scantailor.output_coefficients({}, "sauvola").k == 0.34
+    assert scantailor.output_coefficients({}, "wolf").k == 0.3
+    assert scantailor.output_coefficients({}, "fox").k == 0.2
+    assert scantailor.output_coefficients({}, "window").k == 0.33
+    # Pre-#225 settings: one k for every algorithm keeps producing the same result.
+    legacy = {"k": 0.45}
+    assert {scantailor.output_coefficients(legacy, mode).k for mode in ("sauvola", "wolf")} == {
+        0.45
+    }
+    assert scantailor.output_coefficients({"k": 0.45, "wolf_k": 0.2}, "wolf").k == 0.2
+    assert scantailor.output_coefficients({"sauvola_k": 0.1}, "wolf").k == 0.3
+    # Only technical limits clamp; junk falls back to the default.
+    assert scantailor.output_coefficients({"window_size": 5000}, "wolf").window_size == 501
+    assert scantailor.output_coefficients({"window_size": "x"}, "wolf").window_size == 35
+    assert scantailor.output_coefficients({"wolf_k": float("nan")}, "wolf").k == 0.3
+    assert scantailor.output_coefficients({"wolf_upper_bound": 300}, "wolf").upper_bound == 255
+    # New settings count as settings: changing one makes the result stale.
+    assert scantailor.stage_settings("output", {"fox_k": 1, "output_histogram": {}}) == {"fox_k": 1}
+    for keys in scantailor.OUTPUT_MODE_PARAMETERS.values():
+        assert set(keys) <= set(scantailor.STAGE_SETTING_KEYS["output"])
+
+
+def test_su_marks_strokes_and_ignores_uneven_light() -> None:
+    height, width = 400, 600
+    shade = np.linspace(120, 240, width, dtype=np.float32)[None, :].repeat(height, axis=0)
+    ink = np.zeros((height, width), dtype=bool)
+    for y in range(40, 360, 40):
+        ink[y : y + 6, 40:560] = True
+    rng = np.random.default_rng(2010)
+    # A camera-like page: blurred stroke edges, sensor noise, light falling off by half.
+    sharp = np.where(ink, shade * 0.35, shade) + rng.normal(0, 3, (height, width))
+    gray = cv2.GaussianBlur(sharp.clip(0, 255).astype(np.uint8), (5, 5), 1.2)
+    result = scantailor._binarize_with_cv2(
+        gray, Image.fromarray(gray), "su", window_size=21, k=0.0, invert=False
+    )
+    black = np.asarray(result) == 0
+    near_ink = cv2.dilate(ink.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    assert black[ink].mean() > 0.9
+    assert black[~near_ink].mean() < 0.02
+    # A larger minimum edge count leaves fewer black pixels.
+    shares = [
+        _black_share(Image.fromarray(gray), "su", window_size=21, su_min_edge_ratio=ratio)
+        for ratio in (0.5, 1, 4, 20)
+    ]
+    assert shares == sorted(shares, reverse=True) and shares[-1] < shares[0]
+
+
+def test_histogram_uses_the_selected_algorithm_settings_on_the_preview() -> None:
+    page = _text_with_blank_bottom(1920, 2400)
+    stage_input = make_stage_input(page)
+    default = scantailor._output_histogram(stage_input, "sauvola", {"window_size": 101})
+    assert default["preview_size"] == [768, 960]
+    # The window covers the same part of the page: 101 px full-res -> ~41 px on 960 px.
+    assert default["preview_window"] == 41
+    assert 0 < default["black_fraction"] < 0.5
+    lower = scantailor._output_histogram(
+        stage_input, "sauvola", {"window_size": 101, "sauvola_k": 0.6}
+    )
+    assert lower["threshold"]["median"] < default["threshold"]["median"]
+    # Legacy shared k is honoured too.
+    legacy = scantailor._output_histogram(stage_input, "sauvola", {"window_size": 101, "k": 0.6})
+    assert legacy["threshold"] == lower["threshold"]
+
+    su = scantailor._output_histogram(stage_input, "su", {"window_size": 101})
+    threshold = su["threshold"]
+    assert threshold["kind"] == "local"
+    # Su's T exists only near strokes: the white lower part has none.
+    assert 0 < threshold["defined_fraction"] < 0.6
+    assert threshold["low"] <= threshold["median"] <= threshold["high"]
+
+    otsu = scantailor._output_histogram(stage_input, "otsu", {})
+    cut = otsu["threshold"]["median"]
+    assert otsu["black_fraction"] == pytest.approx(sum(otsu["bins"][: cut + 1]) / (768 * 960))
+    white = scantailor._output_histogram(
+        make_stage_input(Image.new("L", (500, 700), 255)), "su", {}
+    )
+    assert white["threshold"] == {"kind": "local", "defined_fraction": 0.0}
+    assert white["black_fraction"] == 0.0
+
+
 @pytest.mark.django_db(transaction=True)
 def test_deskew_batch_leaves_never_run_successors_idle() -> None:
     client, job = _create_scan_job("batch-no-cascade")
@@ -1060,7 +1240,7 @@ def test_output_default_otsu_is_reproducible() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("output_mode", ["otsu", "sauvola", "wolf", "fox", "window", "grad"])
+@pytest.mark.parametrize("output_mode", ["otsu", "sauvola", "wolf", "fox", "window", "grad", "su"])
 def test_each_documented_output_algorithm_produces_an_artifact(output_mode: str) -> None:
     client, job = _create_scan_job(f"scan-user-output-{output_mode}")
     _upload_scan_page(
@@ -1371,7 +1551,7 @@ def test_unreadable_image_raises_clear_error(tmp_path: Path) -> None:
             run_stage(scantailor._run_deskew, _state(), path)
 
 
-@pytest.mark.parametrize("mode", ["otsu", "sauvola", "wolf", "fox", "window"])
+@pytest.mark.parametrize("mode", ["otsu", "sauvola", "wolf", "fox", "window", "su"])
 def test_binarization_keeps_noisy_paper_white_and_ink_black(mode: str) -> None:
     rng = np.random.default_rng(11)
     gray = rng.normal(225, 7, (400, 600)).clip(0, 255)

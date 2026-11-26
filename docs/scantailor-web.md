@@ -147,8 +147,9 @@ submitted as editable parameters.
 Layout detection allocates arrays only at reduced resolution. Thresholding uses
 768-pixel tiles with a local-window halo capped at 253 pixels; Otsu retains a
 global threshold. Full-size source/output Pillow images remain necessary, but
-there are no page-sized float or component-label arrays. Large local-statistic
-regions use tile-local contrast estimates. On a detection or processing error,
+there are no page-sized float or component-label arrays. Values an algorithm
+needs page-wide (Otsu's T, Wolf's Min/Smax, Su's contrast cutoff) are computed
+over the whole page or zone before the tiles (#225). On a detection or processing error,
 the normalized source is copied and the result records `output_applied="copy_fallback"`
 and `output_warning`. `output_mode="copy"` bypasses zoning and thresholding.
 Successful execution alone does not establish output quality.
@@ -158,18 +159,94 @@ text character-error rate must be at most 5%, no worse than whole-page output by
 more than one percentage point, and picture pixel error must be below 15% of the
 whole-page result. The local Tesseract 5.5.2 run measured 0% CER for both paths,
 with picture detail retained. This is a repeatable layout regression, not proof
-of OCR quality on photographed books or the hackerspace AI server. The six output
-modes use OpenCV/NumPy statistics; Fox is a Niblack-style threshold with a noise
-floor. Wolf uses the Wolf–Jolion formula and computes the minimum grayscale
-value and maximum local deviation over the image or zone before thresholding its
-tiles. Pure white stays white and equality at the threshold stays white.
+of OCR quality on photographed books or the hackerspace AI server.
 
-The Output input pane overlays the grayscale histogram for the saved settings.
-The worker computes the preview at up to 960 px and scales local windows to
-preserve their approximate size on the page. The orange line marks the global
-threshold, or the median local threshold with a shaded 10th–90th percentile
-band. Grad shows the intensity cutoff. For zoned pages the overlay describes the
-unzoned preview. Grayscale counts use a logarithmic scale.
+### Output algorithms and settings (#225, `opencv-zones-v5`)
+
+m is the local mean and s the local standard deviation in the window around a
+pixel. A pixel turns white when its gray value is above its threshold T. The
+editor shows only the settings of the selected algorithm (with zones: of the
+output, text and picture algorithms), explains each one, and gives a recommended
+range. The range is guidance only. A typed value outside it is saved and applied,
+with a note. Only technical limits clamp, and the note says so: window 3–501 px
+(the tile halo bounds memory), Wolf bounds 0–255, r ≥ 1.
+
+| Algorithm | T | Settings (default) | Source |
+|---|---|---|---|
+| Otsu | one T for the page, from the histogram | none | upstream `binarizeOtsu` |
+| Sauvola | `m · (1 + k · (s / r − 1))` | window (35), `sauvola_k` (0.34), `r` (128) | upstream `binarizeSauvola`, as in ScanTailor Advanced |
+| Wolf | `m − k · (m − Min) · (1 − s / Smax)` | window, `wolf_k` (0.3), `wolf_lower_bound` (1), `wolf_upper_bound` (254) | upstream `binarizeWolf`, as in ScanTailor Advanced |
+| Fox | `0.88 · m − k · s` | window, `fox_k` (0.2) | project-specific; no upstream or published source known |
+| Window | `m · (1 − k / 2)` | window, `window_k` (0.33) | project-specific; similar in spirit to Bradley & Roth (2007) |
+| Su | `E_mean + E_std / 2` of the stroke-edge pixels in the window | window, `su_min_edge_ratio` (1.0) | Su, Lu & Tan (2010), added by #225 |
+| Grad | Otsu of the image XOR Otsu of the gradient magnitude | none | project-specific, experimental |
+| Copy | no binarization | none | — |
+
+- **Window size** is in pixels of the full-resolution image. Use about one to
+  three text line heights, roughly 25–75 px at 300 dpi or 50–150 px at 600 dpi.
+  A smaller window follows uneven light more closely but can hollow out thick
+  strokes. A larger one behaves more like a global threshold.
+- **Each algorithm has its own k.** Before #225 one `k` (default 0.33) was shared.
+  A page saved with only `k` keeps using it for Sauvola, Wolf, Fox and Window
+  until its own coefficient is set, so its result does not change (except Fox,
+  whose formula changed, see below). Wolf and
+  Window used to clamp k to 0..1 silently. They now apply it as typed. Both
+  formulas are monotonic in k: a larger k gives less black.
+- **Wolf** computes Min (the darkest gray value) and Smax (the largest local
+  deviation) once over the page or zone, not per tile. A pixel is black only if
+  gray < T. Below `wolf_lower_bound` it is always black, and above
+  `wolf_upper_bound` always white. A completely white tile stays white (issue
+  #225 finding 1), and tiled output equals whole-page output.
+- **Fox changed in #225.** It used to be `T = m − max(|k| · s, 0.12 · m)`. Below
+  |k| ≈ 1 the 12 % floor decided and k had no effect. Above that, T fell quickly
+  until the page turned white. Now the 12 % offset is fixed and k adds Niblack's
+  contrast term on top (`T = 0.88 · m − k · s`). k acts at every value and is
+  monotonic. Negative k gives bolder text, and the sign of k now matters. On a
+  photographed thesis page (window 51 px) the black share fell steadily from
+  3.9 % at k = −0.5 to 2.7 % at 0, 2.3 % at 0.2, 1.2 % at 1, and 0 at 5.
+- **Su** (B. Su, S. Lu, C. L. Tan, "Binarization of historical document images
+  using the local maximum and minimum", DAS 2010, doi:10.1145/1815330.1815351)
+  computes the contrast image `(max − min) / (max + min + ε)` over 3×3 and marks
+  the high-contrast pixels (Otsu on the contrast, computed once per page) as
+  stroke edges. A pixel is black when its window holds at least
+  `N_min = su_min_edge_ratio × window` edge pixels and its gray value is below
+  `E_mean + E_std / 2` of those edge pixels. Elsewhere T is undefined and the
+  pixel is white. The paper uses ≤. Here equality stays white, as upstream Wolf
+  does, so the paper side of a sharp edge stays white. It handles uneven light
+  and stains well, because it reacts to contrast and not to brightness.
+  Checked on four photographed pages, two from a cookbook and two from a thesis
+  (3264×2448 and 3456×4608 camera images, not part of the repository). The result
+  was clean text with no black areas, and tiled output equals whole-page output.
+  It takes about 1–1.6 s per page, against 0.3–0.6 s for Sauvola.
+- **Not added:** Howe (2013) needs a graph-cut solver (max-flow over a Laplacian
+  energy) and automatic tuning of two parameters per image. That is a dependency
+  and runtime cost out of proportion for the second algorithm, so Su is the only
+  addition. **Mokji** (upstream `binarizeMokji` / `BinaryThreshold::mokjiThreshold`)
+  computes one global threshold from an edge co-occurrence matrix. It cannot fix
+  uneven light any better than Otsu, which the editor already offers, and neither
+  ScanTailor nor ScanTailor Advanced offers it in Output. It is not ported.
+
+### Threshold histogram
+
+The Output input pane overlays a histogram of the input, like a camera's. The
+worker computes it from the previous stage's result, scaled to at most 960 px
+(the browser preview size). Only an input that is already smaller is used as it
+is. It uses the selected algorithm and settings, so it reflects an edit once
+the edit's autosave has run the stage again. While an edit is not yet applied the
+overlay is hidden. Local windows (and with them Su's `N_min`) are scaled by
+preview edge / full-resolution edge, so they cover the same part of the page as
+at full resolution; the caption shows the window used on the preview.
+
+- Otsu: one orange line at T.
+- Sauvola, Wolf, Fox, Window, Su: T is a value per pixel. The overlay shades its
+  10th–90th percentile band and marks the median. For Su the caption also says
+  which share of pixels has a T (near text only).
+- Grad: the line marks the intensity part (the Otsu T of the image).
+- The caption also gives the black share of the result on the preview, which
+  makes algorithms and settings easy to compare for one book.
+
+Counts use a logarithmic scale. For zoned pages the overlay describes the
+selected output algorithm on the unzoned preview.
 
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
