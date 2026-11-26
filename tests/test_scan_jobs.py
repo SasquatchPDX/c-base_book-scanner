@@ -609,9 +609,10 @@ def test_blank_declaration_conflicts_with_concurrent_edits_and_reaches_other_edi
     )
     assert refused_edit.status_code == 400
 
-    # The job overview shows the badge.
-    overview = client.get(f"/scan/jobs/{job.pk}/workspace/?view=html")
-    assert b"data-page-blank" in overview.content
+    # The job payload (read by the editor's page strip) reports the disposition.
+    detail = client.get(f"/scan/jobs/{job.pk}/")
+    assert detail.status_code == 200
+    assert {p["page_disposition"] for p in detail.json()["pages"]} >= {"blank"}
 
 
 @pytest.mark.django_db(transaction=True)
