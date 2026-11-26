@@ -1377,7 +1377,7 @@ def _edited_stage_settings(
                 merged.setdefault("margins_mode", "manual")
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
-            if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
+            if output_mode in scantailor.OUTPUT_MODES:
                 algorithm_name = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         if state.applied_revision is not None and scantailor.stage_settings(
             stage, merged
