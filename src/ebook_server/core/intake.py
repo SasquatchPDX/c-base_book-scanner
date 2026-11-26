@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -281,7 +281,16 @@ SIDECAR_METADATA_FIELDS = (
 )
 # Below this title similarity an embedded and a sidecar title name different books.
 SIDECAR_TITLE_CONFLICT_SCORE = 0.5
-PLACEHOLDER_METADATA_VALUES = frozenset({"unknown", "unknown author", "unknown title"})
+# One placeholder vocabulary for intake and identification (#220).
+PLACEHOLDER_METADATA_VALUES = identification.PLACEHOLDER_METADATA_VALUES
+# Key of the sidecar values ``normalize_sidecar_metadata`` dropped, with the reason.
+SIDECAR_IGNORED_KEY = "ignored"
+SIDECAR_IGNORED_PLACEHOLDER = "placeholder"
+# An unenriched sidecar whose "author" is no name: Calibre copied a file-name split
+# into its record ("12 - Beasts Of Gor" -> title "12", author "Beasts Of Gor").
+SIDECAR_IGNORED_FILENAME_SPLIT = "filename_split"
+# Sidecar fields showing the record was downloaded or entered, not split from a name.
+SIDECAR_ENRICHMENT_FIELDS = ("identifier", "publisher", "description", "subjects")
 # Extractor provenance of ``metadata["title"]`` (see ``extract_metadata``).
 TITLE_SOURCE_KEY = "title_source"
 TITLE_SOURCE_EMBEDDED = "embedded"
@@ -330,6 +339,85 @@ class AutoAcceptDecision:
     tie_break: dict[str, Any] | None = None
     # Candidates at or above the threshold that were not accepted.
     passed_over: tuple[identification.IdentificationCandidate, ...] = ()
+    # The accepted record is another printing of the identified work (#220, E1): its
+    # edition values that differ from the file's, recorded but not blocking.
+    edition_mismatch: dict[str, Any] | None = None
+    # The accepted record named no authors; they come from another provider record of
+    # the same title that the file's own authors confirm (#220, F4).
+    authors_completed: dict[str, Any] | None = None
+
+
+# Edition conflicts that only say the record is another printing of the work.
+# Recorded, not blocking, when title and author identify the work (#220, E1). An
+# ISBN or language mismatch still blocks: the file states another edition or a
+# translation.
+TOLERATED_EDITION_CONFLICTS = frozenset({identification.EDITION_PUBLISHER_MISMATCH})
+# ImportJob.evidence keys for the two cases above.
+AUTO_ACCEPT_EDITION_MISMATCH_KEY = "auto_accept_edition_mismatch"
+AUTO_ACCEPT_AUTHORS_COMPLETED_KEY = "auto_accept_authors_completed"
+
+
+def _tolerated_edition_mismatch(
+    candidate: identification.IdentificationCandidate,
+    file_evidence: identification.IdentificationInput,
+    conflicts: list[str],
+) -> bool:
+    return (
+        bool(conflicts)
+        and set(conflicts) <= TOLERATED_EDITION_CONFLICTS
+        and identification.title_and_author_identify_work(file_evidence, candidate)
+    )
+
+
+def _real_authors(candidate: identification.IdentificationCandidate) -> list[str]:
+    return [name for name in candidate.authors if not identification.is_placeholder_author(name)]
+
+
+def _complete_authors(
+    candidate: identification.IdentificationCandidate,
+    candidates: list[identification.IdentificationCandidate],
+    file_authors: list[str],
+    file_evidence: identification.IdentificationInput,
+) -> tuple[identification.IdentificationCandidate, dict[str, Any]] | None:
+    """``candidate`` with the authors of a same-title record the file confirms (F4).
+
+    An edition record without authors ("Nightfall and Other Stories" by ISBN on Open
+    Library) is completed only from another provider record with the same title, no
+    different part, real authors that the file's own authors (embedded or sidecar,
+    never a file-name or folder guess) match strongly. Otherwise ``None``.
+
+    Only a record that lists no names at all is completed: a placeholder such as
+    "Multiple Authors" or "Various" says the book is an anthology, which one
+    contributor's record does not describe (#92). Records found through LLM-proposed
+    terms never supply authors.
+    """
+    if candidate.authors or not file_authors:
+        return None
+    for other in candidates:
+        authors = _real_authors(other)
+        if other is candidate or not authors or len(authors) != len(other.authors):
+            continue
+        if isinstance(other.raw, dict) and other.raw.get(LLM_HINT_SOURCE_KEY) == "llm":
+            continue
+        if not identification.titles_agree(candidate.title, other.title):
+            continue
+        if identification.candidates_name_different_parts(candidate, other):
+            continue
+        if identification.authors_conflict(authors, file_authors):
+            continue
+        if identification.author_similarity(file_authors, authors) < (
+            identification.AUTHOR_VARIANT_MATCH_SCORE
+        ):
+            continue
+        if identification.missing_coauthors(file_evidence, authors):
+            continue
+        return replace(candidate, authors=list(authors)), {
+            "provider_id": other.provider_id,
+            "provider_ref": other.provider_ref,
+            "title": other.title,
+            "authors": list(authors),
+        }
+    return None
 
 
 def _author_block_reason(
@@ -361,7 +449,11 @@ def _block_reason(
     if isinstance(candidate.raw, dict) and candidate.raw.get(LLM_HINT_SOURCE_KEY) == "llm":
         return BLOCK_LLM_DERIVED, conflicts
     reason = _author_block_reason(candidate, file_authors)
-    if reason is None and conflicts:
+    if (
+        reason is None
+        and conflicts
+        and not _tolerated_edition_mismatch(candidate, file_evidence, conflicts)
+    ):
         reason = BLOCK_EDITION_CONFLICT
     if reason is None and identification.title_evidence_conflict(file_evidence, candidate):
         reason = BLOCK_TITLE_EVIDENCE_CONFLICT
@@ -419,6 +511,11 @@ def decide_auto_accept(
     author *and* edition checks is accepted, so a tied fallback whose identifiers
     contradict the file's is never eligible. If tied candidates that pass describe
     different books, the choice is ambiguous and goes to review.
+
+    #220: a record naming no authors is completed from a same-title record the file's
+    own authors confirm (``_complete_authors``); a record of another printing (only the
+    publisher differs) is accepted as the work when title and author identify it, with
+    the mismatch recorded (``edition_mismatch``).
     """
     top = candidates[0] if candidates else None
     if top is None or top.score < AUTO_ACCEPT_SCORE:
@@ -433,6 +530,27 @@ def decide_auto_accept(
     eligible = [
         candidate for candidate, (reason, _) in zip(tied, checks, strict=True) if reason is None
     ]
+    completions: dict[int, dict[str, Any]] = {}
+    originals: dict[int, identification.IdentificationCandidate] = {}
+    if not eligible:
+        # Fallback only: a tied record that names nobody may take the authors of a
+        # same-title record the file's own authors confirm.
+        for position, (candidate, (reason, _)) in enumerate(zip(tied, checks, strict=True)):
+            if reason != BLOCK_NO_PROVIDER_AUTHORS:
+                continue
+            completion = _complete_authors(candidate, candidates, file_authors, file_evidence)
+            if completion is None:
+                continue
+            completed, info = completion
+            completions[id(completed)] = info
+            originals[id(completed)] = candidate
+            tied[position] = completed
+            checks[position] = _block_reason(completed, file_authors, file_evidence)
+        if originals.get(id(tied[0])) is top:
+            top = tied[0]
+        eligible = [
+            candidate for candidate, (reason, _) in zip(tied, checks, strict=True) if reason is None
+        ]
     if not eligible:
         top_reason, top_conflicts = checks[0]
         details = _block_details(top, file_authors)
@@ -462,7 +580,7 @@ def decide_auto_accept(
         different_editions
         and not file_isbns
         and all(
-            identification.candidates_describe_same_work(chosen, other) for other in eligible[1:]
+            identification.candidates_group_as_one_work(chosen, other) for other in eligible[1:]
         )
     ):
         # Several editions (or translations) of one work fit a file that names no ISBN:
@@ -496,13 +614,29 @@ def decide_auto_accept(
                 summary["edition_conflicts"] = conflicts
             passed_over_summaries.append(summary)
         tie_break = {"chosen": _candidate_summary(chosen), "passed_over": passed_over_summaries}
-    eligible_ids = {id(candidate) for candidate in eligible}
+    edition_mismatch: dict[str, Any] | None = None
+    picked_conflicts = next(
+        conflicts
+        for candidate, (_, conflicts) in zip(tied, checks, strict=True)
+        if candidate is picked
+    )
+    if picked_conflicts:
+        # Tolerated by _block_reason: another printing of the identified work. Accept
+        # the work without that printing's ISBN, publisher and year (#220, E1).
+        edition_mismatch = {
+            "edition_conflicts": picked_conflicts,
+            **identification.edition_evidence(picked, file_evidence),
+        }
+        chosen = identification.work_only(chosen)
+    eligible_ids = {id(originals.get(id(candidate), candidate)) for candidate in eligible}
     return AutoAcceptDecision(
         candidate=chosen,
         tie_break=tie_break,
         passed_over=tuple(
             candidate for candidate in above_threshold if id(candidate) not in eligible_ids
         ),
+        edition_mismatch=edition_mismatch,
+        authors_completed=completions.get(id(picked)),
     )
 
 
@@ -916,7 +1050,86 @@ def read_sidecar_metadata(job: ImportJob) -> dict[str, Any] | None:
             reason="generated_by_ebook_server",
         )
         return None
-    return {key: value for key, value in fields.items() if value} or None
+    return normalize_sidecar_metadata({key: value for key, value in fields.items() if value})
+
+
+def normalize_sidecar_metadata(fields: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop sidecar values that are no evidence, once, where the sidecar is read (#220, P1).
+
+    * Placeholder authors and titles (Calibre's "Unknown", "Title - Unknown") and
+      placeholder values of other fields.
+    * The title and authors of an *unenriched* sidecar (no identifier, publisher,
+      description or subjects) whose author is not a person's name: Calibre copied a
+      file-name split into its record ("12 - Beasts Of Gor" -> title "12", author
+      "Beasts Of Gor"), so neither half is curated.
+
+    What was dropped is kept under ``SIDECAR_IGNORED_KEY`` for the evidence, so no
+    placeholder reaches ``applied_fields``, conflicts or provider queries. Idempotent;
+    ``None`` when nothing usable is left.
+    """
+    if not fields:
+        return None
+    normalized = dict(fields)
+    ignored = list(normalized.pop(SIDECAR_IGNORED_KEY, None) or [])
+
+    def drop(key: str, value: Any, reason: str) -> None:
+        normalized.pop(key, None)
+        ignored.append({"field": key, "value": value, "reason": reason})
+
+    raw_authors = normalized.get("authors")
+    if raw_authors is not None:
+        authors = identification.evidence_author_names(normalized)
+        placeholders = [
+            name
+            for name in (raw_authors if isinstance(raw_authors, list) else [raw_authors])
+            if isinstance(name, str) and name.strip() and identification.is_placeholder_author(name)
+        ]
+        if placeholders:
+            ignored.append(
+                {"field": "authors", "value": placeholders, "reason": SIDECAR_IGNORED_PLACEHOLDER}
+            )
+        if authors:
+            normalized["authors"] = authors
+        else:
+            normalized.pop("authors", None)
+    title = normalized.get("title")
+    if isinstance(title, str):
+        stripped = identification.strip_placeholder_segments(title.strip())
+        if not stripped or identification.is_placeholder_title(stripped):
+            drop("title", title, SIDECAR_IGNORED_PLACEHOLDER)
+        elif stripped != title.strip():
+            normalized["title"] = stripped
+    for key in ("language", "publisher", "description"):
+        value = normalized.get(key)
+        if isinstance(value, str) and identification.is_placeholder_value(value):
+            drop(key, value, SIDECAR_IGNORED_PLACEHOLDER)
+    kept_authors = normalized.get("authors")
+    if (
+        isinstance(kept_authors, list)
+        and kept_authors
+        and not any(normalized.get(key) for key in SIDECAR_ENRICHMENT_FIELDS)
+        and not any(_reads_as_person(name) for name in kept_authors)
+    ):
+        drop("authors", kept_authors, SIDECAR_IGNORED_FILENAME_SPLIT)
+        if "title" in normalized:
+            drop("title", normalized["title"], SIDECAR_IGNORED_FILENAME_SPLIT)
+    if ignored:
+        normalized[SIDECAR_IGNORED_KEY] = ignored
+    if not any(normalized.get(key) for key in SIDECAR_METADATA_FIELDS):
+        return {SIDECAR_IGNORED_KEY: ignored} if ignored else None
+    return normalized
+
+
+def _reads_as_person(name: str) -> bool:
+    """A credit shaped like a name: "First Last", "Last, First", or one plain word."""
+    if identification.looks_like_person_name(name) or identification.invert_last_first_name(name):
+        return True
+    if identification.split_author_list(name):
+        return True
+    if name.islower() and name.title() != name:
+        return _reads_as_person(name.title())  # "isaac asimov"
+    tokens = name.split()
+    return len(tokens) == 1 and tokens[0][:1].isupper() and not any(ch.isdigit() for ch in name)
 
 
 def _is_placeholder(value: Any) -> bool:
@@ -924,7 +1137,7 @@ def _is_placeholder(value: Any) -> bool:
         return all(_is_placeholder(item) for item in value)
     if not isinstance(value, str):
         return not value
-    return not value.strip() or value.strip().casefold() in PLACEHOLDER_METADATA_VALUES
+    return identification.is_placeholder_value(value)
 
 
 def _embedded_title(metadata: dict[str, Any]) -> str | None:
@@ -1011,13 +1224,11 @@ def apply_sidecar_metadata(
     When the sidecar contradicts embedded ISBN, title, or authors, nothing is merged;
     the caller then routes the import to review instead of auto-accepting it.
     """
+    # Sidecars are normalised where they are read; this is a no-op for those and
+    # covers callers passing raw fields.
+    sidecar = normalize_sidecar_metadata(sidecar)
     if not sidecar:
         return metadata
-    raw_sidecar = sidecar
-    sidecar = dict(sidecar)
-    sidecar["authors"] = identification.evidence_author_names(sidecar)
-    if _is_placeholder(sidecar.get("title")):
-        sidecar.pop("title", None)
     merged = dict(metadata)
     conflicts = _sidecar_conflicts(metadata, sidecar)
     applied: list[str] = []
@@ -1045,14 +1256,15 @@ def apply_sidecar_metadata(
             if _is_placeholder(metadata.get(key)):
                 merged[key] = value
                 applied.append(key)
-    merged[SIDECAR_EVIDENCE_KEY] = {
+    evidence: dict[str, Any] = {
         "source": SIDECAR_METADATA_NAME,
-        "fields": {
-            key: raw_sidecar[key] for key in SIDECAR_METADATA_FIELDS if raw_sidecar.get(key)
-        },
+        "fields": {key: sidecar[key] for key in SIDECAR_METADATA_FIELDS if sidecar.get(key)},
         "applied_fields": applied,
         "conflicts": conflicts,
     }
+    if sidecar.get(SIDECAR_IGNORED_KEY):
+        evidence[SIDECAR_IGNORED_KEY] = sidecar[SIDECAR_IGNORED_KEY]
+    merged[SIDECAR_EVIDENCE_KEY] = evidence
     return merged
 
 
@@ -3432,6 +3644,13 @@ def _process_claimed_import_job(job: ImportJob) -> None:
             path_hints = source_layout.hints_for_source_file(job.source_location, job.source_path)
             if path_hints is not None:
                 metadata[identification.PATH_LAYOUT_EVIDENCE_KEY] = path_hints.as_evidence()
+            # The whole path below the source root, with the template-less author
+            # candidate of a "Last, First" folder (#220); never proof on its own.
+            relative = source_layout.relative_source_path(job.source_location, job.source_path)
+            if relative is not None:
+                metadata[identification.SOURCE_PATH_EVIDENCE_KEY] = identification.path_evidence(
+                    relative
+                )
         job.evidence = metadata
         job.state = ImportJob.State.SIGNAL_NORMALIZATION
         _save_job(
@@ -3482,6 +3701,19 @@ def _process_claimed_import_job(job: ImportJob) -> None:
                 import_job_id=str(job.id),
                 provider_id=decision.tie_break["chosen"]["provider_id"],
                 passed_over_count=len(decision.tie_break["passed_over"]),
+            )
+        if decision.edition_mismatch is not None or decision.authors_completed is not None:
+            if decision.edition_mismatch is not None:
+                metadata[AUTO_ACCEPT_EDITION_MISMATCH_KEY] = decision.edition_mismatch
+            if decision.authors_completed is not None:
+                metadata[AUTO_ACCEPT_AUTHORS_COMPLETED_KEY] = decision.authors_completed
+            job.evidence = metadata
+            _save_job(job, update_fields=["evidence", "updated_at"])
+            logger.info(
+                "intake_auto_accept_recorded_differences",
+                import_job_id=str(job.id),
+                edition_mismatch=decision.edition_mismatch is not None,
+                authors_completed=decision.authors_completed is not None,
             )
         _save_metadata_candidates(
             job,

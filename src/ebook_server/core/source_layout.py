@@ -271,19 +271,26 @@ def match_path(
     return None
 
 
+def relative_source_path(source_location: SourceLocation, source_path: str) -> str | None:
+    """``source_path`` relative to the source root (POSIX form), or ``None`` outside it."""
+    try:
+        root = Path(source_location.root_path).expanduser().resolve()
+        return Path(source_path).resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return None
+
+
 def hints_for_source_file(source_location: SourceLocation, source_path: str) -> PathHints | None:
     """Path hints for a file below ``source_location``; ``None`` when not configured."""
     templates = source_location.path_layouts
     if not templates or not isinstance(templates, list):
         return None
-    try:
-        root = Path(source_location.root_path).expanduser().resolve()
-        relative = Path(source_path).resolve().relative_to(root)
-    except (OSError, ValueError):
+    relative = relative_source_path(source_location, source_path)
+    if relative is None:
         return None
     ignore_values = source_location.layout_ignore_values
     return match_path(
-        relative.as_posix(),
+        relative,
         [template for template in templates if isinstance(template, str)],
         name_order=source_location.author_name_order,
         ignore_values=ignore_values if isinstance(ignore_values, list) else [],

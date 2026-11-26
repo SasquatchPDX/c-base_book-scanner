@@ -168,7 +168,12 @@ def test_real_intake_scorecard_is_repeatable_without_mutating_caller_data(tmp_pa
     siblings = next(case for case in baseline["cases"] if case["case"] == "sibling-formats-opt-in")
     assert siblings["canonical_books"] == 1
     assert siblings["linked_formats"] == ["epub", "txt"]
-    assert siblings["provider_calls"] >= 2
+    # Both files are verified by a provider search run; their identical query is sent
+    # once and the result reused for the second format (#220, G2).
+    assert siblings["provider_calls"] >= 1
+    sibling_rows = [row for row in baseline["rows"] if row["case"] == "sibling-formats-opt-in"]
+    assert len(sibling_rows) == 2
+    assert all(row["provider_search_runs"] >= 1 for row in sibling_rows)
     assert "no-isbn-fuzzy-threshold" in {row["case"] for row in report["changed_rows"]}
     for name in ("baseline", "trial"):
         measured = {row["case"]: row for row in report[name]["rows"]}

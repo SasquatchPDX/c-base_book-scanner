@@ -147,11 +147,33 @@ class BrowserMetadataProvider:
                 )
             ]
         provider_ref = hashlib.sha256(resolved_title.encode()).hexdigest()[:16]
-        # One concrete English edition from "Hackerspace Acceptance Press". The digital
-        # scenario's EPUB (scripts/run_infrastructure_tests.sh) is English but names
-        # another publisher, so title, author and language score above auto-accept and
-        # the edition check (#37) routes the import to manual review as an
-        # ``edition_conflict``.
+        if resolved_title == "Browser Digital Library":
+            # The digital scenario's EPUB (scripts/run_infrastructure_tests.sh) is an
+            # English book by "Ada Digital Self-Publishing". The provider knows only a
+            # German edition of the same publisher: title, author and publisher score
+            # above auto-accept, and the edition check (#37) routes the import to manual
+            # review as an ``edition_conflict``. (Another publisher alone no longer
+            # blocks when title and author identify the work, #220 E1.)
+            return [
+                {
+                    "key": f"/works/{provider_ref}",
+                    "title": resolved_title,
+                    "author_name": [resolved_author],
+                    "publisher": ["Ada Digital Self-Publishing"],
+                    "first_publish_year": 2026,
+                    "language": ["ger"],
+                    "editions": {
+                        "docs": [
+                            {
+                                "key": f"/books/{provider_ref}M",
+                                "language": ["ger"],
+                                "publisher": ["Ada Digital Self-Publishing"],
+                            }
+                        ]
+                    },
+                },
+            ]
+        # One concrete English edition from "Hackerspace Acceptance Press".
         return [
             {
                 "key": f"/works/{provider_ref}",

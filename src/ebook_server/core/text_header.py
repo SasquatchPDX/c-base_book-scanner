@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .identification import _title_match_score
+from .identification import _title_match_score, is_placeholder_author
 
 HEADER_LINES = 8  # non-empty lines inspected
 NAME_LINE_WINDOW = 5  # bare name-like lines are only trusted this close to the top
@@ -100,7 +100,52 @@ _PLACE_WORDS = frozenset(
 )
 _AUTHOR_TITLE_SEPARATOR = re.compile(r"\.\s+|\s{2,}|\s[-–—]\s")
 _LEADING_ARTICLE = re.compile(r"^(the|a|an|der|die|das)\s+", re.IGNORECASE)
-_PLACEHOLDER_PARTS = {"unknown", "anonymous"}
+
+# Credit plausibility (#220, H1). A by-line can name the site, scan group or imprint
+# that distributed the text instead of a person ("Caldron Pool", a website's mark).
+# A name ending in one of these words, or carrying a domain, is not used as an author.
+_SITE_MARK_WORDS = frozenset(
+    """
+    pool books ebooks ebook library libraries media online digital net network site
+    web press publishing publications productions studio studios archive archives
+    team group forum club scans scanners
+    """.split()
+)
+_DOMAIN = re.compile(
+    r"(?:\bwww\.|https?:|@|\.(?:com|net|org|info|biz|de|uk|ru|io|co)\b)", re.IGNORECASE
+)
+# Title rules that read the title independently of the file name.
+_EXPLICIT_TITLE_RULES = frozenset({"labelled title", "gutenberg header", "title by author"})
+_TITLE_SEGMENT_SEPARATOR = re.compile(r"\s*[:;]\s+|\s+[-–—]+\s+")
+CREDIT_DOMAIN = "domain"
+CREDIT_SITE_MARK = "site_mark"
+CREDIT_PLACEHOLDER = "placeholder"
+CREDIT_TITLE_SEGMENT = "title_segment"
+
+
+def credit_rejection(name: str, title: str | None, *, explicit_title: bool) -> str | None:
+    """Why a header author credit is not a plausible person, or ``None`` when it is.
+
+    Rejected: a domain or address, a site/imprint mark ("Caldron Pool"), a
+    placeholder, and a name equal to one segment of a multi-part title ("Dune: House
+    Atreides" is not by "House Atreides"), or to the whole title when that title was
+    read by an explicit rule.
+    """
+    if _DOMAIN.search(name):
+        return CREDIT_DOMAIN
+    tokens = [token.strip(".,").lower() for token in name.split()]
+    if tokens and tokens[-1] in _SITE_MARK_WORDS:
+        return CREDIT_SITE_MARK
+    if is_placeholder_author(name):
+        return CREDIT_PLACEHOLDER
+    if title:
+        segments = [s for s in _TITLE_SEGMENT_SEPARATOR.split(title) if s.strip()]
+        compared = segments if len(segments) > 1 else []
+        if explicit_title:
+            compared.append(title)
+        if any(_title_match_score(name, segment) >= TITLE_SIMILARITY for segment in compared):
+            return CREDIT_TITLE_SEGMENT
+    return None
 
 
 _OCR_I_BETWEEN_CAPITALS = re.compile(r"(?<=[A-Z])[l1](?=[A-Z])")
@@ -189,10 +234,7 @@ def _title_variants(stem: str) -> list[str]:
     """
     parts = [part.strip() for part in re.split(r"\s+-\s+", stem.replace("_", " ")) if part.strip()]
     parts = [
-        part
-        for part in parts
-        if " ".join(_normalized_tokens(part)) not in _PLACEHOLDER_PARTS
-        and not re.fullmatch(r"\d+", part)
+        part for part in parts if not is_placeholder_author(part) and not re.fullmatch(r"\d+", part)
     ]
     comma_author = [
         part.count(",") == 1 and name_like(" ".join(reversed(part.split(",")))) for part in parts
@@ -406,11 +448,33 @@ def parse_text_header(text: str, filename_stem: str) -> dict[str, Any] | None:
             if len(parts) >= 2 and len(names) == len(parts):
                 add_authors(likely_authors, names, number, "name-list line beside title")
 
-    if title is None and not authors and not likely_authors:
+    # H1: implausible credits are recorded, never used as (rooted) authors.
+    explicit_title = any(
+        rule.get("rule") in _EXPLICIT_TITLE_RULES and rule.get("title") == title for rule in rules
+    )
+    rejected: list[dict[str, str]] = []
+
+    def plausible(names: list[str]) -> list[str]:
+        kept: list[str] = []
+        for name in names:
+            reason = credit_rejection(name, title, explicit_title=explicit_title)
+            if reason is None:
+                kept.append(name)
+            else:
+                rejected.append({"name": name, "reason": reason})
+        return kept
+
+    authors = plausible(authors)
+    likely_authors = plausible(likely_authors)
+
+    if title is None and not authors and not likely_authors and not rejected:
         return None
-    return {
+    result: dict[str, Any] = {
         "title": title,
         "authors": authors,
         "likely_authors": likely_authors,
         "rules": rules,
     }
+    if rejected:
+        result["rejected_authors"] = rejected
+    return result

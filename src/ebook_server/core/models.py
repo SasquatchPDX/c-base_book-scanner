@@ -1993,6 +1993,8 @@ class MetadataSearch(models.Model):
         "results": "Results",
         "no_results": "No results",
         "error": "Error",
+        # Not queried to the end: another provider already returned a decisive match.
+        "skipped": "Not needed",
     }
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
