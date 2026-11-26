@@ -5,6 +5,7 @@ from collections.abc import Iterator
 import pytest
 from django.conf import settings as django_settings
 
+from ebook_server.core.provider_runtime import LocalProviderStateStore, set_store
 from ebook_server.core.rate_limit import LocalRateLimiter, set_rate_limiter
 from tests.rate_limit_fixtures import FakeClock
 
@@ -16,6 +17,20 @@ def rate_limit_clock() -> Iterator[FakeClock]:
     set_rate_limiter(LocalRateLimiter(clock=clock, sleep=clock.sleep))
     yield clock
     set_rate_limiter(None)
+
+
+@pytest.fixture(autouse=True)
+def provider_state() -> Iterator[LocalProviderStateStore]:
+    """Provider circuit breakers and cached lookups never leak between tests (#220)."""
+    store = LocalProviderStateStore()
+    set_store(store)
+    # Early exit depends on which provider thread finishes first; tests of ranking and
+    # tie handling need every provider's answer. tests/test_issue220_intake.py opts in.
+    original = getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT", True)
+    django_settings.BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT = False
+    yield store
+    django_settings.BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT = original
+    set_store(None)
 
 
 @pytest.fixture(autouse=True)

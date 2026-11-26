@@ -112,9 +112,11 @@
         "provider_calls": 1
       },
       {
-        "canonical_books": 0,
-        "case": "edition-publisher-conflict",
-        "linked_formats": [],
+        "canonical_books": 1,
+        "case": "edition-publisher-other-printing",
+        "linked_formats": [
+          "epub"
+        ],
         "provider_calls": 1
       },
       {
@@ -208,7 +210,7 @@
           "epub",
           "txt"
         ],
-        "provider_calls": 2
+        "provider_calls": 1
       },
       {
         "canonical_books": 1,
@@ -266,15 +268,15 @@
         "wrong_work_auto": 0
       },
       "editions": {
-        "auto": 6,
-        "correct_auto": 6,
+        "auto": 7,
+        "correct_auto": 7,
         "failed": 0,
-        "local_suggestions": 5,
+        "local_suggestions": 4,
         "provider_failure_rows": 0,
         "provider_failures": 0,
-        "review": 5,
+        "review": 4,
         "review_policy_violations": 0,
-        "review_rate": 0.454545,
+        "review_rate": 0.363636,
         "rows": 11,
         "wrong_auto": 0,
         "wrong_edition_auto": 0,
@@ -311,15 +313,15 @@
         "wrong_work_auto": 0
       },
       "no-isbn": {
-        "auto": 10,
-        "correct_auto": 10,
+        "auto": 11,
+        "correct_auto": 11,
         "failed": 0,
-        "local_suggestions": 3,
+        "local_suggestions": 2,
         "provider_failure_rows": 0,
         "provider_failures": 0,
-        "review": 8,
+        "review": 7,
         "review_policy_violations": 0,
-        "review_rate": 0.444444,
+        "review_rate": 0.388889,
         "rows": 18,
         "wrong_auto": 0,
         "wrong_edition_auto": 0,
@@ -359,13 +361,13 @@
         "auto": 2,
         "correct_auto": 1,
         "failed": 0,
-        "local_suggestions": 8,
+        "local_suggestions": 7,
         "provider_failure_rows": 1,
         "provider_failures": 1,
-        "review": 16,
+        "review": 15,
         "review_policy_violations": 1,
-        "review_rate": 0.888889,
-        "rows": 18,
+        "review_rate": 0.882353,
+        "rows": 17,
         "wrong_auto": 1,
         "wrong_edition_auto": 1,
         "wrong_work_auto": 1
@@ -416,8 +418,8 @@
         "wrong_work_auto": 0
       },
       "work-only": {
-        "auto": 2,
-        "correct_auto": 2,
+        "auto": 3,
+        "correct_auto": 3,
         "failed": 0,
         "local_suggestions": 0,
         "provider_failure_rows": 0,
@@ -425,7 +427,7 @@
         "review": 0,
         "review_policy_violations": 0,
         "review_rate": 0.0,
-        "rows": 2,
+        "rows": 3,
         "wrong_auto": 0,
         "wrong_edition_auto": 0,
         "wrong_work_auto": 0
@@ -1043,35 +1045,44 @@
         "wrong_auto": false
       },
       {
-        "block_reason": "edition_conflict",
+        "block_reason": null,
         "candidates": [
           {
             "ref": "orchard-second",
             "score": 0.9
           }
         ],
-        "case": "edition-publisher-conflict",
-        "correct_auto": false,
-        "correct_edition": null,
-        "correct_work": null,
+        "case": "edition-publisher-other-printing",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
         "error": "",
         "file": "Mira Calder/The Glass Orchard.epub",
         "groups": [
           "no-isbn",
           "editions",
-          "required-review"
+          "work-only"
         ],
-        "local_suggestion": true,
-        "outcome": "review",
+        "local_suggestion": false,
+        "outcome": "auto",
         "provider_failures": 0,
         "provider_search_runs": 1,
         "review_policy_violation": false,
-        "selected": null,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
         "truth": {
-          "edition": "orchard-en",
-          "require_review": true,
+          "edition": null,
+          "require_review": false,
           "work": "orchard",
-          "work_only_language": null
+          "work_only_language": "en"
         },
         "wrong_auto": false
       },
@@ -1681,15 +1692,15 @@
     ],
     "threshold": 0.86,
     "totals": {
-      "auto": 16,
-      "correct_auto": 15,
+      "auto": 17,
+      "correct_auto": 16,
       "failed": 0,
-      "local_suggestions": 8,
+      "local_suggestions": 7,
       "provider_failure_rows": 2,
       "provider_failures": 2,
-      "review": 17,
+      "review": 16,
       "review_policy_violations": 1,
-      "review_rate": 0.515152,
+      "review_rate": 0.484848,
       "rows": 33,
       "wrong_auto": 1,
       "wrong_edition_auto": 1,
@@ -1722,12 +1733,12 @@
       "file": "Nora Vale/Signal Garden.epub"
     }
   ],
-  "corpus_sha256": "89a711862b05f2837772c2089ee6066b5f57a166b351f1c4649dda43ac9f2871",
-  "dependency_lock_sha256": "0e32b38930e7a2d31adc7d7214f4d8d2a3fcb49e81ecfbc54f25f5bb234b2919",
+  "corpus_sha256": "ea7f27a2954df0bcc563fe27a5538ec9a80d0f224caa746ac88c22d7663f1eeb",
+  "dependency_lock_sha256": "00f11c9aa747aa6299bbbf9c2a4bbafeead1d7ca92dd5b6e42d9ae43f222c303",
   "rule_sha256": {
-    "identification.py": "6415fdfd7cafa809247f932eb2fe88884d1fda0d6a746015c0790bdfc0fc69b3",
-    "intake.py": "9e9aa797f742c6863e98ee52a4f835f93bc1f27b674f51da05198801e990503f",
-    "intake_evaluation.py": "90f8a4c5c92ea52e43bed35585645a4fc1ea11fb81c6d511c89c4a0650cda4a8",
+    "identification.py": "3aa56b80d09f06f2cf2c463e75aca72abababb395b6b11134e415065887fd4a6",
+    "intake.py": "a69f70a15c9f17a0df47789748d88c1efb071b3e428c84363a7b30973a9be1d0",
+    "intake_evaluation.py": "12f7190dbb21eb77ab6f1e07f94b71bd86ea48866ae0a29aa2f3c39a9a37a543",
     "local_identity.py": "7d490e822e576cf99119743865d84f77de154b1f7b372d5c9be42f06302d78e5"
   },
   "schema_version": 1,
@@ -1849,9 +1860,11 @@
         "provider_calls": 1
       },
       {
-        "canonical_books": 0,
-        "case": "edition-publisher-conflict",
-        "linked_formats": [],
+        "canonical_books": 1,
+        "case": "edition-publisher-other-printing",
+        "linked_formats": [
+          "epub"
+        ],
         "provider_calls": 1
       },
       {
@@ -1947,7 +1960,7 @@
           "epub",
           "txt"
         ],
-        "provider_calls": 2
+        "provider_calls": 1
       },
       {
         "canonical_books": 1,
@@ -2005,15 +2018,15 @@
         "wrong_work_auto": 1
       },
       "editions": {
-        "auto": 6,
-        "correct_auto": 6,
+        "auto": 7,
+        "correct_auto": 7,
         "failed": 0,
-        "local_suggestions": 5,
+        "local_suggestions": 4,
         "provider_failure_rows": 0,
         "provider_failures": 0,
-        "review": 5,
+        "review": 4,
         "review_policy_violations": 0,
-        "review_rate": 0.454545,
+        "review_rate": 0.363636,
         "rows": 11,
         "wrong_auto": 0,
         "wrong_edition_auto": 0,
@@ -2050,15 +2063,15 @@
         "wrong_work_auto": 0
       },
       "no-isbn": {
-        "auto": 13,
-        "correct_auto": 11,
+        "auto": 14,
+        "correct_auto": 12,
         "failed": 0,
-        "local_suggestions": 2,
+        "local_suggestions": 1,
         "provider_failure_rows": 0,
         "provider_failures": 0,
-        "review": 5,
+        "review": 4,
         "review_policy_violations": 2,
-        "review_rate": 0.277778,
+        "review_rate": 0.222222,
         "rows": 18,
         "wrong_auto": 2,
         "wrong_edition_auto": 1,
@@ -2098,13 +2111,13 @@
         "auto": 4,
         "correct_auto": 1,
         "failed": 0,
-        "local_suggestions": 7,
+        "local_suggestions": 6,
         "provider_failure_rows": 1,
         "provider_failures": 1,
-        "review": 14,
+        "review": 13,
         "review_policy_violations": 3,
-        "review_rate": 0.777778,
-        "rows": 18,
+        "review_rate": 0.764706,
+        "rows": 17,
         "wrong_auto": 3,
         "wrong_edition_auto": 2,
         "wrong_work_auto": 3
@@ -2155,8 +2168,8 @@
         "wrong_work_auto": 1
       },
       "work-only": {
-        "auto": 2,
-        "correct_auto": 2,
+        "auto": 3,
+        "correct_auto": 3,
         "failed": 0,
         "local_suggestions": 0,
         "provider_failure_rows": 0,
@@ -2164,7 +2177,7 @@
         "review": 0,
         "review_policy_violations": 0,
         "review_rate": 0.0,
-        "rows": 2,
+        "rows": 3,
         "wrong_auto": 0,
         "wrong_edition_auto": 0,
         "wrong_work_auto": 0
@@ -2804,35 +2817,44 @@
         "wrong_auto": false
       },
       {
-        "block_reason": "edition_conflict",
+        "block_reason": null,
         "candidates": [
           {
             "ref": "orchard-second",
             "score": 0.9
           }
         ],
-        "case": "edition-publisher-conflict",
-        "correct_auto": false,
-        "correct_edition": null,
-        "correct_work": null,
+        "case": "edition-publisher-other-printing",
+        "correct_auto": true,
+        "correct_edition": true,
+        "correct_work": true,
         "error": "",
         "file": "Mira Calder/The Glass Orchard.epub",
         "groups": [
           "no-isbn",
           "editions",
-          "required-review"
+          "work-only"
         ],
-        "local_suggestion": true,
-        "outcome": "review",
+        "local_suggestion": false,
+        "outcome": "auto",
         "provider_failures": 0,
         "provider_search_runs": 1,
         "review_policy_violation": false,
-        "selected": null,
+        "selected": {
+          "authors": [
+            "Mira Calder"
+          ],
+          "identifiers": [],
+          "language": "en",
+          "publisher": "",
+          "title": "The Glass Orchard",
+          "year": null
+        },
         "truth": {
-          "edition": "orchard-en",
-          "require_review": true,
+          "edition": null,
+          "require_review": false,
           "work": "orchard",
-          "work_only_language": null
+          "work_only_language": "en"
         },
         "wrong_auto": false
       },
@@ -3452,15 +3474,15 @@
     ],
     "threshold": 0.8,
     "totals": {
-      "auto": 19,
-      "correct_auto": 16,
+      "auto": 20,
+      "correct_auto": 17,
       "failed": 0,
-      "local_suggestions": 7,
+      "local_suggestions": 6,
       "provider_failure_rows": 2,
       "provider_failures": 2,
-      "review": 14,
+      "review": 13,
       "review_policy_violations": 3,
-      "review_rate": 0.424242,
+      "review_rate": 0.393939,
       "rows": 33,
       "wrong_auto": 3,
       "wrong_edition_auto": 2,
