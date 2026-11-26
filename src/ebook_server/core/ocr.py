@@ -31,8 +31,8 @@ from ebook_server.jobs import (
 )
 from ebook_server.storage import LocalFilesystemStorage
 
-from . import archive_layout, conversion, intake, worker_failures
-from .models import Book, FileVariant, ProcessingJob, ScanJob, StorageLocation
+from . import archive_layout, conversion, intake, scan_images, scantailor, worker_failures
+from .models import Book, FileVariant, ProcessingJob, ScanJob, ScanPage, StorageLocation
 from .referenced_files import ReferencedFileError, ensure_reference_intact
 from .storage_registry import StorageConfigurationError, backend_for_location
 
@@ -879,9 +879,49 @@ def _resolve_source_artifact(
     return source_path, source_variant.format, source_variant.mime_type, book, source_variant
 
 
+def _write_blank_ocr_page(zipped: zipfile.ZipFile, page: ScanPage) -> None:
+    filename = f"{page.logical_sequence_number:04d}-{page.side}.png"
+    margins = page.stage_states.select_related("output_storage_location").get(stage="margins")
+    if (
+        margins.output_storage_location is not None
+        and margins.output_storage_identifier
+        and scantailor.stage_result_is_current(margins)
+    ):
+        storage = backend_for_location(margins.output_storage_location)
+        try:
+            source = storage.open(margins.output_storage_identifier)
+        except FileNotFoundError:
+            pass
+        else:
+            with source, zipped.open(filename, "w", force_zip64=True) as member:
+                shutil.copyfileobj(source, member, length=ARTIFACT_CHUNK_BYTES)
+            return
+
+    version = page.active_version()
+    if version is None:
+        raise OCRJobError(f"blank page {page.logical_sequence_number} has no source")
+    image = scan_images.ensure_page_image(version)
+    dpi = (image.dpi_x, image.dpi_y)
+    raw_size = (image.full_width, image.full_height)
+    if page.scan_job.state == ScanJob.State.COMPLETE:
+        # Finalization prunes the stage files, retaining the last rendered size.
+        size = (
+            margins.parameters.get("output_width") or raw_size[0],
+            margins.parameters.get("output_height") or raw_size[1],
+        )
+    else:
+        size = scantailor.blank_page_size(
+            scantailor.margins_aggregate(page.scan_job_id), dpi, raw_size
+        )
+    with scantailor.blank_canvas(size) as canvas, zipped.open(filename, "w") as member:
+        canvas.save(member, format="PNG", dpi=dpi)
+
+
 def _zip_scan_job_pages(scan_job: ScanJob) -> Path:
     pages = list(
-        scan_job.pages.prefetch_related("versions").order_by("logical_sequence_number", "side"),
+        scan_job.pages.select_related("scan_job")
+        .prefetch_related("versions")
+        .order_by("logical_sequence_number", "side"),
     )
     if not pages:
         raise OCRJobError("scan job has no pages")
@@ -896,6 +936,10 @@ def _zip_scan_job_pages(scan_job: ScanJob) -> Path:
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
             written = 0
             for page in pages:
+                if page.declared_blank:
+                    _write_blank_ocr_page(zipped, page)
+                    written += 1
+                    continue
                 version = page.active_version()
                 if version is None:
                     continue

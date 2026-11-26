@@ -13,6 +13,9 @@
       class="st-editor"
       data-scantailor-editor
       data-editable="{% if editable %}true{% else %}false{% endif %}"
+      data-can-declare-blank="{% if can_declare_blank %}true{% else %}false{% endif %}"
+      data-blank-url-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/blank/"
+      data-rescan-url-template="/scan/pages/__PAGE__/rescan/"
       data-events-url="{% url 'scan-job-workspace-events' job.id %}"
       data-workspace-url="{% url 'scan-job-workspace' job.id %}"
       data-workspace-state-url="{% url 'scan-job-workspace-state' job.id %}"
@@ -22,12 +25,20 @@
       data-stage-thumbnail-template="/scan/jobs/{{ job.id }}/pages/__PAGE__/stages/__STAGE__/thumbnail/"
       data-page-thumbnail-template="/scan/pages/__PAGE__/thumbnail/"
       data-batch-url-template="/scan/jobs/{{ job.id }}/stages/__STAGE__/batch/"
+      data-run-all-url="{% url 'scan-job-run-all' job.id %}"
     >
       {% csrf_token %}
       <aside class="st-left" aria-label="Stages and options">
         <header class="st-left-header">
           <a class="st-back" href="{% url 'scan-job-workspace' job.id %}?view=html">← Job overview</a>
           <h1 title="{{ job.provisional_title }}">{{ job.provisional_title|default:"Untitled scan" }}</h1>
+          <p class="review-notice" data-refinish-notice {% if not job.refinish_needed %}hidden{% endif %}>Re-finish needed</p>
+          {% if can_declare_blank %}
+            <form method="post" action="{% url 'scan-job-finish' job.id %}?view=html" data-finish-scan {% if not editable %}hidden{% endif %}>
+              {% csrf_token %}
+              <button type="submit" class="secondary">Finish clean page set</button>
+            </form>
+          {% endif %}
         </header>
         <ol class="st-stages" aria-label="Processing stages">
           {% for stage in stage_navigation %}
@@ -39,6 +50,11 @@
             </li>
           {% endfor %}
         </ol>
+        <div class="st-option-actions" data-pipeline-actions>
+          <button type="button" class="secondary" data-run-pipeline {% if not editable or not pages or run_all_blocked %}disabled{% endif %}>Run all</button>
+          <button type="button" class="secondary" data-cancel-pipeline hidden>Cancel run</button>
+          <p class="muted" data-pipeline-status role="status">{{ run_all_blocked|default:"" }}</p>
+        </div>
         <section class="st-options" aria-labelledby="workspace-editor-title">
           <h2 id="workspace-editor-title" data-editor-title>Choose a page and stage</h2>
           <div class="editor-stage-controls" data-stage-controls></div>
@@ -71,6 +87,8 @@
 
       <main class="st-canvas" aria-label="Page preview">
         <div class="st-canvas-toolbar" role="toolbar" aria-label="Preview">
+          <button type="button" class="secondary" data-toggle-blank disabled>Mark page as blank</button>
+          <button type="button" class="secondary" data-request-rescan disabled>Request rescan</button>
           <div class="st-segmented st-pane-toggle" role="group" aria-label="Shown pane">
             <button type="button" data-preview-input aria-pressed="true">Input</button>
             <button type="button" data-preview-result aria-pressed="false">Result</button>
@@ -83,9 +101,22 @@
             <button type="button" data-zoom-actual>1:1</button>
           </div>
         </div>
+        <dialog data-blank-dialog>
+          <form method="dialog">
+            <h2>Mark this page as blank?</h2>
+            <p>The finished book will keep a white page at this position.</p>
+            <img data-blank-preview alt="Original scan" style="display:block;max-width:100%;max-height:55vh">
+            <button value="cancel" class="secondary" autofocus>Cancel</button>
+            <button value="confirm" data-confirm-blank disabled>Mark as blank</button>
+          </form>
+        </dialog>
         <div class="st-panes" data-panes data-pane="input">
           <section class="st-pane st-pane-input" data-input-pane aria-label="Stage input">
             <span class="st-pane-label">Input</span>
+            <figure class="st-output-histogram" data-output-histogram hidden>
+              <canvas width="256" height="72" aria-label="Input grayscale histogram"></canvas>
+              <figcaption></figcaption>
+            </figure>
             <div class="st-viewport" data-viewport>
               <div class="st-surface" data-surface>
                 <img data-editor-image alt="Processing-stage input preview" hidden>
@@ -110,6 +141,7 @@
 
       <aside class="st-strip" aria-label="Pages">
         <div class="st-strip-scroll" data-strip-scroll role="listbox" aria-multiselectable="true" aria-label="Pages" tabindex="0"></div>
+        <label class="checkbox"><input type="checkbox" data-blank-only>Blank pages only</label>
         <footer class="st-strip-footer">
           <label>Sort
             <select data-strip-sort>

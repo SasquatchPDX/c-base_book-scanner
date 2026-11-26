@@ -402,6 +402,7 @@ def test_finish_without_opf_title_runs_scan_identification(
     if payload is not None:
         assert job.notes["scanner_opf"]["reason"] == "no_title"
         assert job.provisional_authors == ["Ada Scanner"]
+        assert scan_identification._provisional_terms(job) == {"isbn": ISBN}
 
 
 @pytest.mark.django_db(transaction=True)

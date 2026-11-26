@@ -1161,6 +1161,7 @@ class ScanPage(models.Model):
     scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="pages")
     logical_sequence_number = models.PositiveIntegerField()
     side = models.CharField(max_length=16, choices=Side.choices, default=Side.SINGLE)
+    declared_blank = models.BooleanField(default=False)
     # The printed page number the scanner recognised (a string, e.g. "23" or "xiv"),
     # and the scanner's capture status for the page ("ok", ...). Set with the device
     # page upload (#128) and from the latest ``page`` event in scan.jsonl (#129).
@@ -1185,6 +1186,17 @@ class ScanPage(models.Model):
 
     def active_version(self) -> ScanPageVersion | None:
         return self.versions.filter(is_active=True).order_by("-version").first()
+
+
+class ScanPageBlankEvent(models.Model):
+    page = models.ForeignKey(ScanPage, on_delete=models.CASCADE, related_name="blank_events")
+    version = models.ForeignKey("ScanPageVersion", on_delete=models.CASCADE)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    previous_value = models.BooleanField()
+    declared_blank = models.BooleanField()
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class ScanPageVersion(models.Model):
@@ -1574,6 +1586,7 @@ class ScanTailorStageState(models.Model):
         RUNNING = "running", "Running"
         SUCCESS = "success", "Success"
         FAILED = "failed", "Failed"
+        SKIPPED = "skipped", "Skipped"
 
     scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="stage_states")
     scan_page = models.ForeignKey(
@@ -1658,6 +1671,36 @@ class ScanTailorStageState(models.Model):
 
     def __str__(self) -> str:
         return f"{self.scan_page_id}:{self.stage}:rev={self.revision}:{self.status}"
+
+
+class ScanTailorRun(models.Model):
+    """Durable progress and cancellation for an explicit all-stages run."""
+
+    class State(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        RUNNING = "running", "Running"
+        COMPLETE = "complete", "Complete"
+        FAILED = "failed", "Failed"
+        CANCELLED = "cancelled", "Cancelled"
+
+    scan_job = models.ForeignKey(ScanJob, on_delete=models.CASCADE, related_name="pipeline_runs")
+    requested_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    state = models.CharField(max_length=12, choices=State.choices, default=State.QUEUED)
+    page_ids = models.JSONField(default=list)
+    cursor = models.PositiveIntegerField(default=0)
+    failed_steps = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan_job"],
+                condition=models.Q(state__in=["queued", "running"]),
+                name="uniq_active_scantailor_run",
+            )
+        ]
 
 
 class ProcessingJob(models.Model):

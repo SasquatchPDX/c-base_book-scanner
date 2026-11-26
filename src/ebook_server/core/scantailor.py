@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from math import ceil, floor, isfinite
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import cv2
 import numpy as np
@@ -39,7 +39,9 @@ from .models import (
     ProcessingJob,
     ScanJob,
     ScanPage,
+    ScanPageBlankEvent,
     ScanPageVersion,
+    ScanTailorRun,
     ScanTailorStageState,
     StorageLocation,
 )
@@ -66,7 +68,7 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v3 (#195 step 4): port of upstream SkewFinder; positive angles turn clockwise.
     "deskew": "skewfinder-v3",
     # v3 (#195 step 5): port of upstream ContentBoxFinder.
-    "select_content": "contentboxfinder-v3",
+    "select_content": "contentboxfinder-v4",
     # v3 (#208): port of upstream page_layout: one page size for all, margins in mm.
     "margins": "pagelayout-v3",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
@@ -74,8 +76,8 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v4: transform op, detection at working resolution (#195 step 2).
     # v5 (#195 step 6a): upstream's cylindrical-surface model (CylindricalSurfaceDewarper).
     "dewarping": "cylindrical-v5",
-    # v3: rendered once from the original through the composed transform.
-    "output": "opencv-zones-v3",
+    # v4: Wolf collects page-wide statistics before thresholding tiles.
+    "output": "opencv-zones-v4",
 }
 
 
@@ -148,7 +150,7 @@ def _build_output_name(state: ScanTailorStageState, *, preview: bool = False) ->
     # Stages 1-4 keep a lossless working-resolution image (the next stage's input) and
     # a JPEG preview. Output keeps the full-resolution page and a PNG preview, so
     # binarised text stays crisp.
-    if state.stage == ScanTailorStageState.Stage.OUTPUT.value:
+    if state.stage == ScanTailorStageState.Stage.OUTPUT.value or is_blank_margins(state):
         return "preview.png" if preview else "output.png"
     return "preview.jpg" if preview else "work.png"
 
@@ -499,6 +501,12 @@ def stage_input_fingerprint(state: ScanTailorStageState) -> str:
     :func:`margins_input_fingerprint`), so a change of the aggregate makes every
     aligned page's Margins stale through this same mechanism.
     """
+    if is_blank_margins(state):
+        version = state.input_scan_page_version
+        return margins_input_fingerprint(
+            version.checksum_sha256 if version is not None else "",
+            job_margins_aggregate(state).fingerprint,
+        )
     if previous_stage(state.stage) is None:
         version = state.input_scan_page_version
         if version is None:
@@ -528,7 +536,18 @@ def margins_depends_on_aggregate(state: ScanTailorStageState) -> bool:
     version = state.algorithm_version or ""
     if not version or version.startswith(_PRE_LAYOUT_MARGINS_VERSION_PREFIX):
         return False
-    return page_layout.aligns_with_others(state.parameters or {})
+    return is_blank_margins(state) or page_layout.aligns_with_others(state.parameters or {})
+
+
+def is_blank_margins(state: ScanTailorStageState) -> bool:
+    return (
+        state.stage == ScanTailorStageState.Stage.MARGINS
+        and (state.parameters or {}).get("declared_blank") is True
+    )
+
+
+def is_declared_blank_stage(state: ScanTailorStageState) -> bool:
+    return state.status == ScanTailorStageState.StageStatus.SKIPPED or is_blank_margins(state)
 
 
 #: Margins algorithm versions before #208's page layout port ("padding-v2" and older).
@@ -611,11 +630,13 @@ def stage_result_is_current(state: ScanTailorStageState) -> bool:
     recorded input fingerprint equals :func:`stage_input_fingerprint`, and the
     predecessor is itself current (recursively up to the first stage).
     """
+    if state.status == ScanTailorStageState.StageStatus.SKIPPED:
+        return True
     if state.status != ScanTailorStageState.StageStatus.SUCCESS:
         return False
     if not stage_settings_applied(state):
         return False
-    if previous_stage(state.stage) is not None:
+    if previous_stage(state.stage) is not None and not is_blank_margins(state):
         predecessor = state.input_stage_state
         if predecessor is None or not stage_result_is_current(predecessor):
             return False
@@ -624,6 +645,8 @@ def stage_result_is_current(state: ScanTailorStageState) -> bool:
 
 def stage_waiting_for(state: ScanTailorStageState) -> str | None:
     """The first predecessor (pipeline order) without a current result, else None."""
+    if is_blank_margins(state) or state.status == ScanTailorStageState.StageStatus.SKIPPED:
+        return None
     chain: list[ScanTailorStageState] = []
     current = state
     while (predecessor_name := previous_stage(current.stage)) is not None:
@@ -662,6 +685,8 @@ def _common_size_changed(state: ScanTailorStageState) -> bool:
     """The Margins input is unchanged except for the job's common page size."""
     if not margins_depends_on_aggregate(state):
         return False
+    if is_blank_margins(state):
+        return True
     predecessor = state.input_stage_state
     if predecessor is None or not stage_result_is_current(predecessor):
         return False
@@ -722,6 +747,13 @@ def mark_state_stale(
     active_version = page.active_version()
     rows = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     now = timezone.now()
+    if page.declared_blank and active_version is not None:
+        states = list(rows.select_for_update().order_by("pk"))
+        margins = next(state for state in states if is_blank_margins(state))
+        set_page_blank(
+            page, states, version=margins.input_scan_page_version or active_version, blank=False
+        )
+        transaction.on_commit(lambda: queue_after_blank_edit(scan_job_id, page_id))
     if active_version is not None:
         rows.filter(stage=stage_order()[0]).update(
             input_scan_page_version=active_version,
@@ -729,6 +761,60 @@ def mark_state_stale(
         )
     logger.info("scantailor_page_source_changed", scan_page_id=page_id, reason=reason)
     return int(rows.update(updated_at=now))
+
+
+def set_page_blank(
+    page: ScanPage,
+    states: list[ScanTailorStageState],
+    *,
+    version: ScanPageVersion,
+    blank: bool,
+    actor_id: int | None = None,
+) -> None:
+    """Change a declaration under the same row locks as stage edits and page replacement."""
+    ScanPageBlankEvent.objects.create(
+        page=page,
+        version=version,
+        actor_id=actor_id,
+        previous_value=page.declared_blank,
+        declared_blank=blank,
+    )
+    page.declared_blank = blank
+    page.save(update_fields=["declared_blank", "updated_at"])
+    for state in states:
+        status = ScanTailorStageState.StageStatus
+        state.revision += 1
+        _drop_queued_stage_job(state.worker_job_id)
+        state.worker_job_id = ""
+        state.status = status.UNKNOWN
+        state.last_error = ""
+        state.applied_revision = None
+        state.applied_parameters = {}
+        state.applied_input_sha256 = ""
+        state.output_storage_identifier = ""
+        state.preview_storage_identifier = ""
+        state.output_sha256 = ""
+        state.output_size_bytes = None
+        state.started_at = None
+        state.finished_at = None
+        state.parameters = dict(state.parameters or {})
+        state.parameters.pop("declared_blank", None)
+        if state.stage == ScanTailorStageState.Stage.MARGINS:
+            state.input_scan_page_version = version if blank else None
+            state.input_storage_identifier = version.storage_identifier if blank else ""
+            if blank:
+                state.parameters["declared_blank"] = True
+        elif blank:
+            state.status = status.SKIPPED
+        state.save()
+
+
+def queue_after_blank_edit(scan_job_id: str, page_id: str, actor_id: int | None = None) -> None:
+    page = ScanPage.objects.get(pk=page_id)
+    stage = ScanTailorStageState.Stage.MARGINS if page.declared_blank else stage_order()[0]
+    state = page.stage_states.get(stage=stage)
+    ensure_stage_result(state, requested_by_user_id=actor_id)
+    _requeue_after_layout_change(state)
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -1008,7 +1094,9 @@ def _detect_content(stage_input: StageInput) -> tuple[int, int, int, int] | None
     found = content_box.find_content_box(gray150, page_mask)
     if found is None:
         return None
-    left, top, right, bottom = found
+    left, top, right, bottom = _pad_content_box(
+        found, (gray150.shape[1], gray150.shape[0]), page_mask
+    )
     # QRect -> QRectF: the right/bottom edge of the last pixel, then back to full size.
     box = (
         int(floor(left / to150_x)),
@@ -1022,6 +1110,34 @@ def _detect_content(stage_input: StageInput) -> tuple[int, int, int, int] | None
         max(1, min(full_w, box[2])),
         max(1, min(full_h, box[3])),
     )
+
+
+CONTENT_PADDING_AT_WORK_DPI: Final[int] = 5
+
+
+def _pad_content_box(box: Box, size: tuple[int, int], page_mask: np.ndarray | None = None) -> Box:
+    """Pad an inclusive detector rectangle in 150 dpi coordinates."""
+    left, top, right, bottom = box
+    width, height = size
+    distance = CONTENT_PADDING_AT_WORK_DPI
+    if page_mask is None:
+        return (
+            max(0, left - distance),
+            max(0, top - distance),
+            min(width - 1, right + distance),
+            min(height - 1, bottom + distance),
+        )
+    # Never grow into the synthetic corner triangles introduced by Deskew.
+    for _ in range(distance):
+        if left > 0 and page_mask[top : bottom + 1, left - 1].all():
+            left -= 1
+        if right + 1 < width and page_mask[top : bottom + 1, right + 1].all():
+            right += 1
+        if top > 0 and page_mask[top - 1, left : right + 1].all():
+            top -= 1
+        if bottom + 1 < height and page_mask[bottom + 1, left : right + 1].all():
+            bottom += 1
+    return left, top, right, bottom
 
 
 def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
@@ -1261,6 +1377,40 @@ def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageR
     )
 
 
+def blank_page_size(
+    aggregate: page_layout.Aggregate, dpi: tuple[int, int], original_size: tuple[int, int]
+) -> tuple[int, int]:
+    if aggregate.width_mm and aggregate.height_mm:
+        return (
+            max(1, round(aggregate.width_mm * dpi[0] / MM_PER_INCH)),
+            max(1, round(aggregate.height_mm * dpi[1] / MM_PER_INCH)),
+        )
+    # All-blank jobs and jobs whose normal pages have yet to reach Select Content.
+    return original_size
+
+
+def blank_canvas(size: tuple[int, int]) -> Image.Image:
+    if Image.MAX_IMAGE_PIXELS is not None and size[0] * size[1] > Image.MAX_IMAGE_PIXELS:
+        raise ImageLoadError("blank page canvas exceeds image size limit")
+    return Image.new("L", size, color=255)
+
+
+def _run_blank_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    aggregate = job_margins_aggregate(state)
+    size = blank_page_size(aggregate, stage_input.dpi, stage_input.full_size)
+    return StageResult(
+        image=blank_canvas(size),
+        full_size=size,
+        parameters={
+            "declared_blank": True,
+            "aggregate_fingerprint": aggregate.fingerprint,
+            "common_page_width_mm": aggregate.width_mm,
+            "common_page_height_mm": aggregate.height_mm,
+        },
+        full_resolution=True,
+    )
+
+
 type _MarginsRow = tuple[int, int, str, dict[str, Any]]
 
 #: Run states in which a row still holds its last successful result (#205).
@@ -1376,7 +1526,7 @@ def requeue_stale_margins(job: ScanJob | Any) -> int:
         state_id
         for state_id, _revision, status, parameters in rows
         if status == ScanTailorStageState.StageStatus.SUCCESS
-        and page_layout.aligns_with_others(parameters)
+        and (parameters.get("declared_blank") is True or page_layout.aligns_with_others(parameters))
         and parameters.get("aggregate_fingerprint") != aggregate.fingerprint
     }
     if not candidates:
@@ -1680,6 +1830,12 @@ def _odd_window(window_size: int) -> int:
     return block if block % 2 == 1 else block + 1
 
 
+def _local_statistics(gray: np.ndarray, block: int) -> tuple[np.ndarray, np.ndarray]:
+    mean = cv2.blur(gray, (block, block))
+    mean_square = cv2.blur(gray * gray, (block, block))
+    return mean, np.sqrt(np.maximum(mean_square - mean * mean, 0.0))
+
+
 def _binarize_with_cv2(
     grayscale: Any,
     source: Image.Image,
@@ -1689,6 +1845,8 @@ def _binarize_with_cv2(
     k: float,
     r: float,
     invert: bool,
+    wolf_statistics: tuple[float, float] | None = None,
+    observe_threshold: Callable[[float | np.ndarray], None] | None = None,
 ) -> Image.Image:
     if cv2 is None or np is None:
         raise RuntimeError("opencv is not available")
@@ -1697,14 +1855,14 @@ def _binarize_with_cv2(
     if not isinstance(gray, np.ndarray):
         gray = np.array(source.convert("L"))
 
+    threshold: float | np.ndarray
     if mode == "otsu":
-        _, threshold = cv2.threshold(
+        threshold, output = cv2.threshold(
             gray,
             0,
             255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
-        output = threshold
     elif mode == "window":
         # Local-mean threshold with a *relative* offset below the mean: paper noise
         # stays white, only pixels clearly darker than their surroundings turn black.
@@ -1721,7 +1879,8 @@ def _binarize_with_cv2(
         local_sq = cv2.blur(gray_f * gray_f, (block, block))
         local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
         offset = np.maximum(abs(k) * local_std, 0.12 * local_mean)
-        output = (gray_f > (local_mean - offset)).astype(np.uint8) * 255
+        threshold = local_mean - offset
+        output = (gray_f > threshold).astype(np.uint8) * 255
     elif mode == "sauvola":
         # T = m * (1 + k * (s / r - 1)); box filters keep this fast on 24MP scans.
         block = _odd_window(window_size)
@@ -1735,18 +1894,21 @@ def _binarize_with_cv2(
         # Wolf-Jolion: T = (1-a)*m + a*Min + a*(s/Smax)*(m - Min)
         block = _odd_window(window_size)
         gray_f = gray.astype(np.float32)
-        local_mean = cv2.blur(gray_f, (block, block))
-        local_sq = cv2.blur(gray_f * gray_f, (block, block))
-        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
-        floor = float(np.percentile(gray_f[::4, ::4], 1))
-        max_std = max(float(local_std.max()), 1e-3)
+        local_mean, local_std = _local_statistics(gray_f, block)
+        minimum, maximum_deviation = (
+            wolf_statistics
+            if wolf_statistics is not None
+            else (float(gray.min()), float(local_std.max()))
+        )
+        max_std = max(maximum_deviation, 1e-3)
         a_coeff = min(max(k, 0.0), 1.0)
         threshold = (
             (1.0 - a_coeff) * local_mean
-            + a_coeff * floor
-            + a_coeff * (local_std / max_std) * (local_mean - floor)
+            + a_coeff * minimum
+            + a_coeff * (local_std / max_std) * (local_mean - minimum)
         )
-        output = (gray_f > threshold).astype(np.uint8) * 255
+        black = (gray < 1) | ((gray <= 254) & (gray_f < threshold))
+        output = (~black).astype(np.uint8) * 255
     elif mode == "grad":
         # Gradient-aware fallback for bleed-through and uneven lighting.
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -1766,11 +1928,13 @@ def _binarize_with_cv2(
             255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         output = cv2.bitwise_xor(binary, gradient_mask)
     else:
         raise RuntimeError(f"unsupported output mode '{mode}'")
 
+    if observe_threshold is not None:
+        observe_threshold(threshold)
     if invert:
         output = cv2.bitwise_not(output)
     return Image.fromarray(output.astype(np.uint8))
@@ -1802,19 +1966,11 @@ def _output_zones(parameters: dict[str, Any], size: tuple[int, int]) -> list[dic
     return zones
 
 
-def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any]) -> Image.Image:
-    """Bound float-array scratch to a tile plus a ≤251-pixel local-window halo."""
-    if mode == "copy":
-        return source.copy()
-    window = min(501, max(3, _coerce_int(parameters.get("window_size"), 35)))
-    halo = _odd_window(window) // 2 + 2
-    result = Image.new("L", source.size, 255)
-    # Otsu is global, including when the output is tiled. Pillow's histogram uses
-    # one byte per pixel, avoiding page-sized float/label arrays.
-    cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
+def _threshold_tile_regions(
+    source: Image.Image, halo: int
+) -> Iterable[tuple[Box, Box, tuple[int, int]]]:
     for top in range(0, source.height, OUTPUT_TILE_EDGE):
         for left in range(0, source.width, OUTPUT_TILE_EDGE):
-            checkpoint()  # a newer edit stops the run between tiles (#209)
             right, bottom = (
                 min(source.width, left + OUTPUT_TILE_EDGE),
                 min(source.height, top + OUTPUT_TILE_EDGE),
@@ -1825,25 +1981,54 @@ def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any])
                 min(source.width, right + halo),
                 min(source.height, bottom + halo),
             )
-            tile = source.crop(box).convert("L")
-            if cutoff is not None:
-                processed = tile.point(lambda value: 255 if value > cutoff else 0)
-                if _coerce_bool(parameters.get("invert"), False):
-                    processed = ImageOps.invert(processed)
-            else:
-                processed = _binarize_with_cv2(
-                    np.asarray(tile),
-                    tile,
-                    mode,
-                    window_size=window,
-                    k=_coerce_float(parameters.get("k"), 0.33),
-                    r=_coerce_float(parameters.get("r"), 128.0),
-                    invert=_coerce_bool(parameters.get("invert"), False),
-                )
-            result.paste(
-                processed.crop((left - box[0], top - box[1], right - box[0], bottom - box[1])),
+            yield (
+                box,
+                (left - box[0], top - box[1], right - box[0], bottom - box[1]),
                 (left, top),
             )
+
+
+def _wolf_page_statistics(source: Image.Image, block: int, halo: int) -> tuple[float, float]:
+    minimum, maximum_deviation = 255.0, 0.0
+    for box, (left, top, right, bottom), _ in _threshold_tile_regions(source, halo):
+        checkpoint()
+        tile = np.asarray(source.crop(box).convert("L"), dtype=np.float32)
+        _, deviation = _local_statistics(tile, block)
+        minimum = min(minimum, float(tile[top:bottom, left:right].min()))
+        maximum_deviation = max(maximum_deviation, float(deviation[top:bottom, left:right].max()))
+    return minimum, maximum_deviation
+
+
+def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any]) -> Image.Image:
+    """Bound float-array scratch to a tile plus a ≤252-pixel local-window halo."""
+    if mode == "copy":
+        return source.copy()
+    window = min(501, max(3, _coerce_int(parameters.get("window_size"), 35)))
+    block = _odd_window(window)
+    halo = block // 2 + 2
+    result = Image.new("L", source.size, 255)
+    cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
+    wolf_statistics = _wolf_page_statistics(source, block, halo) if mode == "wolf" else None
+    invert = _coerce_bool(parameters.get("invert"), False)
+    for box, core, origin in _threshold_tile_regions(source, halo):
+        checkpoint()
+        tile = source.crop(box).convert("L")
+        if cutoff is not None:
+            processed = tile.point(lambda value: 255 if value > cutoff else 0)
+            if invert:
+                processed = ImageOps.invert(processed)
+        else:
+            processed = _binarize_with_cv2(
+                np.asarray(tile),
+                tile,
+                mode,
+                window_size=window,
+                k=_coerce_float(parameters.get("k"), 0.33),
+                r=_coerce_float(parameters.get("r"), 128.0),
+                invert=invert,
+                wolf_statistics=wolf_statistics,
+            )
+        result.paste(processed.crop(core), origin)
     return result
 
 
@@ -1854,6 +2039,41 @@ def _zones_to_full(zones: list[dict[str, Any]], stage_input: StageInput) -> list
         box = _box_to_full(tuple(int(value) for value in zone["box"]), stage_input)  # type: ignore[arg-type]
         scaled.append({**zone, "box": list(box)})
     return scaled
+
+
+def _output_histogram(
+    stage_input: StageInput, mode: str, parameters: dict[str, Any], *, zoned: bool = False
+) -> dict[str, Any]:
+    """Calculate the preview's grayscale histogram and the effective cutoff distribution."""
+    preview = _thumbnail(stage_input.image, 960).convert("L")
+    result: dict[str, Any] = {"bins": preview.histogram(), "mode": mode, "zoned": zoned}
+    if mode == "copy":
+        return result
+    if mode == "otsu":
+        result["threshold"] = {"median": _pil_otsu_threshold(preview), "kind": "global"}
+        return result
+
+    def record(threshold: float | np.ndarray) -> None:
+        if isinstance(threshold, np.ndarray):
+            low, median, high = np.percentile(threshold, [10, 50, 90]).tolist()
+            result["threshold"] = {"low": low, "median": median, "high": high, "kind": "local"}
+        else:
+            result["threshold"] = {"median": threshold, "kind": "intensity"}
+
+    scale = max(preview.size) / max(stage_input.full_size)
+    window = min(501, max(3, _coerce_int(parameters.get("window_size"), 35)))
+    preview_window = max(3, round(_odd_window(window) * scale))
+    _binarize_with_cv2(
+        np.asarray(preview),
+        preview,
+        mode,
+        window_size=preview_window,
+        k=_coerce_float(parameters.get("k"), 0.33),
+        r=_coerce_float(parameters.get("r"), 128.0),
+        invert=False,
+        observe_threshold=record,
+    )
+    return result
 
 
 def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
@@ -1876,6 +2096,7 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
                 "output_height": full_height,
                 "resolved_zones": [],
                 "output_warning": "",
+                "output_histogram": _output_histogram(stage_input, mode, parameters),
             },
         )
     text_algorithm = _coerce_output_mode(parameters.get("text_algorithm"), default="sauvola")
@@ -1933,6 +2154,9 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
         "picture_algorithm": picture_algorithm,
         "zone_detector_version": output_zones.DETECTOR_VERSION if zone_mode == "auto" else None,
         "output_warning": warning or "",
+        "output_histogram": _output_histogram(
+            stage_input, "copy" if keep_color or warning else mode, parameters, zoned=bool(zones)
+        ),
     }
     if zone_mode == "manual":
         payload["zones"] = zones
@@ -1990,6 +2214,8 @@ _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
 
 
 def _resolve_stage_algorithm(state: ScanTailorStageState) -> StageRunner:
+    if is_blank_margins(state):
+        return _run_blank_margins
     stage_algorithms = _STAGE_RUNNERS.get(state.stage, {})
     algorithm = (state.algorithm or "").strip()
     runner = stage_algorithms.get(algorithm)
@@ -2173,6 +2399,8 @@ def request_stage_job(
         # Pre-port algorithm names run the port now (#195 steps 4 to 6).
         algorithm = _default_algorithm(state.stage)
     algorithm_version = _default_algorithm_version(state.stage, algorithm)
+    if is_blank_margins(state):
+        algorithm_version = "declared-blank-v1"
     now = timezone.now()
     claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(
         worker_job_id=str(job.job_id),
@@ -2247,10 +2475,18 @@ def queue_ready_successor(
         scan_lifecycle.PROCESSING_STATES
     ):
         return None
-    # A stage never opened has no row yet; it runs with its defaults.
-    successor = get_or_create_stage_state(
-        scan_job_id=str(state.scan_job_id), page_id=str(state.scan_page_id), stage=next_name
-    )
+    if batch:
+        # A stage-specific batch re-runs only existing results made stale by this
+        # page's new output. Workspace initialization also creates never-run rows.
+        successor = ScanTailorStageState.objects.filter(
+            scan_page_id=state.scan_page_id, stage=next_name, applied_revision__isnull=False
+        ).first()
+        if successor is None:
+            return None
+    else:
+        successor = get_or_create_stage_state(
+            scan_job_id=str(state.scan_job_id), page_id=str(state.scan_page_id), stage=next_name
+        )
     if successor.input_stage_state_id != state.id:
         return None
     successor.input_stage_state = state
@@ -2299,6 +2535,44 @@ def process_stage_jobs(job_ids: list[str]) -> None:
     """Run a chunk of batch stage jobs; each keeps its own revision checks."""
     for job_id in job_ids:
         process_stage_job(job_id)
+
+
+def run_pipeline_step(
+    run: ScanTailorRun, page_id: str, stage: str
+) -> Literal["current", "failed", "busy"]:
+    """Use the current authored settings and finish one ready, unprocessed step."""
+    if not ScanPage.objects.filter(pk=page_id, scan_job_id=run.scan_job_id).exists():
+        return "current"
+    state = get_or_create_stage_state(scan_job_id=run.scan_job_id, page_id=page_id, stage=stage)
+    with transaction.atomic():
+        if (
+            not ScanTailorRun.objects.select_for_update()
+            .filter(pk=run.pk, state=ScanTailorRun.State.RUNNING)
+            .exists()
+        ):
+            return "failed"
+        state = _linked_page_state(state.pk, lock=True)
+        if stage_result_is_current(state):
+            return "current"
+        if stage_waiting_for(state) is not None:
+            return "failed"
+        active = _active_stage_job(state)
+        if active is not None:
+            age = (timezone.now() - (active.started_at or active.scheduled_at)).total_seconds()
+            return (
+                "busy" if age < django_settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS else "failed"
+            )
+        job = request_stage_job(
+            state=state,
+            requested_by_user_id=run.requested_by_id,
+            dispatch=False,
+            batch=True,
+            extra_details={"pipeline_run_id": run.pk},
+        )
+    process_stage_job(str(job.job_id))
+    return (
+        "current" if stage_result_is_current(_linked_page_state(state.pk, lock=False)) else "failed"
+    )
 
 
 def dispatch_stage_batch(job_ids: Sequence[str]) -> int:
@@ -2361,7 +2635,7 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
     working-resolution output. ``render_full`` composes every upstream op on the
     untouched original, which only the Output stage needs.
     """
-    chain = _upstream_chain(state)
+    chain = [] if is_blank_margins(state) else _upstream_chain(state)
     version = _page_version(state, chain)
     page_image = scan_images.ensure_page_image(version)
     ops: list[scan_transform.Op] = []
@@ -2476,6 +2750,11 @@ def process_stage_job(job_id: str) -> None:
     if state is None:
         _fail_stage_job(job, f"stage state not found: {stage_state_id}")
         return
+    pipeline_run_id = details.get("pipeline_run_id")
+    if isinstance(pipeline_run_id, int) and not _pipeline_run_is_current(pipeline_run_id):
+        release_pipeline_stage(state, job_id)
+        _supersede_stage_job(job, details, "Run all cancelled")
+        return
 
     # A job only ever produces the artifact of the revision it was queued for. A late
     # job (e.g. one overtaken by a manual edit) is a no-op.
@@ -2521,6 +2800,8 @@ def process_stage_job(job_id: str) -> None:
         # The same rule as the commit (_locked_if_current): a newer edit bumps the
         # revision, and a newer job for the same revision (#205) takes over
         # ``worker_job_id``. Either way this run's result would be discarded (#209).
+        if isinstance(pipeline_run_id, int) and not _pipeline_run_is_current(pipeline_run_id):
+            return False
         return ScanTailorStageState.objects.filter(
             id=state.id,
             revision=started_revision,
@@ -2625,6 +2906,8 @@ def process_stage_job(job_id: str) -> None:
     except StageSuperseded as exc:
         # Stopped early for a newer revision (#209); the temporary files are gone and
         # nothing was staged in scan storage yet. The stage row belongs to the new run.
+        if isinstance(pipeline_run_id, int):
+            release_pipeline_stage(state, job_id)
         _supersede_stage_job(job, details, str(exc))
     except Exception as exc:
         with transaction.atomic():
@@ -2634,6 +2917,11 @@ def process_stage_job(job_id: str) -> None:
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc), input_fingerprint=input_fingerprint)
+        return
+
+    if isinstance(pipeline_run_id, int):
+        # Run all advances by stage across the book. This lets Margins see the
+        # settled common size and leaves room for interactive jobs between chunks.
         return
 
     # Chaining (#205): the next stage of the page runs now if its result is stale.
@@ -2820,7 +3108,7 @@ def _park_waiting_stage_job(
             fresh.save(update_fields=["status", "updated_at"])
             parked = True
     _supersede_stage_job(job, {**details, "waiting_for": waiting_for}, f"waiting for {waiting_for}")
-    if not parked:
+    if not parked or isinstance(details.get("pipeline_run_id"), int):
         return
     current = ScanTailorStageState.objects.filter(id=state.id).first()
     if current is None or current.status == ScanTailorStageState.StageStatus.QUEUED:
@@ -2835,6 +3123,26 @@ def _park_waiting_stage_job(
         requested_by_user_id=requested_by if isinstance(requested_by, int) else None,
         batch=bool(details.get("batch")),
     )
+
+
+def _pipeline_run_is_current(run_id: int) -> bool:
+    return ScanTailorRun.objects.filter(
+        pk=run_id,
+        state=ScanTailorRun.State.RUNNING,
+        scan_job__state__in=scan_lifecycle.PROCESSING_STATES,
+    ).exists()
+
+
+def release_pipeline_stage(state: ScanTailorStageState, job_id: str) -> None:
+    ScanTailorStageState.objects.filter(
+        pk=state.pk,
+        revision=state.revision,
+        worker_job_id=job_id,
+        status__in=[
+            ScanTailorStageState.StageStatus.QUEUED,
+            ScanTailorStageState.StageStatus.RUNNING,
+        ],
+    ).update(status=stage_idle_status(state), worker_job_id="", updated_at=timezone.now())
 
 
 def _prune_quietly(prune: Callable[..., int], *args: object) -> None:

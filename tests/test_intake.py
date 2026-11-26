@@ -275,28 +275,15 @@ def test_exact_title_and_author_without_isbn_auto_accepts_with_evidence(
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize(
-    ("upload_name", "creator", "provider_authors", "blocked_reason"),
-    [
-        # Placeholder authors on both sides agree, so the rule promotes the candidate,
-        # but the provider record names nobody real (#42 / #92 guard).
-        ("unknown.epub", "Unknown", ["Unknown"], intake.BLOCK_NO_PROVIDER_AUTHORS),
-    ],
-)
-def test_strong_match_promotion_still_goes_through_author_guard(
+def test_matching_placeholder_authors_do_not_trigger_promotion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    upload_name: str,
-    creator: str,
-    provider_authors: list[str],
-    blocked_reason: str,
 ) -> None:
-    # The exact-title + strong-author rule (#9) only raises a score; intake's author
-    # checks still run on the promoted candidate and route it to review.
+    # An identical placeholder in the file and provider is not authorship evidence.
     _force_stub_provider(
         monkeypatch,
         candidate_title="Borderline Match",
-        authors=provider_authors,
+        authors=["Unknown"],
         auto_accept_threshold=0.86,
         review_threshold=0.55,
     )
@@ -308,20 +295,19 @@ def test_strong_match_promotion_still_goes_through_author_guard(
     monkeypatch.setattr("ebook_server.core.intake._default_storage", lambda: storage)
 
     epub_path = tmp_path / "guarded.epub"
-    _build_epub(epub_path, "Borderline Match", creator=creator)
+    _build_epub(epub_path, "Borderline Match", creator="Unknown")
     response = client.post(
         "/imports/upload/",
-        {"file": SimpleUploadedFile(upload_name, epub_path.read_bytes())},
+        {"file": SimpleUploadedFile("unknown.epub", epub_path.read_bytes())},
     )
 
     assert response.status_code == 201
     job = ImportJob.objects.get(pk=response.json()["job_id"])
     candidate = MetadataCandidate.objects.get(import_job=job)
     evidence = candidate.raw_payload["_auto_accept_rule"]
-    assert evidence["applied"] is True
-    assert float(candidate.score) == pytest.approx(0.86)
+    assert evidence["applied"] is False
+    assert float(candidate.score) < 0.86
     assert candidate.state == MetadataCandidate.CandidateState.REVIEW
-    assert job.evidence[intake.AUTO_ACCEPT_BLOCKED_KEY] == blocked_reason
     assert job.state == ImportJob.State.LOW_CONFIDENCE
     assert job.book_id is None
     assert ReviewTask.objects.filter(import_job=job).exists()

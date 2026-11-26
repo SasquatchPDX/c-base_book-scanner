@@ -982,21 +982,12 @@ def _sidecar_conflicts(metadata: dict[str, Any], sidecar: dict[str, Any]) -> lis
         for title in titles
     ):
         conflicts.append("title")
-    embedded_authors = [
-        author
-        for author in metadata.get("authors") or []
-        if isinstance(author, str) and not _is_placeholder(author)
-    ]
-    sidecar_authors = [author for author in sidecar.get("authors") or [] if isinstance(author, str)]
+    embedded_authors = identification.evidence_author_names(metadata)
+    sidecar_authors = identification.evidence_author_names(sidecar)
     # ``authors`` contains explicit parser rules; ``likely_authors`` is deliberately
     # excluded. Keep the groups separate so agreeing embedded metadata cannot hide a
     # contradictory explicit header credit.
-    header_authors = header.get("authors")
-    header_authors = (
-        [name for name in header_authors if isinstance(name, str) and not _is_placeholder(name)]
-        if isinstance(header_authors, list)
-        else []
-    )
+    header_authors = identification.evidence_author_names(header)
     if sidecar_authors and any(
         authors and identification.author_similarity(authors, sidecar_authors) == 0.0
         for authors in (embedded_authors, header_authors)
@@ -1022,6 +1013,11 @@ def apply_sidecar_metadata(
     """
     if not sidecar:
         return metadata
+    raw_sidecar = sidecar
+    sidecar = dict(sidecar)
+    sidecar["authors"] = identification.evidence_author_names(sidecar)
+    if _is_placeholder(sidecar.get("title")):
+        sidecar.pop("title", None)
     merged = dict(metadata)
     conflicts = _sidecar_conflicts(metadata, sidecar)
     applied: list[str] = []
@@ -1041,12 +1037,19 @@ def apply_sidecar_metadata(
                     merged[TITLE_SOURCE_KEY] = TITLE_SOURCE_SIDECAR
                     applied.append(key)
                 continue
+            if key == "authors":
+                if not identification.evidence_author_names(metadata):
+                    merged[key] = value
+                    applied.append(key)
+                continue
             if _is_placeholder(metadata.get(key)):
                 merged[key] = value
                 applied.append(key)
     merged[SIDECAR_EVIDENCE_KEY] = {
         "source": SIDECAR_METADATA_NAME,
-        "fields": {key: sidecar[key] for key in SIDECAR_METADATA_FIELDS if sidecar.get(key)},
+        "fields": {
+            key: raw_sidecar[key] for key in SIDECAR_METADATA_FIELDS if raw_sidecar.get(key)
+        },
         "applied_fields": applied,
         "conflicts": conflicts,
     }

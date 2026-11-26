@@ -206,16 +206,24 @@ describe("editor helpers", () => {
     const page = {
       stages: chain(["deskew", "success"], ["select_content", "success"], ["dewarping", "queued"]),
     } as never;
-    expect(stripSourceStage(page, "select_content")?.stage).toBe("select_content");
-    expect(stripSourceStage(page, "margins")?.stage).toBe("select_content");
-    expect(stripSourceStage(page, "deskew")?.stage).toBe("deskew");
-    expect(stripSourceStage({ stages: chain(["deskew", "failed"]) } as never, "deskew")).toBe(
+    expect(stripSourceStage(page)?.stage).toBe("select_content");
+    const finished = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    expect(stripSourceStage({ stages: finished } as never)?.stage).toBe("output");
+    finished[4]!.settings_applied = false;
+    expect(stripSourceStage({ stages: finished } as never)?.stage).toBe("margins");
+    expect(stripSourceStage({ stages: chain(["deskew", "failed"]) } as never)).toBe(
       undefined,
     );
     // A stale result (#205) is not shown: Deskew's settings changed since it ran.
     const stale = chain(["deskew", "success"], ["select_content", "success"]);
     stale[0]!.settings_applied = false;
-    expect(stripSourceStage({ stages: stale } as never, "select_content")).toBe(undefined);
+    expect(stripSourceStage({ stages: stale } as never)).toBe(undefined);
   });
 
   it("uses the content box for Select Content and the output size elsewhere", () => {

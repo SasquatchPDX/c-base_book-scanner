@@ -8,6 +8,8 @@ import json
 import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
@@ -28,6 +30,7 @@ from .rate_limit import RateLimitWaitExceeded, throttle_provider
 logger = structlog.get_logger(__name__)
 
 MAX_AUTHOR_LOOKUPS = 5
+MAX_CONCURRENT_PROVIDERS = 3
 MAX_RETRY_AFTER_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5
 # Subject/genre tags are evidence only (#50); keep them bounded so an untrusted file or
@@ -770,8 +773,10 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
         first, last = segments[0], segments[-1]
         if is_placeholder_author(last):
             title_guesses = _titles_for(segments[:-1])
+            normalized = ""
         elif is_placeholder_author(first):
             title_guesses = _titles_for(segments[1:])
+            normalized = ""
         elif len(segments) == 2 and _same_title(first, last):
             title_guesses = [first, last]  # "Die Kandidaten - Die Kandidaten"
         else:
@@ -945,7 +950,7 @@ def build_identification_input(
     )
 
     title_hints = list(dict.fromkeys([h for h in title_hints if h]))
-    author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
+    author_hints = [hint for hint in dict.fromkeys(author_hints) if not is_placeholder_author(hint)]
 
     isbns: list[str] = []
     for field_name in ["isbn", "isbn10", "isbn13", "identifier"]:
@@ -1356,55 +1361,27 @@ def resolve_candidates_with_report(
     A failing provider never aborts the run: it is reported as ``error`` with a
     short reason, so a reviewer can tell "the provider was down" from "no match".
     """
-    raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
-    outcomes: list[ProviderOutcome] = []
-    for provider in _provider_instances():
-        started_at = perf_counter()
-        try:
-            raw_list = _query_provider(provider, signals)
-        except Exception as exc:  # provider boundary: one provider must not abort intake
-            duration = perf_counter() - started_at
-            reason = describe_provider_error(exc)
-            # Network-level failures are expected; only unexpected ones need a traceback.
-            log = logger.warning if isinstance(exc, OSError) else logger.exception
-            log(
-                "metadata_provider_failed",
-                provider_id=provider.provider_id,
-                duration_seconds=duration,
-                error_type=type(exc).__name__,
-                reason=reason,
-            )
-            outcomes.append(
-                ProviderOutcome(
-                    provider_id=provider.provider_id,
-                    status="error",
-                    result_count=0,
-                    duration_seconds=duration,
-                    error=reason,
-                )
-            )
-            continue
-        duration = perf_counter() - started_at
-        logger.info(
-            "metadata_provider_completed",
-            provider_id=provider.provider_id,
-            candidate_count=len(raw_list),
-            duration_seconds=duration,
-        )
-        outcomes.append(
-            ProviderOutcome(
-                provider_id=provider.provider_id,
-                status="results" if raw_list else "no_results",
-                result_count=len(raw_list),
-                duration_seconds=duration,
-            )
-        )
-        for candidate in raw_list:
-            raw_candidates.append((provider, candidate))
+    providers = _provider_instances()
+    if len(providers) <= 1:
+        results = [_query_provider_with_outcome(provider, signals) for provider in providers]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(len(providers), MAX_CONCURRENT_PROVIDERS),
+            thread_name_prefix="metadata-provider",
+        ) as executor:
+            futures = [
+                executor.submit(copy_context().run, _query_provider_with_outcome, provider, signals)
+                for provider in providers
+            ]
+            # Preserve configured ordering for equal scores and provider diagnostics.
+            results = [future.result() for future in futures]
 
-    normalized: list[IdentificationCandidate] = []
-    for provider, payload in raw_candidates:
-        normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
+    normalized = [
+        _normalize_candidate(outcome.provider_id, payload, signals)
+        for payloads, outcome in results
+        for payload in payloads
+    ]
+    outcomes = [outcome for _, outcome in results]
 
     # Among equal scores, a candidate whose edition agrees with the file ranks first
     # (e.g. the ISBN-lookup edition before a search hit for another edition, #37).
@@ -1412,6 +1389,38 @@ def resolve_candidates_with_report(
         key=lambda item: (item.score, not edition_conflicts(item, signals)), reverse=True
     )
     return _apply_strong_match_rule(signals, normalized), outcomes
+
+
+def _query_provider_with_outcome(
+    provider: MetadataProvider,
+    signals: IdentificationInput,
+) -> tuple[list[dict[str, Any]], ProviderOutcome]:
+    started_at = perf_counter()
+    try:
+        rows = _query_provider(provider, signals)
+    except Exception as exc:  # provider boundary: one provider must not abort intake
+        duration = perf_counter() - started_at
+        reason = describe_provider_error(exc)
+        log = logger.warning if isinstance(exc, OSError) else logger.exception
+        log(
+            "metadata_provider_failed",
+            provider_id=provider.provider_id,
+            duration_seconds=duration,
+            error_type=type(exc).__name__,
+            reason=reason,
+        )
+        return [], ProviderOutcome(provider.provider_id, "error", 0, duration, reason)
+
+    duration = perf_counter() - started_at
+    logger.info(
+        "metadata_provider_completed",
+        provider_id=provider.provider_id,
+        candidate_count=len(rows),
+        duration_seconds=duration,
+    )
+    return rows, ProviderOutcome(
+        provider.provider_id, "results" if rows else "no_results", len(rows), duration
+    )
 
 
 def _query_provider(
@@ -1845,6 +1854,12 @@ def _author_name_similarity(left: str, right: str) -> float:
         return 0.0
     # Equal up to spacing too: "HP Lovecraft" / "H P Lovecraft", "Le Guin" / "LeGuin".
     if "".join(left_tokens) == "".join(right_tokens):
+        return 1.0
+    if (
+        len(left_tokens) == len(right_tokens) == 2
+        and (left.count(",") == 1) != (right.count(",") == 1)
+        and left_tokens == right_tokens[::-1]
+    ):
         return 1.0
     if left_tokens[-1] != right_tokens[-1]:
         return 0.0

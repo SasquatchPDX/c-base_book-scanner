@@ -57,6 +57,7 @@ interface StageState {
   stage_label: string;
   revision: number;
   status: string;
+  skip_reason?: string;
   algorithm: string;
   algorithm_version: string;
   parameters: JsonObject;
@@ -99,6 +100,7 @@ interface WorkspacePage {
   logical_sequence_number: number;
   side: string;
   recognized_page_number?: string | null;
+  open_rescan_todos?: number;
   thumbnail?: string;
   /** Token of the first stage's input (the working image); empty while it is generated. */
   work_image_token?: string;
@@ -109,12 +111,24 @@ interface WorkspaceEvent {
   job_id: string;
   state: string;
   updated_at: string;
+  refinish_needed: boolean;
   stages: StageState[];
 }
 
 interface WorkspaceStateDelta {
   cursor: string;
+  state: string;
+  refinish_needed: boolean;
   stages: StageState[];
+}
+
+interface PipelineRun {
+  id: number;
+  state: "queued" | "running" | "complete" | "failed" | "cancelled";
+  checked_steps: number;
+  total_steps: number;
+  stage: StageName | null;
+  error: string;
 }
 
 export interface Size {
@@ -395,21 +409,18 @@ export function fillUrl(template: string, pageId: string, stage = ""): string {
 }
 
 /**
- * The stage whose output the page strip shows for ``stage``: that stage when it has
- * a current result, else the last current stage before it (unbroken from the first).
+ * The furthest current stage with an artifact, independent of the editor's stage.
  */
 export function stripSourceStage(
   page: Pick<WorkspacePage, "stages">,
-  stage: StageName,
 ): StageState | undefined {
-  let latest: StageState | undefined;
-  for (const name of STAGE_ORDER) {
+  for (const name of [...STAGE_ORDER].reverse()) {
     const state = page.stages.find((candidate) => candidate.stage === name);
-    if (!state || !stageReadiness(page, name).current || !artifactToken(state)) break;
-    latest = state;
-    if (name === stage) break;
+    if (state?.status === "success" && stageReadiness(page, name).current && artifactToken(state)) {
+      return state;
+    }
   }
-  return latest;
+  return undefined;
 }
 
 /** Full-resolution size of a page at ``stage`` for the width/height orders. */
@@ -455,14 +466,16 @@ type ReadinessFields = Pick<
   | "input_sha256"
   | "input_basis_sha256"
   | "common_size_changed"
+  | "skip_reason"
 >;
 
 function ownResultCurrent(state: ReadinessFields, previous: ReadinessFields | undefined): boolean {
+  if (state.status === "skipped") return true;
   if (state.status !== "success" || state.settings_applied !== true) return false;
   // The input fingerprint: the page version's checksum for the first stage, else the
   // predecessor's last output.
   let input =
-    state.stage === STAGE_ORDER[0]
+    state.stage === STAGE_ORDER[0] || previous?.skip_reason === "declared_blank"
       ? (state.input_sha256 ?? "")
       : previous?.status === "success"
         ? (previous.output_sha256 ?? "")
@@ -526,6 +539,7 @@ export function stageStatusMessage(
   settingsNotApplied = false,
   restarting = false,
 ): { text: string; tone: "info" | "error" } {
+  if (state.status === "skipped") return { text: "Skipped · Declared blank", tone: "info" };
   const error = stageErrorText(state);
   if (error) return { text: `Failed: ${error}`, tone: "error" };
   if (settingsNotApplied) return { text: SETTINGS_NOT_APPLIED, tone: "info" };
@@ -740,12 +754,13 @@ class WorkspaceController {
   private readonly root: HTMLElement;
   private readonly pages = new Map<string, WorkspacePage>();
   private readonly selectedPages = new Set<string>();
-  private readonly editable: boolean;
+  private editable: boolean;
   private readonly controls: HTMLElement;
   private readonly image: HTMLImageElement;
   private readonly geometryLayer: HTMLElement;
   private readonly message: HTMLElement;
   private readonly liveStatus: HTMLElement;
+  private refreshRunControls?: () => void;
   private readonly title: HTMLElement;
   private readonly revertButton: HTMLButtonElement | null;
   private readonly batchButton: HTMLButtonElement;
@@ -881,6 +896,13 @@ class WorkspaceController {
   }
 
   private bindWorkspaceControls(): void {
+    this.bindPipelineActions();
+    this.root.querySelector("[data-toggle-blank]")?.addEventListener("click", () => {
+      void this.toggleBlank();
+    });
+    this.root.querySelector("[data-request-rescan]")?.addEventListener("click", () => {
+      void this.requestRescan();
+    });
     this.inputButton.addEventListener("click", () => this.showPreview("input"));
     this.resultButton.addEventListener("click", () => this.showPreview("result"));
     this.root.querySelectorAll<HTMLButtonElement>("[data-stage-select]").forEach((button) => {
@@ -939,6 +961,80 @@ class WorkspaceController {
       this.setResultStatus("The result preview could not be loaded.", false);
     });
     this.updateSelectionCount();
+  }
+
+  private bindPipelineActions(): void {
+    const endpoint = this.root.dataset.runAllUrl;
+    const start = this.root.querySelector<HTMLButtonElement>("[data-run-pipeline]");
+    const cancel = this.root.querySelector<HTMLButtonElement>("[data-cancel-pipeline]");
+    const status = this.root.querySelector<HTMLElement>("[data-pipeline-status]");
+    if (!endpoint || !start || !cancel || !status) return;
+    let run: PipelineRun | null = null;
+    let blocked = status.textContent?.trim() ?? "";
+    let timer: number | undefined;
+    let posting = false;
+    let requestNumber = 0;
+    const active = () => run?.state === "queued" || run?.state === "running";
+
+    const render = () => {
+      start.disabled = !this.editable || !this.pages.size || !!blocked || active() || posting;
+      cancel.hidden = !active();
+      cancel.disabled = posting;
+      if (active() && run) {
+        const label = run.stage ? STAGE_LABELS[run.stage] : "Run all";
+        status.textContent = `${label} · ${run.checked_steps} of ${run.total_steps} stage steps checked`;
+      } else {
+        status.textContent = blocked || run?.error || (
+          run?.state === "complete" ? "Run complete." :
+          run?.state === "cancelled" ? "Run cancelled." : ""
+        );
+      }
+    };
+
+    const refresh = async (action?: "start" | "cancel") => {
+      const currentRequest = ++requestNumber;
+      window.clearTimeout(timer);
+      if (action) posting = true;
+      render();
+      let error = "";
+      try {
+        const response = await fetch(endpoint, action ? {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+          body: JSON.stringify({ action, run_id: run?.id }),
+        } : { credentials: "same-origin" });
+        if (currentRequest !== requestNumber) return;
+        if (!response.ok) {
+          const reason = await response.text();
+          if (response.status === 507) blocked = reason;
+          throw new Error(reason);
+        }
+        const payload = await response.json() as { run: PipelineRun | null; blocked_reason?: string };
+        if (currentRequest !== requestNumber) return;
+        run = payload.run;
+        blocked = payload.blocked_reason ?? "";
+      } catch (failure) {
+        error = failure instanceof Error ? failure.message : "Could not update Run all.";
+      } finally {
+        if (currentRequest === requestNumber) {
+          posting = false;
+          render();
+          if (error) status.textContent = error;
+          if (active() || blocked) timer = window.setTimeout(() => void refresh(), 2500);
+        }
+      }
+    };
+
+    start.addEventListener("click", () => {
+      const pages = this.pages.size;
+      if (window.confirm(
+        `Check ${pages} pages through ${STAGE_ORDER.length} stages? Up to ${pages * STAGE_ORDER.length} stages may run. Current results and saved manual settings are kept.`,
+      )) void refresh("start");
+    });
+    cancel.addEventListener("click", () => void refresh("cancel"));
+    this.refreshRunControls = render;
+    void refresh();
   }
 
   /**
@@ -1070,7 +1166,8 @@ class WorkspaceController {
   private async ensureActiveStage(): Promise<void> {
     const context = this.activeContext();
     if (!context || !this.editable) return;
-    const url = this.url("ensureUrlTemplate", context.page.id, context.state.stage);
+    const stage = this.isBlank(context.page) ? "margins" : context.state.stage;
+    const url = this.url("ensureUrlTemplate", context.page.id, stage);
     if (!url) return;
     try {
       const response = await fetch(url, {
@@ -1147,6 +1244,19 @@ class WorkspaceController {
   private showStatus(): void {
     const context = this.activeContext();
     if (!context) return;
+    const blank = this.isBlank(context.page);
+    const button = this.root.querySelector<HTMLButtonElement>("[data-toggle-blank]");
+    if (button) {
+      button.textContent = blank ? "Clear blank declaration" : "Mark page as blank";
+      button.disabled = this.root.dataset.canDeclareBlank !== "true" || !context.page.active_version?.id;
+    }
+    const rescan = this.root.querySelector<HTMLButtonElement>("[data-request-rescan]");
+    if (rescan) {
+      const requested = (context.page.open_rescan_todos ?? 0) > 0;
+      rescan.textContent = requested ? "Rescan requested" : "Request rescan";
+      rescan.disabled = this.root.dataset.canDeclareBlank !== "true" || blank || requested;
+    }
+    this.controls.toggleAttribute("inert", blank);
     if (this.savePending()) {
       this.setMessage(savingMessage(this.restarting(context.state)), "info");
       return;
@@ -1157,7 +1267,93 @@ class WorkspaceController {
       this.settingsNotApplied(),
       this.restarting(context.state),
     );
-    this.setMessage(message.text, message.tone);
+    const suggestBlank =
+      !blank &&
+      context.state.stage === "select_content" &&
+      context.state.parameters.content_found === false &&
+      stageReadiness(context.page, "select_content").current;
+    this.setMessage(
+      suggestBlank ? "No content detected. You can mark this page as blank after reviewing it." : message.text,
+      message.tone,
+    );
+  }
+
+  private isBlank(page: WorkspacePage): boolean {
+    return stageFor(page, "deskew")?.skip_reason === "declared_blank";
+  }
+
+  private async requestRescan(): Promise<void> {
+    const context = this.activeContext();
+    if (!context) return;
+    const { page } = context;
+    const url = this.url("rescanUrlTemplate", page.id);
+    const button = this.root.querySelector<HTMLButtonElement>("[data-request-rescan]");
+    if (!url || !button || button.disabled) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-CSRFToken": csrfToken() },
+      });
+      if (!response.ok) throw new Error(await response.text());
+      page.open_rescan_todos = 1;
+      this.strip?.update(this.stripItem(page));
+      this.showStatus();
+      if (this.activePageId === page.id) this.setMessage("Rescan requested.", "info");
+    } catch (error) {
+      this.showStatus();
+      this.setMessage(error instanceof Error ? error.message : "Could not request rescan.", "error");
+    }
+  }
+
+  private async toggleBlank(): Promise<void> {
+    const context = this.activeContext();
+    if (!context || this.savePending() || this.settingsNotApplied()) return;
+    const { page } = context;
+    const blank = !this.isBlank(page);
+    const version = page.active_version?.id;
+    const url = this.url("blankUrlTemplate", page.id);
+    if (!version || !url) return;
+    const revisions = Object.fromEntries(page.stages.map((stage) => [stage.stage, stage.revision]));
+    if (blank) {
+      const dialog = this.root.querySelector<HTMLDialogElement>("[data-blank-dialog]");
+      const preview = dialog?.querySelector<HTMLImageElement>("[data-blank-preview]");
+      const confirm = dialog?.querySelector<HTMLButtonElement>("[data-confirm-blank]");
+      const rawThumbnail = this.url("pageThumbnailTemplate", page.id);
+      if (!dialog || !preview || !confirm || !rawThumbnail) return;
+      confirm.disabled = true;
+      preview.onload = () => { confirm.disabled = false; };
+      preview.onerror = () => { confirm.disabled = true; };
+      preview.src = `${rawThumbnail}?raw=true&version=${version}`;
+      if (preview.complete && preview.naturalWidth) confirm.disabled = false;
+      dialog.returnValue = "";
+      dialog.showModal();
+      await new Promise<void>((resolve) => dialog.addEventListener("close", () => resolve(), { once: true }));
+      if (dialog.returnValue !== "confirm") return;
+    }
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        body: JSON.stringify({ declared_blank: blank, version_id: version, revisions }),
+      });
+      if (response.status === 409) {
+        if (this.activePageId === page.id) {
+          await this.refreshPage(this.url("stageUrlTemplate", page.id, this.activeStage));
+          this.setMessage("This page changed. Review it again before updating its blank declaration.", "error");
+        }
+        return;
+      }
+      if (!response.ok) throw new Error(await response.text());
+      const updated = (await response.json()) as WorkspacePage;
+      page.open_rescan_todos = updated.open_rescan_todos ?? 0;
+      for (const stage of updated.stages) this.mergeStage(stage);
+      if (this.activePageId === page.id) this.activate(page.id, this.activeStage);
+    } catch (error) {
+      this.setMessage(error instanceof Error ? error.message : "Could not update the page.", "error");
+    }
   }
 
   /**
@@ -1238,8 +1434,10 @@ class WorkspaceController {
    * the previous result stays, dimmed, under a spinner; without a result it says why.
    */
   private updateResultPane(page: WorkspacePage, state: StageState): void {
+    this.updateOutputHistogram(page, state);
     const image = this.resultImage;
     if (!image) return;
+    if (this.isBlank(page)) state = stageFor(page, "margins") ?? state;
     const key = `${page.id}:${state.stage}`;
     // While an edit waits for its autosave or is being saved, its settings count as
     // applied (#209): the previous result stays, dimmed, until the new one is ready.
@@ -1281,6 +1479,51 @@ class WorkspaceController {
     }
     this.resultPane?.classList.toggle("busy", busy);
     this.setResultStatus(message, busy);
+  }
+
+  private updateOutputHistogram(page: WorkspacePage, state: StageState): void {
+    const figure = this.root.querySelector<HTMLElement>("[data-output-histogram]");
+    if (!figure) return;
+    figure.hidden = true;
+    const histogram = state.parameters.output_histogram;
+    if (
+      state.stage !== "output" || this.isBlank(page) || !isObject(histogram) ||
+      !Array.isArray(histogram.bins) || histogram.bins.length !== 256 ||
+      !stageReadiness(page, "output").current || this.settingsNotApplied()
+    ) return;
+    const canvas = figure.querySelector("canvas");
+    const plot = canvas?.getContext("2d");
+    const caption = figure.querySelector("figcaption");
+    if (!canvas || !plot || !caption) return;
+    const bins = histogram.bins.map((value: unknown) => Math.log1p(finiteNumber(value, 0)));
+    const peak = Math.max(1, ...bins);
+    plot.clearRect(0, 0, canvas.width, canvas.height);
+    const marker = (value: number) => Math.min(255, Math.max(0, value));
+    const threshold = histogram.threshold;
+    let description = "Grayscale input · no threshold";
+    if (isObject(threshold) && typeof threshold.median === "number") {
+      const middle = threshold.median;
+      const interval = typeof threshold.low === "number" && typeof threshold.high === "number"
+        ? [threshold.low, threshold.high] as const : null;
+      if (interval) {
+        plot.fillStyle = "rgba(244,178,91,.34)";
+        plot.fillRect(marker(interval[0]), 0, marker(interval[1]) - marker(interval[0]) + 1, canvas.height);
+        description = `Median T ${Math.round(middle)} · 10–90% ${interval.map(Math.round).join("–")}`;
+      } else {
+        description = `${threshold.kind === "intensity" ? "Intensity" : "Global"} T ${Math.round(middle)}`;
+      }
+    }
+    plot.fillStyle = "#d8e0da";
+    for (const [index, value] of bins.entries()) {
+      const height = value / peak * canvas.height;
+      plot.fillRect(index, canvas.height - height, 1, height);
+    }
+    if (isObject(threshold) && typeof threshold.median === "number") {
+      plot.fillStyle = "#ffba67";
+      plot.fillRect(marker(threshold.median), 0, 2, canvas.height);
+    }
+    caption.textContent = `${histogram.zoned ? "Unzoned preview · " : "Input preview · "}${description}`;
+    figure.hidden = false;
   }
 
   /** Re-derive the active stage's result pane, e.g. after another stage changed. */
@@ -1984,24 +2227,44 @@ class WorkspaceController {
 
   private renderOutputControls(): void {
     const algorithms = ["otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"];
-    this.addSelect("Output algorithm", "output_mode", algorithms, "otsu");
-    this.addCheckbox("Keep color", "keep_color", false);
+    this.addSelect("Output algorithm", "output_mode", algorithms, "otsu", true);
+    this.addCheckbox("Keep color", "keep_color", false, true);
     this.addCheckbox("Invert output", "invert", false);
-    this.addNumber("Local window size", "window_size", 3, 501, 2, 35);
-    this.addNumber("Threshold k", "k", -2, 2, 0.01, 0.33);
-    this.addNumber("Threshold r", "r", 1, 512, 1, 128);
     this.addSelect("Text / picture zones", "zone_mode", ["auto", "manual", "off"], "auto", true);
     const detected = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
-    if (this.draft.zone_mode !== "off") {
-      this.addSelect("Text algorithm", "text_algorithm", algorithms, "sauvola");
+    const zoned = this.draft.output_mode !== "copy" && this.draft.zone_mode !== "off";
+    if (zoned) {
+      this.addSelect("Text algorithm", "text_algorithm", algorithms, "sauvola", true);
       this.addSelect(
         "Picture algorithm (Keep color uses copy)",
         "picture_algorithm",
         algorithms,
         "copy",
+        true,
       );
     }
-    if (this.draft.zone_mode === "manual") {
+    const modes = new Set([this.draft.output_mode]);
+    if (zoned) {
+      modes.add(this.draft.text_algorithm);
+      if (!this.draft.keep_color) modes.add(this.draft.picture_algorithm);
+    }
+    if (["sauvola", "wolf", "fox", "window"].some((mode) => modes.has(mode))) {
+      this.addNumber("Local window size (full-resolution pixels)", "window_size", 3, 501, 2, 35);
+      const coefficients =
+        modes.has("sauvola") || modes.has("fox") ? "Threshold k" : "Threshold k (0–1 effective)";
+      this.addNumber(coefficients, "k", -2, 2, 0.01, 0.33);
+      const hint = document.createElement("small");
+      hint.className = "muted";
+      hint.textContent = [
+        modes.has("sauvola") && "Sauvola uses k to weight local contrast.",
+        modes.has("wolf") && "Wolf uses k to weight the page-wide minimum and local contrast.",
+        modes.has("fox") && "Fox uses the magnitude of k above a minimum noise offset.",
+        modes.has("window") && "Window uses k to lower the local mean threshold.",
+      ].filter(Boolean).join(" ");
+      this.controls.append(hint);
+    }
+    if (modes.has("sauvola")) this.addNumber("Sauvola contrast range (r)", "r", 1, 512, 1, 128);
+    if (zoned && this.draft.zone_mode === "manual") {
       if (!("zones" in this.draft)) this.draft.zones = detected;
       const zones = outputZonesForEditing(this.draft);
       this.draft.zones = zones;
@@ -2049,7 +2312,7 @@ class WorkspaceController {
           this.renderControls();
           this.renderGeometry();
         });
-    } else if (this.draft.zone_mode === "auto") {
+    } else if (zoned && this.draft.zone_mode === "auto") {
       this.addZoneButton(`Edit detected regions (${detected.length})`, () => {
         this.draft.zone_mode = "manual";
         this.draft.zones = outputZonesForEditing(this.activeContext()?.state.parameters ?? {});
@@ -2137,7 +2400,7 @@ class WorkspaceController {
     this.controls.append(label);
   }
 
-  private addCheckbox(labelText: string, key: string, fallback: boolean): void {
+  private addCheckbox(labelText: string, key: string, fallback: boolean, rerender = false): void {
     const label = document.createElement("label");
     label.className = "checkbox";
     const input = document.createElement("input");
@@ -2146,6 +2409,7 @@ class WorkspaceController {
     this.draft[key] = input.checked;
     input.addEventListener("change", () => {
       this.draft[key] = input.checked;
+      if (rerender) this.renderControls();
     });
     label.append(input, document.createTextNode(labelText));
     this.controls.append(label);
@@ -2188,6 +2452,8 @@ class WorkspaceController {
 
   private renderGeometry(): void {
     this.clearGeometry();
+    const page = this.activeContext()?.page;
+    if (page && this.isBlank(page)) return;
     if (!this.image.complete || !this.image.naturalWidth || this.image.hidden) return;
     const source = this.sourceSize();
     const display = this.displaySize();
@@ -2564,9 +2830,11 @@ class WorkspaceController {
     // Never replace a newer state with an older one (#209): a save's reply can arrive
     // after the live update of the run it queued.
     if (previous && isOlderStageState(incoming, previous)) return;
+    const wasBlank = this.isBlank(page);
     if (index >= 0) page.stages[index] = incoming;
     else page.stages.push(incoming);
     this.updateStageDom(incoming);
+    if (wasBlank !== this.isBlank(page)) this.refreshStrip();
     this.updateActivePreview(incoming, previous);
     if (incoming.scan_page_id !== this.activePageId || this.saving) return;
     // Another stage of the open page changed: what this stage waits for, whether its
@@ -2600,16 +2868,17 @@ class WorkspaceController {
   // --- page strip ------------------------------------------------------------------
 
   private stripItem(page: WorkspacePage): StripItem {
-    const source = stripSourceStage(page, this.activeStage);
+    const source = stripSourceStage(page);
+    const blank = this.isBlank(page);
     const versionId = page.active_version?.id;
     let thumbnailUrl = "";
     if (source) {
       const template = this.url("stageThumbnailTemplate", page.id, source.stage);
       if (template) thumbnailUrl = `${template}?v=${artifactToken(source)}`;
-    } else if (versionId && page.work_image_token) {
+    } else if (!blank && versionId && page.work_image_token) {
       const template = this.url("pageThumbnailTemplate", page.id);
       if (template) thumbnailUrl = `${template}?v=${page.work_image_token}`;
-    } else {
+    } else if (!blank) {
       // Working image still being generated: the full page thumbnail renders the scan.
       thumbnailUrl = page.thumbnail ?? "";
     }
@@ -2619,8 +2888,13 @@ class WorkspaceController {
     return {
       id: page.id,
       label: `${page.logical_sequence_number}${side}`,
-      caption: page.active_version?.original_filename || printed,
+      caption: blank
+        ? "Declared blank"
+        : (page.open_rescan_todos ?? 0) > 0
+          ? "Rescan requested"
+          : page.active_version?.original_filename || printed,
       thumbnailUrl,
+      declaredBlank: blank,
       width: size.width,
       height: size.height,
       stages: STAGE_ORDER.map((name) => {
@@ -2641,15 +2915,17 @@ class WorkspaceController {
 
   private refreshStrip(): void {
     if (!this.strip) return;
+    const blankOnly = this.root.querySelector<HTMLInputElement>("[data-blank-only]")?.checked;
     const items = this.naturalOrder
       .map((id) => this.pages.get(id))
-      .filter((page): page is WorkspacePage => page !== undefined)
+      .filter((page): page is WorkspacePage => page !== undefined && (!blankOnly || this.isBlank(page)))
       .map((page) => this.stripItem(page));
     const mode = (this.sortSelect?.value ?? "natural") as SortMode;
     this.strip.setItems(items, sortItems(items, mode));
   }
 
   private bindStrip(): void {
+    this.root.querySelector("[data-blank-only]")?.addEventListener("change", () => this.refreshStrip());
     this.sortSelect?.addEventListener("change", () => {
       this.refreshStrip();
       this.strip?.setActive(this.activePageId, new Set(this.selectedPages), true);
@@ -2892,6 +3168,7 @@ class WorkspaceController {
       });
       this.eventSource.addEventListener("workspace", (event) => {
         const payload = JSON.parse((event as MessageEvent<string>).data) as WorkspaceEvent;
+        this.updateJobActions(payload.state, payload.refinish_needed);
         for (const state of payload.stages) this.mergeStage(state);
       });
       this.eventSource.addEventListener("error", () => {
@@ -2916,11 +3193,23 @@ class WorkspaceController {
       const response = await fetch(url, { credentials: "same-origin" });
       if (!response.ok) return;
       const payload = (await response.json()) as WorkspaceStateDelta;
+      this.updateJobActions(payload.state, payload.refinish_needed);
       for (const state of payload.stages) this.mergeStage(state);
       this.pollCursor = payload.cursor;
     } catch {
       this.liveStatus.textContent = "Workspace refresh failed; retrying…";
     }
+  }
+
+  private updateJobActions(state: string, refinish: boolean): void {
+    const editable = ["open", "capturing", "paused", "captured"].includes(state);
+    this.editable = editable;
+    this.root.dataset.editable = String(editable);
+    this.root.dataset.canDeclareBlank = String(editable || state === "complete");
+    this.root.querySelector("[data-finish-scan]")?.toggleAttribute("hidden", !editable);
+    this.root.querySelector("[data-refinish-notice]")?.toggleAttribute("hidden", !refinish);
+    this.refreshRunControls?.();
+    this.showStatus();
   }
 
   private updateSelectionCount(): void {

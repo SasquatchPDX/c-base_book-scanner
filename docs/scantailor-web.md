@@ -23,8 +23,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    shadows, despeckling, content blocks from the largest whitespace rectangles, a
    text mask, and side-by-side trimming of strips that lie closer to the shadows than
    to the text. Modes: auto, manual (the box as drawn) and disabled (the whole page).
-   A page without content keeps the whole page and says so. The content size is also
-   recorded in millimetres (upstream `PhysSizeCalc`).
+   An automatic box grows by 5 pixels at 150 dpi, stopping at the image boundary
+   and the page outline from Deskew. A page without detected content keeps the
+   whole page. The expanded size is recorded in millimetres and used by Margins.
 3. Dewarping — upstream Scan Tailor's cylindrical-surface model (#195 step 6,
    `core/cylindrical.py`): a top and a bottom X-spline follow the text block, and
    the page between them is unrolled as a cylinder (`CylindricalSurfaceDewarper`,
@@ -159,8 +160,16 @@ whole-page result. The local Tesseract 5.5.2 run measured 0% CER for both paths,
 with picture detail retained. This is a repeatable layout regression, not proof
 of OCR quality on photographed books or the hackerspace AI server. The six output
 modes use OpenCV/NumPy statistics; Fox is a Niblack-style threshold with a noise
-floor and Wolf uses the Wolf–Jolion local-statistics formula, not a claim of
-bit-identical ScanTailor Advanced output.
+floor. Wolf uses the Wolf–Jolion formula and computes the minimum grayscale
+value and maximum local deviation over the image or zone before thresholding its
+tiles. Pure white stays white and equality at the threshold stays white.
+
+The Output input pane overlays the grayscale histogram for the saved settings.
+The worker computes the preview at up to 960 px and scales local windows to
+preserve their approximate size on the page. The orange line marks the global
+threshold, or the median local threshold with a shaded 10th–90th percentile
+band. Grad shows the intensity cutoff. For zoned pages the overlay describes the
+unzoned preview. Grayscale counts use a logarithmic scale.
 
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
@@ -483,6 +492,46 @@ rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
 `capture_layout: single_page` and ignores it, and rejects `spread`.
 
+The HTML scan-job list opens jobs in the editor and shows available fields from
+the latest scanner OPF. It computes page counts and selects that metadata in
+the list query.
+
+## Run all stages
+
+Use **Run all** below the stage list to check every page through Output.
+Confirmation shows the page count and the maximum number of steps. The worker
+keeps current results and uses each page's saved settings, including manual
+settings. It checks the whole book at each stage before moving on, so Margins
+sees the current content sizes. Each chunk goes to the back of the queue so an
+interactive edit can run between chunks.
+
+The editor shows progress and offers **Cancel run**. Cancelled runs preserve
+completed results and stop at the next processing checkpoint. A later run skips
+those current results. The scan storage free-space guard can block new runs or
+stop a run between chunks. Run all waits for work already running in another worker and reuses its result.
+If that work exceeds the worker timeout, the run reports the incomplete stages.
+
+## Declared blank pages
+
+In the editor, choose **Mark page as blank** and confirm against the scan preview.
+Select Content can suggest reviewing an empty detection. Use **Blank pages only**
+to find declarations and **Clear blank declaration** to resume normal processing.
+The action records the actor, active raw version, previous value and timestamp.
+A stale edit returns a revision conflict, and other open editors receive the change
+through the workspace event stream.
+
+Deskew, Select Content, Dewarping and Output report `skipped` with reason
+`declared_blank`. A blank page does not contribute to the common page size.
+Margins renders it as a full-resolution white image at that size. Until there is
+a measurable common size, Margins uses the raw page dimensions. Finalization and
+OCR input preserve page order and use the white image. The OCR service still
+receives the page because its interface accepts a complete document.
+
+The original scan and logical page number are preserved. Declaring the page blank
+cancels open or claimed rescans, and a new raw version clears the declaration.
+Changing a declaration after finalization marks previous library derivatives
+stale and returns the job to **re-finish needed**.
+
 ## Browser workspace
 
 Two pages (#195 step 3):
@@ -492,10 +541,12 @@ Two pages (#195 step 3):
   statuses and Run forms, so it works without JavaScript. "Open ScanTailor editor"
   and each stage's "Edit" link open the editor (`?page=<id>&stage=<stage>`).
 - **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. It
-  fills the browser viewport (no site header, no page scrolling) with three columns:
+  fills the browser viewport with three columns. Use **Request rescan** on a page
+  or **Finish clean page set** to start the existing finalization workflow:
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
-    batch processing"), the options of the selected stage with "Revert to saved"
+    batch processing"). A stage batch starts only that stage and reruns any
+    existing downstream results made stale on the same page. Below are the options of the selected stage with "Revert to saved"
     (there is no save button: edits are autosaved, see "Automatic runs and cancellation") and "Apply to…" (selected pages, all pages, this page only, this page and the
     following ones, or every other page counted from this one, optionally keeping
     pages with manual settings), and a
@@ -527,9 +578,9 @@ Two pages (#195 step 3):
     stage gestures (deskew rotation). The image is the stage's working-resolution
     preview (about 150 dpi); full-resolution tiles are not part of this step;
   - *right*: the page strip. It is virtualised (only the rows in view exist in the
-    DOM) and its thumbnails load lazily from tokenised, immutable URLs: the current
-    stage's current output (each stage run writes a 400 px `thumbnail.jpg`), else the
-    last current stage before it, else the page's working-image thumbnail. Under
+    DOM) and its thumbnails load lazily from tokenised, immutable URLs: the
+    output of the furthest current stage (each stage run writes a 400 px
+    `thumbnail.jpg`), or the page's working-image thumbnail if no stage is current. Under
     each: the page number and file name, and one small numbered icon per stage: grey
     (not started), grey ring (waiting for an earlier stage), amber and pulsing
     (queued or running), green (done), green ring (stale result), blue (done with

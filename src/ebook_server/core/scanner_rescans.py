@@ -276,6 +276,10 @@ def flag_page(page: ScanPage, *, reason: str, user: Any) -> FlagResult:
             raise scan_lifecycle.LifecycleError(
                 job.state, "scan job is not accepting rescan requests"
             )
+        if ScanPage.objects.filter(pk=page.pk, declared_blank=True).exists():
+            raise scan_lifecycle.LifecycleError(
+                job.state, "clear the blank declaration before requesting a rescan"
+            )
         existing = (
             page.todos.filter(todo_type=ScanTodo.TodoType.RESCAN, state__in=OPEN_TODO_STATES)
             .order_by("-created_at")

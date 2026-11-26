@@ -44,7 +44,9 @@ class WorkspaceEventPoller:
         self._fingerprint: str | None = None
 
     def poll(self) -> WorkspaceUpdate:
-        jobs = ScanJob.objects.filter(pk=self.job_id).only("id", "state", "updated_at")
+        jobs = ScanJob.objects.filter(pk=self.job_id).only(
+            "id", "state", "refinish_needed", "updated_at"
+        )
         postgres = connection.vendor == "postgresql"
         if postgres:
             # Reduce idle transfer to one row. Hash only cheap metadata, never the
@@ -114,6 +116,7 @@ class WorkspaceEventPoller:
             {
                 "job_id": str(job.pk),
                 "state": job.state,
+                "refinish_needed": job.refinish_needed,
                 "updated_at": job.updated_at.isoformat(),
                 "stages": [self.serialize_stage(state) for state in states],
             },

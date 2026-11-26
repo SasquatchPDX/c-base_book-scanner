@@ -23,6 +23,7 @@ export interface StripItem {
   label: string;
   caption: string;
   thumbnailUrl: string;
+  declaredBlank?: boolean;
   stages: StripStage[];
   /** Size used by the width/height orders (current stage, full resolution). */
   width: number | null;
@@ -44,6 +45,8 @@ export function statusKind(
       return "working";
     case "failed":
       return "failed";
+    case "skipped":
+      return "done";
     default:
       // Derived from input fingerprints (#205): waiting beats an old result.
       if (stage.waiting_for) return "waiting";
@@ -54,6 +57,7 @@ export function statusKind(
 }
 
 export function statusTooltip(stage: StripStage): string {
+  if (stage.status === "skipped") return `${stage.label}: skipped (declared blank)`;
   const kind = statusKind(stage);
   const text: Record<StatusKind, string> = {
     idle: "not started",
@@ -273,6 +277,7 @@ export class PageStrip {
       else image.removeAttribute("src");
       image.alt = item.label;
     }
+    if (image) image.hidden = item.declaredBlank === true && !item.thumbnailUrl;
     const caption = node.querySelector<HTMLElement>(".st-strip-caption");
     if (caption) caption.textContent = item.caption ? `${item.label} · ${item.caption}` : item.label;
     const icons = node.querySelector<HTMLElement>(".st-strip-icons");

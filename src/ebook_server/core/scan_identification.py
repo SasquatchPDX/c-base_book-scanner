@@ -47,6 +47,11 @@ def job_payload(job: ProcessingJob) -> dict[str, Any]:
 
 
 def _provisional_terms(scan_job: ScanJob) -> dict[str, Any]:
+    opf = _scanner_opf_evidence(scan_job).get("scanner_opf", {})
+    if opf.get("reason") == "no_title":
+        isbn = metadata_search.canonical_isbn13(opf.get("isbn"))
+        if isbn is not None:
+            return {"isbn": isbn}
     return {
         "title": scan_job.provisional_title.strip(),
         "authors": [
@@ -171,7 +176,7 @@ def request_scan_identification(
             and not search_terms.get("authors")
             and not metadata_search.is_isbn_terms(search_terms)
         ):
-            raise ScanIdentificationError("a provisional title or author is required")
+            raise ScanIdentificationError("a provisional title, author or ISBN is required")
         active = (
             ProcessingJob.objects.select_for_update()
             .filter(

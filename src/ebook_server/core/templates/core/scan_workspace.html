@@ -39,7 +39,7 @@
   {% endif %}
 
   {% if job.state == 'captured' %}
-    <p class="review-notice" data-raw-scan>Raw scan, being processed. It joins the library after ScanTailor processing and finish.{% if job.refinish_needed %} A page was replaced after the book was finished: re-finish needed.{% endif %}</p>
+    <p class="review-notice" data-raw-scan>Raw scan, being processed. It joins the library after ScanTailor processing and finish.{% if job.refinish_needed %} This scan changed after the book was finished. Re-finish needed.{% endif %}</p>
   {% endif %}
 
   {% if job.completeness_flags is not None %}

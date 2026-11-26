@@ -1152,22 +1152,22 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				}
 			}
 		};
-		function K(e, t) {
+		function et(e, t) {
 			var n = !1;
 			return function() {
 				return n ||= (_.console.warn(t), !0), e.apply(this, arguments);
 			};
 		}
-		function et(e, t) {
+		function tt(e, t) {
 			return e.name = t.name, e.axis = t.axis, e.edges = t.edges, e;
 		}
-		function tt(e) {
+		function nt(e) {
 			return S.bool(e) ? (this.options.styleCursor = e, this) : e === null ? (delete this.options.styleCursor, this) : this.options.styleCursor;
 		}
-		function nt(e) {
+		function rt(e) {
 			return S.func(e) ? (this.options.actionChecker = e, this) : e === null ? (delete this.options.actionChecker, this) : this.options.actionChecker;
 		}
-		var rt = {
+		var it = {
 			id: "auto-start/interactableMethods",
 			install: function(e) {
 				var t = e.Interactable;
@@ -1189,21 +1189,21 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 						return i.fire("auto-start:check", a), a.action;
 					}(this, n, r, i, e);
 					return this.options.actionChecker ? this.options.actionChecker(t, n, a, this, i, r) : a;
-				}, t.prototype.ignoreFrom = K((function(e) {
+				}, t.prototype.ignoreFrom = et((function(e) {
 					return this._backCompatOption("ignoreFrom", e);
-				}), "Interactable.ignoreFrom() has been deprecated. Use Interactble.draggable({ignoreFrom: newValue})."), t.prototype.allowFrom = K((function(e) {
+				}), "Interactable.ignoreFrom() has been deprecated. Use Interactble.draggable({ignoreFrom: newValue})."), t.prototype.allowFrom = et((function(e) {
 					return this._backCompatOption("allowFrom", e);
-				}), "Interactable.allowFrom() has been deprecated. Use Interactble.draggable({allowFrom: newValue})."), t.prototype.actionChecker = nt, t.prototype.styleCursor = tt;
+				}), "Interactable.allowFrom() has been deprecated. Use Interactble.draggable({allowFrom: newValue})."), t.prototype.actionChecker = rt, t.prototype.styleCursor = nt;
 			}
 		};
-		function it(e, t, n, r, i) {
-			return t.testIgnoreAllow(t.options[e.name], n, r) && t.options[e.name].enabled && st(t, n, e, i) ? e : null;
+		function at(e, t, n, r, i) {
+			return t.testIgnoreAllow(t.options[e.name], n, r) && t.options[e.name].enabled && ct(t, n, e, i) ? e : null;
 		}
-		function at(e, t, n, r, i, a, o) {
+		function ot(e, t, n, r, i, a, o) {
 			for (var s = 0, c = r.length; s < c; s++) {
 				var l = r[s], u = i[s], d = l.getAction(t, n, e, u);
 				if (d) {
-					var f = it(d, l, u, a, o);
+					var f = at(d, l, u, a, o);
 					if (f) return {
 						action: f,
 						interactable: l,
@@ -1217,14 +1217,14 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				element: null
 			};
 		}
-		function q(e, t, n, r, i) {
+		function K(e, t, n, r, i) {
 			var a = [], o = [], s = r;
 			function c(e) {
 				a.push(e), o.push(s);
 			}
 			for (; S.element(s);) {
 				a = [], o = [], i.interactables.forEachMatch(s, c);
-				var l = at(e, t, n, a, o, r, i);
+				var l = ot(e, t, n, a, o, r, i);
 				if (l.action && !l.interactable.options[l.action.name].manualStart) return l;
 				s = A(s);
 			}
@@ -1234,11 +1234,11 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				element: null
 			};
 		}
-		function ot(e, t, n) {
+		function st(e, t, n) {
 			var r = t.action, i = t.interactable, a = t.element;
-			r ||= { name: null }, e.interactable = i, e.element = a, et(e.prepared, r), e.rect = i && r.name ? i.getRect(a) : null, ut(e, n), n.fire("autoStart:prepared", { interaction: e });
+			r ||= { name: null }, e.interactable = i, e.element = a, tt(e.prepared, r), e.rect = i && r.name ? i.getRect(a) : null, dt(e, n), n.fire("autoStart:prepared", { interaction: e });
 		}
-		function st(e, t, n, r) {
+		function ct(e, t, n, r) {
 			var i = e.options, a = i[n.name].max, o = i[n.name].maxPerElement, s = r.autoStart.maxInteractions, c = 0, l = 0, u = 0;
 			if (!(a && o && s)) return !1;
 			for (var d = 0, f = r.interactions.list; d < f.length; d++) {
@@ -1247,14 +1247,14 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 			}
 			return s > 0;
 		}
-		function ct(e, t) {
+		function lt(e, t) {
 			return S.number(e) ? (t.autoStart.maxInteractions = e, this) : t.autoStart.maxInteractions;
 		}
-		function lt(e, t, n) {
+		function ut(e, t, n) {
 			var r = n.autoStart.cursorElement;
 			r && r !== e && (r.style.cursor = ""), e.ownerDocument.documentElement.style.cursor = t, e.style.cursor = t, n.autoStart.cursorElement = t ? e : null;
 		}
-		function ut(e, t) {
+		function dt(e, t) {
 			var n = e.interactable, r = e.element, i = e.prepared;
 			if (e.pointerType === "mouse" && n && n.options.styleCursor) {
 				var a = "";
@@ -1262,15 +1262,15 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					var o = n.options[i.name].cursorChecker;
 					a = S.func(o) ? o(i, n, r, e._interacting) : t.actions.map[i.name].getCursor(i);
 				}
-				lt(e.element, a || "", t);
-			} else t.autoStart.cursorElement && lt(t.autoStart.cursorElement, "", t);
+				ut(e.element, a || "", t);
+			} else t.autoStart.cursorElement && ut(t.autoStart.cursorElement, "", t);
 		}
-		var dt = {
+		var ft = {
 			id: "auto-start/base",
 			before: ["actions"],
 			install: function(e) {
 				var t = e.interactStatic, n = e.defaults;
-				e.usePlugin(rt), n.base.actionChecker = null, n.base.styleCursor = !0, N(n.perAction, {
+				e.usePlugin(it), n.base.actionChecker = null, n.base.styleCursor = !0, N(n.perAction, {
 					manualStart: !1,
 					max: 1 / 0,
 					maxPerElement: 1,
@@ -1278,40 +1278,40 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					ignoreFrom: null,
 					mouseButtons: 1
 				}), t.maxInteractions = function(t) {
-					return ct(t, e);
+					return lt(t, e);
 				}, e.autoStart = {
 					maxInteractions: 1 / 0,
-					withinInteractionLimit: st,
+					withinInteractionLimit: ct,
 					cursorElement: null
 				};
 			},
 			listeners: {
 				"interactions:down": function(e, t) {
 					var n = e.interaction, r = e.pointer, i = e.event, a = e.eventTarget;
-					n.interacting() || ot(n, q(n, r, i, a, t), t);
+					n.interacting() || st(n, K(n, r, i, a, t), t);
 				},
 				"interactions:move": function(e, t) {
 					(function(e, t) {
 						var n = e.interaction, r = e.pointer, i = e.event, a = e.eventTarget;
-						n.pointerType !== "mouse" || n.pointerIsDown || n.interacting() || ot(n, q(n, r, i, a, t), t);
+						n.pointerType !== "mouse" || n.pointerIsDown || n.interacting() || st(n, K(n, r, i, a, t), t);
 					})(e, t), function(e, t) {
 						var n = e.interaction;
 						if (n.pointerIsDown && !n.interacting() && n.pointerWasMoved && n.prepared.name) {
 							t.fire("autoStart:before-start", e);
 							var r = n.interactable, i = n.prepared.name;
-							i && r && (r.options[i].manualStart || !st(r, n.element, n.prepared, t) ? n.stop() : (n.start(n.prepared, r, n.element), ut(n, t)));
+							i && r && (r.options[i].manualStart || !ct(r, n.element, n.prepared, t) ? n.stop() : (n.start(n.prepared, r, n.element), dt(n, t)));
 						}
 					}(e, t);
 				},
 				"interactions:stop": function(e, t) {
 					var n = e.interaction, r = n.interactable;
-					r && r.options.styleCursor && lt(n.element, "", t);
+					r && r.options.styleCursor && ut(n.element, "", t);
 				}
 			},
-			maxInteractions: ct,
-			withinInteractionLimit: st,
-			validateAction: it
-		}, ft = {
+			maxInteractions: lt,
+			withinInteractionLimit: ct,
+			validateAction: at
+		}, pt = {
 			id: "auto-start/dragAxis",
 			listeners: { "autoStart:before-start": function(e, t) {
 				var n = e.interaction, r = e.eventTarget, i = e.dx, a = e.dy;
@@ -1328,7 +1328,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 										if (!t) return !1;
 										var n = t.options.drag.startAxis;
 										return e === "xy" || n === "xy" || n === e;
-									}(u, e) && dt.validateAction(a, e, d, r, t)) return e;
+									}(u, e) && ft.validateAction(a, e, d, r, t)) return e;
 								}
 							}
 						}; S.element(d);) {
@@ -1343,24 +1343,24 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				}
 			} }
 		};
-		function pt(e) {
+		function mt(e) {
 			var t = e.prepared && e.prepared.name;
 			if (!t) return null;
 			var n = e.interactable.options;
 			return n[t].hold || n[t].delay;
 		}
-		var mt = {
+		var ht = {
 			id: "auto-start/hold",
 			install: function(e) {
 				var t = e.defaults;
-				e.usePlugin(dt), t.perAction.hold = 0, t.perAction.delay = 0;
+				e.usePlugin(ft), t.perAction.hold = 0, t.perAction.delay = 0;
 			},
 			listeners: {
 				"interactions:new": function(e) {
 					e.interaction.autoStartHoldTimer = null;
 				},
 				"autoStart:prepared": function(e) {
-					var t = e.interaction, n = pt(t);
+					var t = e.interaction, n = mt(t);
 					n > 0 && (t.autoStartHoldTimer = setTimeout((function() {
 						t.start(t.prepared, t.interactable, t.element);
 					}), n));
@@ -1371,27 +1371,27 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				},
 				"autoStart:before-start": function(e) {
 					var t = e.interaction;
-					pt(t) > 0 && (t.prepared.name = null);
+					mt(t) > 0 && (t.prepared.name = null);
 				}
 			},
-			getHoldDuration: pt
-		}, ht = {
+			getHoldDuration: mt
+		}, gt = {
 			id: "auto-start",
 			install: function(e) {
-				e.usePlugin(dt), e.usePlugin(mt), e.usePlugin(ft);
+				e.usePlugin(ft), e.usePlugin(ht), e.usePlugin(pt);
 			}
-		}, gt = function(e) {
+		}, _t = function(e) {
 			return /^(always|never|auto)$/.test(e) ? (this.options.preventDefault = e, this) : S.bool(e) ? (this.options.preventDefault = e ? "always" : "never", this) : this.options.preventDefault;
 		};
-		function _t(e) {
+		function vt(e) {
 			var t = e.interaction, n = e.event;
 			t.interactable && t.interactable.checkAndPreventDefault(n);
 		}
-		var vt = {
+		var yt = {
 			id: "core/interactablePreventDefault",
 			install: function(e) {
 				var t = e.Interactable;
-				t.prototype.preventDefault = gt, t.prototype.checkAndPreventDefault = function(t) {
+				t.prototype.preventDefault = _t, t.prototype.checkAndPreventDefault = function(t) {
 					return function(e, t, n) {
 						var r = e.options.preventDefault;
 						if (r !== "never") {
@@ -1420,23 +1420,23 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				"up",
 				"cancel"
 			].reduce((function(e, t) {
-				return e[`interactions:${t}`] = _t, e;
+				return e[`interactions:${t}`] = vt, e;
 			}), {})
 		};
-		function J(e, t) {
+		function q(e, t) {
 			if (t.phaselessTypes[e]) return !0;
 			for (var n in t.map) if (e.indexOf(n) === 0 && e.substr(n.length) in t.phases) return !0;
 			return !1;
 		}
-		function Y(e) {
+		function J(e) {
 			var t = {};
 			for (var n in e) {
 				var r = e[n];
-				t[n] = S.plainObject(r) ? Y(r) : S.array(r) ? Pe(r) : r;
+				t[n] = S.plainObject(r) ? J(r) : S.array(r) ? Pe(r) : r;
 			}
 			return t;
 		}
-		var yt = function() {
+		var Y = function() {
 			function e(t) {
 				i(this, e), this.states = [], this.startOffset = {
 					left: 0,
@@ -1638,7 +1638,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					key: "copyFrom",
 					value: function(e) {
 						this.startOffset = e.startOffset, this.startDelta = e.startDelta, this.startEdges = e.startEdges, this.edges = e.edges, this.states = e.states.map((function(e) {
-							return Y(e);
+							return J(e);
 						})), this.result = bt(N({}, e.result.coords), N({}, e.result.rect));
 					}
 				},
@@ -1705,7 +1705,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 			listeners: {
 				"interactions:new": function(e) {
 					var t = e.interaction;
-					t.modification = new yt(t);
+					t.modification = new Y(t);
 				},
 				"interactions:before-action-start": function(e) {
 					var t = e.interaction, n = e.interaction.modification;
@@ -1888,7 +1888,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					pointer: null,
 					event: null,
 					eventTarget: null
-				}, this.prevEvent = null, this.pointerIsDown = !1, this.pointerWasMoved = !1, this._interacting = !1, this._ending = !1, this._stopped = !0, this._proxy = void 0, this.simulation = null, this.doMove = K((function(e) {
+				}, this.prevEvent = null, this.pointerIsDown = !1, this.pointerWasMoved = !1, this._interacting = !1, this._ending = !1, this._stopped = !0, this._proxy = void 0, this.simulation = null, this.doMove = et((function(e) {
 					this.move(e);
 				}), "The interaction.doMove() method has been renamed to interaction.move()"), this.coords = {
 					start: {
@@ -1988,7 +1988,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				{
 					key: "start",
 					value: function(e, t, n) {
-						return !(this.interacting() || !this.pointerIsDown || this.pointers.length < (e.name === "gesture" ? 2 : 1) || !t.options[e.name].enabled) && (et(this.prepared, e), this.interactable = t, this.element = n, this.rect = t.getRect(n), this.edges = this.prepared.edges ? N({}, this.prepared.edges) : {
+						return !(this.interacting() || !this.pointerIsDown || this.pointers.length < (e.name === "gesture" ? 2 : 1) || !t.options[e.name].enabled) && (tt(this.prepared, e), this.interactable = t, this.element = n, this.rect = t.getRect(n), this.edges = this.prepared.edges ? N({}, this.prepared.edges) : {
 							left: !0,
 							right: !0,
 							top: !0,
@@ -2249,7 +2249,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					value: function(e) {
 						var t = this.interaction, n = Pt(t);
 						if (!n || !n.enabled) return !1;
-						var r = t.coords.velocity.client, i = ve(r.x, r.y), a = this.modification ||= new yt(t);
+						var r = t.coords.velocity.client, i = ve(r.x, r.y), a = this.modification ||= new Y(t);
 						if (a.copyFrom(t.modification), this.t0 = t._now(), this.allowResume = n.allowResume, this.v0 = i, this.currentOffset = {
 							x: 0,
 							y: 0
@@ -2914,7 +2914,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					listeners: t,
 					docEvents: a,
 					pointerMoveTolerance: 1
-				}, e.usePlugin(vt);
+				}, e.usePlugin(yt);
 			},
 			listeners: {
 				"scope:add-document": function(e) {
@@ -2960,7 +2960,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					key: "updatePerActionListeners",
 					value: function(e, t, n) {
 						var r = this, i = this._actions.map[e]?.filterEventType, a = function(e) {
-							return (i == null || i(e)) && J(e, r._actions);
+							return (i == null || i(e)) && q(e, r._actions);
 						};
 						(S.array(t) || S.object(t)) && this._onOff($t.Off, e, t, void 0, a), (S.array(n) || S.object(n)) && this._onOff($t.On, e, n, void 0, a);
 					}
@@ -2971,7 +2971,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 						var n = this._defaults;
 						for (var r in t) {
 							var i = r, a = this.options[e], o = t[i];
-							i === "listeners" && this.updatePerActionListeners(e, a.listeners, o), S.array(o) ? a[i] = Pe(o) : S.plainObject(o) ? (a[i] = N(a[i] || {}, Y(o)), S.object(n.perAction[i]) && "enabled" in n.perAction[i] && (a[i].enabled = !1 !== o.enabled)) : S.bool(o) && S.object(n.perAction[i]) ? a[i].enabled = o : a[i] = o;
+							i === "listeners" && this.updatePerActionListeners(e, a.listeners, o), S.array(o) ? a[i] = Pe(o) : S.plainObject(o) ? (a[i] = N(a[i] || {}, J(o)), S.object(n.perAction[i]) && "enabled" in n.perAction[i] && (a[i].enabled = !1 !== o.enabled)) : S.bool(o) && S.object(n.perAction[i]) ? a[i].enabled = o : a[i] = o;
 						}
 					}
 				},
@@ -3065,7 +3065,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 							o === "wheel" && (o = k.wheelEvent);
 							for (var s = 0, c = a[o]; s < c.length; s++) {
 								var l = c[s];
-								J(o, this._actions) ? this.events[e === $t.On ? "on" : "off"](o, l) : S.string(this.target) ? this._scopeEvents[e === $t.On ? "addDelegate" : "removeDelegate"](this.target, this._context, o, l, r) : this._scopeEvents[e === $t.On ? "add" : "remove"](this.target, o, l, r);
+								q(o, this._actions) ? this.events[e === $t.On ? "on" : "off"](o, l) : S.string(this.target) ? this._scopeEvents[e === $t.On ? "addDelegate" : "removeDelegate"](this.target, this._context, o, l, r) : this._scopeEvents[e === $t.On ? "add" : "remove"](this.target, o, l, r);
 							}
 						}
 						return this;
@@ -3087,7 +3087,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					key: "set",
 					value: function(e) {
 						var t = this._defaults;
-						for (var n in S.object(e) || (e = {}), this.options = Y(t.base), this._actions.methodDict) {
+						for (var n in S.object(e) || (e = {}), this.options = J(t.base), this._actions.methodDict) {
 							var r = n, i = this._actions.methodDict[r];
 							this.options[r] = {}, this.setPerAction(r, N(N({}, t.perAction), t.actions[r])), this[i](e[r]);
 						}
@@ -3156,7 +3156,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 		}(), nn = function() {
 			function e() {
 				var t = this;
-				i(this, e), this.id = `__interact_scope_${Math.floor(100 * Math.random())}`, this.isInitialized = !1, this.listenerMaps = [], this.browser = k, this.defaults = Y(xt), this.Eventable = Bt, this.actions = {
+				i(this, e), this.id = `__interact_scope_${Math.floor(100 * Math.random())}`, this.isInitialized = !1, this.listenerMaps = [], this.browser = k, this.defaults = J(xt), this.Eventable = Bt, this.actions = {
 					map: {},
 					phases: {
 						start: !0,
@@ -3174,7 +3174,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 						return this.scope.usePlugin(e, t), this;
 					}, t.isSet = function(e, t) {
 						return !!this.scope.interactables.get(e, t && t.context);
-					}, t.on = K((function(e, t, n) {
+					}, t.on = et((function(e, t, n) {
 						if (S.string(e) && e.search(" ") !== -1 && (e = e.trim().split(/ +/)), S.array(e)) {
 							for (var r = 0, i = e; r < i.length; r++) {
 								var a = i[r];
@@ -3186,8 +3186,8 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 							for (var o in e) this.on(o, e[o], t);
 							return this;
 						}
-						return J(e, this.scope.actions) ? this.globalEvents[e] ? this.globalEvents[e].push(t) : this.globalEvents[e] = [t] : this.scope.events.add(this.scope.document, e, t, { options: n }), this;
-					}), "The interact.on() method is being deprecated"), t.off = K((function(e, t, n) {
+						return q(e, this.scope.actions) ? this.globalEvents[e] ? this.globalEvents[e].push(t) : this.globalEvents[e] = [t] : this.scope.events.add(this.scope.document, e, t, { options: n }), this;
+					}), "The interact.on() method is being deprecated"), t.off = et((function(e, t, n) {
 						if (S.string(e) && e.search(" ") !== -1 && (e = e.trim().split(/ +/)), S.array(e)) {
 							for (var r = 0, i = e; r < i.length; r++) {
 								var a = i[r];
@@ -3200,7 +3200,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 							return this;
 						}
 						var s;
-						return J(e, this.scope.actions) ? e in this.globalEvents && (s = this.globalEvents[e].indexOf(t)) !== -1 && this.globalEvents[e].splice(s, 1) : this.scope.events.remove(this.scope.document, e, t, n), this;
+						return q(e, this.scope.actions) ? e in this.globalEvents && (s = this.globalEvents[e].indexOf(t)) !== -1 && this.globalEvents[e].splice(s, 1) : this.scope.events.remove(this.scope.document, e, t, n), this;
 					}), "The interact.off() method is being deprecated"), t.debug = function() {
 						return this.scope;
 					}, t.supportsTouch = function() {
@@ -3430,7 +3430,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					y: f.top ? -1 : 1
 				};
 				if (!1 !== c && N(i, f), d != null && d.length) {
-					var m = new yt(e.interaction);
+					var m = new Y(e.interaction);
 					m.copyFrom(e.interaction.modification), m.prepareStates(d), t.subModification = m, m.startAll(n({}, e));
 				}
 			},
@@ -3742,7 +3742,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 					return t ? (e.state.targetFields = e.state.targetFields || [[t.left ? "left" : "right", t.top ? "top" : "bottom"]], An.start(e)) : null;
 				},
 				set: An.set,
-				defaults: N(Y(An.defaults), {
+				defaults: N(J(An.defaults), {
 					targets: void 0,
 					range: void 0,
 					offset: {
@@ -4032,12 +4032,12 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 				}
 			}
 		};
-		if ($.use(vt), $.use(Mt), $.use({
+		if ($.use(yt), $.use(Mt), $.use({
 			id: "pointer-events",
 			install: function(e) {
 				e.usePlugin(zn), e.usePlugin(Vn), e.usePlugin(Hn);
 			}
-		}), $.use(Rt), $.use(Nn), $.use(ht), $.use(Ye), $.use($e), $.use({
+		}), $.use(Rt), $.use(Nn), $.use(gt), $.use(Ye), $.use($e), $.use({
 			id: "reflow",
 			install: function(e) {
 				var t = e.Interactable;
@@ -4062,7 +4062,7 @@ var e = Object.create, t = Object.defineProperty, n = Object.getOwnPropertyDescr
 										eventTarget: n,
 										phase: "reflow"
 									};
-									a.interactable = t, a.element = n, a.prevEvent = i, a.updatePointer(i, i, n, !0), Se(a.coords.delta), et(a.prepared, r), a._doPhase(o);
+									a.interactable = t, a.element = n, a.prevEvent = i, a.updatePointer(i, i, n, !0), Se(a.coords.delta), tt(a.prepared, r), a._doPhase(o);
 									var s = e.window.Promise, c = s ? new s((function(e) {
 										a._reflowResolve = e;
 									})) : void 0;
@@ -4145,10 +4145,12 @@ function l(e) {
 		case "queued":
 		case "running": return "working";
 		case "failed": return "failed";
+		case "skipped": return "done";
 		default: return e.waiting_for ? "waiting" : e.status === "success" ? e.stale_reason ? "stale" : e.manual ? "manual" : "done" : "idle";
 	}
 }
 function u(e) {
+	if (e.status === "skipped") return `${e.label}: skipped (declared blank)`;
 	let t = l(e), n = {
 		idle: "not started",
 		waiting: `waiting for ${e.waiting_for ?? ""}`,
@@ -4274,7 +4276,7 @@ var h = class {
 	fill(e, t) {
 		e.classList.toggle("active", t.id === this.active), e.classList.toggle("selected", this.selected.has(t.id)), e.setAttribute("aria-selected", String(this.selected.has(t.id))), e.title = t.caption ? `${t.label} · ${t.caption}` : t.label;
 		let n = e.querySelector("img");
-		n && n.getAttribute("src") !== t.thumbnailUrl && (t.thumbnailUrl ? n.src = t.thumbnailUrl : n.removeAttribute("src"), n.alt = t.label);
+		n && n.getAttribute("src") !== t.thumbnailUrl && (t.thumbnailUrl ? n.src = t.thumbnailUrl : n.removeAttribute("src"), n.alt = t.label), n && (n.hidden = t.declaredBlank === !0 && !t.thumbnailUrl);
 		let r = e.querySelector(".st-strip-caption");
 		r && (r.textContent = t.caption ? `${t.label} · ${t.caption}` : t.label);
 		let i = e.querySelector(".st-strip-icons");
@@ -5260,13 +5262,13 @@ function Ke(e, t) {
 }
 function qe(e) {
 	let t = e.zone_mode === "manual" && Array.isArray(e.zones) ? e.zones : e.resolved_zones;
-	return Array.isArray(t) ? t.slice(0, 64).flatMap((e) => !yt(e) || e.kind !== "text" && e.kind !== "picture" || !Array.isArray(e.box) || e.box.length !== 4 || !e.box.every((e) => typeof e == "number" && Number.isFinite(e)) ? [] : [{
+	return Array.isArray(t) ? t.slice(0, 64).flatMap((e) => !Y(e) || e.kind !== "text" && e.kind !== "picture" || !Array.isArray(e.box) || e.box.length !== 4 || !e.box.every((e) => typeof e == "number" && Number.isFinite(e)) ? [] : [{
 		kind: e.kind,
 		box: [...e.box]
 	}]) : ["text", "picture"].flatMap((t) => {
 		let n = e[`${t}_box`];
-		if (!(Array.isArray(n) && n.length === 4) && !yt(n)) return [];
-		let r = _t(n, {
+		if (!(Array.isArray(n) && n.length === 4) && !Y(n)) return [];
+		let r = vt(n, {
 			x1: 0,
 			y1: 0,
 			x2: 1,
@@ -5325,42 +5327,41 @@ function Qe(e, t) {
 function $e(e, t) {
 	return `${e}${e.includes("?") ? "&" : "?"}retry=${t}`;
 }
-function K(e) {
+function et(e) {
 	return e.status === "failed" ? e.last_error || "Stage failed" : "";
 }
-function et(e) {
+function tt(e) {
 	return !e || e.status !== "success" || !e.output_sha256 ? "" : `${e.revision}-${e.output_sha256.slice(0, 16)}`;
 }
-function tt(e, t, n = "") {
+function nt(e, t, n = "") {
 	return e.replace("__PAGE__", t).replace("__STAGE__", n);
 }
-function nt(e, t) {
-	let n;
-	for (let r of R) {
-		let i = e.stages.find((e) => e.stage === r);
-		if (!i || !q(e, r).current || !et(i) || (n = i, r === t)) break;
+function rt(e) {
+	for (let t of [...R].reverse()) {
+		let n = e.stages.find((e) => e.stage === t);
+		if (n?.status === "success" && K(e, t).current && tt(n)) return n;
 	}
-	return n;
 }
-function rt(e, t) {
+function it(e, t) {
 	let n = e.stages.find((e) => e.stage === t)?.parameters ?? {};
 	return {
-		width: Y(t === "select_content" ? n.content_area_width : n.output_width),
-		height: Y(t === "select_content" ? n.content_area_height : n.output_height)
+		width: J(t === "select_content" ? n.content_area_width : n.output_width),
+		height: J(t === "select_content" ? n.content_area_height : n.output_height)
 	};
 }
-function it(e) {
+function at(e) {
 	return e.status;
 }
-function at(e, t) {
+function ot(e, t) {
+	if (e.status === "skipped") return !0;
 	if (e.status !== "success" || e.settings_applied !== !0) return !1;
-	let n = e.stage === R[0] ? e.input_sha256 ?? "" : t?.status === "success" ? t.output_sha256 ?? "" : "";
+	let n = e.stage === R[0] || t?.skip_reason === "declared_blank" ? e.input_sha256 ?? "" : t?.status === "success" ? t.output_sha256 ?? "" : "";
 	return e.input_basis_sha256 && (n = t?.status === "success" && t.output_sha256 === e.input_basis_sha256 ? e.input_sha256 ?? "" : ""), n === (e.applied_input_sha256 ?? "");
 }
-function q(e, t) {
+function K(e, t) {
 	let n = !0, r = null, i;
 	for (let a of R) {
-		let o = e.stages.find((e) => e.stage === a), s = n && o !== void 0 && at(o, i);
+		let o = e.stages.find((e) => e.stage === a), s = n && o !== void 0 && ot(o, i);
 		if (a === t) {
 			let e = "";
 			return o?.status === "success" && !s && (e = o.settings_applied === !0 ? n && o.common_size_changed === !0 && i?.output_sha256 === o.input_basis_sha256 ? "common page size changed" : "input changed" : "settings changed, not applied"), {
@@ -5377,19 +5378,23 @@ function q(e, t) {
 		staleReason: ""
 	};
 }
-function ot(e, t, n = !1, r = !1) {
-	let i = K(e);
+function st(e, t, n = !1, r = !1) {
+	if (e.status === "skipped") return {
+		text: "Skipped · Declared blank",
+		tone: "info"
+	};
+	let i = et(e);
 	if (i) return {
 		text: `Failed: ${i}`,
 		tone: "error"
 	};
 	if (n) return {
-		text: st,
+		text: ct,
 		tone: "info"
 	};
 	let a = `Revision ${e.revision}`;
 	return e.status === "queued" || e.status === "running" ? {
-		text: r ? lt : ct,
+		text: r ? ut : lt,
 		tone: "info"
 	} : t?.waitingFor ? {
 		text: `Waiting for ${z[t.waitingFor]}.`,
@@ -5405,56 +5410,56 @@ function ot(e, t, n = !1, r = !1) {
 		tone: "info"
 	};
 }
-var st = "Settings not applied yet.", ct = "Running…", lt = "Restarting with new settings…";
-function ut(e) {
-	return e ? lt : "Saving…";
+var ct = "Settings not applied yet.", lt = "Running…", ut = "Restarting with new settings…";
+function dt(e) {
+	return e ? ut : "Saving…";
 }
-var dt = 600;
-function ft(e) {
-	return JSON.stringify(e, (e, t) => yt(t) ? Object.fromEntries(Object.entries(t).sort(([e], [t]) => e.localeCompare(t))) : t);
-}
+var ft = 600;
 function pt(e) {
+	return JSON.stringify(e, (e, t) => Y(t) ? Object.fromEntries(Object.entries(t).sort(([e], [t]) => e.localeCompare(t))) : t);
+}
+function mt(e) {
 	if (typeof e != "string") return null;
 	let t = /^(.*T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(.*)$/.exec(e);
 	if (!t) return null;
 	let n = Date.parse(`${t[1]}${t[3] ?? ""}`);
 	return Number.isNaN(n) ? null : n * 1e3 + Number((t[2] ?? "").padEnd(6, "0"));
 }
-var mt = {
+var ht = {
 	unknown: 0,
 	queued: 1,
 	running: 2,
 	success: 3,
 	failed: 3
 };
-function ht(e, t) {
+function gt(e, t) {
 	if (e.revision !== t.revision) return e.revision < t.revision;
-	let n = pt(e.updated_at), r = pt(t.updated_at);
-	return n !== null && r !== null && n !== r ? n < r : (mt[e.status] ?? 0) < (mt[t.status] ?? 0);
+	let n = mt(e.updated_at), r = mt(t.updated_at);
+	return n !== null && r !== null && n !== r ? n < r : (ht[e.status] ?? 0) < (ht[t.status] ?? 0);
 }
-function gt(e, t, n = !1) {
-	let r = K(e);
-	return r ? `Failed: ${r}` : n ? `${st} The result appears once they are saved.` : e.status === "queued" ? "Queued: the result appears here once the worker has run this stage." : e.status === "running" ? "Running: the result appears here when it finishes." : t.waitingFor ? `Waiting for ${z[t.waitingFor]}. This stage runs when it is done.` : e.status === "success" ? t.current ? e.preview_storage_identifier || e.output_storage_identifier ? "" : "This run produced no result preview." : `Stale: ${t.staleReason || "input changed"}. It runs again by itself.` : "Not run yet. The result appears here once this stage has run.";
+function _t(e, t, n = !1) {
+	let r = et(e);
+	return r ? `Failed: ${r}` : n ? `${ct} The result appears once they are saved.` : e.status === "queued" ? "Queued: the result appears here once the worker has run this stage." : e.status === "running" ? "Running: the result appears here when it finishes." : t.waitingFor ? `Waiting for ${z[t.waitingFor]}. This stage runs when it is done.` : e.status === "success" ? t.current ? e.preview_storage_identifier || e.output_storage_identifier ? "" : "This run produced no result preview." : `Stale: ${t.staleReason || "input changed"}. It runs again by itself.` : "Not run yet. The result appears here once this stage has run.";
 }
-function _t(e, t) {
-	if (Array.isArray(e) && e.length >= 4) return vt({
-		x1: J(e[0], t.x1),
-		y1: J(e[1], t.y1),
-		x2: J(e[2], t.x2),
-		y2: J(e[3], t.y2)
+function vt(e, t) {
+	if (Array.isArray(e) && e.length >= 4) return yt({
+		x1: q(e[0], t.x1),
+		y1: q(e[1], t.y1),
+		x2: q(e[2], t.x2),
+		y2: q(e[3], t.y2)
 	});
-	if (yt(e)) {
-		let n = J(e.x1, t.x1), r = J(e.y1, t.y1), i = J(e.width, t.x2 - t.x1), a = J(e.height, t.y2 - t.y1);
-		return vt({
+	if (Y(e)) {
+		let n = q(e.x1, t.x1), r = q(e.y1, t.y1), i = q(e.width, t.x2 - t.x1), a = q(e.height, t.y2 - t.y1);
+		return yt({
 			x1: n,
 			y1: r,
-			x2: J(e.x2, n + i),
-			y2: J(e.y2, r + a)
+			x2: q(e.x2, n + i),
+			y2: q(e.y2, r + a)
 		});
 	}
 	return t;
 }
-function vt(e) {
+function yt(e) {
 	return {
 		x1: Math.min(e.x1, e.x2),
 		y1: Math.min(e.y1, e.y2),
@@ -5462,15 +5467,15 @@ function vt(e) {
 		y2: Math.max(e.y1, e.y2)
 	};
 }
-function J(e, t) {
+function q(e, t) {
 	let n = typeof e == "number" ? e : Number(e);
 	return Number.isFinite(n) ? n : t;
 }
-function Y(e) {
-	let t = J(e, 0);
+function J(e) {
+	let t = q(e, 0);
 	return t > 0 ? t : null;
 }
-function yt(e) {
+function Y(e) {
 	return typeof e == "object" && !!e && !Array.isArray(e);
 }
 function bt(e) {
@@ -5510,6 +5515,7 @@ var wt = class {
 	geometryLayer;
 	message;
 	liveStatus;
+	refreshRunControls;
 	title;
 	revertButton;
 	batchButton;
@@ -5576,7 +5582,7 @@ var wt = class {
 		this.strip = n ? new h(n, { onClick: (e, t) => this.clickPage(e, t) }) : null;
 	}
 	url(e, t = "", n = "") {
-		return tt(this.root.dataset[e] ?? "", t, n);
+		return nt(this.root.dataset[e] ?? "", t, n);
 	}
 	start() {
 		this.bindWorkspaceControls();
@@ -5584,7 +5590,11 @@ var wt = class {
 		r ? this.activate(r.id, bt(n) ? n : R[0]) : this.disableEditor("Upload a page to begin editing."), this.startLiveUpdates();
 	}
 	bindWorkspaceControls() {
-		this.inputButton.addEventListener("click", () => this.showPreview("input")), this.resultButton.addEventListener("click", () => this.showPreview("result")), this.root.querySelectorAll("[data-stage-select]").forEach((e) => {
+		this.bindPipelineActions(), this.root.querySelector("[data-toggle-blank]")?.addEventListener("click", () => {
+			this.toggleBlank();
+		}), this.root.querySelector("[data-request-rescan]")?.addEventListener("click", () => {
+			this.requestRescan();
+		}), this.inputButton.addEventListener("click", () => this.showPreview("input")), this.resultButton.addEventListener("click", () => this.showPreview("result")), this.root.querySelectorAll("[data-stage-select]").forEach((e) => {
 			e.addEventListener("click", () => {
 				let t = e.dataset.stageSelect ?? "";
 				if (!bt(t)) return;
@@ -5607,6 +5617,50 @@ var wt = class {
 		}), this.resultImage?.addEventListener("error", () => {
 			this.resultImage?.getAttribute("src") && (this.resultImage.hidden = !0, this.setResultStatus("The result preview could not be loaded.", !1));
 		}), this.updateSelectionCount();
+	}
+	bindPipelineActions() {
+		let e = this.root.dataset.runAllUrl, t = this.root.querySelector("[data-run-pipeline]"), n = this.root.querySelector("[data-cancel-pipeline]"), r = this.root.querySelector("[data-pipeline-status]");
+		if (!e || !t || !n || !r) return;
+		let i = null, a = r.textContent?.trim() ?? "", o, s = !1, c = 0, l = () => i?.state === "queued" || i?.state === "running", u = () => {
+			if (t.disabled = !this.editable || !this.pages.size || !!a || l() || s, n.hidden = !l(), n.disabled = s, l() && i) {
+				let e = i.stage ? z[i.stage] : "Run all";
+				r.textContent = `${e} · ${i.checked_steps} of ${i.total_steps} stage steps checked`;
+			} else r.textContent = a || i?.error || (i?.state === "complete" ? "Run complete." : i?.state === "cancelled" ? "Run cancelled." : "");
+		}, d = async (t) => {
+			let n = ++c;
+			window.clearTimeout(o), t && (s = !0), u();
+			let f = "";
+			try {
+				let r = await fetch(e, t ? {
+					method: "POST",
+					credentials: "same-origin",
+					headers: {
+						"Content-Type": "application/json",
+						"X-CSRFToken": Z()
+					},
+					body: JSON.stringify({
+						action: t,
+						run_id: i?.id
+					})
+				} : { credentials: "same-origin" });
+				if (n !== c) return;
+				if (!r.ok) {
+					let e = await r.text();
+					throw r.status === 507 && (a = e), Error(e);
+				}
+				let o = await r.json();
+				if (n !== c) return;
+				i = o.run, a = o.blocked_reason ?? "";
+			} catch (e) {
+				f = e instanceof Error ? e.message : "Could not update Run all.";
+			} finally {
+				n === c && (s = !1, u(), f && (r.textContent = f), (l() || a) && (o = window.setTimeout(() => void d(), 2500)));
+			}
+		};
+		t.addEventListener("click", () => {
+			let e = this.pages.size;
+			window.confirm(`Check ${e} pages through ${R.length} stages? Up to ${e * R.length} stages may run. Current results and saved manual settings are kept.`) && d("start");
+		}), n.addEventListener("click", () => void d("cancel")), this.refreshRunControls = u, d();
 	}
 	async explainPreviewFailure(e, t) {
 		if (!e) return;
@@ -5633,7 +5687,7 @@ var wt = class {
 	showInputFailure(e, t, n, r) {
 		if (t.status === 404 && t.body.trim().toLowerCase() === "input preview not ready") {
 			if (this.savePending() || this.settingsNotApplied()) return;
-			let t = this.activeContext()?.page, n = t ? q(t, e).waitingFor : null;
+			let t = this.activeContext()?.page, n = t ? K(t, e).waitingFor : null;
 			if (n) {
 				this.setMessage(`Waiting for ${z[n]}: its result is not ready yet.`, r);
 				return;
@@ -5658,14 +5712,14 @@ var wt = class {
 		let i = t !== this.activeStage;
 		(e !== this.activePageId || i) && (this.fitPending = !0), this.activePageId = e, this.activeStage = t, this.selectedPages.has(e) || (this.selectedPages.clear(), this.selectedPages.add(e), this.selectionAnchor = e), this.draft = Ke(t, r.parameters ?? {});
 		let a = this.root.querySelector(`[data-stage-select="${t}"]`)?.dataset.hint;
-		this.statusHint && (this.statusHint.textContent = a ?? ""), i && this.refreshStrip(), this.strip?.setActive(e, new Set(this.selectedPages), this.keepInView?.checked ?? !0), this.updateSelectionCount(), this.title.textContent = `Page ${n.logical_sequence_number} · ${z[t]}`, this.markActiveControls(), this.restartingRevision = null, this.renderControls(), this.appliedDraft = ft(this.draft), this.showPreview(this.previewMode), this.revertButton && (this.revertButton.disabled = !this.editable), this.showStatus(), this.ensuring = this.ensureActiveStage();
+		this.statusHint && (this.statusHint.textContent = a ?? ""), i && this.refreshStrip(), this.strip?.setActive(e, new Set(this.selectedPages), this.keepInView?.checked ?? !0), this.updateSelectionCount(), this.title.textContent = `Page ${n.logical_sequence_number} · ${z[t]}`, this.markActiveControls(), this.restartingRevision = null, this.renderControls(), this.appliedDraft = pt(this.draft), this.showPreview(this.previewMode), this.revertButton && (this.revertButton.disabled = !this.editable), this.showStatus(), this.ensuring = this.ensureActiveStage();
 	}
 	async ensureActiveStage() {
 		let e = this.activeContext();
 		if (!e || !this.editable) return;
-		let t = this.url("ensureUrlTemplate", e.page.id, e.state.stage);
-		if (t) try {
-			let e = await fetch(t, {
+		let t = this.isBlank(e.page) ? "margins" : e.state.stage, n = this.url("ensureUrlTemplate", e.page.id, t);
+		if (n) try {
+			let e = await fetch(n, {
 				method: "POST",
 				credentials: "same-origin",
 				headers: { "X-CSRFToken": Z() }
@@ -5675,8 +5729,8 @@ var wt = class {
 				return;
 			}
 			if (!e.ok) return;
-			let n = await e.json();
-			this.mergeStage(n.stage);
+			let t = await e.json();
+			this.mergeStage(t.stage);
 		} catch {}
 	}
 	revertDraft() {
@@ -5687,7 +5741,7 @@ var wt = class {
 			pageId: this.activePageId,
 			stage: this.activeStage,
 			draft: structuredClone(this.draft),
-			sent: ft(this.draft)
+			sent: pt(this.draft)
 		} : null;
 	}
 	leaveDraft() {
@@ -5696,7 +5750,7 @@ var wt = class {
 		e && this.editable && (this.leftDrafts.push(e), this.saving || this.commitDraft());
 	}
 	settingsNotApplied() {
-		return ft(this.draft) !== this.appliedDraft;
+		return pt(this.draft) !== this.appliedDraft;
 	}
 	savePending() {
 		return this.commitTimer !== null || this.saving;
@@ -5707,12 +5761,82 @@ var wt = class {
 	showStatus() {
 		let e = this.activeContext();
 		if (!e) return;
-		if (this.savePending()) {
-			this.setMessage(ut(this.restarting(e.state)), "info");
+		let t = this.isBlank(e.page), n = this.root.querySelector("[data-toggle-blank]");
+		n && (n.textContent = t ? "Clear blank declaration" : "Mark page as blank", n.disabled = this.root.dataset.canDeclareBlank !== "true" || !e.page.active_version?.id);
+		let r = this.root.querySelector("[data-request-rescan]");
+		if (r) {
+			let n = (e.page.open_rescan_todos ?? 0) > 0;
+			r.textContent = n ? "Rescan requested" : "Request rescan", r.disabled = this.root.dataset.canDeclareBlank !== "true" || t || n;
+		}
+		if (this.controls.toggleAttribute("inert", t), this.savePending()) {
+			this.setMessage(dt(this.restarting(e.state)), "info");
 			return;
 		}
-		let t = ot(e.state, q(e.page, e.state.stage), this.settingsNotApplied(), this.restarting(e.state));
-		this.setMessage(t.text, t.tone);
+		let i = st(e.state, K(e.page, e.state.stage), this.settingsNotApplied(), this.restarting(e.state)), a = !t && e.state.stage === "select_content" && e.state.parameters.content_found === !1 && K(e.page, "select_content").current;
+		this.setMessage(a ? "No content detected. You can mark this page as blank after reviewing it." : i.text, i.tone);
+	}
+	isBlank(e) {
+		return X(e, "deskew")?.skip_reason === "declared_blank";
+	}
+	async requestRescan() {
+		let e = this.activeContext();
+		if (!e) return;
+		let { page: t } = e, n = this.url("rescanUrlTemplate", t.id), r = this.root.querySelector("[data-request-rescan]");
+		if (n && r && !r.disabled) {
+			r.disabled = !0;
+			try {
+				let e = await fetch(n, {
+					method: "POST",
+					credentials: "same-origin",
+					headers: { "X-CSRFToken": Z() }
+				});
+				if (!e.ok) throw Error(await e.text());
+				t.open_rescan_todos = 1, this.strip?.update(this.stripItem(t)), this.showStatus(), this.activePageId === t.id && this.setMessage("Rescan requested.", "info");
+			} catch (e) {
+				this.showStatus(), this.setMessage(e instanceof Error ? e.message : "Could not request rescan.", "error");
+			}
+		}
+	}
+	async toggleBlank() {
+		let e = this.activeContext();
+		if (!e || this.savePending() || this.settingsNotApplied()) return;
+		let { page: t } = e, n = !this.isBlank(t), r = t.active_version?.id, i = this.url("blankUrlTemplate", t.id);
+		if (!r || !i) return;
+		let a = Object.fromEntries(t.stages.map((e) => [e.stage, e.revision]));
+		if (n) {
+			let e = this.root.querySelector("[data-blank-dialog]"), n = e?.querySelector("[data-blank-preview]"), i = e?.querySelector("[data-confirm-blank]"), a = this.url("pageThumbnailTemplate", t.id);
+			if (!e || !n || !i || !a || (i.disabled = !0, n.onload = () => {
+				i.disabled = !1;
+			}, n.onerror = () => {
+				i.disabled = !0;
+			}, n.src = `${a}?raw=true&version=${r}`, n.complete && n.naturalWidth && (i.disabled = !1), e.returnValue = "", e.showModal(), await new Promise((t) => e.addEventListener("close", () => t(), { once: !0 })), e.returnValue !== "confirm")) return;
+		}
+		try {
+			let e = await fetch(i, {
+				method: "POST",
+				credentials: "same-origin",
+				headers: {
+					"Content-Type": "application/json",
+					"X-CSRFToken": Z()
+				},
+				body: JSON.stringify({
+					declared_blank: n,
+					version_id: r,
+					revisions: a
+				})
+			});
+			if (e.status === 409) {
+				this.activePageId === t.id && (await this.refreshPage(this.url("stageUrlTemplate", t.id, this.activeStage)), this.setMessage("This page changed. Review it again before updating its blank declaration.", "error"));
+				return;
+			}
+			if (!e.ok) throw Error(await e.text());
+			let o = await e.json();
+			t.open_rescan_todos = o.open_rescan_todos ?? 0;
+			for (let e of o.stages) this.mergeStage(e);
+			this.activePageId === t.id && this.activate(t.id, this.activeStage);
+		} catch (e) {
+			this.setMessage(e instanceof Error ? e.message : "Could not update the page.", "error");
+		}
 	}
 	draftEdited() {
 		this.settingsNotApplied() && this.scheduleCommit(), this.saving || (this.settingsNotApplied() && this.previewMode === "result" ? this.showPreview("input") : this.refreshResultPane(), this.showStatus());
@@ -5721,7 +5845,7 @@ var wt = class {
 		let e = this.activeContext();
 		if (!e) return !1;
 		let t = e.state;
-		return q(e.page, t.stage).current && !this.settingsNotApplied() && !!(t.preview_storage_identifier || t.output_storage_identifier);
+		return K(e.page, t.stage).current && !this.settingsNotApplied() && !!(t.preview_storage_identifier || t.output_storage_identifier);
 	}
 	showPreview(e) {
 		let t = this.activeContext();
@@ -5733,7 +5857,7 @@ var wt = class {
 		let o = "";
 		if (a) {
 			let e = R.indexOf(n.stage), r = e > 0 ? R[e - 1] : void 0, i;
-			i = r ? et(X(t.page, r)) : t.page.work_image_token ?? "";
+			i = r ? tt(X(t.page, r)) : t.page.work_image_token ?? "";
 			let s = i ? `v=${i}` : `revision=${n.revision}-${n.status}`;
 			o = `${a}${a.includes("?") ? "&" : "?"}${s}`;
 		}
@@ -5742,14 +5866,38 @@ var wt = class {
 		this.warnings.textContent = s ? `Worker warning: ${s}` : "", this.warnings.hidden = !s, this.updateResultPane(t.page, n), this.applyDeskewPreview(), this.renderGeometry();
 	}
 	updateResultPane(e, t) {
+		this.updateOutputHistogram(e, t);
 		let n = this.resultImage;
 		if (!n) return;
-		let r = `${e.id}:${t.stage}`, i = e.id === this.activePageId && t.stage === this.activeStage, a = i && this.savePending(), o = i && !a && this.settingsNotApplied(), s = a ? ut(this.restarting(t)) : gt(t, q(e, t.stage), o), c = a || !o && (t.status === "queued" || t.status === "running"), l = this.url("previewUrlTemplate", e.id, t.stage), u = "";
+		this.isBlank(e) && (t = X(e, "margins") ?? t);
+		let r = `${e.id}:${t.stage}`, i = e.id === this.activePageId && t.stage === this.activeStage, a = i && this.savePending(), o = i && !a && this.settingsNotApplied(), s = a ? dt(this.restarting(t)) : _t(t, K(e, t.stage), o), c = a || !o && (t.status === "queued" || t.status === "running"), l = this.url("previewUrlTemplate", e.id, t.stage), u = "";
 		if (l && !s) {
-			let e = et(t);
+			let e = tt(t);
 			u = `${l}?${e ? `v=${e}` : `revision=${t.revision}-${t.status}`}`;
 		}
 		u ? (this.resultKey = r, u !== this.resultUrl && (this.resultUrl = u, n.src = u), n.hidden = !1) : c && this.resultKey === r && this.resultUrl ? n.hidden = !1 : (o && this.resultKey === r && this.resultUrl || (this.resultUrl = "", this.resultKey = "", n.removeAttribute("src")), n.hidden = !0), this.resultPane?.classList.toggle("busy", c), this.setResultStatus(s, c);
+	}
+	updateOutputHistogram(e, t) {
+		let n = this.root.querySelector("[data-output-histogram]");
+		if (!n) return;
+		n.hidden = !0;
+		let r = t.parameters.output_histogram;
+		if (t.stage !== "output" || this.isBlank(e) || !Y(r) || !Array.isArray(r.bins) || r.bins.length !== 256 || !K(e, "output").current || this.settingsNotApplied()) return;
+		let i = n.querySelector("canvas"), a = i?.getContext("2d"), o = n.querySelector("figcaption");
+		if (!i || !a || !o) return;
+		let s = r.bins.map((e) => Math.log1p(q(e, 0))), c = Math.max(1, ...s);
+		a.clearRect(0, 0, i.width, i.height);
+		let l = (e) => Math.min(255, Math.max(0, e)), u = r.threshold, d = "Grayscale input · no threshold";
+		if (Y(u) && typeof u.median == "number") {
+			let e = u.median, t = typeof u.low == "number" && typeof u.high == "number" ? [u.low, u.high] : null;
+			t ? (a.fillStyle = "rgba(244,178,91,.34)", a.fillRect(l(t[0]), 0, l(t[1]) - l(t[0]) + 1, i.height), d = `Median T ${Math.round(e)} · 10–90% ${t.map(Math.round).join("–")}`) : d = `${u.kind === "intensity" ? "Intensity" : "Global"} T ${Math.round(e)}`;
+		}
+		a.fillStyle = "#d8e0da";
+		for (let [e, t] of s.entries()) {
+			let n = t / c * i.height;
+			a.fillRect(e, i.height - n, 1, n);
+		}
+		Y(u) && typeof u.median == "number" && (a.fillStyle = "#ffba67", a.fillRect(l(u.median), 0, 2, i.height)), o.textContent = `${r.zoned ? "Unzoned preview · " : "Input preview · "}${d}`, n.hidden = !1;
 	}
 	refreshResultPane() {
 		let e = this.activeContext();
@@ -5852,9 +6000,9 @@ var wt = class {
 		c.className = "st-stage-result", c.dataset.deskewResult = "", c.textContent = e?.status === "success" ? xe(e.parameters) : "", this.controls.append(c);
 	}
 	deskewAngle() {
-		if ("manual_angle" in this.draft) return P(J(this.draft.manual_angle, 0));
+		if ("manual_angle" in this.draft) return P(q(this.draft.manual_angle, 0));
 		let e = this.activeContext()?.state;
-		return e ? P(J(e.parameters.angle, 0)) : 0;
+		return e ? P(q(e.parameters.angle, 0)) : 0;
 	}
 	deskewEditing() {
 		return this.editable && this.activeStage === "deskew" && !this.image.hidden;
@@ -5958,11 +6106,11 @@ var wt = class {
 			y2: 0
 		};
 		if (t === "manual" && this.draft.content_box !== void 0) {
-			let e = _t(this.draft.content_box, n);
+			let e = vt(this.draft.content_box, n);
 			return e.x2 > e.x1 && e.y2 > e.y1 ? e : null;
 		}
 		if (!e || e.status !== "success" || e.parameters.content_found === !1) return null;
-		let r = _t(e.parameters.content_box, n);
+		let r = vt(e.parameters.content_box, n);
 		return r.x2 > r.x1 && r.y2 > r.y1 ? r : null;
 	}
 	defaultContentBox() {
@@ -5977,7 +6125,7 @@ var wt = class {
 	contentDpi() {
 		let e = this.activeContext()?.state.parameters.dpi;
 		if (Array.isArray(e) && e.length >= 2) {
-			let t = Y(e[0]), n = Y(e[1]);
+			let t = J(e[0]), n = J(e[1]);
 			if (t && n) return {
 				x: t,
 				y: n
@@ -6105,7 +6253,7 @@ var wt = class {
 		let i = document.createElement("label");
 		i.textContent = "Depth perception";
 		let a = document.createElement("input");
-		a.type = "range", a.min = "1", a.max = "3", a.step = "0.1", a.dataset.depthPerception = "", a.disabled = !this.editable, a.value = String(J(this.draft.depth_perception ?? e?.parameters.depth_perception, 2)), a.addEventListener("input", () => {
+		a.type = "range", a.min = "1", a.max = "3", a.step = "0.1", a.dataset.depthPerception = "", a.disabled = !this.editable, a.value = String(q(this.draft.depth_perception ?? e?.parameters.depth_perception, 2)), a.addEventListener("input", () => {
 			this.draft.depth_perception = Number(a.value), this.dewarpOverlay && (this.dewarpOverlay.depth = Number(a.value), this.dewarpOverlay.draw());
 		}), a.addEventListener("change", () => void this.commitDraft()), i.append(a), this.controls.append(i);
 		let o = document.createElement("p");
@@ -6145,7 +6293,7 @@ var wt = class {
 			this.removeDewarpOverlay();
 			return;
 		}
-		let i = J(this.draft.depth_perception ?? n?.parameters.depth_perception, 2), a = this.dewarpCurves(), o = this.dewarpOverlay;
+		let i = q(this.draft.depth_perception ?? n?.parameters.depth_perception, 2), a = this.dewarpCurves(), o = this.dewarpOverlay;
 		if (o) {
 			o.setCurves(a.top, a.bottom, i), o.element.parentElement !== this.geometryLayer && this.geometryLayer.append(o.element), o.layout(e, t);
 			return;
@@ -6173,13 +6321,32 @@ var wt = class {
 			"grad",
 			"copy"
 		];
-		this.addSelect("Output algorithm", "output_mode", e, "otsu"), this.addCheckbox("Keep color", "keep_color", !1), this.addCheckbox("Invert output", "invert", !1), this.addNumber("Local window size", "window_size", 3, 501, 2, 35), this.addNumber("Threshold k", "k", -2, 2, .01, .33), this.addNumber("Threshold r", "r", 1, 512, 1, 128), this.addSelect("Text / picture zones", "zone_mode", [
+		this.addSelect("Output algorithm", "output_mode", e, "otsu", !0), this.addCheckbox("Keep color", "keep_color", !1, !0), this.addCheckbox("Invert output", "invert", !1), this.addSelect("Text / picture zones", "zone_mode", [
 			"auto",
 			"manual",
 			"off"
 		], "auto", !0);
-		let t = qe(this.activeContext()?.state.parameters ?? {});
-		if (this.draft.zone_mode !== "off" && (this.addSelect("Text algorithm", "text_algorithm", e, "sauvola"), this.addSelect("Picture algorithm (Keep color uses copy)", "picture_algorithm", e, "copy")), this.draft.zone_mode === "manual") {
+		let t = qe(this.activeContext()?.state.parameters ?? {}), n = this.draft.output_mode !== "copy" && this.draft.zone_mode !== "off";
+		n && (this.addSelect("Text algorithm", "text_algorithm", e, "sauvola", !0), this.addSelect("Picture algorithm (Keep color uses copy)", "picture_algorithm", e, "copy", !0));
+		let r = /* @__PURE__ */ new Set([this.draft.output_mode]);
+		if (n && (r.add(this.draft.text_algorithm), this.draft.keep_color || r.add(this.draft.picture_algorithm)), [
+			"sauvola",
+			"wolf",
+			"fox",
+			"window"
+		].some((e) => r.has(e))) {
+			this.addNumber("Local window size (full-resolution pixels)", "window_size", 3, 501, 2, 35);
+			let e = r.has("sauvola") || r.has("fox") ? "Threshold k" : "Threshold k (0–1 effective)";
+			this.addNumber(e, "k", -2, 2, .01, .33);
+			let t = document.createElement("small");
+			t.className = "muted", t.textContent = [
+				r.has("sauvola") && "Sauvola uses k to weight local contrast.",
+				r.has("wolf") && "Wolf uses k to weight the page-wide minimum and local contrast.",
+				r.has("fox") && "Fox uses the magnitude of k above a minimum noise offset.",
+				r.has("window") && "Window uses k to lower the local mean threshold."
+			].filter(Boolean).join(" "), this.controls.append(t);
+		}
+		if (r.has("sauvola") && this.addNumber("Sauvola contrast range (r)", "r", 1, 512, 1, 128), n && this.draft.zone_mode === "manual") {
 			"zones" in this.draft || (this.draft.zones = t);
 			let e = qe(this.draft);
 			this.draft.zones = e, e.forEach((t, n) => {
@@ -6196,7 +6363,7 @@ var wt = class {
 					i.textContent = `Region ${n + 1} ${r}`;
 					let a = document.createElement("input");
 					a.type = "number", a.min = "0", a.value = String(t.box[e]), a.addEventListener("change", () => {
-						t.box[e] = Math.max(0, J(a.value, t.box[e] ?? 0)), this.renderGeometry();
+						t.box[e] = Math.max(0, q(a.value, t.box[e] ?? 0)), this.renderGeometry();
 					}), i.append(a), this.controls.append(i);
 				}
 				this.addZoneButton(`Remove region ${n + 1}`, () => {
@@ -6216,7 +6383,7 @@ var wt = class {
 					]
 				}), this.renderControls(), this.renderGeometry();
 			});
-		} else this.draft.zone_mode === "auto" && this.addZoneButton(`Edit detected regions (${t.length})`, () => {
+		} else n && this.draft.zone_mode === "auto" && this.addZoneButton(`Edit detected regions (${t.length})`, () => {
 			this.draft.zone_mode = "manual", this.draft.zones = qe(this.activeContext()?.state.parameters ?? {}), this.showPreview("input"), this.renderControls(), this.renderGeometry();
 		});
 	}
@@ -6246,17 +6413,17 @@ var wt = class {
 		let o = document.createElement("label");
 		o.textContent = e;
 		let s = document.createElement("input");
-		s.type = "number", s.value = String(J(this.draft[t], a)), s.step = String(i), n !== void 0 && (s.min = String(n)), r !== void 0 && (s.max = String(r)), this.draft[t] = Number(s.value), s.addEventListener("input", () => {
+		s.type = "number", s.value = String(q(this.draft[t], a)), s.step = String(i), n !== void 0 && (s.min = String(n)), r !== void 0 && (s.max = String(r)), this.draft[t] = Number(s.value), s.addEventListener("input", () => {
 			s.validity.valid && s.value !== "" && (this.draft[t] = Number(s.value), this.renderGeometry());
 		}), o.append(s), this.controls.append(o);
 	}
-	addCheckbox(e, t, n) {
-		let r = document.createElement("label");
-		r.className = "checkbox";
-		let i = document.createElement("input");
-		i.type = "checkbox", i.checked = typeof this.draft[t] == "boolean" ? !!this.draft[t] : n, this.draft[t] = i.checked, i.addEventListener("change", () => {
-			this.draft[t] = i.checked;
-		}), r.append(i, document.createTextNode(e)), this.controls.append(r);
+	addCheckbox(e, t, n, r = !1) {
+		let i = document.createElement("label");
+		i.className = "checkbox";
+		let a = document.createElement("input");
+		a.type = "checkbox", a.checked = typeof this.draft[t] == "boolean" ? !!this.draft[t] : n, this.draft[t] = a.checked, a.addEventListener("change", () => {
+			this.draft[t] = a.checked, r && this.renderControls();
+		}), i.append(a, document.createTextNode(e)), this.controls.append(i);
 	}
 	sourceSize() {
 		let e = this.activeContext(), t = {
@@ -6264,7 +6431,7 @@ var wt = class {
 			height: Math.max(1, this.image.naturalHeight)
 		};
 		if (!e) return t;
-		let n = e.state.parameters, r = Y(n.input_width ?? n.source_width), i = Y(n.input_height ?? n.source_height);
+		let n = e.state.parameters, r = J(n.input_width ?? n.source_width), i = J(n.input_height ?? n.source_height);
 		if (r && i) return {
 			width: r,
 			height: i
@@ -6273,7 +6440,7 @@ var wt = class {
 		if (a > 0) {
 			let t = R[a - 1];
 			if (t) {
-				let n = X(e.page, t)?.parameters ?? {}, r = Y(n.output_width ?? n.resolved_width ?? n.canvas_width), i = Y(n.output_height ?? n.content_area_height ?? n.canvas_height);
+				let n = X(e.page, t)?.parameters ?? {}, r = J(n.output_width ?? n.resolved_width ?? n.canvas_width), i = J(n.output_height ?? n.content_area_height ?? n.canvas_height);
 				if (r && i) return {
 					width: r,
 					height: i
@@ -6289,25 +6456,27 @@ var wt = class {
 		};
 	}
 	renderGeometry() {
-		if (this.clearGeometry(), !this.image.complete || !this.image.naturalWidth || this.image.hidden) return;
-		let e = this.sourceSize(), t = this.displaySize();
-		switch (this.geometryLayer.style.width = `${t.width}px`, this.geometryLayer.style.height = `${t.height}px`, this.activeStage) {
+		this.clearGeometry();
+		let e = this.activeContext()?.page;
+		if (e && this.isBlank(e) || !this.image.complete || !this.image.naturalWidth || this.image.hidden) return;
+		let t = this.sourceSize(), n = this.displaySize();
+		switch (this.geometryLayer.style.width = `${n.width}px`, this.geometryLayer.style.height = `${n.height}px`, this.activeStage) {
 			case "select_content":
-				this.renderContentBox(e, t);
+				this.renderContentBox(t, n);
 				break;
 			case "dewarping":
-				this.renderDewarpOverlay(e, t);
+				this.renderDewarpOverlay(t, n);
 				break;
 			case "output": {
-				let n = this.draft.zone_mode === "manual";
-				qe(n ? this.draft : this.activeContext()?.state.parameters ?? {}).forEach((r, i) => {
-					let a = _t(r.box, {
+				let e = this.draft.zone_mode === "manual";
+				qe(e ? this.draft : this.activeContext()?.state.parameters ?? {}).forEach((r, i) => {
+					let a = vt(r.box, {
 						x1: 0,
 						y1: 0,
-						x2: e.width,
-						y2: e.height
+						x2: t.width,
+						y2: t.height
 					});
-					if (n) this.renderRectangle("zones", `${r.kind} ${i + 1}`, r.kind, e, t, 0, 1, a, (e) => {
+					if (e) this.renderRectangle("zones", `${r.kind} ${i + 1}`, r.kind, t, n, 0, 1, a, (e) => {
 						let t = this.draft.zones;
 						t[i].box = [
 							e.x1,
@@ -6317,8 +6486,8 @@ var wt = class {
 						];
 					});
 					else if (this.draft.zone_mode === "auto") {
-						let n = document.createElement("div");
-						n.className = `geometry-rectangle geometry-${r.kind}`, n.style.pointerEvents = "none", n.textContent = `Detected ${r.kind} ${i + 1}`, this.positionRectangle(n, We(a, e, t)), this.geometryLayer.append(n);
+						let e = document.createElement("div");
+						e.className = `geometry-rectangle geometry-${r.kind}`, e.style.pointerEvents = "none", e.textContent = `Detected ${r.kind} ${i + 1}`, this.positionRectangle(e, We(a, t, n)), this.geometryLayer.append(e);
 					}
 				});
 				break;
@@ -6341,7 +6510,7 @@ var wt = class {
 			y1: r.height * .1,
 			x2: r.width * o,
 			y2: r.height * .9
-		}, d = s ?? _t(this.draft[e], u);
+		}, d = s ?? vt(this.draft[e], u);
 		l || (this.draft[e] = [
 			d.x1,
 			d.y1,
@@ -6398,12 +6567,12 @@ var wt = class {
 		e.style.left = `${t.x1}px`, e.style.top = `${t.y1}px`, e.style.width = `${Math.max(1, t.x2 - t.x1)}px`, e.style.height = `${Math.max(1, t.y2 - t.y1)}px`;
 	}
 	elementBox(e) {
-		let t = J(e.style.left.replace("px", ""), 0), n = J(e.style.top.replace("px", ""), 0);
+		let t = q(e.style.left.replace("px", ""), 0), n = q(e.style.top.replace("px", ""), 0);
 		return {
 			x1: t,
 			y1: n,
-			x2: t + J(e.style.width.replace("px", ""), e.offsetWidth),
-			y2: n + J(e.style.height.replace("px", ""), e.offsetHeight)
+			x2: t + q(e.style.width.replace("px", ""), e.offsetWidth),
+			y2: n + q(e.style.height.replace("px", ""), e.offsetHeight)
 		};
 	}
 	async saveActiveStage() {
@@ -6414,7 +6583,7 @@ var wt = class {
 		let t = this.pages.get(e.pageId), n = t ? X(t, e.stage) : void 0, r = this.url("stageUrlTemplate", e.pageId, e.stage);
 		if (!t || !n || !r || !this.editable) return;
 		let { pageId: i, stage: a, sent: o } = e, s = () => this.activePageId === i && this.activeStage === a, c = n.status === "queued" || n.status === "running";
-		this.saving = !0, s() && this.setMessage(ut(c), "info");
+		this.saving = !0, s() && this.setMessage(dt(c), "info");
 		try {
 			let i = await fetch(r, {
 				method: "POST",
@@ -6447,7 +6616,7 @@ var wt = class {
 			}
 			let f = this.activeContext()?.state ?? l.stage;
 			if (f.status !== "success") {
-				let e = this.pages.get(f.scan_page_id), t = ot(f, e ? q(e, f.stage) : void 0, !1, this.restartingRevision === f.revision);
+				let e = this.pages.get(f.scan_page_id), t = st(f, e ? K(e, f.stage) : void 0, !1, this.restartingRevision === f.revision);
 				this.setMessage(t.text, t.tone);
 				return;
 			}
@@ -6508,9 +6677,11 @@ var wt = class {
 		let t = this.pages.get(e.scan_page_id);
 		if (!t) return;
 		let n = t.stages.findIndex((t) => t.stage === e.stage), r = n >= 0 ? t.stages[n] : void 0;
-		if (r && ht(e, r) || (n >= 0 ? t.stages[n] = e : t.stages.push(e), this.updateStageDom(e), this.updateActivePreview(e, r), e.scan_page_id !== this.activePageId || this.saving)) return;
-		let i = e.status === "success" && (r?.status !== "success" || r.revision !== e.revision);
-		e.stage === this.activeStage ? i || this.showStatus() : (e.stage === H(this.activeStage) && !this.isDragging() ? this.showPreview(this.previewMode) : this.refreshResultPane(), this.showStatus());
+		if (r && gt(e, r)) return;
+		let i = this.isBlank(t);
+		if (n >= 0 ? t.stages[n] = e : t.stages.push(e), this.updateStageDom(e), i !== this.isBlank(t) && this.refreshStrip(), this.updateActivePreview(e, r), e.scan_page_id !== this.activePageId || this.saving) return;
+		let a = e.status === "success" && (r?.status !== "success" || r.revision !== e.revision);
+		e.stage === this.activeStage ? a || this.showStatus() : (e.stage === H(this.activeStage) && !this.isDragging() ? this.showPreview(this.previewMode) : this.refreshResultPane(), this.showStatus());
 	}
 	isDragging() {
 		return this.deskewOverlay?.isDragging() === !0 || this.contentOverlay?.isDragging() === !0 || this.dewarpOverlay?.isDragging() === !0;
@@ -6520,24 +6691,25 @@ var wt = class {
 		t && this.strip && this.strip.update(this.stripItem(t));
 	}
 	stripItem(e) {
-		let t = nt(e, this.activeStage), n = e.active_version?.id, r = "";
+		let t = rt(e), n = this.isBlank(e), r = e.active_version?.id, i = "";
 		if (t) {
 			let n = this.url("stageThumbnailTemplate", e.id, t.stage);
-			n && (r = `${n}?v=${et(t)}`);
-		} else if (n && e.work_image_token) {
+			n && (i = `${n}?v=${tt(t)}`);
+		} else if (!n && r && e.work_image_token) {
 			let t = this.url("pageThumbnailTemplate", e.id);
-			t && (r = `${t}?v=${e.work_image_token}`);
-		} else r = e.thumbnail ?? "";
-		let i = e.side && e.side !== "single" ? ` ${e.side}` : "", a = e.recognized_page_number ? `p. ${e.recognized_page_number}` : "", o = rt(e, this.activeStage);
+			t && (i = `${t}?v=${e.work_image_token}`);
+		} else n || (i = e.thumbnail ?? "");
+		let a = e.side && e.side !== "single" ? ` ${e.side}` : "", o = e.recognized_page_number ? `p. ${e.recognized_page_number}` : "", s = it(e, this.activeStage);
 		return {
 			id: e.id,
-			label: `${e.logical_sequence_number}${i}`,
-			caption: e.active_version?.original_filename || a,
-			thumbnailUrl: r,
-			width: o.width,
-			height: o.height,
+			label: `${e.logical_sequence_number}${a}`,
+			caption: n ? "Declared blank" : (e.open_rescan_todos ?? 0) > 0 ? "Rescan requested" : e.active_version?.original_filename || o,
+			thumbnailUrl: i,
+			declaredBlank: n,
+			width: s.width,
+			height: s.height,
 			stages: R.map((t) => {
-				let n = X(e, t), r = q(e, t);
+				let n = X(e, t), r = K(e, t);
 				return {
 					stage: t,
 					label: z[t],
@@ -6552,11 +6724,11 @@ var wt = class {
 	}
 	refreshStrip() {
 		if (!this.strip) return;
-		let e = this.naturalOrder.map((e) => this.pages.get(e)).filter((e) => e !== void 0).map((e) => this.stripItem(e)), t = this.sortSelect?.value ?? "natural";
-		this.strip.setItems(e, f(e, t));
+		let e = this.root.querySelector("[data-blank-only]")?.checked, t = this.naturalOrder.map((e) => this.pages.get(e)).filter((t) => t !== void 0 && (!e || this.isBlank(t))).map((e) => this.stripItem(e)), n = this.sortSelect?.value ?? "natural";
+		this.strip.setItems(t, f(t, n));
 	}
 	bindStrip() {
-		this.sortSelect?.addEventListener("change", () => {
+		this.root.querySelector("[data-blank-only]")?.addEventListener("change", () => this.refreshStrip()), this.sortSelect?.addEventListener("change", () => {
 			this.refreshStrip(), this.strip?.setActive(this.activePageId, new Set(this.selectedPages), !0);
 		}), this.refreshStrip(), document.addEventListener("keydown", (e) => {
 			if (e.target?.closest("input, select, textarea, [contenteditable='true']") || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -6705,6 +6877,7 @@ var wt = class {
 				this.liveStatus.textContent = "Live updates connected", this.liveStatus.className = "live-status connected";
 			}), this.eventSource.addEventListener("workspace", (e) => {
 				let t = JSON.parse(e.data);
+				this.updateJobActions(t.state, t.refinish_needed);
 				for (let e of t.stages) this.mergeStage(e);
 			}), this.eventSource.addEventListener("error", () => {
 				this.liveStatus.textContent = "Live updates reconnecting…", this.liveStatus.className = "live-status reconnecting";
@@ -6719,11 +6892,21 @@ var wt = class {
 			let t = this.pollCursor ? `${e}?since=${encodeURIComponent(this.pollCursor)}` : e, n = await fetch(t, { credentials: "same-origin" });
 			if (!n.ok) return;
 			let r = await n.json();
+			this.updateJobActions(r.state, r.refinish_needed);
 			for (let e of r.stages) this.mergeStage(e);
 			this.pollCursor = r.cursor;
 		} catch {
 			this.liveStatus.textContent = "Workspace refresh failed; retrying…";
 		}
+	}
+	updateJobActions(e, t) {
+		let n = [
+			"open",
+			"capturing",
+			"paused",
+			"captured"
+		].includes(e);
+		this.editable = n, this.root.dataset.editable = String(n), this.root.dataset.canDeclareBlank = String(n || e === "complete"), this.root.querySelector("[data-finish-scan]")?.toggleAttribute("hidden", !n), this.root.querySelector("[data-refinish-notice]")?.toggleAttribute("hidden", !t), this.refreshRunControls?.(), this.showStatus();
 	}
 	updateSelectionCount() {
 		this.selectionCount.textContent = `${this.selectedPages.size} page(s) selected`, this.batchButton.disabled = !this.editable || this.batchScope.value === "selected" && this.selectedPages.size === 0;
@@ -6746,6 +6929,6 @@ function Et(e) {
 }
 var Dt = document.querySelector("[data-scantailor-editor]");
 Dt && Et(Dt);
-export { dt as AUTOSAVE_DELAY_MS, G as INITIAL_PREVIEW_RETRY, W as PREVIEW_RETRY_EXHAUSTED_MESSAGE, Je as PREVIEW_RETRY_MAX_ATTEMPTS, lt as RESTARTING_MESSAGE, ct as RUNNING_MESSAGE, st as SETTINGS_NOT_APPLIED, R as STAGE_ORDER, et as artifactToken, B as clamp, Ge as displayBoxToSource, Ke as editableParameters, tt as fillUrl, Et as initializeScanTailorWorkspace, ht as isOlderStageState, Qe as nextPreviewRetry, _t as normalizeBox, qe as outputZonesForEditing, U as previewErrorMessage, Ze as previewIsBeingPrepared, $e as previewRetryUrl, H as previousStageName, gt as resultPaneMessage, ut as savingMessage, We as sourceBoxToDisplay, ft as stableJson, K as stageErrorText, q as stageReadiness, rt as stageSize, it as stageStatusLabel, ot as stageStatusMessage, V as stageWorkerWarnings, nt as stripSourceStage };
+export { ft as AUTOSAVE_DELAY_MS, G as INITIAL_PREVIEW_RETRY, W as PREVIEW_RETRY_EXHAUSTED_MESSAGE, Je as PREVIEW_RETRY_MAX_ATTEMPTS, ut as RESTARTING_MESSAGE, lt as RUNNING_MESSAGE, ct as SETTINGS_NOT_APPLIED, R as STAGE_ORDER, tt as artifactToken, B as clamp, Ge as displayBoxToSource, Ke as editableParameters, nt as fillUrl, Et as initializeScanTailorWorkspace, gt as isOlderStageState, Qe as nextPreviewRetry, vt as normalizeBox, qe as outputZonesForEditing, U as previewErrorMessage, Ze as previewIsBeingPrepared, $e as previewRetryUrl, H as previousStageName, _t as resultPaneMessage, dt as savingMessage, We as sourceBoxToDisplay, pt as stableJson, et as stageErrorText, K as stageReadiness, it as stageSize, at as stageStatusLabel, st as stageStatusMessage, V as stageWorkerWarnings, rt as stripSourceStage };
 
 //# sourceMappingURL=scantailor-workspace.js.map

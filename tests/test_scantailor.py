@@ -13,7 +13,7 @@ from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
 from PIL import Image, ImageDraw
 
-from ebook_server.core import deskew, scantailor, views
+from ebook_server.core import deskew, scan_artifact_pruning, scan_run, scantailor, views
 from ebook_server.core.models import (
     ProcessingJob,
     ScanPage,
@@ -24,7 +24,7 @@ from ebook_server.core.storage_registry import backend_for_location
 from ebook_server.storage import LocalFilesystemStorage
 from tests.stage_helpers import run_stage
 from tests.stage_helpers import stage_input as make_stage_input
-from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
+from tests.test_scan_jobs import _create_scan_job, _DeferredQueue, _upload_scan_page
 
 
 def _stage_url(job_id: str, page_id: str, stage: str) -> str:
@@ -593,6 +593,147 @@ def test_select_content_detects_text_area() -> None:
     assert 0 < preview_height < 560
     assert state.parameters["content_area_width"] < 420
     assert state.parameters["content_area_height"] < 560
+
+
+def test_auto_content_padding_clamps_to_image_and_page_mask() -> None:
+    assert scantailor._pad_content_box((10, 15, 20, 25), (40, 50)) == (5, 10, 25, 30)
+    assert scantailor._pad_content_box((2, 0, 35, 49), (40, 50)) == (0, 0, 39, 49)
+    assert scantailor._pad_content_box((0, 0, 39, 49), (40, 50)) == (0, 0, 39, 49)
+    mask = np.ones((50, 40), dtype=bool)
+    mask[:8, :] = False
+    assert scantailor._pad_content_box((10, 10, 20, 25), (40, 50), mask) == (5, 8, 25, 30)
+
+
+def test_wolf_uses_page_wide_statistics_across_tiles() -> None:
+    source = Image.new("L", (1600, 100), color=255)
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((20, 20, 180, 30), fill=5)
+    draw.rectangle((750, 40, 820, 46), fill=115)
+    draw.rectangle((760, 55, 1050, 70), fill=205)
+    tiled = scantailor._threshold_tiles(source, "wolf", {"window_size": 35})
+    whole = scantailor._binarize_with_cv2(
+        np.asarray(source), source, "wolf", window_size=35, k=0.33, r=128.0, invert=False
+    )
+    assert tiled.tobytes() == whole.tobytes()
+    assert tiled.crop((1536, 0, 1600, 100)).getextrema() == (255, 255)
+
+
+def test_output_histogram_reports_global_and_local_thresholds() -> None:
+    source = Image.new("L", (1200, 300), color=240)
+    ImageDraw.Draw(source).rectangle((0, 0, 299, 299), fill=30)
+    stage_input = make_stage_input(source)
+    histogram = scantailor._output_histogram(stage_input, "otsu", {})
+    assert sum(histogram["bins"]) == 960 * 240
+    assert histogram["threshold"] == {
+        "median": scantailor._pil_otsu_threshold(scantailor._thumbnail(source, 960)),
+        "kind": "global",
+    }
+
+    local = scantailor._output_histogram(stage_input, "wolf", {"window_size": 35}, zoned=True)
+    threshold = local["threshold"]
+    assert local["bins"] == histogram["bins"]
+    assert local["zoned"] and threshold["kind"] == "local"
+    assert threshold["low"] < threshold["median"] <= threshold["high"]
+    assert "threshold" not in scantailor._output_histogram(stage_input, "copy", {})
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deskew_batch_leaves_never_run_successors_idle() -> None:
+    client, job = _create_scan_job("batch-no-cascade")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"a page", filename="page.png")
+    assert upload.status_code == 201
+    page = job.pages.get()
+    # The editor creates rows even for stages that never ran.
+    assert client.get(_stages_url(str(job.pk), str(page.pk))).status_code == 200
+    result = client.post(
+        _batch_stage_url(str(job.pk), "deskew"), {}, content_type="application/json"
+    )
+    assert result.status_code == 202
+    assert page.stage_states.get(stage="deskew").status == "success"
+    assert page.stage_states.get(stage="select_content").status == "unknown"
+    assert not ProcessingJob.objects.filter(details__stage="select_content").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_all_checks_stages_in_order_and_only_runs_stale_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, job = _create_scan_job("run-all-stages")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="page.png")
+    assert upload.status_code == 201
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_run, "get_queue", lambda: queue)
+    url = f"/scan/jobs/{job.pk}/run-all/"
+    request = {"action": "start"}
+
+    response = client.post(url, request, content_type="application/json")
+    assert response.status_code == 202
+    first = response.json()["run"]
+    assert first["state"] == "queued" and first["total_steps"] == 5
+    duplicate = client.post(url, request, content_type="application/json")
+    assert duplicate.json()["run"]["id"] == first["id"] and len(queue.calls) == 1
+    for step, stage in enumerate(scantailor.stage_order(), start=1):
+        queue.run_next()
+        status = client.get(url).json()["run"]
+        assert status["checked_steps"] == step
+        assert job.stage_states.get(stage=stage).status == "success"
+    assert status["state"] == "complete"
+    stage_jobs = ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE)
+    assert [item.details["stage"] for item in stage_jobs.order_by("scheduled_at")] == list(
+        scantailor.stage_order()
+    )
+
+    response = client.post(url, request, content_type="application/json")
+    assert response.json()["run"]["id"] != first["id"]
+    for _ in scantailor.stage_order():
+        queue.run_next()
+    assert client.get(url).json()["run"]["state"] == "complete"
+    assert stage_jobs.count() == len(scantailor.stage_order())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_all_cancel_and_free_space_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, job = _create_scan_job("run-all-cancel")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="page.png")
+    assert upload.status_code == 201
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_run, "get_queue", lambda: queue)
+    url = f"/scan/jobs/{job.pk}/run-all/"
+    request = {"action": "start"}
+    with monkeypatch.context() as patch:
+        patch.setattr(scan_artifact_pruning, "low_space_message", lambda: "Disk is full.")
+        assert client.get(url).json()["blocked_reason"] == "Disk is full."
+        assert client.post(url, request, content_type="application/json").status_code == 507
+        assert not queue.calls
+
+    run = client.post(url, request, content_type="application/json").json()["run"]
+    cancelled = client.post(
+        url, {"action": "cancel", "run_id": run["id"]}, content_type="application/json"
+    )
+    assert cancelled.json()["run"]["state"] == "cancelled"
+    queue.run_next()
+    assert not queue.calls and not job.stage_states.exists()
+
+    running = client.post(url, request, content_type="application/json").json()["run"]
+    resolve_algorithm = scantailor._resolve_stage_algorithm
+
+    def cancel_during_stage(state: ScanTailorStageState) -> scantailor.StageRunner:
+        runner = resolve_algorithm(state)
+
+        def cancel_then_run(
+            state: ScanTailorStageState, stage_input: scantailor.StageInput
+        ) -> scantailor.StageResult:
+            scan_run.cancel(job.pk, running["id"])
+            return runner(state, stage_input)
+
+        return cancel_then_run
+
+    monkeypatch.setattr(scantailor, "_resolve_stage_algorithm", cancel_during_stage)
+    queue.run_next()
+    assert client.get(url).json()["run"]["state"] == "cancelled"
+    deskew = job.stage_states.get(stage="deskew")
+    assert deskew.status == "unknown" and not deskew.output_storage_identifier
+    assert not queue.calls
 
 
 @pytest.mark.django_db(transaction=True)

@@ -105,3 +105,12 @@ sibling content remains held for review.
 Extend this corpus with independently adjudicated, privacy-safe real imports
 before making a deployment-wide calibration claim. Retain difficult examples and
 provider-error cases; do not relabel errors to obtain a better headline number.
+
+
+## Provider lookup timing
+
+A live lookup runs up to three configured providers concurrently. Requests within
+each provider still follow its rate limits, timeouts and title fallback order. The
+search waits for every provider outcome before ranking and applying the existing
+acceptance rules. Equal scores and diagnostics retain configured provider order.
+Compare wall-clock import time separately from the sum of provider durations.
