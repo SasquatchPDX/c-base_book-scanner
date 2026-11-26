@@ -166,6 +166,8 @@ def _serialize_scan_page(
             active_version.page_number_verified if active_version is not None else None
         ),
         "scanner_status": page.status,
+        # A person's decision (#219): "normal" or "blank" ("excluded" is reserved).
+        "page_disposition": page.page_disposition,
         "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
         "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],
@@ -2366,6 +2368,14 @@ def scan_page_blank(request: HttpRequest, job_id: str, page_id: str) -> HttpResp
         return HttpResponseForbidden()
     payload = _json_body(request)
     blank = payload.get("declared_blank")
+    disposition = payload.get("disposition")
+    if blank is None and isinstance(disposition, str):
+        # ``page_disposition`` models ``excluded`` too (#219); only blank is built.
+        if disposition == ScanPage.Disposition.EXCLUDED:
+            return HttpResponseBadRequest("excluding a page is not supported yet")
+        if disposition not in ScanPage.Disposition.values:
+            return HttpResponseBadRequest("unknown page disposition")
+        blank = disposition == ScanPage.Disposition.BLANK
     revisions = payload.get("revisions")
     if not isinstance(blank, bool) or not isinstance(revisions, dict):
         return HttpResponseBadRequest("blank declaration and stage revisions are required")

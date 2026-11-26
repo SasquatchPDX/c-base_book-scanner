@@ -39,7 +39,7 @@ from .models import (
     ProcessingJob,
     ScanJob,
     ScanPage,
-    ScanPageBlankEvent,
+    ScanPageDispositionEvent,
     ScanPageVersion,
     ScanTailorRun,
     ScanTailorStageState,
@@ -748,10 +748,17 @@ def mark_state_stale(
     rows = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     now = timezone.now()
     if page.declared_blank and active_version is not None:
+        # A rescan replaced a page declared blank (#219): the new image may have
+        # content, so the declaration never silently survives it. The stages run again.
         states = list(rows.select_for_update().order_by("pk"))
-        margins = next(state for state in states if is_blank_margins(state))
+        margins = next((state for state in states if is_blank_margins(state)), None)
+        declared_version = margins.input_scan_page_version if margins is not None else None
         set_page_blank(
-            page, states, version=margins.input_scan_page_version or active_version, blank=False
+            page,
+            states,
+            version=declared_version or active_version,
+            blank=False,
+            reason=DISPOSITION_REASON_REPLACED,
         )
         transaction.on_commit(lambda: queue_after_blank_edit(scan_job_id, page_id))
     if active_version is not None:
@@ -763,6 +770,11 @@ def mark_state_stale(
     return int(rows.update(updated_at=now))
 
 
+#: ``ScanPageDispositionEvent.reason`` values (#219).
+DISPOSITION_REASON_DECLARED: Final[str] = "declared"
+DISPOSITION_REASON_REPLACED: Final[str] = "raw_version_replaced"
+
+
 def set_page_blank(
     page: ScanPage,
     states: list[ScanTailorStageState],
@@ -770,17 +782,27 @@ def set_page_blank(
     version: ScanPageVersion,
     blank: bool,
     actor_id: int | None = None,
+    reason: str = DISPOSITION_REASON_DECLARED,
 ) -> None:
-    """Change a declaration under the same row locks as stage edits and page replacement."""
-    ScanPageBlankEvent.objects.create(
+    """Change a declaration under the same row locks as stage edits and page replacement.
+
+    Declaring or clearing is an audited event (#219). Every stage row gets a new
+    revision, so a concurrent editor's stale save conflicts, and live clients see the
+    change through the workspace events. Blank: Deskew, Select Content, Dewarping and
+    Output become ``skipped`` (reason ``declared_blank``); Margins renders a white page
+    of the common size. Clearing re-queues the stages from the first one.
+    """
+    disposition = ScanPage.Disposition.BLANK if blank else ScanPage.Disposition.NORMAL
+    ScanPageDispositionEvent.objects.create(
         page=page,
         version=version,
         actor_id=actor_id,
-        previous_value=page.declared_blank,
-        declared_blank=blank,
+        previous_disposition=page.page_disposition,
+        disposition=disposition,
+        reason=reason,
     )
-    page.declared_blank = blank
-    page.save(update_fields=["declared_blank", "updated_at"])
+    page.page_disposition = disposition
+    page.save(update_fields=["page_disposition", "updated_at"])
     for state in states:
         status = ScanTailorStageState.StageStatus
         state.revision += 1

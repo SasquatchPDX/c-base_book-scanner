@@ -276,7 +276,9 @@ def flag_page(page: ScanPage, *, reason: str, user: Any) -> FlagResult:
             raise scan_lifecycle.LifecycleError(
                 job.state, "scan job is not accepting rescan requests"
             )
-        if ScanPage.objects.filter(pk=page.pk, declared_blank=True).exists():
+        if ScanPage.objects.filter(
+            pk=page.pk, page_disposition=ScanPage.Disposition.BLANK
+        ).exists():
             raise scan_lifecycle.LifecycleError(
                 job.state, "clear the blank declaration before requesting a rescan"
             )

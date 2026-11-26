@@ -23,6 +23,7 @@ from ebook_server.core.models import (
     ScanPage,
     ScanPageVersion,
     ScanTailorRun,
+    ScanTailorStageState,
     ScanTodo,
     StorageLocation,
 )
@@ -366,9 +367,13 @@ def test_blank_page_is_audited_preserved_in_pdf_and_reset_on_replacement(
     assert all(row["skip_reason"] == "declared_blank" for row in skipped)
     assert page.todos.get().state == ScanTodo.State.CANCELLED
     assert client.post(f"/scan/pages/{page.pk}/rescan/").status_code == 400
-    event = page.blank_events.get()
+    event = page.disposition_events.get()
     assert event.actor_id == job.operator_id
-    assert not event.previous_value and event.declared_blank
+    assert (event.previous_disposition, event.disposition) == ("normal", "blank")
+    assert event.reason == "declared" and event.version_id == version.pk
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.BLANK
+    assert response.json()["page_disposition"] == "blank"
     assert (
         client.post(f"{page_url}/blank/", payload, content_type="application/json").status_code
         == 409
@@ -439,14 +444,112 @@ def test_blank_page_is_audited_preserved_in_pdf_and_reset_on_replacement(
     job.refresh_from_db()
     assert not page.declared_blank and page.versions.count() == 2
     assert job.refinish_needed
-    assert list(
-        page.blank_events.order_by("created_at").values_list("declared_blank", flat=True)
-    ) == [
-        True,
-        False,
-        True,
-        False,
-    ]
+    events = list(page.disposition_events.order_by("created_at", "pk"))
+    assert [event.disposition for event in events] == ["blank", "normal", "blank", "normal"]
+    # The rescan cleared the declaration: a system event (no actor) with its reason.
+    assert events[-1].reason == "raw_version_replaced" and events[-1].actor_id is None
+    # ...and re-queued the page's stages: nothing is skipped any more.
+    assert not page.stage_states.filter(status=ScanTailorStageState.StageStatus.SKIPPED).exists()
+    margins_after = page.stage_states.get(stage="margins")
+    assert "declared_blank" not in margins_after.parameters
+
+
+@pytest.mark.django_db(transaction=True)
+def test_blank_declaration_conflicts_with_concurrent_edits_and_reaches_other_editors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#219 criteria 1 and 7: the declaration uses the stage revisions and live events."""
+    from ebook_server.core.models import get_or_create_profile
+    from ebook_server.core.workspace_events import WorkspaceEventPoller
+
+    client, job = _create_scan_job_with_book("blank-page-editor-a")
+    other = Client()
+    other.force_login(get_or_create_profile("blank-page-editor-b").user)
+    monkeypatch.setattr(scantailor, "get_queue", lambda: None)
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="1.png")
+    assert upload.status_code == 201
+    page = job.pages.get()
+    version = page.active_version()
+    assert version is not None
+    page_url = f"/scan/jobs/{job.pk}/pages/{page.pk}"
+    assert client.get(f"{page_url}/stages/deskew/").status_code == 200
+    stale = dict(page.stage_states.values_list("stage", "revision"))
+
+    # Only "blank" is built; "excluded" is modelled but refused (open question 1).
+    for disposition in ("excluded", "bogus"):
+        refused = client.post(
+            f"{page_url}/blank/",
+            {"disposition": disposition, "version_id": str(version.pk), "revisions": stale},
+            content_type="application/json",
+        )
+        assert refused.status_code == 400
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.NORMAL
+
+    # Editor B saves a Deskew change first: editor A's declaration was made against
+    # the old revisions and must conflict instead of overwriting B's edit.
+    saved = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 1.0},
+            "expected_revision": stale["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert saved.status_code in {200, 202}, saved.content
+    conflict = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": stale},
+        content_type="application/json",
+    )
+    assert conflict.status_code == 409
+    assert not page.disposition_events.exists()
+
+    poller = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state)
+    poller.poll()
+    current = dict(page.stage_states.values_list("stage", "revision"))
+    declared = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": current},
+        content_type="application/json",
+    )
+    assert declared.status_code == 200, declared.content
+    # Editor B's open workspace receives every row of the page with the new state.
+    update = poller.poll()
+    assert update.payload is not None
+    rows = {row["stage"]: row for row in update.payload["stages"]}
+    assert {stage for stage, row in rows.items() if row["skip_reason"] == "declared_blank"} == {
+        "deskew",
+        "select_content",
+        "dewarping",
+        "output",
+    }
+    assert rows["margins"]["parameters"].get("declared_blank") is True
+    # ...and B's next save with its old revision conflicts; editing a skipped stage
+    # is refused until the declaration is cleared.
+    late = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": current["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert late.status_code == 409
+    refused_edit = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": rows["deskew"]["revision"],
+        },
+        content_type="application/json",
+    )
+    assert refused_edit.status_code == 400
+
+    # The job overview shows the badge.
+    overview = client.get(f"/scan/jobs/{job.pk}/workspace/?view=html")
+    assert b"data-page-blank" in overview.content
 
 
 @pytest.mark.django_db(transaction=True)
