@@ -20,7 +20,7 @@ from django.conf import settings as django_settings
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q, Subquery
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q, Subquery
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -1066,9 +1066,18 @@ def stage_job_status(
 
 
 def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
+    """Jobs for the JSON list (#226): pages, versions and open todos in four queries."""
+    pages = ScanPage.objects.order_by("logical_sequence_number", "side").prefetch_related(
+        "versions",
+        Prefetch(
+            "todos",
+            queryset=ScanTodo.objects.filter(state=ScanTodo.State.OPEN).only("pk", "scan_page_id"),
+            to_attr="open_todos",
+        ),
+    )
     queryset = (
         ScanJob.objects.select_related("book", "operator")
-        .prefetch_related("pages", "pages__versions")
+        .prefetch_related(Prefetch("pages", queryset=pages, to_attr="ordered_pages"))
         .order_by("-created_at")
     )
     if with_open_todo_count:
@@ -1079,6 +1088,9 @@ def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
                     todos__state=ScanTodo.State.OPEN,
                     todos__todo_type=ScanTodo.TodoType.RESCAN,
                 ),
+                # The with_open_todos filter joins todos again; without distinct the
+                # count is multiplied by that join.
+                distinct=True,
             )
         )
     return queryset
@@ -1125,16 +1137,22 @@ def _scan_job_payload(job: ScanJob) -> dict[str, Any]:
     return _serialize_scan_job_with_pages(job, include_pages=True)
 
 
-def _scan_job_payload_with_open_todos(job: ScanJob) -> dict[str, Any]:
-    payload = _serialize_scan_job(
-        job,
-        include_open_todo_count=True,
-        include_pipeline=True,
-    )
-    payload["pages"] = [
-        _serialize_scan_page(page)
-        for page in job.pages.all().order_by("logical_sequence_number", "side")
-    ]
+def _scan_job_list_item(job: ScanJob, *, include_open_todo_count: bool = False) -> dict[str, Any]:
+    """One ``GET /scan/jobs/`` item from :func:`_scan_job_queryset`'s prefetches (#226).
+
+    The query count does not grow with the number of pages, and nothing touches scan
+    storage: the per-page pipeline progress (which checks every page file on disk)
+    is only part of the job detail, ``GET /scan/jobs/{id}/``.
+    """
+    payload = _serialize_scan_job(job, include_open_todo_count=include_open_todo_count)
+    pages: list[dict[str, Any]] = []
+    for page in job.ordered_pages:  # type: ignore[attr-defined]
+        versions = list(page.versions.all())
+        item = _serialize_scan_page(page, versions=versions, open_todo_count=len(page.open_todos))
+        if _prefetched_active_version(versions) is not None:
+            item["thumbnail"] = _scan_page_thumbnail_url(page)
+        pages.append(item)
+    payload["pages"] = pages
     return payload
 
 
@@ -2107,8 +2125,9 @@ def scan_jobs(
                     "books": Book.objects.order_by("title")[:500],
                 },
             )
-        serializer = _scan_job_payload_with_open_todos if include_open_todos else _scan_job_payload
-        items = [serializer(job) for job in queryset]
+        items = [
+            _scan_job_list_item(job, include_open_todo_count=include_open_todos) for job in queryset
+        ]
         return JsonResponse({"items": items, "count": len(items)})
 
     payload = _parse_scan_request_payload(request)

@@ -423,6 +423,18 @@ export function stripSourceStage(
   return undefined;
 }
 
+/**
+ * How many page stages Run all would process (#224): every stage of every page
+ * without a current result. Current results are kept, so they are not counted.
+ */
+export function runAllEstimate(pages: Iterable<{ stages: readonly ReadinessFields[] }>): number {
+  let steps = 0;
+  for (const page of pages) {
+    for (const name of STAGE_ORDER) if (!stageReadiness(page, name).current) steps += 1;
+  }
+  return steps;
+}
+
 /** Full-resolution size of a page at ``stage`` for the width/height orders. */
 export function stageSize(
   page: Pick<WorkspacePage, "stages">,
@@ -1028,8 +1040,10 @@ class WorkspaceController {
 
     start.addEventListener("click", () => {
       const pages = this.pages.size;
+      const steps = runAllEstimate(this.pages.values());
       if (window.confirm(
-        `Check ${pages} pages through ${STAGE_ORDER.length} stages? Up to ${pages * STAGE_ORDER.length} stages may run. Current results and saved manual settings are kept.`,
+        `Run all: ${pages} pages, ${STAGE_ORDER.length} stages: about ${steps} stage job${steps === 1 ? "" : "s"} ` +
+          `(${pages * STAGE_ORDER.length - steps} already current). Current results and saved manual settings are kept.`,
       )) void refresh("start");
     });
     cancel.addEventListener("click", () => void refresh("cancel"));

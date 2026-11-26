@@ -46,7 +46,7 @@ import {
   visibleRange,
 } from "./page-strip";
 import { clampZoom, fitView, MAX_ZOOM, MIN_ZOOM, panBy, wheelFactor, zoomAt } from "./pan-zoom";
-import { fillUrl, stageSize, stripSourceStage } from "./scantailor-workspace";
+import { fillUrl, runAllEstimate, stageSize, stripSourceStage } from "./scantailor-workspace";
 
 describe("pan and zoom (#195 step 3)", () => {
   it("fits the whole image centred in the pane", () => {
@@ -202,7 +202,7 @@ describe("editor helpers", () => {
     });
   };
 
-  it("shows the current stage's output, else the last completed stage before it", () => {
+  it("shows the furthest current stage, whichever stage is selected (#221)", () => {
     const page = {
       stages: chain(["deskew", "success"], ["select_content", "success"], ["dewarping", "queued"]),
     } as never;
@@ -224,6 +224,42 @@ describe("editor helpers", () => {
     const stale = chain(["deskew", "success"], ["select_content", "success"]);
     stale[0]!.settings_applied = false;
     expect(stripSourceStage({ stages: stale } as never)).toBe(undefined);
+    // Invalidating a middle stage falls back to the furthest still-current stage before
+    // it, although later stages still hold (now stale) results.
+    const middle = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    middle[2]!.settings_applied = false;
+    expect(stripSourceStage({ stages: middle } as never)?.stage).toBe("select_content");
+    // A queued or running stage does not blank the thumbnail.
+    const running = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "running"],
+    );
+    expect(stripSourceStage({ stages: running } as never)?.stage).toBe("dewarping");
+  });
+
+  it("estimates Run all from the stages without a current result (#224)", () => {
+    const finished = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    const partial = chain(["deskew", "success"], ["select_content", "failed"]);
+    expect(runAllEstimate([])).toBe(0);
+    expect(runAllEstimate([{ stages: finished }] as never)).toBe(0);
+    expect(runAllEstimate([{ stages: [] }] as never)).toBe(5);
+    expect(
+      runAllEstimate([{ stages: finished }, { stages: partial }, { stages: [] }] as never),
+    ).toBe(4 + 5);
   });
 
   it("uses the content box for Select Content and the output size elsewhere", () => {
