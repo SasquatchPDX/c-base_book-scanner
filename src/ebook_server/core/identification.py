@@ -1545,7 +1545,7 @@ def _query_concurrently(
     """Run ``active`` providers in threads within the budget; stop early when decisive."""
     results: dict[int, tuple[list[dict[str, Any]], ProviderOutcome]] = {}
     budget = provider_budget_seconds()
-    early_exit = early_exit_enabled()
+    early_exit = bool(signals.isbns) and early_exit_enabled()
     started_at = perf_counter()
     executor = ThreadPoolExecutor(
         max_workers=min(len(active), MAX_CONCURRENT_PROVIDERS),
@@ -2684,37 +2684,20 @@ def candidates_group_as_one_work(
     )
 
 
-def _rooted_author_evidence(signals: IdentificationInput) -> bool:
-    """The file names its authors itself: embedded, sidecar, explicit header or layout."""
-    return any(
-        group.kind == AUTHORS_COAUTHORS
-        and group.source in {EVIDENCE_EMBEDDED, EVIDENCE_SIDECAR, EVIDENCE_HEADER, EVIDENCE_LAYOUT}
-        for group in signals.author_groups()
-    )
-
-
 def decisive_candidate(
     signals: IdentificationInput,
     candidates: list[IdentificationCandidate],
 ) -> IdentificationCandidate | None:
-    """A candidate so clearly the file's book that other providers need not answer.
+    """Return a candidate that confirms the file's ISBN, title and author evidence.
 
-    Used only to stop waiting for slower providers (#220, G2); acceptance still goes
-    through every intake check. Decisive is either
-
-    * the file's own ISBN confirmed by the record's edition, with a title agreeing
-      with the file and real authors not contradicting the file's, or
-    * an exact title and strong author match against author evidence the file states
-      itself (not a file-name or folder guess) that passes the strong-match rule's
-      checks and has no rival of another work within the tie margin.
-
-    A title-only file is never decisive. ``None`` when nothing is.
+    Without a source ISBN, wait for the remaining providers within their budget:
+    title and author identify a work, and a slower result can reveal an edition tie.
+    Intake still applies all acceptance checks to the returned candidates.
     """
-    if not candidates:
+    file_isbns = _isbn13_set(signals.isbns)
+    if not file_isbns:
         return None
     ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
-    file_isbns = _isbn13_set(signals.isbns)
-    config = _strong_match_settings()
     for candidate in ranked:
         authors = [a for a in candidate.authors if not is_placeholder_author(a)]
         if not authors or edition_conflicts(candidate, signals):
@@ -2727,19 +2710,6 @@ def decisive_candidate(
             and title_agrees
             and candidate.score >= AUTO_ACCEPT_SCORE
         ):
-            return candidate
-        if not _rooted_author_evidence(signals):
-            continue
-        if _strong_match_assessment(signals, candidate, config)["blocked_by"]:
-            continue
-        rivals = [
-            other
-            for other in ranked
-            if other is not candidate
-            and abs(candidate.score - other.score) <= config.tie_margin
-            and not candidates_group_as_one_work(candidate, other)
-        ]
-        if not rivals:
             return candidate
     return None
 

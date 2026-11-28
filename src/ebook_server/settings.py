@@ -139,7 +139,7 @@ class Settings(BaseSettings):
     metadata_rate_limit_max_wait_seconds: float = 60.0
     # Provider lookup costs (#220, docs/intake-evaluation.md): wall-clock budget per
     # provider, circuit breaker after repeated failures, reuse of identical queries
-    # (0 disables), and stopping early once a finished provider is decisive.
+    # (0 disables), and stopping early once a provider confirms the source ISBN.
     metadata_provider_timeout_seconds: float = 20.0
     metadata_provider_breaker_failures: int = 3
     metadata_provider_breaker_cooldown_seconds: float = 120.0

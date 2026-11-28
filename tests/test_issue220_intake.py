@@ -193,6 +193,7 @@ def test_2001_a_space_odissey_unknown_header_credit_is_used_and_no_placeholder_i
     path = job.evidence[identification.SOURCE_PATH_EVIDENCE_KEY]
     assert path["authors"] == []  # the Calibre "Unknown/" folder is never an author
     assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None
     assert [author.full_name for author in job.book.authors.all()] == ["Arthur C. Clarke"]
 
 
@@ -251,6 +252,7 @@ def test_nightfall_authorless_isbn_record_takes_authors_from_a_same_title_record
     (job,) = _import_all(root, tmp_path)
 
     assert job.state == ImportJob.State.COMPLETE, job.evidence
+    assert job.book is not None
     assert [author.full_name for author in job.book.authors.all()] == ["Isaac Asimov"]
     completed = job.evidence[intake.AUTO_ACCEPT_AUTHORS_COMPLETED_KEY]
     assert completed["provider_id"] == "dnb"
@@ -373,6 +375,7 @@ def test_flinx_in_flux_other_printing_is_accepted_as_the_work(
     assert mismatch["edition_conflicts"] == [identification.EDITION_PUBLISHER_MISMATCH]
     assert mismatch["edition_publishers"] == ["New English Library"]
     # The other printing's ISBN is not written onto the Book.
+    assert job.book is not None
     assert not job.book.identifiers.filter(normalized_value="9780450048432").exists()
 
 
@@ -447,12 +450,13 @@ def test_brave_new_world_study_guide_and_duplicates_are_no_rivals(
     (job,) = _import_all(root, tmp_path)
 
     assert job.state == ImportJob.State.COMPLETE
+    assert job.book is not None
     assert [author.full_name for author in job.book.authors.all()] == ["Aldous Huxley"]
-    rule = (
-        job.metadata_candidates.filter(raw_payload__has_key=STRONG_MATCH_EVIDENCE_KEY)
-        .first()
-        .raw_payload[STRONG_MATCH_EVIDENCE_KEY]
-    )
+    candidate = job.metadata_candidates.filter(
+        raw_payload__has_key=STRONG_MATCH_EVIDENCE_KEY
+    ).first()
+    assert candidate is not None
+    rule = candidate.raw_payload[STRONG_MATCH_EVIDENCE_KEY]
     assert rule["applied"] is True
     assert "near_tied_candidate" not in rule["blocked_by"]
     # The three copies of one DNB record collapse into one candidate.
@@ -634,11 +638,11 @@ def test_path_evidence_reads_only_last_first_folders_as_authors(
 # --- G2: concurrency, early exit, budget, circuit breaker, reuse ---------------------------
 
 
-def _signals_with_embedded_author() -> identification.IdentificationInput:
+def _signals_with_embedded_author(*, isbn: str | None = None) -> identification.IdentificationInput:
     return build_identification_input(
         source_path="/in/Example Book.epub",
         original_filename="Example Book.epub",
-        extracted_metadata={"title": "Example Book", "authors": ["Author Name"]},
+        extracted_metadata={"title": "Example Book", "authors": ["Author Name"], "isbn": isbn},
     )
 
 
@@ -653,17 +657,28 @@ class SlowProvider(RecordingProvider):
 
 
 @override_settings(BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT=True)
-def test_early_exit_stops_waiting_once_a_finished_provider_is_decisive(
+def test_early_exit_stops_waiting_once_a_provider_confirms_the_source_isbn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    isbn = "9780306406157"
     release = threading.Event()
     fast = RecordingProvider(
-        "fast", [{"key": "hit", "title": "Example Book", "author_name": ["Author Name"]}]
+        "fast",
+        [
+            {
+                "key": "hit",
+                "title": "Example Book",
+                "author_name": ["Author Name"],
+                "isbn_13": [isbn],
+            }
+        ],
     )
     slow = SlowProvider("slow", release)
     _use_providers(monkeypatch, slow, fast)
     try:
-        candidates, outcomes = resolve_candidates_with_report(_signals_with_embedded_author())
+        candidates, outcomes = resolve_candidates_with_report(
+            _signals_with_embedded_author(isbn=isbn)
+        )
     finally:
         release.set()
     assert [c.provider_ref for c in candidates] == ["hit"]
@@ -672,6 +687,37 @@ def test_early_exit_stops_waiting_once_a_finished_provider_is_decisive(
         ("fast", "results"),
     ]
     assert outcomes[0].error == identification.PROVIDER_SKIPPED_REASON
+
+
+@override_settings(
+    BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT=True,
+    BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED=True,
+)
+def test_same_work_different_editions_wait_for_the_slower_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    record = {"title": "Example Book", "author_name": ["Author Name"]}
+    fast = RecordingProvider(
+        "fast", [{**record, "key": "fast-edition", "isbn_13": ["9780306406157"]}]
+    )
+    slow = SlowProvider("slow", release)
+    slow.records = [{**record, "key": "slow-edition", "isbn_13": ["9780141187761"]}]
+    _use_providers(monkeypatch, fast, slow)
+    signals = _signals_with_embedded_author()
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+    try:
+        candidates, outcomes = resolve_candidates_with_report(signals)
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert [outcome.status for outcome in outcomes] == ["results", "results"]
+    decision = intake.decide_auto_accept(candidates, ["Author Name"], file_evidence=signals)
+    assert decision.candidate is not None
+    assert decision.candidate.title == "Example Book"
+    assert decision.candidate.isbn13 is None
 
 
 @override_settings(BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT=True)

@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from django.test import Client
+from django.test import Client, override_settings
 
 from ebook_server.core import identification, scan_identification, scan_pipeline, scanner_opf
 from ebook_server.core.models import (
@@ -885,6 +885,7 @@ def test_isbn_only_opf_is_completed_in_the_background_and_finish_uses_it(
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("edition", [True, False], ids=["edition-record", "work-record"])
+@override_settings(BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED=True)
 def test_title_and_author_without_isbn_complete_the_isbn_on_a_strong_match(
     key: str, admin_client: Client, providers: list[dict[str, Any]], edition: bool
 ) -> None:
