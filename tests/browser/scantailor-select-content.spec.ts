@@ -75,11 +75,12 @@ test("auto draws the detected content box and dragging an edge makes it manual",
   const autoResult = await result.getAttribute("src");
   const inputSource = await page.locator("[data-editor-image]").getAttribute("src");
   const before = (await box.boundingBox())!;
-  // The box sits on the detected text: x 90..512 of the 600 px wide page.
+  // The detected text starts at (90, 120). The 5 px pad at 150 dpi is 10 px
+  // on this 300 dpi input, so the drawn box starts at (80, 110).
   const shown = (await page.locator("[data-editor-image]").boundingBox())!;
   const scale = shown.width / 600;
-  expect(Math.abs(before.x - (shown.x + 90 * scale))).toBeLessThan(4);
-  expect(Math.abs(before.y - (shown.y + 120 * scale))).toBeLessThan(4);
+  expect(Math.abs(before.x - (shown.x + 80 * scale))).toBeLessThan(4);
+  expect(Math.abs(before.y - (shown.y + 110 * scale))).toBeLessThan(4);
 
   // Drag the right edge 30 px to the left: only that edge moves, no request until release.
   const posts: string[] = [];

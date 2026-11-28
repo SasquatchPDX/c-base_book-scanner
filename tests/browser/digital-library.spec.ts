@@ -17,7 +17,7 @@ test("the upload picker offers TXT and the server rejects unsupported files", as
   await (await choosing).setFiles({
     name: "Browser Plain Story.txt",
     mimeType: "text/plain",
-    buffer: Buffer.from("Title: Browser Plain Story\nAuthor: Ada Digital\n\nA plain text story.\n"),
+    buffer: Buffer.from("Title: Browser Plain Story\nAuthor: Ada Lovelace\n\nA plain text story.\n"),
   });
   await page.getByRole("button", { name: "Start import" }).click();
   await expect(page).toHaveURL(/\/imports\/[0-9a-f-]+\/$/);
@@ -27,7 +27,7 @@ test("the upload picker offers TXT and the server rejects unsupported files", as
   await page.getByRole("link", { name: "Resolve metadata" }).click();
   await page.getByRole("link", { name: "Browser Plain Story", exact: true }).click();
   // This candidate comes from the same external-provider fixture as EPUB intake.
-  await expect(page.locator(".candidate-list")).toContainText("Ada Digital");
+  await expect(page.locator(".candidate-list")).toContainText("Ada Lovelace");
   await page.getByRole("button", { name: "Accept", exact: true }).click();
   await page.goto("/library/books/?view=html&q=Browser%20Plain%20Story");
   await page.getByRole("link", { name: "Browser Plain Story", exact: true }).click();
