@@ -579,18 +579,18 @@
       "rationale": "Fitting translations without file language must yield only a work."
     },
     {
-      "id": "edition-publisher-conflict",
+      "id": "edition-publisher-other-printing",
       "groups": [
         "no-isbn",
         "editions",
-        "required-review"
+        "work-only"
       ],
       "files": [
         {
           "path": "Mira Calder/The Glass Orchard.epub",
           "work": "orchard",
-          "edition": "orchard-en",
-          "require_review": true,
+          "edition": null,
+          "require_review": false,
           "metadata": {
             "title": "The Glass Orchard",
             "authors": [
@@ -598,13 +598,14 @@
             ],
             "publisher": "Northbank Press",
             "language": "en"
-          }
+          },
+          "work_only_language": "en"
         }
       ],
       "records": [
         "orchard-second"
       ],
-      "rationale": "A different publisher requires review."
+      "rationale": "Issue #220 (E1): only another printing's publisher differs; title and author identify the work, which is accepted without that printing's ISBN, publisher and year (previously required review)."
     },
     {
       "id": "edition-language-conflict",

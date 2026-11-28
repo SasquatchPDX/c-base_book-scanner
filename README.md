@@ -71,7 +71,7 @@ Run the web process and an RQ worker:
 
 ```bash
 uv run python manage.py runserver
-uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 ebook-server
+uv run rq worker --with-scheduler --config ebook_server.rq_settings --url redis://localhost:6379/0 metadata ebook-server
 ```
 
 `--with-scheduler` is required: job retries use delays, and in rq 2.x a delayed
@@ -105,7 +105,8 @@ static-file step, reverse-proxy requirements, example `systemd` units
 - `/reviews/?view=html` — low-confidence metadata review queue
 - `/review-identifications/<job-id>/` — durable repeat metadata-search status
 - `/scan/jobs/?view=html` — scanner jobs and page capture
-- `/scan/jobs/<id>/workspace/?view=html` — per-page ScanTailor workspace
+- `/scan/jobs/<id>/editor/` — ScanTailor editor: per-page processing, rescan requests and finish
+  (`/scan/jobs/<id>/workspace/?view=html`, the retired job overview, redirects here)
 - `/scan/jobs/<id>/identify/` — queue public metadata lookup for an unlinked scan
 - `/scan-identifications/<job-id>/` — durable scan-identification status
 - `/scan/jobs/<id>/finish/` — queue scan packaging and optional OCR

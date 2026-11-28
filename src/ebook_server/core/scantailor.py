@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from math import ceil, floor, isfinite
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import cv2
 import numpy as np
@@ -39,7 +39,9 @@ from .models import (
     ProcessingJob,
     ScanJob,
     ScanPage,
+    ScanPageDispositionEvent,
     ScanPageVersion,
+    ScanTailorRun,
     ScanTailorStageState,
     StorageLocation,
 )
@@ -66,7 +68,7 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v3 (#195 step 4): port of upstream SkewFinder; positive angles turn clockwise.
     "deskew": "skewfinder-v3",
     # v3 (#195 step 5): port of upstream ContentBoxFinder.
-    "select_content": "contentboxfinder-v3",
+    "select_content": "contentboxfinder-v4",
     # v3 (#208): port of upstream page_layout: one page size for all, margins in mm.
     "margins": "pagelayout-v3",
     # v2: the output canvas keeps the whole warped input instead of cropping to the quad.
@@ -74,8 +76,10 @@ DEFAULT_STAGE_ALGORITHM_VERSION: Final[dict[str, str]] = {
     # v4: transform op, detection at working resolution (#195 step 2).
     # v5 (#195 step 6a): upstream's cylindrical-surface model (CylindricalSurfaceDewarper).
     "dewarping": "cylindrical-v5",
-    # v3: rendered once from the original through the composed transform.
-    "output": "opencv-zones-v3",
+    # v4: Wolf collects page-wide statistics before thresholding tiles.
+    # v5 (#225): one coefficient per algorithm, Fox's k without dead zone, no k
+    # clamping for Wolf/Window, Wolf bounds as settings, Su et al. (2010).
+    "output": "opencv-zones-v5",
 }
 
 
@@ -148,7 +152,7 @@ def _build_output_name(state: ScanTailorStageState, *, preview: bool = False) ->
     # Stages 1-4 keep a lossless working-resolution image (the next stage's input) and
     # a JPEG preview. Output keeps the full-resolution page and a PNG preview, so
     # binarised text stays crisp.
-    if state.stage == ScanTailorStageState.Stage.OUTPUT.value:
+    if state.stage == ScanTailorStageState.Stage.OUTPUT.value or is_blank_margins(state):
         return "preview.png" if preview else "output.png"
     return "preview.jpg" if preview else "work.png"
 
@@ -457,8 +461,16 @@ STAGE_SETTING_KEYS: Final[dict[str, tuple[str, ...]]] = {
         "text_algorithm",
         "picture_algorithm",
         "window_size",
+        # Shared by every algorithm before #225; read when no own coefficient is set.
         "k",
         "r",
+        "sauvola_k",
+        "wolf_k",
+        "wolf_lower_bound",
+        "wolf_upper_bound",
+        "fox_k",
+        "window_k",
+        "su_min_edge_ratio",
     ),
 }
 
@@ -499,6 +511,12 @@ def stage_input_fingerprint(state: ScanTailorStageState) -> str:
     :func:`margins_input_fingerprint`), so a change of the aggregate makes every
     aligned page's Margins stale through this same mechanism.
     """
+    if is_blank_margins(state):
+        version = state.input_scan_page_version
+        return margins_input_fingerprint(
+            version.checksum_sha256 if version is not None else "",
+            job_margins_aggregate(state).fingerprint,
+        )
     if previous_stage(state.stage) is None:
         version = state.input_scan_page_version
         if version is None:
@@ -528,7 +546,18 @@ def margins_depends_on_aggregate(state: ScanTailorStageState) -> bool:
     version = state.algorithm_version or ""
     if not version or version.startswith(_PRE_LAYOUT_MARGINS_VERSION_PREFIX):
         return False
-    return page_layout.aligns_with_others(state.parameters or {})
+    return is_blank_margins(state) or page_layout.aligns_with_others(state.parameters or {})
+
+
+def is_blank_margins(state: ScanTailorStageState) -> bool:
+    return (
+        state.stage == ScanTailorStageState.Stage.MARGINS
+        and (state.parameters or {}).get("declared_blank") is True
+    )
+
+
+def is_declared_blank_stage(state: ScanTailorStageState) -> bool:
+    return state.status == ScanTailorStageState.StageStatus.SKIPPED or is_blank_margins(state)
 
 
 #: Margins algorithm versions before #208's page layout port ("padding-v2" and older).
@@ -611,11 +640,13 @@ def stage_result_is_current(state: ScanTailorStageState) -> bool:
     recorded input fingerprint equals :func:`stage_input_fingerprint`, and the
     predecessor is itself current (recursively up to the first stage).
     """
+    if state.status == ScanTailorStageState.StageStatus.SKIPPED:
+        return True
     if state.status != ScanTailorStageState.StageStatus.SUCCESS:
         return False
     if not stage_settings_applied(state):
         return False
-    if previous_stage(state.stage) is not None:
+    if previous_stage(state.stage) is not None and not is_blank_margins(state):
         predecessor = state.input_stage_state
         if predecessor is None or not stage_result_is_current(predecessor):
             return False
@@ -624,6 +655,8 @@ def stage_result_is_current(state: ScanTailorStageState) -> bool:
 
 def stage_waiting_for(state: ScanTailorStageState) -> str | None:
     """The first predecessor (pipeline order) without a current result, else None."""
+    if is_blank_margins(state) or state.status == ScanTailorStageState.StageStatus.SKIPPED:
+        return None
     chain: list[ScanTailorStageState] = []
     current = state
     while (predecessor_name := previous_stage(current.stage)) is not None:
@@ -662,6 +695,8 @@ def _common_size_changed(state: ScanTailorStageState) -> bool:
     """The Margins input is unchanged except for the job's common page size."""
     if not margins_depends_on_aggregate(state):
         return False
+    if is_blank_margins(state):
+        return True
     predecessor = state.input_stage_state
     if predecessor is None or not stage_result_is_current(predecessor):
         return False
@@ -722,6 +757,20 @@ def mark_state_stale(
     active_version = page.active_version()
     rows = ScanTailorStageState.objects.filter(scan_job_id=scan_job_id, scan_page_id=page_id)
     now = timezone.now()
+    if page.declared_blank and active_version is not None:
+        # A rescan replaced a page declared blank (#219): the new image may have
+        # content, so the declaration never silently survives it. The stages run again.
+        states = list(rows.select_for_update().order_by("pk"))
+        margins = next((state for state in states if is_blank_margins(state)), None)
+        declared_version = margins.input_scan_page_version if margins is not None else None
+        set_page_blank(
+            page,
+            states,
+            version=declared_version or active_version,
+            blank=False,
+            reason=DISPOSITION_REASON_REPLACED,
+        )
+        transaction.on_commit(lambda: queue_after_blank_edit(scan_job_id, page_id))
     if active_version is not None:
         rows.filter(stage=stage_order()[0]).update(
             input_scan_page_version=active_version,
@@ -729,6 +778,75 @@ def mark_state_stale(
         )
     logger.info("scantailor_page_source_changed", scan_page_id=page_id, reason=reason)
     return int(rows.update(updated_at=now))
+
+
+#: ``ScanPageDispositionEvent.reason`` values (#219).
+DISPOSITION_REASON_DECLARED: Final[str] = "declared"
+DISPOSITION_REASON_REPLACED: Final[str] = "raw_version_replaced"
+
+
+def set_page_blank(
+    page: ScanPage,
+    states: list[ScanTailorStageState],
+    *,
+    version: ScanPageVersion,
+    blank: bool,
+    actor_id: int | None = None,
+    reason: str = DISPOSITION_REASON_DECLARED,
+) -> None:
+    """Change a declaration under the same row locks as stage edits and page replacement.
+
+    Declaring or clearing is an audited event (#219). Every stage row gets a new
+    revision, so a concurrent editor's stale save conflicts, and live clients see the
+    change through the workspace events. Blank: Deskew, Select Content, Dewarping and
+    Output become ``skipped`` (reason ``declared_blank``); Margins renders a white page
+    of the common size. Clearing re-queues the stages from the first one.
+    """
+    disposition = ScanPage.Disposition.BLANK if blank else ScanPage.Disposition.NORMAL
+    ScanPageDispositionEvent.objects.create(
+        page=page,
+        version=version,
+        actor_id=actor_id,
+        previous_disposition=page.page_disposition,
+        disposition=disposition,
+        reason=reason,
+    )
+    page.page_disposition = disposition
+    page.save(update_fields=["page_disposition", "updated_at"])
+    for state in states:
+        status = ScanTailorStageState.StageStatus
+        state.revision += 1
+        _drop_queued_stage_job(state.worker_job_id)
+        state.worker_job_id = ""
+        state.status = status.UNKNOWN
+        state.last_error = ""
+        state.applied_revision = None
+        state.applied_parameters = {}
+        state.applied_input_sha256 = ""
+        state.output_storage_identifier = ""
+        state.preview_storage_identifier = ""
+        state.output_sha256 = ""
+        state.output_size_bytes = None
+        state.started_at = None
+        state.finished_at = None
+        state.parameters = dict(state.parameters or {})
+        state.parameters.pop("declared_blank", None)
+        if state.stage == ScanTailorStageState.Stage.MARGINS:
+            state.input_scan_page_version = version if blank else None
+            state.input_storage_identifier = version.storage_identifier if blank else ""
+            if blank:
+                state.parameters["declared_blank"] = True
+        elif blank:
+            state.status = status.SKIPPED
+        state.save()
+
+
+def queue_after_blank_edit(scan_job_id: str, page_id: str, actor_id: int | None = None) -> None:
+    page = ScanPage.objects.get(pk=page_id)
+    stage = ScanTailorStageState.Stage.MARGINS if page.declared_blank else stage_order()[0]
+    state = page.stage_states.get(stage=stage)
+    ensure_stage_result(state, requested_by_user_id=actor_id)
+    _requeue_after_layout_change(state)
 
 
 def _set_inputs_from_page(state: ScanTailorStageState, scan_page: ScanPage) -> None:
@@ -1008,7 +1126,9 @@ def _detect_content(stage_input: StageInput) -> tuple[int, int, int, int] | None
     found = content_box.find_content_box(gray150, page_mask)
     if found is None:
         return None
-    left, top, right, bottom = found
+    left, top, right, bottom = _pad_content_box(
+        found, (gray150.shape[1], gray150.shape[0]), page_mask
+    )
     # QRect -> QRectF: the right/bottom edge of the last pixel, then back to full size.
     box = (
         int(floor(left / to150_x)),
@@ -1022,6 +1142,34 @@ def _detect_content(stage_input: StageInput) -> tuple[int, int, int, int] | None
         max(1, min(full_w, box[2])),
         max(1, min(full_h, box[3])),
     )
+
+
+CONTENT_PADDING_AT_WORK_DPI: Final[int] = 5
+
+
+def _pad_content_box(box: Box, size: tuple[int, int], page_mask: np.ndarray | None = None) -> Box:
+    """Pad an inclusive detector rectangle in 150 dpi coordinates."""
+    left, top, right, bottom = box
+    width, height = size
+    distance = CONTENT_PADDING_AT_WORK_DPI
+    if page_mask is None:
+        return (
+            max(0, left - distance),
+            max(0, top - distance),
+            min(width - 1, right + distance),
+            min(height - 1, bottom + distance),
+        )
+    # Never grow into the synthetic corner triangles introduced by Deskew.
+    for _ in range(distance):
+        if left > 0 and page_mask[top : bottom + 1, left - 1].all():
+            left -= 1
+        if right + 1 < width and page_mask[top : bottom + 1, right + 1].all():
+            right += 1
+        if top > 0 and page_mask[top - 1, left : right + 1].all():
+            top -= 1
+        if bottom + 1 < height and page_mask[bottom + 1, left : right + 1].all():
+            bottom += 1
+    return left, top, right, bottom
 
 
 def _run_select_content(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
@@ -1261,6 +1409,40 @@ def _run_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageR
     )
 
 
+def blank_page_size(
+    aggregate: page_layout.Aggregate, dpi: tuple[int, int], original_size: tuple[int, int]
+) -> tuple[int, int]:
+    if aggregate.width_mm and aggregate.height_mm:
+        return (
+            max(1, round(aggregate.width_mm * dpi[0] / MM_PER_INCH)),
+            max(1, round(aggregate.height_mm * dpi[1] / MM_PER_INCH)),
+        )
+    # All-blank jobs and jobs whose normal pages have yet to reach Select Content.
+    return original_size
+
+
+def blank_canvas(size: tuple[int, int]) -> Image.Image:
+    if Image.MAX_IMAGE_PIXELS is not None and size[0] * size[1] > Image.MAX_IMAGE_PIXELS:
+        raise ImageLoadError("blank page canvas exceeds image size limit")
+    return Image.new("L", size, color=255)
+
+
+def _run_blank_margins(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
+    aggregate = job_margins_aggregate(state)
+    size = blank_page_size(aggregate, stage_input.dpi, stage_input.full_size)
+    return StageResult(
+        image=blank_canvas(size),
+        full_size=size,
+        parameters={
+            "declared_blank": True,
+            "aggregate_fingerprint": aggregate.fingerprint,
+            "common_page_width_mm": aggregate.width_mm,
+            "common_page_height_mm": aggregate.height_mm,
+        },
+        full_resolution=True,
+    )
+
+
 type _MarginsRow = tuple[int, int, str, dict[str, Any]]
 
 #: Run states in which a row still holds its last successful result (#205).
@@ -1376,7 +1558,7 @@ def requeue_stale_margins(job: ScanJob | Any) -> int:
         state_id
         for state_id, _revision, status, parameters in rows
         if status == ScanTailorStageState.StageStatus.SUCCESS
-        and page_layout.aligns_with_others(parameters)
+        and (parameters.get("declared_blank") is True or page_layout.aligns_with_others(parameters))
         and parameters.get("aggregate_fingerprint") != aggregate.fingerprint
     }
     if not candidates:
@@ -1609,9 +1791,97 @@ def _run_dewarping(state: ScanTailorStageState, stage_input: StageInput) -> Stag
     return _run_cylindrical_dewarp(state, stage_input)
 
 
+#: Output algorithms (#225). ``su`` is Su, Lu & Tan (2010), added by #225.
+OUTPUT_MODES: Final[frozenset[str]] = frozenset(
+    {"otsu", "sauvola", "wolf", "fox", "window", "grad", "su", "copy"}
+)
+
+
+@dataclass(frozen=True)
+class OutputParameter:
+    """One Output setting (#225): its default and the clamp the code cannot exceed.
+
+    ``hard`` is a technical limit (memory, the 8-bit range); a value beyond it is
+    clamped. Recommended ranges are guidance in the editor only and never clamp.
+    """
+
+    default: float
+    hard: tuple[float, float] | None = None
+    #: Settings saved before #225 had one ``k`` shared by every algorithm.
+    legacy_key: str | None = None
+
+
+OUTPUT_PARAMETERS: Final[dict[str, OutputParameter]] = {
+    # 501 bounds the tile halo (≤ 253 px) and thereby the float scratch per tile.
+    "window_size": OutputParameter(35, hard=(3, 501)),
+    # ScanTailor Advanced defaults: Sauvola 0.34, Wolf 0.3, Wolf bounds 1/254.
+    "sauvola_k": OutputParameter(0.34, legacy_key="k"),
+    "r": OutputParameter(128.0, hard=(1.0, 1e6)),
+    "wolf_k": OutputParameter(0.3, legacy_key="k"),
+    "wolf_lower_bound": OutputParameter(1, hard=(0, 255)),
+    "wolf_upper_bound": OutputParameter(254, hard=(0, 255)),
+    "fox_k": OutputParameter(0.2, legacy_key="k"),
+    "window_k": OutputParameter(0.33, legacy_key="k"),
+    "su_min_edge_ratio": OutputParameter(1.0, hard=(0.0, 1e6)),
+}
+
+#: Which settings each algorithm reads; the editor shows exactly these.
+OUTPUT_MODE_PARAMETERS: Final[dict[str, tuple[str, ...]]] = {
+    "otsu": (),
+    "sauvola": ("window_size", "sauvola_k", "r"),
+    "wolf": ("window_size", "wolf_k", "wolf_lower_bound", "wolf_upper_bound"),
+    "fox": ("window_size", "fox_k"),
+    "window": ("window_size", "window_k"),
+    "grad": (),
+    "su": ("window_size", "su_min_edge_ratio"),
+    "copy": (),
+}
+
+
+def output_parameter(parameters: dict[str, Any], key: str) -> float:
+    """A finite Output setting: own key, else the pre-#225 shared ``k``, else default."""
+    spec = OUTPUT_PARAMETERS[key]
+    value: float | None = None
+    for candidate in (key, spec.legacy_key):
+        if candidate and candidate in parameters:
+            coerced = _coerce_float(parameters[candidate], float("nan"))
+            if isfinite(coerced):
+                value = coerced
+                break
+    if value is None:
+        value = float(spec.default)
+    if spec.hard is not None:
+        value = min(max(value, spec.hard[0]), spec.hard[1])
+    return value
+
+
+@dataclass(frozen=True)
+class OutputCoefficients:
+    """The resolved settings one algorithm runs with (#225)."""
+
+    window_size: int = 35
+    k: float = 0.33
+    r: float = 128.0
+    lower_bound: int = 1
+    upper_bound: int = 254
+    min_edge_ratio: float = 1.0
+
+
+def output_coefficients(parameters: dict[str, Any], mode: str) -> OutputCoefficients:
+    k_key = f"{mode}_k"
+    return OutputCoefficients(
+        window_size=round(output_parameter(parameters, "window_size")),
+        k=output_parameter(parameters, k_key) if k_key in OUTPUT_PARAMETERS else 0.0,
+        r=output_parameter(parameters, "r"),
+        lower_bound=round(output_parameter(parameters, "wolf_lower_bound")),
+        upper_bound=round(output_parameter(parameters, "wolf_upper_bound")),
+        min_edge_ratio=output_parameter(parameters, "su_min_edge_ratio"),
+    )
+
+
 def _coerce_output_mode(value: object, default: str = "otsu") -> str:
     mode = str(value).strip().lower()
-    if mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
+    if mode in OUTPUT_MODES:
         return mode
     if mode in {"adaptiveta", "adaptive", "window_threshold"}:
         return "window"
@@ -1643,9 +1913,8 @@ def _zone_rectangles(
     }
 
 
-def _pil_otsu_threshold(image: Image.Image) -> int:
-    grayscale = image.convert("L")
-    histogram = grayscale.histogram()
+def _otsu_from_histogram(histogram: Sequence[int]) -> int:
+    """Otsu's global threshold of a 256-bin histogram; values above it are foreground."""
     total = sum(histogram)
     if total == 0:
         return 128
@@ -1675,9 +1944,60 @@ def _pil_otsu_threshold(image: Image.Image) -> int:
     return best_threshold
 
 
+def _pil_otsu_threshold(image: Image.Image) -> int:
+    return _otsu_from_histogram(image.convert("L").histogram())
+
+
 def _odd_window(window_size: int) -> int:
     block = max(3, window_size)
     return block if block % 2 == 1 else block + 1
+
+
+def _local_statistics(gray: np.ndarray, block: int) -> tuple[np.ndarray, np.ndarray]:
+    mean = cv2.blur(gray, (block, block))
+    mean_square = cv2.blur(gray * gray, (block, block))
+    return mean, np.sqrt(np.maximum(mean_square - mean * mean, 0.0))
+
+
+#: Fox's offset below the local mean that flat, noisy paper never reaches (#225).
+FOX_NOISE_FLOOR: Final = 0.12
+
+
+def _su_contrast(gray: np.ndarray) -> np.ndarray:
+    """Su et al. (2010), eq. 1: (max - min) / (max + min + eps) over 3x3, as 0..255."""
+    kernel = np.ones((3, 3), np.uint8)
+    local_max = cv2.dilate(gray, kernel).astype(np.float32)
+    local_min = cv2.erode(gray, kernel).astype(np.float32)
+    contrast = (local_max - local_min) / (local_max + local_min + 1e-6)
+    # Quantised so a page-wide Otsu over tiles equals the one over the whole image.
+    return np.rint(contrast * 255.0).astype(np.uint8)
+
+
+def _su_threshold(
+    gray: np.ndarray, block: int, min_edge_ratio: float, contrast_cutoff: int | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Su et al. (2010): the per-pixel threshold and where it is defined.
+
+    High-contrast pixels (Otsu on the contrast image) mark stroke edges. A pixel is
+    text when its window holds at least ``N_min = min_edge_ratio * window`` of them and
+    its intensity is at most ``E_mean + E_std / 2`` of those edge pixels.
+    """
+    contrast = _su_contrast(gray)
+    if contrast_cutoff is None:
+        contrast_cutoff = _otsu_from_histogram(
+            np.bincount(contrast.ravel(), minlength=256).tolist()
+        )
+    edges = (contrast > contrast_cutoff).astype(np.float32)
+    gray_f = gray.astype(np.float32)
+    share = cv2.blur(edges, (block, block))
+    weighted = cv2.blur(edges * gray_f, (block, block))
+    weighted_square = cv2.blur(edges * gray_f * gray_f, (block, block))
+    count = share * float(block * block)
+    defined = count >= max(1.0, min_edge_ratio * block) - 1e-3
+    safe = np.maximum(share, 1e-6)
+    mean = weighted / safe
+    deviation = np.sqrt(np.maximum(weighted_square / safe - mean * mean, 0.0))
+    return mean + deviation / 2.0, defined
 
 
 def _binarize_with_cv2(
@@ -1687,9 +2007,22 @@ def _binarize_with_cv2(
     *,
     window_size: int,
     k: float,
-    r: float,
+    r: float = 128.0,
     invert: bool,
+    lower_bound: int = 1,
+    upper_bound: int = 254,
+    min_edge_ratio: float = 1.0,
+    wolf_statistics: tuple[float, float] | None = None,
+    su_contrast_cutoff: int | None = None,
+    observe_threshold: Callable[[float | np.ndarray], None] | None = None,
 ) -> Image.Image:
+    """Binarise one image or tile; white where the pixel is above its threshold.
+
+    ``k`` is the coefficient of the selected algorithm (#225: each has its own) and is
+    used as given: no clamping, every formula is monotonic in ``k``. Page-wide values
+    (Wolf's minimum and maximum deviation, Su's contrast cutoff) are passed in by
+    the tiled caller so every tile uses the same ones.
+    """
     if cv2 is None or np is None:
         raise RuntimeError("opencv is not available")
 
@@ -1697,58 +2030,70 @@ def _binarize_with_cv2(
     if not isinstance(gray, np.ndarray):
         gray = np.array(source.convert("L"))
 
+    threshold: float | np.ndarray
     if mode == "otsu":
-        _, threshold = cv2.threshold(
+        threshold, output = cv2.threshold(
             gray,
             0,
             255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
-        output = threshold
     elif mode == "window":
-        # Local-mean threshold with a *relative* offset below the mean: paper noise
-        # stays white, only pixels clearly darker than their surroundings turn black.
+        # Project-specific (no upstream source): local mean lowered by k/2 of itself,
+        # T = m * (1 - k/2). Paper noise stays white; larger k, less black.
         block = _odd_window(window_size)
         local_mean = cv2.blur(gray.astype(np.float32), (block, block))
-        threshold = local_mean * (1.0 - min(max(k, 0.0), 1.0) * 0.5)
+        threshold = local_mean * (1.0 - k * 0.5)
         output = (gray.astype(np.float32) > threshold).astype(np.uint8) * 255
     elif mode == "fox":
-        # Niblack-style (mean - k*std) with a floor on the offset so flat, noisy
-        # paper (std ~ 0) is not split in half by noise around its own mean.
+        # Project-specific Niblack variant (no upstream source):
+        # T = m * (1 - 0.12) - k * s. The fixed 12 % offset keeps flat, noisy paper
+        # white; k adds Niblack's contrast term on top, so it acts at every value
+        # (#225: it used to be max(|k|*s, 0.12*m), a dead zone followed by a cliff).
         block = _odd_window(window_size)
         gray_f = gray.astype(np.float32)
-        local_mean = cv2.blur(gray_f, (block, block))
-        local_sq = cv2.blur(gray_f * gray_f, (block, block))
-        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
-        offset = np.maximum(abs(k) * local_std, 0.12 * local_mean)
-        output = (gray_f > (local_mean - offset)).astype(np.uint8) * 255
+        local_mean, local_std = _local_statistics(gray_f, block)
+        threshold = local_mean * (1.0 - FOX_NOISE_FLOOR) - k * local_std
+        output = (gray_f > threshold).astype(np.uint8) * 255
     elif mode == "sauvola":
         # T = m * (1 + k * (s / r - 1)); box filters keep this fast on 24MP scans.
         block = _odd_window(window_size)
         gray_f = gray.astype(np.float32)
-        local_mean = cv2.blur(gray_f, (block, block))
-        local_sq = cv2.blur(gray_f * gray_f, (block, block))
-        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
+        local_mean, local_std = _local_statistics(gray_f, block)
         threshold = local_mean * (1.0 + k * (local_std / max(r, 1.0) - 1.0))
         output = (gray_f > threshold).astype(np.uint8) * 255
     elif mode == "wolf":
-        # Wolf-Jolion: T = (1-a)*m + a*Min + a*(s/Smax)*(m - Min)
+        # Wolf-Jolion: T = (1-a)*m + a*Min + a*(s/Smax)*(m - Min), upstream
+        # binarizeWolf: Min and Smax are page-wide; black only if gray < T, below
+        # lower_bound always black, above upper_bound always white.
         block = _odd_window(window_size)
         gray_f = gray.astype(np.float32)
-        local_mean = cv2.blur(gray_f, (block, block))
-        local_sq = cv2.blur(gray_f * gray_f, (block, block))
-        local_std = np.sqrt(np.maximum(local_sq - local_mean * local_mean, 0.0))
-        floor = float(np.percentile(gray_f[::4, ::4], 1))
-        max_std = max(float(local_std.max()), 1e-3)
-        a_coeff = min(max(k, 0.0), 1.0)
-        threshold = (
-            (1.0 - a_coeff) * local_mean
-            + a_coeff * floor
-            + a_coeff * (local_std / max_std) * (local_mean - floor)
+        local_mean, local_std = _local_statistics(gray_f, block)
+        minimum, maximum_deviation = (
+            wolf_statistics
+            if wolf_statistics is not None
+            else (float(gray.min()), float(local_std.max()))
         )
-        output = (gray_f > threshold).astype(np.uint8) * 255
+        max_std = max(maximum_deviation, 1e-3)
+        threshold = (
+            (1.0 - k) * local_mean
+            + k * minimum
+            + k * (local_std / max_std) * (local_mean - minimum)
+        )
+        black = (gray < lower_bound) | ((gray <= upper_bound) & (gray_f < threshold))
+        output = (~black).astype(np.uint8) * 255
+    elif mode == "su":
+        block = _odd_window(window_size)
+        su_threshold, defined = _su_threshold(gray, block, min_edge_ratio, su_contrast_cutoff)
+        # The paper uses I <= T; equality stays white here (as upstream Wolf does), so a
+        # window that only reaches the paper side of a sharp edge (T = paper) keeps
+        # that paper white.
+        black = defined & (gray.astype(np.float32) < su_threshold)
+        output = (~black).astype(np.uint8) * 255
+        threshold = np.where(defined, su_threshold, np.nan)
     elif mode == "grad":
-        # Gradient-aware fallback for bleed-through and uneven lighting.
+        # Project-specific (no upstream source): Otsu of the image XOR Otsu of the
+        # Sobel gradient magnitude.
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
         gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
@@ -1766,11 +2111,13 @@ def _binarize_with_cv2(
             255,
             cv2.THRESH_BINARY + cv2.THRESH_OTSU,
         )
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         output = cv2.bitwise_xor(binary, gradient_mask)
     else:
         raise RuntimeError(f"unsupported output mode '{mode}'")
 
+    if observe_threshold is not None:
+        observe_threshold(threshold)
     if invert:
         output = cv2.bitwise_not(output)
     return Image.fromarray(output.astype(np.uint8))
@@ -1802,19 +2149,11 @@ def _output_zones(parameters: dict[str, Any], size: tuple[int, int]) -> list[dic
     return zones
 
 
-def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any]) -> Image.Image:
-    """Bound float-array scratch to a tile plus a ≤251-pixel local-window halo."""
-    if mode == "copy":
-        return source.copy()
-    window = min(501, max(3, _coerce_int(parameters.get("window_size"), 35)))
-    halo = _odd_window(window) // 2 + 2
-    result = Image.new("L", source.size, 255)
-    # Otsu is global, including when the output is tiled. Pillow's histogram uses
-    # one byte per pixel, avoiding page-sized float/label arrays.
-    cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
+def _threshold_tile_regions(
+    source: Image.Image, halo: int
+) -> Iterable[tuple[Box, Box, tuple[int, int]]]:
     for top in range(0, source.height, OUTPUT_TILE_EDGE):
         for left in range(0, source.width, OUTPUT_TILE_EDGE):
-            checkpoint()  # a newer edit stops the run between tiles (#209)
             right, bottom = (
                 min(source.width, left + OUTPUT_TILE_EDGE),
                 min(source.height, top + OUTPUT_TILE_EDGE),
@@ -1825,25 +2164,75 @@ def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any])
                 min(source.width, right + halo),
                 min(source.height, bottom + halo),
             )
-            tile = source.crop(box).convert("L")
-            if cutoff is not None:
-                processed = tile.point(lambda value: 255 if value > cutoff else 0)
-                if _coerce_bool(parameters.get("invert"), False):
-                    processed = ImageOps.invert(processed)
-            else:
-                processed = _binarize_with_cv2(
-                    np.asarray(tile),
-                    tile,
-                    mode,
-                    window_size=window,
-                    k=_coerce_float(parameters.get("k"), 0.33),
-                    r=_coerce_float(parameters.get("r"), 128.0),
-                    invert=_coerce_bool(parameters.get("invert"), False),
-                )
-            result.paste(
-                processed.crop((left - box[0], top - box[1], right - box[0], bottom - box[1])),
+            yield (
+                box,
+                (left - box[0], top - box[1], right - box[0], bottom - box[1]),
                 (left, top),
             )
+
+
+def _wolf_page_statistics(source: Image.Image, block: int, halo: int) -> tuple[float, float]:
+    """Wolf's page-wide Min and Smax (upstream binarizeWolf), collected tile by tile."""
+    minimum, maximum_deviation = 255.0, 0.0
+    for box, (left, top, right, bottom), _ in _threshold_tile_regions(source, halo):
+        checkpoint()
+        tile = np.asarray(source.crop(box).convert("L"), dtype=np.float32)
+        _, deviation = _local_statistics(tile, block)
+        minimum = min(minimum, float(tile[top:bottom, left:right].min()))
+        maximum_deviation = max(maximum_deviation, float(deviation[top:bottom, left:right].max()))
+    return minimum, maximum_deviation
+
+
+def _su_page_contrast_cutoff(source: Image.Image, halo: int) -> int:
+    """Su's Otsu cutoff on the contrast image, over the whole page (not per tile)."""
+    histogram = np.zeros(256, dtype=np.int64)
+    for box, (left, top, right, bottom), _ in _threshold_tile_regions(source, halo):
+        checkpoint()
+        contrast = _su_contrast(np.asarray(source.crop(box).convert("L")))
+        histogram += np.bincount(contrast[top:bottom, left:right].ravel(), minlength=256)
+    return _otsu_from_histogram(histogram.tolist())
+
+
+def _threshold_tiles(source: Image.Image, mode: str, parameters: dict[str, Any]) -> Image.Image:
+    """Bound float-array scratch to a tile plus a ≤252-pixel local-window halo.
+
+    Values that algorithms need page-wide (Otsu's T, Wolf's Min/Smax, Su's contrast
+    cutoff) are computed once over the whole page first, so tiling never changes the
+    result (#225).
+    """
+    if mode == "copy":
+        return source.copy()
+    coefficients = output_coefficients(parameters, mode)
+    block = _odd_window(coefficients.window_size)
+    halo = block // 2 + 2
+    result = Image.new("L", source.size, 255)
+    cutoff = _pil_otsu_threshold(source) if mode == "otsu" else None
+    wolf_statistics = _wolf_page_statistics(source, block, halo) if mode == "wolf" else None
+    su_cutoff = _su_page_contrast_cutoff(source, halo) if mode == "su" else None
+    invert = _coerce_bool(parameters.get("invert"), False)
+    for box, core, origin in _threshold_tile_regions(source, halo):
+        checkpoint()
+        tile = source.crop(box).convert("L")
+        if cutoff is not None:
+            processed = tile.point(lambda value: 255 if value > cutoff else 0)
+            if invert:
+                processed = ImageOps.invert(processed)
+        else:
+            processed = _binarize_with_cv2(
+                np.asarray(tile),
+                tile,
+                mode,
+                window_size=coefficients.window_size,
+                k=coefficients.k,
+                r=coefficients.r,
+                invert=invert,
+                lower_bound=coefficients.lower_bound,
+                upper_bound=coefficients.upper_bound,
+                min_edge_ratio=coefficients.min_edge_ratio,
+                wolf_statistics=wolf_statistics,
+                su_contrast_cutoff=su_cutoff,
+            )
+        result.paste(processed.crop(core), origin)
     return result
 
 
@@ -1854,6 +2243,75 @@ def _zones_to_full(zones: list[dict[str, Any]], stage_input: StageInput) -> list
         box = _box_to_full(tuple(int(value) for value in zone["box"]), stage_input)  # type: ignore[arg-type]
         scaled.append({**zone, "box": list(box)})
     return scaled
+
+
+#: Long edge of the image the histogram is computed on (#225): the browser preview size.
+HISTOGRAM_PREVIEW_EDGE: Final = 960
+
+
+def _output_histogram(
+    stage_input: StageInput, mode: str, parameters: dict[str, Any], *, zoned: bool = False
+) -> dict[str, Any]:
+    """The Output input's grayscale histogram and the threshold T the algorithm chose.
+
+    Computed on the ≤960 px preview of the previous stage's result with the selected
+    algorithm and settings (#225). Otsu has one T; the local algorithms have one T
+    per pixel, reported as its 10th/50th/90th percentile. Local windows are scaled to
+    the preview so they cover the same part of the page as at full resolution.
+    """
+    preview = _thumbnail(stage_input.image, HISTOGRAM_PREVIEW_EDGE).convert("L")
+    result: dict[str, Any] = {
+        "bins": preview.histogram(),
+        "mode": mode,
+        "zoned": zoned,
+        "preview_size": list(preview.size),
+    }
+    if mode == "copy":
+        return result
+    if mode == "otsu":
+        threshold = _pil_otsu_threshold(preview)
+        result["threshold"] = {"median": threshold, "kind": "global"}
+        result["black_fraction"] = sum(preview.histogram()[: threshold + 1]) / max(
+            1, preview.width * preview.height
+        )
+        return result
+
+    def record(threshold: float | np.ndarray) -> None:
+        if isinstance(threshold, np.ndarray):
+            values = threshold[np.isfinite(threshold)]
+            if values.size == 0:
+                result["threshold"] = {"kind": "local", "defined_fraction": 0.0}
+                return
+            low, median, high = np.percentile(values, [10, 50, 90]).tolist()
+            result["threshold"] = {
+                "low": low,
+                "median": median,
+                "high": high,
+                "kind": "local",
+                "defined_fraction": values.size / threshold.size,
+            }
+        else:
+            result["threshold"] = {"median": float(threshold), "kind": "intensity"}
+
+    coefficients = output_coefficients(parameters, mode)
+    scale = max(preview.size) / max(1, *stage_input.full_size)
+    preview_window = max(3, round(_odd_window(coefficients.window_size) * min(1.0, scale)))
+    result["preview_window"] = _odd_window(preview_window)
+    output = _binarize_with_cv2(
+        np.asarray(preview),
+        preview,
+        mode,
+        window_size=preview_window,
+        k=coefficients.k,
+        r=coefficients.r,
+        invert=False,
+        lower_bound=coefficients.lower_bound,
+        upper_bound=coefficients.upper_bound,
+        min_edge_ratio=coefficients.min_edge_ratio,
+        observe_threshold=record,
+    )
+    result["black_fraction"] = float((np.asarray(output) == 0).mean())
+    return result
 
 
 def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageResult:
@@ -1876,6 +2334,7 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
                 "output_height": full_height,
                 "resolved_zones": [],
                 "output_warning": "",
+                "output_histogram": _output_histogram(stage_input, mode, parameters),
             },
         )
     text_algorithm = _coerce_output_mode(parameters.get("text_algorithm"), default="sauvola")
@@ -1933,6 +2392,9 @@ def _run_output(state: ScanTailorStageState, stage_input: StageInput) -> StageRe
         "picture_algorithm": picture_algorithm,
         "zone_detector_version": output_zones.DETECTOR_VERSION if zone_mode == "auto" else None,
         "output_warning": warning or "",
+        "output_histogram": _output_histogram(
+            stage_input, "copy" if keep_color or warning else mode, parameters, zoned=bool(zones)
+        ),
     }
     if zone_mode == "manual":
         payload["zones"] = zones
@@ -1982,6 +2444,7 @@ _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
         "binarization_fox": _run_output,
         "binarization_window": _run_output,
         "binarization_grad": _run_output,
+        "binarization_su": _run_output,
         "binarization": _run_output,
         "copy": _run_output,
         "copy_detect": _run_output,
@@ -1990,6 +2453,8 @@ _STAGE_RUNNERS: dict[str, dict[str, StageRunner]] = {
 
 
 def _resolve_stage_algorithm(state: ScanTailorStageState) -> StageRunner:
+    if is_blank_margins(state):
+        return _run_blank_margins
     stage_algorithms = _STAGE_RUNNERS.get(state.stage, {})
     algorithm = (state.algorithm or "").strip()
     runner = stage_algorithms.get(algorithm)
@@ -2173,6 +2638,8 @@ def request_stage_job(
         # Pre-port algorithm names run the port now (#195 steps 4 to 6).
         algorithm = _default_algorithm(state.stage)
     algorithm_version = _default_algorithm_version(state.stage, algorithm)
+    if is_blank_margins(state):
+        algorithm_version = "declared-blank-v1"
     now = timezone.now()
     claimed = ScanTailorStageState.objects.filter(id=state.id, revision=revision).update(
         worker_job_id=str(job.job_id),
@@ -2247,10 +2714,18 @@ def queue_ready_successor(
         scan_lifecycle.PROCESSING_STATES
     ):
         return None
-    # A stage never opened has no row yet; it runs with its defaults.
-    successor = get_or_create_stage_state(
-        scan_job_id=str(state.scan_job_id), page_id=str(state.scan_page_id), stage=next_name
-    )
+    if batch:
+        # A stage-specific batch re-runs only existing results made stale by this
+        # page's new output. Workspace initialization also creates never-run rows.
+        successor = ScanTailorStageState.objects.filter(
+            scan_page_id=state.scan_page_id, stage=next_name, applied_revision__isnull=False
+        ).first()
+        if successor is None:
+            return None
+    else:
+        successor = get_or_create_stage_state(
+            scan_job_id=str(state.scan_job_id), page_id=str(state.scan_page_id), stage=next_name
+        )
     if successor.input_stage_state_id != state.id:
         return None
     successor.input_stage_state = state
@@ -2299,6 +2774,44 @@ def process_stage_jobs(job_ids: list[str]) -> None:
     """Run a chunk of batch stage jobs; each keeps its own revision checks."""
     for job_id in job_ids:
         process_stage_job(job_id)
+
+
+def run_pipeline_step(
+    run: ScanTailorRun, page_id: str, stage: str
+) -> Literal["current", "failed", "busy"]:
+    """Use the current authored settings and finish one ready, unprocessed step."""
+    if not ScanPage.objects.filter(pk=page_id, scan_job_id=run.scan_job_id).exists():
+        return "current"
+    state = get_or_create_stage_state(scan_job_id=run.scan_job_id, page_id=page_id, stage=stage)
+    with transaction.atomic():
+        if (
+            not ScanTailorRun.objects.select_for_update()
+            .filter(pk=run.pk, state=ScanTailorRun.State.RUNNING)
+            .exists()
+        ):
+            return "failed"
+        state = _linked_page_state(state.pk, lock=True)
+        if stage_result_is_current(state):
+            return "current"
+        if stage_waiting_for(state) is not None:
+            return "failed"
+        active = _active_stage_job(state)
+        if active is not None:
+            age = (timezone.now() - (active.started_at or active.scheduled_at)).total_seconds()
+            return (
+                "busy" if age < django_settings.BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS else "failed"
+            )
+        job = request_stage_job(
+            state=state,
+            requested_by_user_id=run.requested_by_id,
+            dispatch=False,
+            batch=True,
+            extra_details={"pipeline_run_id": run.pk},
+        )
+    process_stage_job(str(job.job_id))
+    return (
+        "current" if stage_result_is_current(_linked_page_state(state.pk, lock=False)) else "failed"
+    )
 
 
 def dispatch_stage_batch(job_ids: Sequence[str]) -> int:
@@ -2361,7 +2874,7 @@ def _stage_input(state: ScanTailorStageState, storage: LocalFilesystemStorage) -
     working-resolution output. ``render_full`` composes every upstream op on the
     untouched original, which only the Output stage needs.
     """
-    chain = _upstream_chain(state)
+    chain = [] if is_blank_margins(state) else _upstream_chain(state)
     version = _page_version(state, chain)
     page_image = scan_images.ensure_page_image(version)
     ops: list[scan_transform.Op] = []
@@ -2476,6 +2989,11 @@ def process_stage_job(job_id: str) -> None:
     if state is None:
         _fail_stage_job(job, f"stage state not found: {stage_state_id}")
         return
+    pipeline_run_id = details.get("pipeline_run_id")
+    if isinstance(pipeline_run_id, int) and not _pipeline_run_is_current(pipeline_run_id):
+        release_pipeline_stage(state, job_id)
+        _supersede_stage_job(job, details, "Run all cancelled")
+        return
 
     # A job only ever produces the artifact of the revision it was queued for. A late
     # job (e.g. one overtaken by a manual edit) is a no-op.
@@ -2521,6 +3039,8 @@ def process_stage_job(job_id: str) -> None:
         # The same rule as the commit (_locked_if_current): a newer edit bumps the
         # revision, and a newer job for the same revision (#205) takes over
         # ``worker_job_id``. Either way this run's result would be discarded (#209).
+        if isinstance(pipeline_run_id, int) and not _pipeline_run_is_current(pipeline_run_id):
+            return False
         return ScanTailorStageState.objects.filter(
             id=state.id,
             revision=started_revision,
@@ -2625,6 +3145,8 @@ def process_stage_job(job_id: str) -> None:
     except StageSuperseded as exc:
         # Stopped early for a newer revision (#209); the temporary files are gone and
         # nothing was staged in scan storage yet. The stage row belongs to the new run.
+        if isinstance(pipeline_run_id, int):
+            release_pipeline_stage(state, job_id)
         _supersede_stage_job(job, details, str(exc))
     except Exception as exc:
         with transaction.atomic():
@@ -2634,6 +3156,11 @@ def process_stage_job(job_id: str) -> None:
                 state.finished_at = timezone.now()
                 state.save(update_fields=["status", "last_error", "finished_at", "updated_at"])
         _fail_stage_job(job, str(exc), input_fingerprint=input_fingerprint)
+        return
+
+    if isinstance(pipeline_run_id, int):
+        # Run all advances by stage across the book. This lets Margins see the
+        # settled common size and leaves room for interactive jobs between chunks.
         return
 
     # Chaining (#205): the next stage of the page runs now if its result is stale.
@@ -2820,7 +3347,7 @@ def _park_waiting_stage_job(
             fresh.save(update_fields=["status", "updated_at"])
             parked = True
     _supersede_stage_job(job, {**details, "waiting_for": waiting_for}, f"waiting for {waiting_for}")
-    if not parked:
+    if not parked or isinstance(details.get("pipeline_run_id"), int):
         return
     current = ScanTailorStageState.objects.filter(id=state.id).first()
     if current is None or current.status == ScanTailorStageState.StageStatus.QUEUED:
@@ -2835,6 +3362,26 @@ def _park_waiting_stage_job(
         requested_by_user_id=requested_by if isinstance(requested_by, int) else None,
         batch=bool(details.get("batch")),
     )
+
+
+def _pipeline_run_is_current(run_id: int) -> bool:
+    return ScanTailorRun.objects.filter(
+        pk=run_id,
+        state=ScanTailorRun.State.RUNNING,
+        scan_job__state__in=scan_lifecycle.PROCESSING_STATES,
+    ).exists()
+
+
+def release_pipeline_stage(state: ScanTailorStageState, job_id: str) -> None:
+    ScanTailorStageState.objects.filter(
+        pk=state.pk,
+        revision=state.revision,
+        worker_job_id=job_id,
+        status__in=[
+            ScanTailorStageState.StageStatus.QUEUED,
+            ScanTailorStageState.StageStatus.RUNNING,
+        ],
+    ).update(status=stage_idle_status(state), worker_job_id="", updated_at=timezone.now())
 
 
 def _prune_quietly(prune: Callable[..., int], *args: object) -> None:

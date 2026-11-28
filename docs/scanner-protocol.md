@@ -58,7 +58,7 @@ a replacement page. See "Raw scans" below.
 | D7 Rescans | Replacements add a page version and keep the old one; todos are `ScanTodo` rows keyed by `sequence_number`; `rescan_flag`/`rescan_replace` lines are appended to `scan.jsonl`. Allowed in `captured` and after `complete`. |
 | D9 Authentication | **Differs:** the contract's per-device key is one key for the one scanner (#125). The server stores only its SHA-256 in `BOOK_SCANNER_SCANNER_API_KEY_SHA256`; `manage.py generate_scanner_key` creates it. There is no device registry. |
 | D10 Transport | TLS 1.3 only, LAN only, through `deploy/nginx/serif-lan-tls.conf`; the plain-HTTP listener refuses `/api/scanner/`. See `deploy/nginx/README.md` and `docs/operations.md`. |
-| D11 Portal | `/j/<job_id>` requires the normal login and redirects to the job workspace. `portal_url` is built from `BOOK_SCANNER_PUBLIC_BASE_URL`. |
+| D11 Portal | `/j/<job_id>` requires the normal login and redirects to the job's ScanTailor editor. `portal_url` is built from `BOOK_SCANNER_PUBLIC_BASE_URL`. |
 
 Limits (§6.12) come from `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` (50 MiB) and
 `BOOK_SCANNER_SCANNER_MAX_OPF_BYTES` (1 MiB); event batches are capped at 1000 lines and
@@ -74,14 +74,18 @@ Limits (§6.12) come from `BOOK_SCANNER_SCANNER_MAX_IMAGE_BYTES` (50 MiB) and
 
 ## API surface (v1)
 
-- `POST /scan/jobs/` -> create job
-- `GET /scan/jobs/` -> list open jobs for scanner/operator
+- `POST /scan/jobs/` -> create job (session API only; the web form is hidden, "maybe
+  later", #227: the scanner creates jobs over `/api/scanner/v1/`)
+- `GET /scan/jobs/` -> list open jobs for scanner/operator (pages with versions and open
+  todo counts; the per-page `pipeline` progress, which checks page files in scan storage,
+  is only in the job detail)
 - `GET /scan/jobs/{job_id}/` -> detail
 - `POST /scan/jobs/{job_id}/pages/` -> upload page
 - `PUT /scan/pages/{page_id}/` -> replace/reupload idempotently
 - `POST /scan/jobs/{job_id}/logs/` -> upload a scanner log file (202, processed by a worker)
 - `GET /scan/jobs/{job_id}/logs/` -> the job's logs and their processing state
-- `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review
+- `POST /scan/jobs/{job_id}/identify/` -> queue bibliographic lookup/review (API only:
+  the web UI no longer offers it, identification runs automatically, #227)
 - `GET /scan-identifications/{processing_job_id}/` -> lookup job status
 - `POST /library/books/{book_id}/ocr/` -> request OCR from library variant
 - `POST /scan/jobs/{job_id}/ocr/` -> request OCR from scan pages
@@ -132,6 +136,9 @@ rejected with 400:
 
 Send `{"allow_raw_pages": true}` to build from the raw uploads instead. A job with no linked
 book queues bibliographic identification instead (202, `requires_bibliographic_review`).
+Finish is refused (400, `outstanding scan todos must be resolved`) while a rescan todo is
+`open` or `claimed`. The ScanTailor editor's **Finish…** dialog uses this endpoint and
+explains these refusals before sending (see `docs/scantailor-web.md`, #228).
 
 ## Client recipe (non-browser clients)
 
@@ -231,7 +238,9 @@ successful page upload alone cannot authorize local deletion.
   todo. The check runs under the job's row lock. Allowed while the job is being captured or processed, and also for
   `captured` and `complete` jobs (D7). For a scanner job it appends a `rescan_flag` line
   to `scan.jsonl` in the same transaction. The scanner fetches and fulfils these todos
-  through the device API (see "Rescans over the device API" below).
+  through the device API (see "Rescans over the device API" below). The ScanTailor
+  editor's **Request rescan** posts here with a `reason` (JSON) and marks the page in its
+  strip; a form post (HTML) redirects back to the editor on that page (#228).
 - `GET /scan/jobs/{job_id}/todos/` lists todos for a specific job.
 - `GET /scan/todos/?state=...` lists or filters todos across jobs.
 - `POST /scan/todos/{todo_id}/claim/` claims a todo.
@@ -395,9 +404,37 @@ The response carries `metadata_opf` (`sha256`, `version`) and the parsed `metada
 version are kept in `ScanJobOpf`. An OPF carrying the application's own marker
 `<meta name="ebook-server:generated" content="true"/>` is stored but never used as metadata.
 
-**While the scan is raw** the current OPF's title, authors, ISBN and language are shown on
-the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`) and in
-**Raw scans** (`/scan/raw/`, `metadata`). No Book is created.
+**While the scan is raw** the current OPF's title, authors, ISBN and language are shown in
+the scan job list (`/scan/jobs/?view=html`), **Raw scans** (`/scan/raw/`,
+`metadata`) and the workspace JSON
+(`/scan/jobs/{id}/workspace/`, `metadata_opf`); the editor's finish dialog names the OPF
+title the Book will come from (#228). No Book is created.
+
+**Automatic completion of missing fields (#227).** When a new OPF version is stored for a
+job without a Book and it lacks the title, the authors or the ISBN, a background
+scan-identification job (`ProcessingJob` type `scan_identification`, `details.automatic`)
+looks it up on the metadata queue (see "Queues" in `docs/operations.md`), using the OPF's
+own evidence: its ISBN (an ISBN lookup, which also covers an OPF with nothing but an ISBN),
+otherwise its title, authors and language. Fields are completed **only on a strong
+match**, and only fields the OPF leaves empty:
+
+- ISBN lookup: every provider record that itself lists the OPF's ISBN describes the same
+  book, and that record names its authors;
+- text lookup: the intake auto-accept rule (`intake.decide_auto_accept`: score at least
+  `BOOK_SCANNER_IDENTIFICATION_AUTO_ACCEPT`, no tie between different books, author,
+  edition and title checks);
+- in both cases the record agrees with the OPF's title and authors (else `contradicted`).
+
+The result is stored on the job (`ScanJob.notes["opf_completion"]`: status `completed`,
+`no_strong_match` or `contradicted`, the completed fields, the provider record, the
+search) and tied to the OPF version; a newer version makes it obsolete and starts a new
+lookup if fields are still missing. The job list shows completed values. At
+finish the OPF plus the completion is used; completed fields get provenance
+`provider_check`, and a later OPF that names such a field replaces it. A weak match
+completes nothing: an OPF with a title stays as the scanner sent it (the provider check
+after finish verifies it); an OPF **without** a title opens the scan-identification
+review, because the Book's identity is unknown. `BOOK_SCANNER_SCAN_METADATA_COMPLETION=false`
+switches the automatic lookup off.
 
 **At finish** (`scan_lifecycle.register_book_linker`, `scanner_opf.link_book_from_opf`):
 
@@ -405,8 +442,9 @@ the job page (`/scan/jobs/{id}/workspace/`, also in its JSON as `metadata_opf`) 
    variant. The OPF fills that Book's empty fields; a differing field opens a review.
 2. Otherwise a new Book is created from the OPF fields. Every field gets a provenance row
    with source `scanner_opf` (`BookMetadataProvenance`).
-3. No OPF, or an OPF without a title: the existing scan identification and review queue
-   run, with the OPF's authors as hints.
+3. No OPF, or an OPF without a title (and no completed title): the existing scan
+   identification and review queue run, with the OPF's ISBN (ISBN lookup; a unique
+   verified record links automatically) or its authors and language as terms.
 
 Two cases go to scan identification and its review instead of guessing (AGENTS.md):
 an ISBN that **several** Books carry, and an **ISBN-less** OPF whose normalised title and
@@ -499,7 +537,7 @@ complete --replacement page--> captured ("re-finish needed")
   `refinish_needed` (note "re-finish needed"). Its library variants stay until the next
   finish, which retires them in favour of the new cleaned output.
 - `/j/<job_id>` (the scanner's QR code) requires login and redirects to the job's
-  workspace.
+  ScanTailor editor (the old job overview is retired, #228).
 
 **Raw scans never appear in the library.** `core/library_visibility.py` hides, at the
 query level, every book that is linked only to unfinished (or cancelled) scan jobs and has

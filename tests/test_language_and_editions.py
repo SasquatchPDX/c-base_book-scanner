@@ -357,17 +357,38 @@ def test_probe_french_file_is_not_matched_to_the_english_edition() -> None:
     assert boosted.blocked_reason == intake.BLOCK_EDITION_CONFLICT
 
 
-def test_probe_gollancz_file_is_not_matched_to_the_ace_edition() -> None:
+def test_probe_gollancz_file_is_accepted_as_the_work_not_the_ace_edition() -> None:
+    # #220 E1: another printing's publisher is an edition mismatch, not a work
+    # conflict. Title and author identify the work, so it is accepted without the Ace
+    # edition's ISBN, publisher and year, and the mismatch is recorded.
     signals = _signals(**ABSOLUTION_GAP, publisher="gollancz")
-    decision = _resolve_through_open_library(signals)
-    assert decision.candidate is None
     candidate = _normalize_candidate("openlibrary", SEARCH_DOC, signals)
-    assert candidate.score < AUTO_ACCEPT_SCORE
     assert edition_conflicts(candidate, signals) == [EDITION_PUBLISHER_MISMATCH]
     boosted = intake.decide_auto_accept(
         [dataclasses.replace(candidate, score=1.0)], [], file_evidence=signals
     )
-    assert boosted.blocked_reason == intake.BLOCK_EDITION_CONFLICT
+    assert boosted.blocked_reason is None
+    assert boosted.candidate is not None
+    assert boosted.candidate.isbn13 is None
+    assert boosted.candidate.publisher is None
+    assert boosted.edition_mismatch is not None
+    assert boosted.edition_mismatch["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
+    assert boosted.edition_mismatch["file_publisher"] == "gollancz"
+
+
+def test_publisher_mismatch_still_blocks_when_title_and_author_do_not_identify_the_work() -> None:
+    # Only the work identity makes another publisher harmless: with a file-name title
+    # guess that is one part of a longer name, the mismatch still blocks.
+    signals = _signals(
+        title_hints=["Absolution Gap", "Revelation Space - Absolution Gap"],
+        author_hints=["Someone Else"],
+        publisher="gollancz",
+    )
+    candidate = _normalize_candidate("openlibrary", SEARCH_DOC, signals)
+    decision = intake.decide_auto_accept(
+        [dataclasses.replace(candidate, score=1.0)], [], file_evidence=signals
+    )
+    assert decision.blocked_reason == intake.BLOCK_EDITION_CONFLICT
 
 
 def test_english_ace_file_still_auto_accepts_the_matching_edition() -> None:
@@ -559,11 +580,16 @@ def _decide_all_systems_red(file_publisher: str) -> intake.AutoAcceptDecision:
 @pytest.mark.parametrize(
     "file_publisher", ["Tor.com", "Tor.com Publishing", "Tor.com (www.tor.com)"]
 )
-def test_domain_shaped_publisher_still_blocks_the_wrong_edition(file_publisher: str) -> None:
+def test_domain_shaped_publisher_is_still_an_edition_mismatch(file_publisher: str) -> None:
+    # A domain-shaped publisher is a real publisher, not tool noise: the Gollancz
+    # edition is another printing. Since #220 (E1) the work is accepted without that
+    # printing's details and the mismatch is recorded instead of blocking.
     decision = _decide_all_systems_red(file_publisher)
-    assert decision.candidate is None
-    assert decision.blocked_reason == intake.BLOCK_EDITION_CONFLICT
-    assert decision.details["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
+    assert decision.blocked_reason is None
+    assert decision.candidate is not None
+    assert decision.candidate.publisher is None
+    assert decision.edition_mismatch is not None
+    assert decision.edition_mismatch["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
 
 
 @pytest.mark.parametrize(
@@ -739,7 +765,7 @@ def test_browser_fixture_digital_scenario_is_held_for_edition_review() -> None:
     assert candidates[0].score >= AUTO_ACCEPT_SCORE
     decision = intake.decide_auto_accept(candidates, ["Ada Digital"], file_evidence=signals)
     assert decision.blocked_reason == intake.BLOCK_EDITION_CONFLICT
-    assert decision.details["edition_conflicts"] == [EDITION_PUBLISHER_MISMATCH]
+    assert decision.details["edition_conflicts"] == [EDITION_LANGUAGE_MISMATCH]
 
 
 def _write_absolution_epub(path: Path, metadata_xml: str) -> None:

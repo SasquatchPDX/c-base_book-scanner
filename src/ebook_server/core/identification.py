@@ -8,6 +8,8 @@ import json
 import re
 import socket
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
@@ -22,12 +24,22 @@ from isbnlib import is_isbn10, is_isbn13, to_isbn13
 from rapidfuzz.fuzz import ratio, token_set_ratio, token_sort_ratio
 from rapidfuzz.utils import default_process
 
+from . import provider_runtime
 from .languages import normalize_language, normalize_languages
 from .rate_limit import RateLimitWaitExceeded, throttle_provider
 
 logger = structlog.get_logger(__name__)
 
 MAX_AUTHOR_LOOKUPS = 5
+MAX_CONCURRENT_PROVIDERS = 3
+# Wall-clock budget for one provider's whole lookup (all title hints, retries and
+# rate-limit waits) when several providers run concurrently (#220, G2). A provider
+# still running after it is reported as timed out and counts towards its circuit
+# breaker. ``BOOK_SCANNER_METADATA_PROVIDER_TIMEOUT_SECONDS`` overrides it.
+DEFAULT_PROVIDER_BUDGET_SECONDS = 20.0
+PROVIDER_BUDGET_REASON = "timed out (provider budget)"
+PROVIDER_CIRCUIT_OPEN_REASON = "skipped (circuit open after repeated failures)"
+PROVIDER_SKIPPED_REASON = "not needed (decisive candidate found)"
 MAX_RETRY_AFTER_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5
 # Subject/genre tags are evidence only (#50); keep them bounded so an untrusted file or
@@ -221,13 +233,17 @@ EVIDENCE_EMBEDDED = "embedded"
 EVIDENCE_SIDECAR = "sidecar"
 EVIDENCE_HEADER = "header"
 EVIDENCE_LAYOUT = "layout"
+# A source folder named "Last, First" without a configured layout (#220): an author
+# candidate only, weaker than a layout and stronger than a file-name split.
+EVIDENCE_PATH = "path"
 EVIDENCE_FILENAME = "filename"
 EVIDENCE_UNKNOWN = "unknown"
 EVIDENCE_RANK = {
-    EVIDENCE_EMBEDDED: 5,
-    EVIDENCE_SIDECAR: 4,
-    EVIDENCE_HEADER: 3,
-    EVIDENCE_LAYOUT: 2,
+    EVIDENCE_EMBEDDED: 6,
+    EVIDENCE_SIDECAR: 5,
+    EVIDENCE_HEADER: 4,
+    EVIDENCE_LAYOUT: 3,
+    EVIDENCE_PATH: 2,
     EVIDENCE_FILENAME: 1,
     EVIDENCE_UNKNOWN: 0,
 }
@@ -297,10 +313,12 @@ class ProviderOutcome:
     """What one provider did during one search run."""
 
     provider_id: str
-    status: str  # "results" | "no_results" | "error"
+    status: str  # "results" | "no_results" | "error" | "skipped"
     result_count: int
     duration_seconds: float
     error: str = ""
+    # The rows were reused from an identical earlier query (#220).
+    cached: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -309,6 +327,7 @@ class ProviderOutcome:
             "result_count": self.result_count,
             "duration_seconds": round(self.duration_seconds, 3),
             "error": self.error,
+            "cached": self.cached,
         }
 
 
@@ -734,6 +753,15 @@ def _commits(author_end: int, other_end: int) -> bool:
     return author_end == _END_NAME_SHAPED and other_end == _END_NOT_A_NAME
 
 
+def _numbered_title(first: str, last: str) -> bool:
+    """One end is a bare number and the other plainly no name: "12 - Beasts Of Gor"."""
+    for number, other in ((first, last), (last, first)):
+        if _NUMERIC_SEGMENT.match(number) and not _NUMERIC_SEGMENT.match(other):
+            # A single word may be a bare surname ("1984 - Orwell"): not this case.
+            return _author_end(other)[0] == _END_NOT_A_NAME
+    return False
+
+
 def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
     """Return title and author candidates from filename patterns.
 
@@ -770,10 +798,17 @@ def parse_filename_signals(raw_filename: str) -> tuple[list[str], list[str]]:
         first, last = segments[0], segments[-1]
         if is_placeholder_author(last):
             title_guesses = _titles_for(segments[:-1])
+            normalized = ""
         elif is_placeholder_author(first):
             title_guesses = _titles_for(segments[1:])
+            normalized = ""
         elif len(segments) == 2 and _same_title(first, last):
             title_guesses = [first, last]  # "Die Kandidaten - Die Kandidaten"
+        elif len(segments) == 2 and _numbered_title(first, last):
+            # "12 - Beasts Of Gor": a series number and a title, no author (#220). Calibre
+            # writes exactly this split into its sidecar as title "12", author "Beasts Of
+            # Gor". "1984 - George Orwell" keeps the usual handling: the other end is a name.
+            title_guesses = [last if _NUMERIC_SEGMENT.match(first) else first]
         else:
             last_strength, last_names = _author_end(last)
             first_strength, first_names = _author_end(first)
@@ -868,7 +903,9 @@ def _apply_text_header_hints(
             if normalize_text(hint) in protected_keys
             or _title_match_score(hint, header_title) < 0.95
         ]
-    explicit_authors = _header_strings(header.get("authors"))
+    explicit_authors = [
+        name for name in _header_strings(header.get("authors")) if not is_placeholder_author(name)
+    ]
     if explicit_authors:
         kept = [
             name
@@ -879,9 +916,7 @@ def _apply_text_header_hints(
             )
         ]
         return title_hints, explicit_authors + kept
-    author_hints = [
-        hint for hint in author_hints if normalize_text(hint) not in {"unknown", "anonymous"}
-    ]
+    author_hints = [hint for hint in author_hints if not is_placeholder_author(hint)]
     for likely in _header_strings(header.get("likely_authors")):
         if not any(_author_name_similarity(likely, known) for known in author_hints):
             author_hints.append(likely)
@@ -891,6 +926,57 @@ def _apply_text_header_hints(
 # Evidence key holding hints from the source's configured folder layout (#35); written
 # by intake from ``core.source_layout``, read here when building signals.
 PATH_LAYOUT_EVIDENCE_KEY = "path_layout"
+# Evidence key holding the file's path below its source root and what the template-less
+# default reads from it (#220): the folder names, nearest first, and an author
+# candidate from the nearest folder written as "Last, First". Written by intake.
+SOURCE_PATH_EVIDENCE_KEY = "path_evidence"
+MAX_PATH_FOLDERS = 8
+MAX_PATH_SEGMENT_LENGTH = 255
+# Calibre book folders end in the database id: "Dune (123)".
+_CALIBRE_FOLDER_ID = re.compile(r"\s*\(\d+\)\s*$")
+
+
+def path_evidence(relative_path: str) -> dict[str, Any]:
+    """Folder evidence for a file at ``relative_path`` below its source root.
+
+    Every folder is kept (nearest first) as a folder hint. Without a configured layout
+    a folder cannot be told apart reliably as author, series or book folder, so only
+    the unambiguous "Last, First" shape (``Herbert, Frank/``) is read as an author
+    candidate, with provenance ``path``. It is a hint for the providers and the
+    reviewer: it is never accepted without a provider record that names that author,
+    and a placeholder folder (Calibre's ``Unknown/``) is never an author.
+    """
+    parts = [
+        part[:MAX_PATH_SEGMENT_LENGTH]
+        for part in relative_path.replace("\\", "/").split("/")
+        if part and part not in {".", ".."}
+    ]
+    folders = list(reversed(parts[:-1]))[:MAX_PATH_FOLDERS]
+    authors: list[str] = []
+    author_folders: list[str] = []
+    for folder in folders:
+        cleaned = _CALIBRE_FOLDER_ID.sub("", folder).strip()
+        if not cleaned or is_placeholder_author(cleaned):
+            continue
+        name = invert_last_first_name(cleaned)
+        if name and not is_placeholder_author(name):
+            authors.append(name)
+            author_folders.append(folder)
+            break  # the nearest author folder only
+    return {
+        "relative_path": "/".join(parts)[: MAX_PATH_SEGMENT_LENGTH * 4],
+        "folders": folders,
+        "authors": authors,
+        "author_folders": author_folders,
+    }
+
+
+def _path_value(extracted_metadata: dict[str, Any], key: str) -> list[str]:
+    evidence = extracted_metadata.get(SOURCE_PATH_EVIDENCE_KEY)
+    values = evidence.get(key) if isinstance(evidence, dict) else None
+    if not isinstance(values, list):
+        return []
+    return [value.strip() for value in values if isinstance(value, str) and value.strip()]
 
 
 def build_identification_input(
@@ -933,6 +1019,20 @@ def build_identification_input(
                 if normalized_author and normalized_author not in author_hints:
                     author_hints.insert(0, normalized_author)
 
+    path_authors = _default_path_authors(extracted_metadata)
+    if path_authors:
+        # A "Last, First" folder ranks after the file's own credits (embedded metadata,
+        # explicit header) and before the guesses from splitting the file name.
+        explicit_header = _header_strings(header.get("authors")) if isinstance(header, dict) else []
+        rooted = {
+            normalize_text(name)
+            for name in [*evidence_author_names(extracted_metadata), *explicit_header]
+        }
+        known = {normalize_text(hint) for hint in author_hints}
+        lead = [hint for hint in author_hints if normalize_text(hint) in rooted]
+        rest = [hint for hint in author_hints if normalize_text(hint) not in rooted]
+        author_hints = lead + [n for n in path_authors if normalize_text(n) not in known] + rest
+
     title_hints, author_hints = _apply_path_layout_hints(
         extracted_metadata,
         list(title_hints),
@@ -944,8 +1044,9 @@ def build_identification_input(
         ),
     )
 
-    title_hints = list(dict.fromkeys([h for h in title_hints if h]))
-    author_hints = [h for h in dict.fromkeys(author_hints).keys()] if author_hints else []
+    # No placeholder reaches the providers (#220): "X - Unknown" is the title X.
+    title_hints = list(dict.fromkeys(t for t in map(strip_placeholder_segments, title_hints) if t))
+    author_hints = [hint for hint in dict.fromkeys(author_hints) if not is_placeholder_author(hint)]
 
     isbns: list[str] = []
     for field_name in ["isbn", "isbn10", "isbn13", "identifier"]:
@@ -957,8 +1058,10 @@ def build_identification_input(
                 if isbn not in isbns:
                     isbns.append(isbn)
 
-    folder_hint = Path(source_path).parent.name
-    folder_hints = [folder_hint] if folder_hint else []
+    # The whole relative path when intake recorded it, nearest folder first; else the
+    # parent folder name. A placeholder folder (Calibre's "Unknown/") is no hint.
+    folder_hints = _path_value(extracted_metadata, "folders") or [Path(source_path).parent.name]
+    folder_hints = [hint for hint in folder_hints if hint and not _is_placeholder_segment(hint)]
 
     embedded_title = (
         metadata_title
@@ -969,7 +1072,7 @@ def build_identification_input(
         title_hints=title_hints,
         author_hints=author_hints,
         isbns=isbns,
-        folder_hints=[h for h in folder_hints if h],
+        folder_hints=folder_hints,
         # Normalised (ISO 639-1, else 639-3) so "en" and "eng" compare equal; "UND" and
         # unknown codes become None ("no signal"), never a mismatch.
         language=normalize_language(_first_str(extracted_metadata.get("language"))),
@@ -994,6 +1097,17 @@ def build_identification_input(
 def _layout_value(extracted_metadata: dict[str, Any], key: str) -> Any:
     layout = extracted_metadata.get(PATH_LAYOUT_EVIDENCE_KEY)
     return layout.get(key) if isinstance(layout, dict) else None
+
+
+def _default_path_authors(extracted_metadata: dict[str, Any]) -> list[str]:
+    """Author candidates of the template-less path default; a configured layout wins."""
+    if _layout_value(extracted_metadata, "authors"):
+        return []
+    return [
+        name
+        for name in _path_value(extracted_metadata, "authors")
+        if not is_placeholder_author(name)
+    ]
 
 
 def _coauthor_names(raw_names: Any) -> tuple[str, ...]:
@@ -1037,6 +1151,9 @@ def _author_evidence(
             likely = _coauthor_names(header.get("likely_authors"))
             if likely:
                 groups.append(AuthorEvidence(AUTHORS_ALTERNATIVES, EVIDENCE_HEADER, likely))
+    path_authors = tuple(_default_path_authors(extracted_metadata))
+    if path_authors:
+        groups.append(AuthorEvidence(AUTHORS_ALTERNATIVES, EVIDENCE_PATH, path_authors))
     if layout:
         groups.append(AuthorEvidence(AUTHORS_COAUTHORS, EVIDENCE_LAYOUT, layout))
     elif filename_author_hints:
@@ -1350,77 +1467,275 @@ def resolve_candidates(signals: IdentificationInput) -> list[IdentificationCandi
 
 def resolve_candidates_with_report(
     signals: IdentificationInput,
+    *,
+    reuse_results: bool = True,
 ) -> tuple[list[IdentificationCandidate], list[ProviderOutcome]]:
     """Ranked candidates plus what every configured provider did.
 
+    ``reuse_results=False`` (a reviewer's explicit search) never answers from earlier
+    identical queries; the fresh result still refreshes the reuse cache.
+
     A failing provider never aborts the run: it is reported as ``error`` with a
     short reason, so a reviewer can tell "the provider was down" from "no match".
+
+    Cost (#220, G2): the providers run concurrently, each within a wall-clock budget
+    (``provider_budget_seconds``); a provider whose circuit breaker is open after
+    repeated failures is not asked at all; identical queries reuse an earlier result
+    (``core.provider_runtime``); and once a finished provider returned a decisive
+    candidate (``decisive_candidate``) the run stops waiting for the others, which
+    are reported as ``skipped``. Candidates are always ranked in configured provider
+    order, whatever order the providers finish in.
     """
-    raw_candidates: list[tuple[MetadataProvider, dict[str, Any]]] = []
-    outcomes: list[ProviderOutcome] = []
-    for provider in _provider_instances():
-        started_at = perf_counter()
-        try:
-            raw_list = _query_provider(provider, signals)
-        except Exception as exc:  # provider boundary: one provider must not abort intake
-            duration = perf_counter() - started_at
-            reason = describe_provider_error(exc)
-            # Network-level failures are expected; only unexpected ones need a traceback.
-            log = logger.warning if isinstance(exc, OSError) else logger.exception
-            log(
-                "metadata_provider_failed",
+    providers = _provider_instances()
+    results: dict[int, tuple[list[dict[str, Any]], ProviderOutcome]] = {}
+    active: list[tuple[int, MetadataProvider]] = []
+    for index, provider in enumerate(providers):
+        if provider_runtime.breaker_open(provider.provider_id):
+            logger.warning(
+                "metadata_provider_skipped",
                 provider_id=provider.provider_id,
-                duration_seconds=duration,
-                error_type=type(exc).__name__,
-                reason=reason,
+                reason="circuit_open",
             )
-            outcomes.append(
+            results[index] = (
+                [],
                 ProviderOutcome(
-                    provider_id=provider.provider_id,
-                    status="error",
-                    result_count=0,
-                    duration_seconds=duration,
-                    error=reason,
-                )
+                    provider.provider_id, "error", 0, 0.0, PROVIDER_CIRCUIT_OPEN_REASON
+                ),
+            )
+        else:
+            active.append((index, provider))
+
+    if len(active) <= 1:
+        for index, provider in active:
+            results[index] = _query_provider_with_outcome(provider, signals, reuse_results)
+    else:
+        results.update(_query_concurrently(active, signals, reuse_results))
+
+    ordered = [results[index] for index in range(len(providers))]
+    normalized = _dedupe_candidates(
+        [
+            _normalize_candidate(outcome.provider_id, payload, signals)
+            for payloads, outcome in ordered
+            for payload in payloads
+        ]
+    )
+    outcomes = [outcome for _, outcome in ordered]
+    return _apply_strong_match_rule(signals, _rank_candidates(signals, normalized)), outcomes
+
+
+def provider_budget_seconds() -> float:
+    return float(
+        getattr(
+            django_settings,
+            "BOOK_SCANNER_METADATA_PROVIDER_TIMEOUT_SECONDS",
+            DEFAULT_PROVIDER_BUDGET_SECONDS,
+        )
+    )
+
+
+def early_exit_enabled() -> bool:
+    return bool(getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT", True))
+
+
+def _query_concurrently(
+    active: list[tuple[int, MetadataProvider]],
+    signals: IdentificationInput,
+    reuse_results: bool = True,
+) -> dict[int, tuple[list[dict[str, Any]], ProviderOutcome]]:
+    """Run ``active`` providers in threads within the budget; stop early when decisive."""
+    results: dict[int, tuple[list[dict[str, Any]], ProviderOutcome]] = {}
+    budget = provider_budget_seconds()
+    early_exit = bool(signals.isbns) and early_exit_enabled()
+    started_at = perf_counter()
+    executor = ThreadPoolExecutor(
+        max_workers=min(len(active), MAX_CONCURRENT_PROVIDERS),
+        thread_name_prefix="metadata-provider",
+    )
+    futures: dict[Future[tuple[list[dict[str, Any]], ProviderOutcome]], tuple[int, str]] = {
+        executor.submit(
+            copy_context().run, _query_provider_with_outcome, provider, signals, reuse_results
+        ): (
+            index,
+            provider.provider_id,
+        )
+        for index, provider in active
+    }
+    pending = set(futures)
+    decisive = False
+    try:
+        while pending:
+            remaining = budget - (perf_counter() - started_at)
+            if remaining <= 0:
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            for future in done:
+                results[futures[future][0]] = future.result()
+            if pending and early_exit:
+                so_far = [
+                    _normalize_candidate(outcome.provider_id, payload, signals)
+                    for payloads, outcome in results.values()
+                    for payload in payloads
+                ]
+                if decisive_candidate(signals, so_far) is not None:
+                    decisive = True
+                    break
+    finally:
+        # Never wait for a provider past its budget; its thread ends on its own
+        # request timeout and its late answer is discarded.
+        executor.shutdown(wait=False, cancel_futures=True)
+    duration = perf_counter() - started_at
+    for future in pending:
+        index, provider_id = futures[future]
+        if decisive:
+            logger.info("metadata_provider_skipped", provider_id=provider_id, reason="decisive")
+            results[index] = (
+                [],
+                ProviderOutcome(provider_id, "skipped", 0, duration, PROVIDER_SKIPPED_REASON),
             )
             continue
-        duration = perf_counter() - started_at
-        logger.info(
-            "metadata_provider_completed",
-            provider_id=provider.provider_id,
-            candidate_count=len(raw_list),
+        logger.warning(
+            "metadata_provider_failed",
+            provider_id=provider_id,
             duration_seconds=duration,
+            error_type="ProviderBudgetExceeded",
+            reason=PROVIDER_BUDGET_REASON,
         )
-        outcomes.append(
-            ProviderOutcome(
-                provider_id=provider.provider_id,
-                status="results" if raw_list else "no_results",
-                result_count=len(raw_list),
-                duration_seconds=duration,
-            )
+        provider_runtime.record_failure(provider_id)
+        results[index] = (
+            [],
+            ProviderOutcome(provider_id, "error", 0, duration, PROVIDER_BUDGET_REASON),
         )
-        for candidate in raw_list:
-            raw_candidates.append((provider, candidate))
+    return results
 
-    normalized: list[IdentificationCandidate] = []
-    for provider, payload in raw_candidates:
-        normalized.append(_normalize_candidate(provider.provider_id, payload, signals))
 
-    # Among equal scores, a candidate whose edition agrees with the file ranks first
-    # (e.g. the ISBN-lookup edition before a search hit for another edition, #37).
-    normalized.sort(
-        key=lambda item: (item.score, not edition_conflicts(item, signals)), reverse=True
+def _rank_candidates(
+    signals: IdentificationInput, candidates: list[IdentificationCandidate]
+) -> list[IdentificationCandidate]:
+    """Best score first; ties keep provider order after two tie-breaks.
+
+    Among equal scores a candidate whose edition agrees with the file ranks first
+    (e.g. the ISBN-lookup edition before a search hit for another edition, #37), then
+    one crediting no contributor the file does not name (#220, S2): "Brave New World"
+    by Aldous Huxley before the same title by ["SparkNotes", "Aldous Huxley"].
+    """
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item.score,
+            not edition_conflicts(item, signals),
+            -_unmatched_contributors(signals, item),
+        ),
+        reverse=True,
     )
-    return _apply_strong_match_rule(signals, normalized), outcomes
+
+
+def _unmatched_contributors(
+    signals: IdentificationInput, candidate: IdentificationCandidate
+) -> int:
+    """Extra contributors: candidate authors matching no author hint, counted only
+    when another of its authors does match (0 without hints or without a match)."""
+    hints = [normalize_text(name) for group in signals.author_groups() for name in group.names]
+    hints = [hint for hint in hints if hint]
+    if not hints:
+        return 0
+    names = [normalize_text(author) for author in candidate.authors if normalize_text(author)]
+    unmatched = [
+        name for name in names if not any(_author_name_similarity(name, hint) for hint in hints)
+    ]
+    return len(unmatched) if len(unmatched) < len(names) else 0
+
+
+def _dedupe_candidates(candidates: list[IdentificationCandidate]) -> list[IdentificationCandidate]:
+    """Drop repeats of one record (same provider, reference, title and authors).
+
+    DNB and Google Books return the same record several times for one query (#220);
+    the copies are neither extra evidence nor rivals.
+    """
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    unique: list[IdentificationCandidate] = []
+    for candidate in candidates:
+        key = (
+            candidate.provider_id,
+            candidate.provider_ref,
+            normalize_text(candidate.title),
+            tuple(normalize_text(author) for author in candidate.authors),
+        )
+        if candidate.provider_ref and key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _query_provider_with_outcome(
+    provider: MetadataProvider,
+    signals: IdentificationInput,
+    reuse_results: bool = True,
+) -> tuple[list[dict[str, Any]], ProviderOutcome]:
+    started_at = perf_counter()
+    cache_key = provider_runtime.query_key(provider.provider_id, _provider_query(signals))
+    cached_rows = provider_runtime.cached_result(cache_key) if reuse_results else None
+    if cached_rows is not None:
+        logger.info(
+            "metadata_provider_cached",
+            provider_id=provider.provider_id,
+            candidate_count=len(cached_rows),
+        )
+        return cached_rows, ProviderOutcome(
+            provider.provider_id,
+            "results" if cached_rows else "no_results",
+            len(cached_rows),
+            perf_counter() - started_at,
+            cached=True,
+        )
+    try:
+        rows = _query_provider(provider, signals)
+    except Exception as exc:  # provider boundary: one provider must not abort intake
+        duration = perf_counter() - started_at
+        reason = describe_provider_error(exc)
+        log = logger.warning if isinstance(exc, OSError) else logger.exception
+        log(
+            "metadata_provider_failed",
+            provider_id=provider.provider_id,
+            duration_seconds=duration,
+            error_type=type(exc).__name__,
+            reason=reason,
+        )
+        provider_runtime.record_failure(provider.provider_id)
+        return [], ProviderOutcome(provider.provider_id, "error", 0, duration, reason)
+
+    duration = perf_counter() - started_at
+    provider_runtime.record_success(provider.provider_id)
+    provider_runtime.store_result(cache_key, rows)
+    logger.info(
+        "metadata_provider_completed",
+        provider_id=provider.provider_id,
+        candidate_count=len(rows),
+        duration_seconds=duration,
+    )
+    return rows, ProviderOutcome(
+        provider.provider_id, "results" if rows else "no_results", len(rows), duration
+    )
+
+
+def _provider_query(signals: IdentificationInput) -> dict[str, Any]:
+    """Everything ``_query_provider`` sends, as the identity of a query."""
+    return {
+        "titles": signals.title_hints[:3],
+        "author": signals.best_author(),
+        "isbn": signals.isbns[0] if signals.isbns else None,
+        "folder_hint": signals.folder_hints[0] if signals.folder_hints else None,
+    }
 
 
 def _query_provider(
     provider: MetadataProvider,
     signals: IdentificationInput,
 ) -> list[dict[str, Any]]:
-    isbn = signals.isbns[0] if signals.isbns else None
-    author = signals.best_author()
-    folder_hint = signals.folder_hints[0] if signals.folder_hints else None
+    query = _provider_query(signals)
+    isbn = query["isbn"]
+    author = query["author"]
+    folder_hint = query["folder_hint"]
 
     for title in signals.title_hints[:3]:
         hits = provider.search(
@@ -1846,6 +2161,28 @@ def _author_name_similarity(left: str, right: str) -> float:
     # Equal up to spacing too: "HP Lovecraft" / "H P Lovecraft", "Le Guin" / "LeGuin".
     if "".join(left_tokens) == "".join(right_tokens):
         return 1.0
+    # The same tokens in another order (#220, N1/N2): Google Books writes "Stross
+    # Charles" for "Stross, Charles" without the comma. Order is no evidence here.
+    if len(left_tokens) >= 2 and sorted(left_tokens) == sorted(right_tokens):
+        return 1.0
+    score = _ordered_name_similarity(left_tokens, right_tokens)
+    if score:
+        return score
+    # N3: a comma-less "Surname Given ..." against "Given ... Surname" ("Stross Charles
+    # M." vs "Charles M. Stross") is compared with its surname moved to the end.
+    for tokens, other, raw in (
+        (left_tokens, right_tokens, left),
+        (right_tokens, left_tokens, right),
+    ):
+        if "," not in raw and len(tokens) >= 2 and tokens[0] == other[-1]:
+            score = _ordered_name_similarity([*tokens[1:], tokens[0]], other)
+            if score:
+                return score
+    return 0.0
+
+
+def _ordered_name_similarity(left_tokens: list[str], right_tokens: list[str]) -> float:
+    """Variant match of two "Given ... Surname" token lists (shared surname)."""
     if left_tokens[-1] != right_tokens[-1]:
         return 0.0
     left_given = left_tokens[:-1]
@@ -2007,9 +2344,70 @@ _PLACEHOLDER_AUTHORS = frozenset(
 )
 
 
+# Title values that name no book ("Unknown", Calibre's "Unknown title").
+_PLACEHOLDER_TITLES = frozenset(
+    {
+        "unknown",
+        "unknown title",
+        "untitled",
+        "unbekannt",
+        "unbekannter titel",
+        "ohne titel",
+        "inconnu",
+        "sans titre",
+        "n/a",
+        "none",
+    }
+)
+# Values that are a placeholder for any metadata field (publisher, language, ...).
+# This module holds the one placeholder vocabulary (#220): intake, sidecars, the
+# file-name parser and the text-header parser use the helpers below instead of
+# keeping lists of their own.
+PLACEHOLDER_METADATA_VALUES = frozenset({"unknown", "unknown author", "unknown title"})
+
+
+def _placeholder_key(value: str) -> str:
+    return normalize_text(value).strip(" .,;:-_()[]")
+
+
 def is_placeholder_author(name: str) -> bool:
     """True for creator values such as "Microsoft Office User" that name nobody."""
-    return normalize_text(name).strip(" .,;:-_") in _PLACEHOLDER_AUTHORS
+    return _placeholder_key(name) in _PLACEHOLDER_AUTHORS
+
+
+def is_placeholder_title(title: str) -> bool:
+    """True for title values such as "Unknown" or "Untitled" that name no book."""
+    return _placeholder_key(title) in _PLACEHOLDER_TITLES
+
+
+def is_placeholder_value(value: str) -> bool:
+    """True for an empty or generic placeholder value of any metadata field."""
+    key = _placeholder_key(value)
+    return not key or key in PLACEHOLDER_METADATA_VALUES
+
+
+def _is_placeholder_segment(segment: str) -> bool:
+    return is_placeholder_author(segment) or is_placeholder_title(segment)
+
+
+def strip_placeholder_segments(title: str) -> str:
+    """ "2001 A Space Odissey - Unknown" -> "2001 A Space Odissey".
+
+    Calibre names files ``<title> - <author>``; without an author that leaves a
+    trailing (or, in the other convention, leading) `` - Unknown`` segment that is not
+    part of the title. Returns ``""`` when only placeholders are left.
+    """
+    segments = [s.strip() for s in _FILENAME_SEPARATOR.split(title)]
+    segments = [s for s in segments if s.strip("-")]
+    if len(segments) < 2:
+        return "" if _is_placeholder_segment(title) else title
+    if not any(_is_placeholder_segment(s) for s in segments):
+        return title
+    while segments and _is_placeholder_segment(segments[-1]):
+        segments.pop()
+    while segments and _is_placeholder_segment(segments[0]):
+        segments.pop(0)
+    return " - ".join(segments)
 
 
 def evidence_author_names(metadata: dict[str, Any]) -> list[str]:
@@ -2257,6 +2655,65 @@ def candidates_describe_same_work(
     return _authors_name_same_people(left.authors, right.authors)
 
 
+def candidates_group_as_one_work(
+    left: IdentificationCandidate,
+    right: IdentificationCandidate,
+) -> bool:
+    """Whether two records belong to one work for rivalry and ties (#220, S2).
+
+    ``candidates_describe_same_work``, or the same full title without different
+    parts where one record's authors are all among the other's: an extra contributor
+    (a study-guide label such as "SparkNotes", an editor) beside the same author does
+    not make another work. A record crediting *other* people only (a study guide by
+    its own author) still does.
+    """
+    if candidates_describe_same_work(left, right):
+        return True
+    if candidates_name_different_parts(left, right):
+        return False
+    if _title_match_score(left.title, right.title) < 1.0:
+        return False
+    if not left.authors or not right.authors:
+        return False
+    return (
+        max(
+            _author_coverage(left.authors, right.authors),
+            _author_coverage(right.authors, left.authors),
+        )
+        >= AUTHOR_VARIANT_MATCH_SCORE
+    )
+
+
+def decisive_candidate(
+    signals: IdentificationInput,
+    candidates: list[IdentificationCandidate],
+) -> IdentificationCandidate | None:
+    """Return a candidate that confirms the file's ISBN, title and author evidence.
+
+    Without a source ISBN, wait for the remaining providers within their budget:
+    title and author identify a work, and a slower result can reveal an edition tie.
+    Intake still applies all acceptance checks to the returned candidates.
+    """
+    file_isbns = _isbn13_set(signals.isbns)
+    if not file_isbns:
+        return None
+    ranked = sorted(candidates, key=lambda item: item.score, reverse=True)
+    for candidate in ranked:
+        authors = [a for a in candidate.authors if not is_placeholder_author(a)]
+        if not authors or edition_conflicts(candidate, signals):
+            continue
+        if _explicit_authors_unmatched(signals, authors):
+            continue
+        title_agrees = any(titles_agree(hint, candidate.title) for hint in signals.title_hints)
+        if (
+            file_isbns & _edition_isbn13s(candidate)
+            and title_agrees
+            and candidate.score >= AUTO_ACCEPT_SCORE
+        ):
+            return candidate
+    return None
+
+
 def editions_disagree_on_language(candidates: list[IdentificationCandidate]) -> bool:
     """Whether same-work candidates name different languages (e.g. translations)."""
     named = [_candidate_languages(candidate) for candidate in candidates]
@@ -2391,6 +2848,27 @@ def edition_evidence(
     }
 
 
+@dataclass(frozen=True)
+class ScoringWeights:
+    title: float
+    author: float
+
+
+def scoring_weights() -> ScoringWeights:
+    """Title and author weights of the additive score (configurable, #220 S1).
+
+    The defaults (0.55 + 0.30) put "exact title + exact author, nothing else" at 0.85,
+    one step below the default auto-accept threshold on purpose: reaching the threshold
+    from title and author alone is the strong-match rule's decision, which also checks
+    where the title and author came from (a partial file-name title, both from one
+    hint, a missing coauthor). Raising the author weight would skip those checks.
+    """
+    return ScoringWeights(
+        title=float(getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_TITLE_WEIGHT", 0.55)),
+        author=float(getattr(django_settings, "BOOK_SCANNER_IDENTIFICATION_AUTHOR_WEIGHT", 0.3)),
+    )
+
+
 def _apply_scoring(
     signals: IdentificationInput,
     candidate: IdentificationCandidate,
@@ -2407,11 +2885,12 @@ def _apply_scoring(
     title_scores = [
         _title_match_score(title_hint, candidate.title) for title_hint in signals.title_hints
     ]
+    weights = scoring_weights()
     if title_scores:
-        score += 0.55 * max(title_scores)
+        score += weights.title * max(title_scores)
 
     author_score = author_evidence_score(signals, candidate.authors)
-    score += 0.3 * author_score
+    score += weights.author * author_score
 
     # Language and publisher are compared with the selected edition; the work's lists
     # count only for a candidate that names no edition (#37). A field a concrete edition
@@ -2618,6 +3097,36 @@ def _strong_match_assessment(
     }
 
 
+# Strong-match blockers that are about *which work* the candidate is, as opposed to
+# which edition or how many rivals there are.
+_WORK_IDENTITY_BLOCKERS = frozenset(
+    {
+        "title_not_exact",
+        "stronger_title_evidence_disagrees",  # TITLE_EVIDENCE_CONFLICT, defined below
+        "author_not_strong",
+        "missing_coauthor",
+        "author_evidence_conflict",
+        "title_and_author_from_same_hint",
+        PARTIAL_TITLE_HINT,
+    }
+)
+
+
+def title_and_author_identify_work(
+    signals: IdentificationInput, candidate: IdentificationCandidate
+) -> bool:
+    """Whether title and author alone identify the candidate's *work* (#220, E1).
+
+    The exact-title + strong-author checks of the strong-match rule without its
+    edition and rivalry checks: an exact title from evidence nothing stronger
+    contradicts, every stated coauthor covered, and title and author from different
+    hints. Used to tell an edition mismatch (another printing's publisher) from a work
+    conflict.
+    """
+    assessment = _strong_match_assessment(signals, candidate, _strong_match_settings())
+    return not _WORK_IDENTITY_BLOCKERS.intersection(assessment["blocked_by"])
+
+
 def _title_forms(title: str) -> list[str]:
     """A title plus its cheap variants and its " - " segments, for agreement checks."""
     forms = _title_variants(title)
@@ -2731,7 +3240,9 @@ def _apply_strong_match_rule(
     blocked_by = list(assessment["blocked_by"])
     # Other editions of the same work (DNB, Google Books and Open Library often return
     # several) are no competing books: they neither tie with nor rival the top one.
-    rivals = [other for other in candidates[1:] if not candidates_describe_same_work(top, other)]
+    # Nor is a record of the same title crediting an extra contributor beside the same
+    # author (#220, S2: ["SparkNotes", "Aldous Huxley"] next to "Aldous Huxley").
+    rivals = [other for other in candidates[1:] if not candidates_group_as_one_work(top, other)]
     same_work_editions = len(candidates) - 1 - len(rivals)
     runner_up_score = rivals[0].score if rivals else None
     if runner_up_score is not None and top.score - runner_up_score <= config.tie_margin:

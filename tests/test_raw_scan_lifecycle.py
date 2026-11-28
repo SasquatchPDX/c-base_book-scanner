@@ -564,7 +564,7 @@ def test_abort_is_refused_after_capture_complete(key: str) -> None:
 
 
 @pytest.mark.django_db
-def test_portal_link_redirects_through_login_to_workspace(
+def test_portal_link_redirects_through_login_to_editor(
     key: str,
 ) -> None:
     _register(key)
@@ -580,7 +580,8 @@ def test_portal_link_redirects_through_login_to_workspace(
     client.force_login(get_or_create_profile("qr-reader").user)
     response = client.get(f"/j/{JOB_ID}")
     assert response.status_code == 302
-    assert response["Location"] == f"/scan/jobs/{JOB_ID}/workspace/?view=html"
+    # The QR code opens the editor; the job overview is retired (#228).
+    assert response["Location"] == f"/scan/jobs/{JOB_ID}/editor/"
     assert client.get(f"/j/{JOB_ID}/").status_code == 302
 
     page = client.get(response["Location"])

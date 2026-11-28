@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from django.test import override_settings
 
-from ebook_server.core import identification
+from ebook_server.core import identification, intake
 from ebook_server.core.identification import (
     AUTHOR_VARIANT_MATCH_SCORE,
     AUTO_ACCEPT_SCORE,
@@ -890,3 +891,61 @@ def test_goethe_volumes_with_their_own_isbns_still_tie() -> None:
 )
 def test_volume_markers(texts: tuple[str | None, ...], expected: set[tuple[str, int]]) -> None:
     assert identification.volume_markers(*texts) == expected
+
+
+def test_calibre_placeholders_stay_out_of_identification_signals() -> None:
+    filename = "A Space Odyssey - Unknown.txt"
+    embedded = {
+        "title": "A Space Odyssey - Unknown",
+        "title_source": "filename",
+        "authors": ["Unknown"],
+        identification.TEXT_HEADER_EVIDENCE_KEY: {"authors": ["Arthur C. Clarke"]},
+    }
+    merged = intake.apply_sidecar_metadata(
+        embedded, {"title": "A Space Odyssey", "authors": ["Unknown"]}
+    )
+    assert intake.sidecar_conflicts_in(merged) == []
+    assert "authors" not in merged[intake.SIDECAR_EVIDENCE_KEY]["applied_fields"]
+    signals = identification.build_identification_input(
+        source_path=f"/books/Unknown/{filename}",
+        original_filename=filename,
+        extracted_metadata=merged,
+    )
+    assert all("Unknown" not in title for title in signals.title_hints)
+    assert all(not identification.is_placeholder_author(author) for author in signals.author_hints)
+    assert identification.author_similarity(["Stross, Charles"], ["Stross Charles"]) == 1.0
+
+
+def test_providers_overlap_without_changing_result_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    together = Barrier(3)
+
+    class Provider:
+        def __init__(self, provider_id: str, fails: bool = False) -> None:
+            self.provider_id = provider_id
+            self.fails = fails
+
+        def search(self, **terms: Any) -> list[dict[str, Any]]:
+            together.wait(timeout=5)
+            if self.fails:
+                raise TimeoutError("slow provider")
+            return [{"title": terms["title"], "author_name": ["Author Name"]}]
+
+    monkeypatch.setattr(
+        identification,
+        "_provider_instances",
+        lambda: [Provider("first"), Provider("unavailable", fails=True), Provider("last")],
+    )
+    candidates, outcomes = identification.resolve_candidates_with_report(
+        identification.build_identification_input(
+            source_path="Example Book.txt",
+            original_filename="Example Book.txt",
+            extracted_metadata={"title": "Example Book", "authors": ["Author Name"]},
+        )
+    )
+
+    assert [candidate.provider_id for candidate in candidates] == ["first", "last"]
+    assert [(outcome.provider_id, outcome.status) for outcome in outcomes] == [
+        ("first", "results"),
+        ("unavailable", "error"),
+        ("last", "results"),
+    ]

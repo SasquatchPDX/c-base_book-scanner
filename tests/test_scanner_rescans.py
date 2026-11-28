@@ -541,7 +541,7 @@ def test_thumbnails_are_cached(key: str, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.django_db
-def test_workspace_shows_page_number_verification(
+def test_editor_marks_unverified_page_number(
     key: str,  # noqa: F811
     member: Client,
 ) -> None:
@@ -549,9 +549,19 @@ def test_workspace_shows_page_number_verification(
     todo = _open_todo(0)
     response = _replace(key, todo.pk, _jpeg(b"unverified"), 0, page_number_verified=False)
     assert response.status_code == 201
-    html = member.get(f"/scan/jobs/{JOB_ID}/workspace/?view=html").content.decode()
-    assert html.count("data-page-number-unverified") == 1
-    assert "Page number not verified" in html
+    # The editor's page strip marks it (#228): the page data and the live markers carry
+    # the scanner's check of the active version.
+    html = member.get(f"/scan/jobs/{JOB_ID}/editor/").content.decode()
+    data = html.split('id="scantailor-workspace-data" type="application/json">', 1)[1]
+    pages = json.loads(data.split("</script>", 1)[0])
+    assert [page["page_number_verified"] for page in pages] == [False, None, None, None]
+    markers = member.get(f"/scan/jobs/{JOB_ID}/workspace/state/").json()["pages"]
+    assert [(m["page_number_verified"], m["open_rescan_todos"]) for m in markers] == [
+        (False, 0),
+        (None, 0),
+        (None, 0),
+        (None, 0),
+    ]
     page = member.get(f"/scan/pages/{_page(0).pk}/").json()
     assert page["page_number_verified"] is False
     assert page["active_version"]["page_number_verified"] is False

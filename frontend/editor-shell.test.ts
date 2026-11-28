@@ -37,6 +37,7 @@ import {
 import {
   applyClick,
   neighbour,
+  pageMarkers,
   PageStrip,
   ROW_HEIGHT,
   sortItems,
@@ -46,7 +47,15 @@ import {
   visibleRange,
 } from "./page-strip";
 import { clampZoom, fitView, MAX_ZOOM, MIN_ZOOM, panBy, wheelFactor, zoomAt } from "./pan-zoom";
-import { fillUrl, stageSize, stripSourceStage } from "./scantailor-workspace";
+import {
+  fillUrl,
+  finishBlockers,
+  finishRequestBody,
+  runAllEstimate,
+  stageSize,
+  STAGE_ORDER,
+  stripSourceStage,
+} from "./scantailor-workspace";
 
 describe("pan and zoom (#195 step 3)", () => {
   it("fits the whole image centred in the pane", () => {
@@ -202,20 +211,64 @@ describe("editor helpers", () => {
     });
   };
 
-  it("shows the current stage's output, else the last completed stage before it", () => {
+  it("shows the furthest current stage, whichever stage is selected (#221)", () => {
     const page = {
       stages: chain(["deskew", "success"], ["select_content", "success"], ["dewarping", "queued"]),
     } as never;
-    expect(stripSourceStage(page, "select_content")?.stage).toBe("select_content");
-    expect(stripSourceStage(page, "margins")?.stage).toBe("select_content");
-    expect(stripSourceStage(page, "deskew")?.stage).toBe("deskew");
-    expect(stripSourceStage({ stages: chain(["deskew", "failed"]) } as never, "deskew")).toBe(
+    expect(stripSourceStage(page)?.stage).toBe("select_content");
+    const finished = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    expect(stripSourceStage({ stages: finished } as never)?.stage).toBe("output");
+    finished[4]!.settings_applied = false;
+    expect(stripSourceStage({ stages: finished } as never)?.stage).toBe("margins");
+    expect(stripSourceStage({ stages: chain(["deskew", "failed"]) } as never)).toBe(
       undefined,
     );
     // A stale result (#205) is not shown: Deskew's settings changed since it ran.
     const stale = chain(["deskew", "success"], ["select_content", "success"]);
     stale[0]!.settings_applied = false;
-    expect(stripSourceStage({ stages: stale } as never, "select_content")).toBe(undefined);
+    expect(stripSourceStage({ stages: stale } as never)).toBe(undefined);
+    // Invalidating a middle stage falls back to the furthest still-current stage before
+    // it, although later stages still hold (now stale) results.
+    const middle = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    middle[2]!.settings_applied = false;
+    expect(stripSourceStage({ stages: middle } as never)?.stage).toBe("select_content");
+    // A queued or running stage does not blank the thumbnail.
+    const running = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "running"],
+    );
+    expect(stripSourceStage({ stages: running } as never)?.stage).toBe("dewarping");
+  });
+
+  it("estimates Run all from the stages without a current result (#224)", () => {
+    const finished = chain(
+      ["deskew", "success"],
+      ["select_content", "success"],
+      ["dewarping", "success"],
+      ["margins", "success"],
+      ["output", "success"],
+    );
+    const partial = chain(["deskew", "success"], ["select_content", "failed"]);
+    expect(runAllEstimate([])).toBe(0);
+    expect(runAllEstimate([{ stages: finished }] as never)).toBe(0);
+    expect(runAllEstimate([{ stages: [] }] as never)).toBe(5);
+    expect(
+      runAllEstimate([{ stages: finished }, { stages: partial }, { stages: [] }] as never),
+    ).toBe(4 + 5);
   });
 
   it("uses the content box for Select Content and the output size elsewhere", () => {
@@ -480,5 +533,121 @@ describe("dewarping (#195 step 6a)", () => {
     expect(overlay.bottom.points).toHaveLength(5);
     overlay.remove();
     host.remove();
+  });
+});
+
+describe("rescan markers and finish in the editor (#228)", () => {
+  /** A page whose stages each ran on the previous stage's current output. */
+  const finishedPage = (id: string, sequence: number, extra: Record<string, unknown> = {}) => {
+    let input = `version-${id}`;
+    const stages = STAGE_ORDER.map((name, index) => {
+      const output = `${id}-${name}-out`;
+      const row: Record<string, unknown> = {
+        stage: name,
+        status: "success",
+        revision: 1,
+        output_sha256: output,
+        settings_applied: true,
+        applied_input_sha256: input,
+        input_sha256: index === 0 ? `version-${id}` : "",
+        parameters: {},
+      };
+      input = output;
+      return row;
+    });
+    return { id, logical_sequence_number: sequence, side: "single", stages, ...extra };
+  };
+  type TestPage = ReturnType<typeof finishedPage>;
+  const blockersOf = (pages: TestPage[]) => finishBlockers(pages as never);
+
+  it("marks requested rescans and unverified page numbers, never a verified one", () => {
+    expect(pageMarkers({})).toEqual([]);
+    expect(pageMarkers({ open_rescan_todos: 0, page_number_verified: true })).toEqual([]);
+    expect(pageMarkers({ page_number_verified: null })).toEqual([]);
+    expect(pageMarkers({ open_rescan_todos: 1 }).map((marker) => marker.kind)).toEqual(["rescan"]);
+    expect(
+      pageMarkers({ open_rescan_todos: 2, page_number_verified: false }).map((marker) => marker.kind),
+    ).toEqual(["rescan", "unverified"]);
+  });
+
+  it("draws the markers as badges on the strip thumbnail and updates them", () => {
+    const scroller = document.createElement("div");
+    document.body.append(scroller);
+    const strip = new PageStrip(scroller, { onClick: vi.fn() });
+    const entry: StripItem = {
+      id: "p1",
+      label: "1",
+      caption: "",
+      thumbnailUrl: "/t/p1",
+      stages: [],
+      width: null,
+      height: null,
+      markers: pageMarkers({ open_rescan_todos: 1, page_number_verified: false }),
+    };
+    strip.setItems([entry], ["p1"]);
+    const badges = () =>
+      [...scroller.querySelectorAll<HTMLElement>("[data-strip-page='p1'] [data-marker]")].map(
+        (badge) => badge.dataset.marker,
+      );
+    expect(badges()).toEqual(["rescan", "unverified"]);
+    expect(scroller.querySelector("[data-marker='unverified']")?.getAttribute("title")).toContain(
+      "Page number not verified",
+    );
+    strip.update({ ...entry, markers: [] });
+    expect(badges()).toEqual([]);
+    scroller.remove();
+  });
+
+  it("explains why finish is refused: no pages, open rescans, missing Output", () => {
+    expect(blockersOf([]).map((blocker) => blocker.kind)).toEqual(["no_pages"]);
+    const ready = finishedPage("a", 1);
+    expect(blockersOf([ready])).toEqual([]);
+
+    const rescan = finishedPage("b", 2, { open_rescan_todos: 1 });
+    const unfinished = finishedPage("c", 3);
+    unfinished.stages[4]!.status = "queued";
+    const blockers = blockersOf([ready, rescan, unfinished]);
+    expect(blockers.map((blocker) => [blocker.kind, blocker.pageIds])).toEqual([
+      ["open_rescans", ["b"]],
+      ["missing_output", ["c"]],
+    ]);
+    expect(blockers[1]!.message).toBe("1 page(s) have no current Output result: 3.");
+
+    // A stale Output (its settings changed since it ran) is not a result to finish with.
+    const stale = finishedPage("d", 4);
+    stale.stages[4]!.settings_applied = false;
+    expect(blockersOf([stale])[0]!.kind).toBe("missing_output");
+
+    // A page declared blank needs its Margins result, not an Output result.
+    // Every other stage is skipped; Margins renders the white page from the scan.
+    const blank = finishedPage("e", 5);
+    for (const index of [0, 1, 2, 4]) {
+      blank.stages[index]!.status = "skipped";
+      blank.stages[index]!.skip_reason = "declared_blank";
+    }
+    blank.stages[3]!.input_sha256 = "version-e";
+    blank.stages[3]!.applied_input_sha256 = "version-e";
+    expect(blockersOf([blank])).toEqual([]);
+    blank.stages[3]!.status = "queued";
+    expect(blockersOf([blank])[0]!.kind).toBe("missing_output");
+  });
+
+  it("lists at most ten pages in a blocker", () => {
+    const pages = Array.from({ length: 12 }, (_, index) =>
+      finishedPage(`p${index}`, index + 1, { open_rescan_todos: 1 }),
+    );
+    expect(blockersOf(pages)[0]!.message).toBe(
+      "12 page(s) wait for a requested rescan: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more.",
+    );
+  });
+
+  it("always asks for the cleaned variant and sends the OCR language only with OCR", () => {
+    expect(finishRequestBody(false, "deu")).toEqual({ create_cleaned_variant: true, auto_ocr: false });
+    expect(finishRequestBody(true, " deu ")).toEqual({
+      create_cleaned_variant: true,
+      auto_ocr: true,
+      language: "deu",
+    });
+    expect(finishRequestBody(true, "")).toEqual({ create_cleaned_variant: true, auto_ocr: true });
   });
 });

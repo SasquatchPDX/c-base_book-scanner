@@ -7,6 +7,12 @@ a max timestamp: a transaction with an older timestamp that commits late must st
 be delivered. No shared cache or writer-side locks are needed. Every connection
 starts with a complete snapshot. Stage mutations must update updated_at (as normal
 model saves, worker status writes and invalidations do).
+
+Page markers (#228) travel with the stages: whenever the job's rescan todos change
+(a member requests a rescan, the scanner claims it or a replacement completes it), the
+payload carries ``pages`` with every page's open rescan count and the scanner's page
+number check of its active version. The todo token is part of the job row query, so an
+idle tick still costs the same queries.
 """
 
 from __future__ import annotations
@@ -17,12 +23,58 @@ from datetime import datetime
 from typing import Any
 
 from django.db import connection
+from django.db.models import Count, Max, OuterRef, Q, Subquery
 from django.db.models.expressions import RawSQL
 
 from . import scantailor
-from .models import ScanJob, ScanTailorStageState
+from .models import ScanJob, ScanPage, ScanPageVersion, ScanTailorStageState, ScanTodo
 
 StageToken = tuple[int, str, datetime]
+
+# Rescan todos still waiting for a replacement (the scanner may have claimed one).
+OPEN_RESCAN_STATES = (ScanTodo.State.OPEN, ScanTodo.State.CLAIMED)
+
+
+def _rescan_todos_of_job() -> Any:
+    return ScanTodo.objects.filter(
+        scan_job_id=OuterRef("pk"), todo_type=ScanTodo.TodoType.RESCAN
+    ).order_by()
+
+
+def page_markers(job_id: str) -> list[dict[str, Any]]:
+    """Every page's open rescan count and page-number check, in one query (#228).
+
+    ``page_number_verified`` is the scanner's check of the active version: ``False``
+    only for a rescan replacement whose printed page number could not be confirmed.
+    """
+    active_verified = (
+        ScanPageVersion.objects.filter(scan_page_id=OuterRef("pk"), is_active=True)
+        .order_by("-version")
+        .values("page_number_verified")[:1]
+    )
+    pages = (
+        ScanPage.objects.filter(scan_job_id=job_id)
+        .annotate(
+            open_rescans=Count(
+                "todos",
+                filter=Q(
+                    todos__todo_type=ScanTodo.TodoType.RESCAN,
+                    todos__state__in=OPEN_RESCAN_STATES,
+                ),
+            ),
+            active_page_number_verified=Subquery(active_verified),
+        )
+        .order_by("logical_sequence_number", "side", "pk")
+        .values("pk", "open_rescans", "active_page_number_verified")
+    )
+    return [
+        {
+            "id": str(page["pk"]),
+            "open_rescan_todos": page["open_rescans"],
+            "page_number_verified": page["active_page_number_verified"],
+        }
+        for page in pages
+    ]
 
 
 @dataclass(frozen=True)
@@ -41,10 +93,31 @@ class WorkspaceEventPoller:
         self.serialize_stage = serialize_stage
         self._tokens: dict[int, StageToken] | None = None
         self._job_token: tuple[str, datetime] | None = None
+        self._todo_token: tuple[Any, ...] | None = None
         self._fingerprint: str | None = None
 
     def poll(self) -> WorkspaceUpdate:
-        jobs = ScanJob.objects.filter(pk=self.job_id).only("id", "state", "updated_at")
+        rescans = _rescan_todos_of_job()
+        jobs = (
+            ScanJob.objects.filter(pk=self.job_id)
+            .only("id", "state", "refinish_needed", "updated_at")
+            .annotate(
+                # Count and newest change of the job's rescan todos (#228): a request,
+                # a claim and a completed replacement each move one of them.
+                _rescan_count=Subquery(
+                    rescans.values("scan_job_id").annotate(n=Count("pk")).values("n")[:1]
+                ),
+                _rescan_open=Subquery(
+                    rescans.filter(state__in=OPEN_RESCAN_STATES)
+                    .values("scan_job_id")
+                    .annotate(n=Count("pk"))
+                    .values("n")[:1]
+                ),
+                _rescan_changed=Subquery(
+                    rescans.values("scan_job_id").annotate(m=Max("updated_at")).values("m")[:1]
+                ),
+            )
+        )
         postgres = connection.vendor == "postgresql"
         if postgres:
             # Reduce idle transfer to one row. Hash only cheap metadata, never the
@@ -65,11 +138,17 @@ class WorkspaceEventPoller:
         if job is None:
             return WorkspaceUpdate(False, None)
         job_token = (job.state, job.updated_at)
+        todo_token = (
+            getattr(job, "_rescan_count", None),
+            getattr(job, "_rescan_open", None),
+            getattr(job, "_rescan_changed", None),
+        )
+        todos_changed = todo_token != self._todo_token
         fingerprint = getattr(job, "_workspace_fingerprint", None)
         unchanged_stages = (
             postgres and self._tokens is not None and fingerprint == self._fingerprint
         )
-        if unchanged_stages and job_token == self._job_token:
+        if unchanged_stages and job_token == self._job_token and not todos_changed:
             return WorkspaceUpdate(True, None)
         # The first stage serializes its input version's checksum (#205); an aligned
         # Margins row its predecessor's output and the job's common page size (#208).
@@ -95,7 +174,7 @@ class WorkspaceEventPoller:
                     "pk", "revision", "status", "updated_at"
                 )
             }
-            if job_token == self._job_token and tokens == self._tokens:
+            if job_token == self._job_token and tokens == self._tokens and not todos_changed:
                 # A previous payload fetch may have already observed a newer row
                 # version than its fingerprint query. Advance the cheap cursor too.
                 self._fingerprint = fingerprint
@@ -106,15 +185,17 @@ class WorkspaceEventPoller:
         # cause one harmless duplicate next tick, but cannot be hidden by this fetch.
         self._tokens = tokens
         self._job_token = job_token
+        self._todo_token = todo_token
         self._fingerprint = fingerprint
         # The common page size is computed once per tick, not once per Margins row.
         scantailor.attach_margins_aggregate_if_needed(states)
-        return WorkspaceUpdate(
-            True,
-            {
-                "job_id": str(job.pk),
-                "state": job.state,
-                "updated_at": job.updated_at.isoformat(),
-                "stages": [self.serialize_stage(state) for state in states],
-            },
-        )
+        payload: dict[str, Any] = {
+            "job_id": str(job.pk),
+            "state": job.state,
+            "refinish_needed": job.refinish_needed,
+            "updated_at": job.updated_at.isoformat(),
+            "stages": [self.serialize_stage(state) for state in states],
+        }
+        if todos_changed:
+            payload["pages"] = page_markers(self.job_id)
+        return WorkspaceUpdate(True, payload)

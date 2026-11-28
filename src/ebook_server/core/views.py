@@ -20,7 +20,7 @@ from django.conf import settings as django_settings
 from django.contrib.auth.decorators import login_required
 from django.core.files.base import File
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.http import (
     FileResponse,
     HttpRequest,
@@ -47,13 +47,16 @@ from ebook_server.storage import (
 from . import (
     capture_layout,
     intake,
+    metadata_search,
     ocr,
     scan_artifact_pruning,
     scan_identification,
     scan_images,
+    scan_job_status,
     scan_lifecycle,
     scan_logs,
     scan_pipeline,
+    scan_run,
     scan_thumbnails,
     scanner_opf,
     scanner_rescans,
@@ -83,7 +86,7 @@ from .view_helpers import (
     _request_payload,
     _wants_html,
 )
-from .workspace_events import WorkspaceEventPoller
+from .workspace_events import WorkspaceEventPoller, page_markers
 
 SCANNING_STORAGE_ROOT = "scan-artifacts"
 SCANNING_NAMESPACE: Final[str] = "scan-jobs"
@@ -151,7 +154,9 @@ def _serialize_scan_page(
         active_version = _prefetched_active_version(versions)
         ordered_versions = sorted(versions, key=lambda version: version.version, reverse=True)
     if open_todo_count is None:
-        open_todo_count = page.todos.filter(state=ScanTodo.State.OPEN).count()
+        open_todo_count = page.todos.filter(
+            todo_type=ScanTodo.TodoType.RESCAN, state__in=scanner_rescans.OPEN_TODO_STATES
+        ).count()
     return {
         "id": str(page.id),
         "logical_sequence_number": page.logical_sequence_number,
@@ -162,6 +167,8 @@ def _serialize_scan_page(
             active_version.page_number_verified if active_version is not None else None
         ),
         "scanner_status": page.status,
+        # A person's decision (#219): "normal" or "blank" ("excluded" is reserved).
+        "page_disposition": page.page_disposition,
         "open_rescan_todos": open_todo_count,
         "active_version": _serialize_scan_page_version(active_version),
         "available_versions": [_serialize_scan_page_version(v) for v in ordered_versions],
@@ -176,6 +183,8 @@ def _serialize_margins_input(state: ScanTailorStageState) -> dict[str, Any]:
         or state.status != ScanTailorStageState.StageStatus.SUCCESS
     ):
         return {}
+    if scantailor.is_blank_margins(state):
+        return {"input_sha256": scantailor.stage_input_fingerprint(state)}
     predecessor = state.input_stage_state
     if predecessor is None or not scantailor.margins_depends_on_aggregate(state):
         return {}
@@ -211,6 +220,7 @@ def _serialize_stage_state(state: ScanTailorStageState) -> dict[str, Any]:
         "stage_label": ScanTailorStageState.Stage(state.stage).label,
         "revision": state.revision,
         "status": state.status,
+        "skip_reason": "declared_blank" if state.status == "skipped" else "",
         "algorithm": state.algorithm,
         "algorithm_version": state.algorithm_version,
         "parameters": state.parameters,
@@ -1059,9 +1069,18 @@ def stage_job_status(
 
 
 def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
+    """Jobs for the JSON list (#226): pages, versions and open todos in four queries."""
+    pages = ScanPage.objects.order_by("logical_sequence_number", "side").prefetch_related(
+        "versions",
+        Prefetch(
+            "todos",
+            queryset=ScanTodo.objects.filter(state=ScanTodo.State.OPEN).only("pk", "scan_page_id"),
+            to_attr="open_todos",
+        ),
+    )
     queryset = (
         ScanJob.objects.select_related("book", "operator")
-        .prefetch_related("pages", "pages__versions")
+        .prefetch_related(Prefetch("pages", queryset=pages, to_attr="ordered_pages"))
         .order_by("-created_at")
     )
     if with_open_todo_count:
@@ -1072,6 +1091,9 @@ def _scan_job_queryset(*, with_open_todo_count: bool = False) -> Any:
                     todos__state=ScanTodo.State.OPEN,
                     todos__todo_type=ScanTodo.TodoType.RESCAN,
                 ),
+                # The with_open_todos filter joins todos again; without distinct the
+                # count is multiplied by that join.
+                distinct=True,
             )
         )
     return queryset
@@ -1118,16 +1140,22 @@ def _scan_job_payload(job: ScanJob) -> dict[str, Any]:
     return _serialize_scan_job_with_pages(job, include_pages=True)
 
 
-def _scan_job_payload_with_open_todos(job: ScanJob) -> dict[str, Any]:
-    payload = _serialize_scan_job(
-        job,
-        include_open_todo_count=True,
-        include_pipeline=True,
-    )
-    payload["pages"] = [
-        _serialize_scan_page(page)
-        for page in job.pages.all().order_by("logical_sequence_number", "side")
-    ]
+def _scan_job_list_item(job: ScanJob, *, include_open_todo_count: bool = False) -> dict[str, Any]:
+    """One ``GET /scan/jobs/`` item from :func:`_scan_job_queryset`'s prefetches (#226).
+
+    The query count does not grow with the number of pages, and nothing touches scan
+    storage: the per-page pipeline progress (which checks every page file on disk)
+    is only part of the job detail, ``GET /scan/jobs/{id}/``.
+    """
+    payload = _serialize_scan_job(job, include_open_todo_count=include_open_todo_count)
+    pages: list[dict[str, Any]] = []
+    for page in job.ordered_pages:  # type: ignore[attr-defined]
+        versions = list(page.versions.all())
+        item = _serialize_scan_page(page, versions=versions, open_todo_count=len(page.open_todos))
+        if _prefetched_active_version(versions) is not None:
+            item["thumbnail"] = _scan_page_thumbnail_url(page)
+        pages.append(item)
+    payload["pages"] = pages
     return payload
 
 
@@ -1160,7 +1188,14 @@ def _serialize_workspace_pages(job: ScanJob) -> list[dict[str, Any]]:
     """
     page_list = list(
         job.pages.annotate(
-            open_todo_count=Count("todos", filter=Q(todos__state=ScanTodo.State.OPEN)),
+            # Open or claimed rescans: the page waits for a replacement (#228).
+            open_todo_count=Count(
+                "todos",
+                filter=Q(
+                    todos__todo_type=ScanTodo.TodoType.RESCAN,
+                    todos__state__in=scanner_rescans.OPEN_TODO_STATES,
+                ),
+            ),
         )
         .prefetch_related("versions", "versions__page_image")
         .order_by("logical_sequence_number", "side"),
@@ -1359,6 +1394,9 @@ def _edited_stage_settings(
     parameters = payload.get("parameters")
     if isinstance(parameters, dict):
         merged = dict(parameters)
+        # Blank declarations are page-wide, audited changes. Stage parameters are
+        # editable by API clients and cannot set that flag.
+        merged.pop("declared_blank", None)
         if stage == "select_content":
             if _contains_stage_manual_override(stage, merged):
                 merged.setdefault("content_mode", "manual")
@@ -1367,7 +1405,7 @@ def _edited_stage_settings(
                 merged.setdefault("margins_mode", "manual")
         elif stage == "output":
             output_mode = str(merged.get("output_mode", "")).strip().lower()
-            if output_mode in {"otsu", "sauvola", "wolf", "fox", "window", "grad", "copy"}:
+            if output_mode in scantailor.OUTPUT_MODES:
                 algorithm_name = "copy" if output_mode == "copy" else f"binarization_{output_mode}"
         if state.applied_revision is not None and scantailor.stage_settings(
             stage, merged
@@ -1418,7 +1456,7 @@ def _apply_stage_payload_to_state(
 def _lock_stage_state(state: ScanTailorStageState) -> ScanTailorStageState:
     """Re-read ``state`` under a row lock; call inside ``transaction.atomic()``."""
     return (
-        ScanTailorStageState.objects.select_for_update()
+        ScanTailorStageState.objects.select_for_update(of=("self",))
         .select_related("scan_job", "scan_page")
         .get(pk=state.pk)
     )
@@ -1462,32 +1500,27 @@ def scan_job_workspace(
     except (ScanJob.DoesNotExist, ValueError):
         return HttpResponseNotFound()
 
+    if _wants_html(request):
+        # The old job overview is retired (#228): the editor covers per-page work,
+        # rescan requests and finish. Old links and bookmarks land in the editor.
+        return redirect(_scan_editor_url(job.pk, page_id=request.GET.get("page")))
     pages = _serialize_workspace_pages(job)
-    opf_metadata = scanner_opf.display_metadata(job)
     payload = {
         "job_id": str(job.id),
         "state": job.state,
         "pages": pages,
         "count": len(pages),
         "stage_order": list(scantailor.stage_order()),
-        "metadata_opf": opf_metadata,
+        "metadata_opf": scanner_opf.display_metadata(job),
     }
-    if _wants_html(request):
-        stage_navigation = [
-            {"name": stage, "label": ScanTailorStageState.Stage(stage).label}
-            for stage in scantailor.stage_order()
-        ]
-        return render(
-            request,
-            "core/scan_workspace.html",
-            {
-                "job": job,
-                "pages": pages,
-                "stage_navigation": stage_navigation,
-                "opf_metadata": opf_metadata,
-            },
-        )
     return JsonResponse(payload)
+
+
+def _scan_editor_url(job_id: Any, *, page_id: Any = None) -> str:
+    """The editor of ``job_id``, opened on ``page_id`` when it is a page UUID."""
+    url = reverse("scan-job-editor", kwargs={"job_id": str(job_id)})
+    page = _coerce_uuid(str(page_id)) if page_id else None
+    return f"{url}?page={page}" if page is not None else url
 
 
 # Rows changed this long before the client's cursor are sent again, so a transaction
@@ -1507,7 +1540,11 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
     """
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
-    job = ScanJob.objects.filter(pk=job_id).only("id", "state", "updated_at").first()
+    job = (
+        ScanJob.objects.filter(pk=job_id)
+        .only("id", "state", "refinish_needed", "updated_at")
+        .first()
+    )
     if job is None:
         return HttpResponseNotFound()
     cursor = timezone.now()
@@ -1526,7 +1563,10 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
             "state": job.state,
             "updated_at": job.updated_at.isoformat(),
             "cursor": cursor.isoformat(),
+            "refinish_needed": job.refinish_needed,
             "stages": _serialize_stage_states(list(states.order_by("pk"))),
+            # Rescan markers of every page (#228): one aggregate query.
+            "pages": page_markers(str(job.pk)),
         }
     )
 
@@ -1536,13 +1576,13 @@ def scan_job_workspace_state(request: HttpRequest, job_id: str) -> HttpResponseB
 def scan_job_editor(request: HttpRequest, job_id: str) -> HttpResponseBase:
     """The ScanTailor editor: stage list, preview canvas and page strip (#195 step 3).
 
-    Upstream Scan Tailor's main window: the whole viewport, three columns. The job
-    overview (``workspace/``) keeps uploads, identification, finishing and the
-    no-JavaScript Run forms.
+    Upstream Scan Tailor's main window: the whole viewport, three columns. Since #228
+    it is the only job page: it also requests rescans and finishes the job (the old
+    job overview at ``workspace/`` redirects here).
     """
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
-    job = ScanJob.objects.filter(pk=job_id).first()
+    job = ScanJob.objects.select_related("book").filter(pk=job_id).first()
     if job is None:
         return HttpResponseNotFound()
     return render(
@@ -1552,6 +1592,11 @@ def scan_job_editor(request: HttpRequest, job_id: str) -> HttpResponseBase:
             "job": job,
             "pages": _serialize_workspace_pages(job),
             "editable": job.state in scan_lifecycle.PROCESSING_STATES,
+            "can_declare_blank": job.state in scan_lifecycle.RESCAN_STATES,
+            # Finish (#228): what happens to the book link, shown in the dialog.
+            "finish_book_hint": _finish_book_hint(job, scanner_opf.display_metadata(job)),
+            "latest_finalization": _latest_finalization_job(job),
+            "run_all_blocked": scan_artifact_pruning.low_space_message(),
             "stage_navigation": [
                 {
                     "name": stage,
@@ -1561,6 +1606,33 @@ def scan_job_editor(request: HttpRequest, job_id: str) -> HttpResponseBase:
                 for stage in scantailor.stage_order()
             ],
         },
+    )
+
+
+def _finish_book_hint(job: ScanJob, opf_metadata: dict[str, Any] | None) -> str:
+    """What finish does about the library book, as ``scan_job_finish`` decides it."""
+    if job.book is not None:
+        return f"Adds the cleaned pages to the library book \u201c{job.book.title}\u201d."
+    if opf_metadata and opf_metadata.get("title") and not opf_metadata.get("ignored"):
+        return (
+            "Links or creates the library book from the scanner's metadata "
+            f"(\u201c{opf_metadata['title']}\u201d), then builds the cleaned book."
+        )
+    return (
+        "No library book is linked yet: finish starts the bibliographic identification "
+        "first. Finish again once the book is identified."
+    )
+
+
+def _latest_finalization_job(job: ScanJob) -> ProcessingJob | None:
+    """The newest finalization of ``job``, linked from the editor (#228)."""
+    return (
+        ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.SCAN_FINALIZATION,
+            details__scan_job_id=str(job.pk),
+        )
+        .order_by("-scheduled_at")
+        .first()
     )
 
 
@@ -1725,6 +1797,8 @@ def scan_page_stage(
         state = _lock_stage_state(state)
         if expected_revision is not None and expected_revision != state.revision:
             return _conflict_response(state, expected_revision)
+        if scantailor.is_declared_blank_stage(state):
+            return HttpResponseBadRequest("clear the blank declaration before editing stages")
         # Posting the stored settings again changes nothing: no revision, no job (#209).
         unchanged = _stage_edit_is_noop(state, normalized_stage, payload)
         if not unchanged:
@@ -1741,7 +1815,7 @@ def scan_page_stage(
     response_payload = _ensure_payload(ensured)
     response_payload["unchanged"] = unchanged
     if _wants_html(request):
-        return redirect("scan-job-workspace", job_id=page.scan_job_id)
+        return redirect(_scan_editor_url(page.scan_job_id, page_id=page.pk))
     # 202 while work is pending for the edit; 200 when nothing changed and nothing runs.
     idle = unchanged and ensured.outcome in {"current", "failed", "waiting"}
     return JsonResponse(response_payload, status=200 if idle else 202)
@@ -1817,6 +1891,39 @@ def _stage_low_space_response() -> HttpResponse | None:
     return HttpResponse(message, status=507, content_type="text/plain; charset=utf-8")
 
 
+@require_http_methods(["GET", "POST"])
+@scan_api_login_required
+def scan_job_run_all(request: HttpRequest, job_id: str) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    job = ScanJob.objects.filter(pk=job_id).first()
+    if job is None:
+        return HttpResponseNotFound()
+    if request.method == "POST":
+        data = _json_body(request)
+        action = data.get("action")
+        if action == "start":
+            if low_space := _stage_low_space_response():
+                return low_space
+            try:
+                run = scan_run.start(job_id, profile.user_id)
+            except scan_run.RunError as exc:
+                return HttpResponseBadRequest(str(exc))
+            return JsonResponse({"run": scan_run.payload(run)}, status=202)
+        run_id = _coerce_int(data.get("run_id"), minimum=1)
+        if action != "cancel" or run_id is None:
+            return HttpResponseBadRequest("Provide a Run all action and a run ID for cancellation.")
+        scan_run.cancel(job_id, run_id)
+    latest = job.pipeline_runs.order_by("-pk").first()
+    return JsonResponse(
+        {
+            "run": scan_run.payload(latest) if latest else None,
+            "blocked_reason": scan_artifact_pruning.low_space_message() or "",
+        }
+    )
+
+
 @require_POST
 @scan_api_login_required
 def scan_job_stage_batch(
@@ -1882,7 +1989,9 @@ def scan_job_stage_batch(
         )
         with transaction.atomic():
             state = _lock_stage_state(state)
-            if preserve_exceptions and _is_manual_stage_state(state):
+            if scantailor.is_declared_blank_stage(state) or (
+                preserve_exceptions and _is_manual_stage_state(state)
+            ):
                 skipped.append(str(page.id))
                 continue
             _apply_and_save_stage_edit(state, page, normalized_stage, payload)
@@ -1959,7 +2068,7 @@ def scan_page_stage_preview(
 
     wants_input = _coerce_bool(request.GET.get("input"))
     token = ""
-    if wants_input and state.input_stage_state is not None:
+    if wants_input and state.input_stage_state is not None and not state.scan_page.declared_blank:
         identifier = (
             state.input_stage_state.preview_storage_identifier
             or state.input_stage_state.output_storage_identifier
@@ -2007,7 +2116,12 @@ def scan_jobs(
             ScanJob.State.CAPTURED,
             ScanJob.State.FINALIZING,
         ]
-        queryset = _scan_job_queryset(with_open_todo_count=include_open_todos)
+        html = _wants_html(request)
+        queryset = (
+            ScanJob.objects.order_by("-created_at")
+            if html
+            else _scan_job_queryset(with_open_todo_count=include_open_todos)
+        )
         queryset = queryset.filter(state__in=states)
         if include_open_todos:
             queryset = queryset.filter(
@@ -2017,22 +2131,23 @@ def scan_jobs(
         scanner_id = _coerce_str_or_none(request.GET.get("scanner_id"))
         if scanner_id:
             queryset = queryset.filter(scanner_id=scanner_id)
-        serializer = _scan_job_payload_with_open_todos if include_open_todos else _scan_job_payload
-        response_payload = {
-            "items": [serializer(job) for job in queryset],
-            "count": queryset.count(),
-        }
-        if _wants_html(request):
+        if html:
+            # Derived pipeline status and scanner metadata with a fixed number of
+            # aggregated queries for the whole list, never per page (#226, #227).
+            # "Create scan job" is hidden in the template (#227, maybe later); the
+            # POST branch below still serves the session API.
             return render(
                 request,
                 "core/scan_jobs.html",
                 {
-                    "jobs": list(queryset),
+                    "jobs": scan_job_status.list_jobs(queryset),
                     "states": ScanJob.State.choices,
-                    "books": Book.objects.order_by("title")[:500],
                 },
             )
-        return JsonResponse(response_payload)
+        items = [
+            _scan_job_list_item(job, include_open_todo_count=include_open_todos) for job in queryset
+        ]
+        return JsonResponse({"items": items, "count": len(items)})
 
     payload = _parse_scan_request_payload(request)
     job_title = _coerce_str_or_none(payload.get("provisional_title")) or ""
@@ -2079,7 +2194,7 @@ def scan_jobs(
         notes=notes,
     )
     if _wants_html(request):
-        return redirect("scan-job-workspace", job_id=job.id)
+        return redirect("scan-job-editor", job_id=job.id)
     return JsonResponse(_scan_job_payload(job), status=201)
 
 
@@ -2188,6 +2303,12 @@ def scan_job_identification_request(
     request: HttpRequest,
     job_id: str,
 ) -> HttpResponseBase:
+    """Session API: start scan identification by hand.
+
+    The web UI no longer offers this (#227): identification runs automatically when a
+    scanner OPF arrives with missing fields, and at finish. The endpoint stays for API
+    clients and tests.
+    """
     if normalize_scan_job_id(job_id) is None:
         return HttpResponseBadRequest("invalid job id")
     profile = _active_library_profile(request)
@@ -2223,7 +2344,10 @@ def scan_job_identification_request(
             scan_job=scan_job,
             requested_by_user_id=profile.user_id,
         )
-    except scan_identification.ScanIdentificationError as exc:
+    except (
+        scan_identification.ScanIdentificationError,
+        metadata_search.SearchInProgressError,
+    ) as exc:
         return HttpResponseBadRequest(str(exc))
     response_payload = scan_identification.job_payload(job)
     if _wants_html(request):
@@ -2283,6 +2407,65 @@ def scan_todos(
 
 @require_POST
 @scan_api_login_required
+def scan_page_blank(request: HttpRequest, job_id: str, page_id: str) -> HttpResponseBase:
+    profile = _active_library_profile(request)
+    if profile is None:
+        return HttpResponseForbidden()
+    payload = _json_body(request)
+    blank = payload.get("declared_blank")
+    disposition = payload.get("disposition")
+    if blank is None and isinstance(disposition, str):
+        # ``page_disposition`` models ``excluded`` too (#219); only blank is built.
+        if disposition == ScanPage.Disposition.EXCLUDED:
+            return HttpResponseBadRequest("excluding a page is not supported yet")
+        if disposition not in ScanPage.Disposition.values:
+            return HttpResponseBadRequest("unknown page disposition")
+        blank = disposition == ScanPage.Disposition.BLANK
+    revisions = payload.get("revisions")
+    if not isinstance(blank, bool) or not isinstance(revisions, dict):
+        return HttpResponseBadRequest("blank declaration and stage revisions are required")
+    if low_space := _stage_low_space_response():
+        return low_space
+
+    with transaction.atomic():
+        job = ScanJob.objects.select_for_update().filter(pk=job_id).first()
+        if job is None:
+            return HttpResponseNotFound()
+        page = job.pages.select_for_update().filter(pk=page_id).first()
+        if page is None:
+            return HttpResponseNotFound()
+        if job.state not in scan_lifecycle.RESCAN_STATES:
+            return HttpResponseBadRequest("scan job is not accepting processing changes")
+        version = page.active_version()
+        if version is None or str(version.pk) != str(payload.get("version_id")):
+            return JsonResponse(
+                {"error": "The active page image changed. Review it again."}, status=409
+            )
+        _ensure_workspace_stage_states(job, page)
+        states = list(page.stage_states.select_for_update().order_by("pk"))
+        if any(revisions.get(state.stage) != state.revision for state in states):
+            return JsonResponse(
+                {"error": "Page settings changed. Review the page again."}, status=409
+            )
+        if page.declared_blank != blank:
+            scantailor.set_page_blank(
+                page, states, version=version, blank=blank, actor_id=profile.user_id
+            )
+            if blank:
+                page.todos.filter(
+                    todo_type=ScanTodo.TodoType.RESCAN,
+                    state__in=scanner_rescans.OPEN_TODO_STATES,
+                ).update(state=ScanTodo.State.CANCELLED, updated_at=timezone.now())
+            scan_lifecycle.reopen_for_refinish(job)
+            scan_pipeline.invalidate_scan_job_library_artifacts(job)
+            transaction.on_commit(
+                lambda: scantailor.queue_after_blank_edit(job_id, page_id, profile.user_id)
+            )
+    return JsonResponse(_serialize_workspace_page(page))
+
+
+@require_POST
+@scan_api_login_required
 def scan_page_request_rescan(
     request: HttpRequest,
     page_id: str,
@@ -2306,10 +2489,10 @@ def scan_page_request_rescan(
     # the same transaction (#131, contract §6.11); the state is re-checked under lock.
     try:
         flagged = scanner_rescans.flag_page(page, reason=reason, user=profile.user)
-    except scan_lifecycle.LifecycleError:
-        return HttpResponseBadRequest("scan job is not accepting rescan requests")
+    except scan_lifecycle.LifecycleError as exc:
+        return HttpResponseBadRequest(str(exc))
     if _wants_html(request):
-        return redirect("scan-job-workspace", job_id=page.scan_job_id)
+        return redirect(_scan_editor_url(page.scan_job_id, page_id=page.pk))
     return JsonResponse(
         {
             "todo": _serialize_scan_todo(flagged.todo),
@@ -2428,7 +2611,7 @@ def upload_scan_page(
 
     status_code = 201 if created else 200
     if _wants_html(request):
-        return redirect("scan-job-workspace", job_id=job.id)
+        return redirect(_scan_editor_url(job.id, page_id=page.pk))
     return JsonResponse(
         {
             "job_id": str(job.id),
@@ -2681,12 +2864,16 @@ def scan_page_thumbnail(
     # One read of the stage rows and of the active version selects ONE artifact; the
     # bytes and the token/ETag both derive from that selection, so an invalidation
     # racing this request can never pair new bytes with an old immutable token.
-    states = {
-        state.stage: state
-        for state in ScanTailorStageState.objects.filter(
-            scan_job_id=page.scan_job_id, scan_page=page
-        ).select_related("preview_storage_location", "output_storage_location")
-    }
+    states = (
+        {
+            state.stage: state
+            for state in ScanTailorStageState.objects.filter(
+                scan_job_id=page.scan_job_id, scan_page=page
+            ).select_related("preview_storage_location", "output_storage_location")
+        }
+        if not _coerce_bool(request.GET.get("raw"))
+        else {}
+    )
     version = page.active_version()
     scantailor.link_page_states(states, version, scantailor.page_margins_aggregate(states))
     page_image = (
@@ -2727,7 +2914,7 @@ def scan_page_thumbnail(
 @require_GET
 @login_required
 def scan_job_portal_link(request: HttpRequest, job_id: str) -> HttpResponseBase:
-    """``/j/<job_id>`` (contract §9): the scanner's QR code. Login, then the workspace.
+    """``/j/<job_id>`` (contract §9): the scanner's QR code. Login, then the editor.
 
     It answers as soon as the job is registered (§8.4); an unknown ID is a 404.
     """
@@ -2737,7 +2924,7 @@ def scan_job_portal_link(request: HttpRequest, job_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
     if not ScanJob.objects.filter(pk=job_id).exists():
         return HttpResponseNotFound()
-    return redirect(reverse("scan-job-workspace", kwargs={"job_id": job_id}) + "?view=html")
+    return redirect("scan-job-editor", job_id=job_id)
 
 
 @require_GET
@@ -2836,7 +3023,10 @@ def scan_job_finish(
                 scan_job=job,
                 requested_by_user_id=profile.user_id,
             )
-        except scan_identification.ScanIdentificationError as exc:
+        except (
+            scan_identification.ScanIdentificationError,
+            metadata_search.SearchInProgressError,
+        ) as exc:
             return HttpResponseBadRequest(str(exc))
         identification_payload = scan_identification.job_payload(identification_job)
         if _wants_html(request):

@@ -4,8 +4,9 @@ import io
 import json
 from collections.abc import AsyncGenerator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import cv2
 import numpy as np
 import pytest
 from asgiref.sync import async_to_sync
@@ -13,7 +14,7 @@ from django.http import StreamingHttpResponse
 from django.test import Client, override_settings
 from PIL import Image, ImageDraw
 
-from ebook_server.core import deskew, scantailor, views
+from ebook_server.core import deskew, scan_artifact_pruning, scan_run, scantailor, views
 from ebook_server.core.models import (
     ProcessingJob,
     ScanPage,
@@ -24,7 +25,7 @@ from ebook_server.core.storage_registry import backend_for_location
 from ebook_server.storage import LocalFilesystemStorage
 from tests.stage_helpers import run_stage
 from tests.stage_helpers import stage_input as make_stage_input
-from tests.test_scan_jobs import _create_scan_job, _upload_scan_page
+from tests.test_scan_jobs import _create_scan_job, _DeferredQueue, _upload_scan_page
 
 
 def _stage_url(job_id: str, page_id: str, stage: str) -> str:
@@ -595,6 +596,428 @@ def test_select_content_detects_text_area() -> None:
     assert state.parameters["content_area_height"] < 560
 
 
+def test_auto_content_padding_clamps_to_image_and_page_mask() -> None:
+    assert scantailor._pad_content_box((10, 15, 20, 25), (40, 50)) == (5, 10, 25, 30)
+    assert scantailor._pad_content_box((2, 0, 35, 49), (40, 50)) == (0, 0, 39, 49)
+    assert scantailor._pad_content_box((0, 0, 39, 49), (40, 50)) == (0, 0, 39, 49)
+    mask = np.ones((50, 40), dtype=bool)
+    mask[:8, :] = False
+    assert scantailor._pad_content_box((10, 10, 20, 25), (40, 50), mask) == (5, 8, 25, 30)
+
+
+def test_select_content_pads_only_the_automatic_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#222: auto grows by 5 px at 150 dpi (also the mm size); manual/disabled do not."""
+    from ebook_server.core import content_box
+
+    source = Image.new("L", (300, 400), color=255)
+    source.info["dpi"] = (300, 300)  # full resolution = 2 x the 150 dpi working image
+    monkeypatch.setattr(content_box, "find_content_box", lambda gray, mask: (50, 60, 100, 120))
+
+    def run(parameters: dict[str, object]) -> dict[str, object]:
+        state = ScanTailorStageState(stage="select_content", parameters=parameters)
+        result = run_stage(scantailor._run_select_content, state, source)
+        return result.parameters
+
+    def box(parameters: dict[str, object]) -> tuple[int, int, int, int]:
+        value = cast(dict[str, int], parameters["content_box"])
+        return value["x1"], value["y1"], value["x2"], value["y2"]
+
+    assert scantailor._dpi_of(source) == (300, 300)
+    auto = run({"content_mode": "auto"})
+    # (50, 60, 100, 120) at 150 dpi, padded to (45, 55, 105, 125), back to 300 dpi.
+    assert box(auto) == (90, 110, 212, 252)
+    manual_box = {"x1": 100, "y1": 120, "x2": 202, "y2": 242}
+    manual = run({"content_mode": "manual", "content_box": manual_box})
+    assert box(manual) == (100, 120, 202, 242)
+    assert box(run({"content_mode": "disabled"})) == (0, 0, 300, 400)
+    # PhysSizeCalc: the millimetre size is that of the padded automatic box.
+    assert auto["content_size_mm"] == {
+        "width": round(122 * 25.4 / 300, 1),
+        "height": round(142 * 25.4 / 300, 1),
+    }
+
+
+def test_wolf_uses_page_wide_statistics_across_tiles() -> None:
+    source = Image.new("L", (1600, 100), color=255)
+    draw = ImageDraw.Draw(source)
+    draw.rectangle((20, 20, 180, 30), fill=5)
+    draw.rectangle((750, 40, 820, 46), fill=115)
+    draw.rectangle((760, 55, 1050, 70), fill=205)
+    tiled = scantailor._threshold_tiles(source, "wolf", {"window_size": 35})
+    whole = scantailor._binarize_with_cv2(
+        np.asarray(source), source, "wolf", window_size=35, k=0.33, r=128.0, invert=False
+    )
+    assert tiled.tobytes() == whole.tobytes()
+    assert tiled.crop((1536, 0, 1600, 100)).getextrema() == (255, 255)
+
+
+def test_output_histogram_reports_global_and_local_thresholds() -> None:
+    source = Image.new("L", (1200, 300), color=240)
+    ImageDraw.Draw(source).rectangle((0, 0, 299, 299), fill=30)
+    stage_input = make_stage_input(source)
+    histogram = scantailor._output_histogram(stage_input, "otsu", {})
+    assert sum(histogram["bins"]) == 960 * 240
+    assert histogram["threshold"] == {
+        "median": scantailor._pil_otsu_threshold(scantailor._thumbnail(source, 960)),
+        "kind": "global",
+    }
+
+    local = scantailor._output_histogram(stage_input, "wolf", {"window_size": 35}, zoned=True)
+    threshold = local["threshold"]
+    assert local["bins"] == histogram["bins"]
+    assert local["zoned"] and threshold["kind"] == "local"
+    assert threshold["low"] < threshold["median"] <= threshold["high"]
+    assert "threshold" not in scantailor._output_histogram(stage_input, "copy", {})
+
+
+# --- #225: Output algorithms, settings and threshold feedback -----------------
+
+
+def _text_with_blank_bottom(width: int = 1600, height: int = 1800) -> Image.Image:
+    """Text lines on top, an empty lower part bigger than a 768 px tile (#225)."""
+    rng = np.random.default_rng(225)
+    gray = rng.normal(232, 4, (height, width)).clip(0, 255)
+    for y in range(60, 700, 45):
+        for x in range(80, width - 80, 70):
+            gray[y : y + 14, x : x + 40] = rng.normal(40, 6, (14, 40)).clip(0, 255)
+    gray[1000:, :] = 255  # a pure-white strip, as after Margins
+    return Image.fromarray(gray.astype(np.uint8))
+
+
+@pytest.mark.parametrize("mode", ["wolf", "su", "sauvola", "fox", "window"])
+def test_tiled_output_equals_whole_page_and_white_tiles_stay_white(mode: str) -> None:
+    page = _text_with_blank_bottom()
+    parameters = {"window_size": 35}
+    tiled = scantailor._threshold_tiles(page, mode, parameters)
+    coefficients = scantailor.output_coefficients(parameters, mode)
+    whole = scantailor._binarize_with_cv2(
+        np.asarray(page),
+        page,
+        mode,
+        window_size=35,
+        k=coefficients.k,
+        r=coefficients.r,
+        invert=False,
+        min_edge_ratio=coefficients.min_edge_ratio,
+    )
+    assert np.array_equal(np.asarray(tiled), np.asarray(whole))
+    # Issue #225 finding 1: a white tile used to turn solid black with Wolf.
+    assert np.asarray(tiled)[1100:, :].min() == 255
+    assert (np.asarray(tiled)[60:700] == 0).mean() > 0.05
+
+
+@pytest.mark.parametrize("mode", ["wolf", "su", "sauvola", "fox", "window", "otsu"])
+def test_completely_white_page_stays_white(mode: str) -> None:
+    page = Image.new("L", (900, 900), 255)
+    assert scantailor._threshold_tiles(page, mode, {}).getextrema() == (255, 255)
+
+
+def test_wolf_bounds_and_strict_threshold() -> None:
+    gray = np.full((40, 40), 200, dtype=np.uint8)
+    gray[10:30, 10:30] = 60
+    image = Image.fromarray(gray)
+
+    def black(**kwargs: Any) -> float:
+        result = scantailor._binarize_with_cv2(
+            gray, image, "wolf", window_size=15, k=0.3, invert=False, **kwargs
+        )
+        return float((np.asarray(result) == 0).mean())
+
+    assert 0 < black() < 1
+    # Above the upper bound always white, below the lower bound always black.
+    assert black(upper_bound=50) == 0.0
+    assert black(lower_bound=201) == 1.0
+    # Flat image: T equals the gray value, equality stays white (upstream: gray < T).
+    flat = np.full((20, 20), 120, dtype=np.uint8)
+    result = scantailor._binarize_with_cv2(
+        flat, Image.fromarray(flat), "wolf", window_size=5, k=0.3, invert=False
+    )
+    assert result.getextrema() == (255, 255)
+    # The bounds are settings; the tiled path reads them.
+    assert (
+        np.asarray(
+            scantailor._threshold_tiles(image, "wolf", {"window_size": 15, "wolf_upper_bound": 50})
+        ).min()
+        == 255
+    )
+
+
+def _black_share(page: Image.Image, mode: str, **settings: Any) -> float:
+    result = scantailor._threshold_tiles(page, mode, {"window_size": 35, **settings})
+    return float((np.asarray(result) == 0).mean())
+
+
+def test_fox_k_is_monotonic_without_dead_zone() -> None:
+    # Blurred strokes, as photographed: the threshold position matters at their edges.
+    page = Image.fromarray(
+        cv2.GaussianBlur(np.asarray(_text_with_blank_bottom(800, 900)), (7, 7), 2)
+    )
+    shares = [_black_share(page, "fox", fox_k=k) for k in (-0.5, 0, 0.1, 0.2, 0.33, 0.5, 1, 2)]
+    assert shares == sorted(shares, reverse=True)
+    # Issue #225 finding 5: 0, 0.1, 0.2 and 0.33 all gave the same output before.
+    assert len(set(shares[1:5])) == 4
+
+
+def test_typed_coefficients_outside_the_guidance_are_applied() -> None:
+    page = _text_with_blank_bottom(800, 900)
+    # Window and Wolf used to clamp k to 0..1.
+    assert _black_share(page, "window", window_k=1.5) < _black_share(page, "window", window_k=1)
+    assert _black_share(page, "window", window_k=-0.2) > _black_share(page, "window", window_k=0)
+    assert _black_share(page, "wolf", wolf_k=1.5) <= _black_share(page, "wolf", wolf_k=1)
+    assert _black_share(page, "wolf", wolf_k=-0.2) > _black_share(page, "wolf", wolf_k=0)
+    assert _black_share(page, "fox", fox_k=10) < _black_share(page, "fox", fox_k=1)
+
+
+def test_output_parameters_resolve_per_algorithm_with_legacy_k() -> None:
+    assert scantailor.output_coefficients({}, "sauvola").k == 0.34
+    assert scantailor.output_coefficients({}, "wolf").k == 0.3
+    assert scantailor.output_coefficients({}, "fox").k == 0.2
+    assert scantailor.output_coefficients({}, "window").k == 0.33
+    # Pre-#225 settings: one k for every algorithm keeps producing the same result.
+    legacy = {"k": 0.45}
+    assert {scantailor.output_coefficients(legacy, mode).k for mode in ("sauvola", "wolf")} == {
+        0.45
+    }
+    assert scantailor.output_coefficients({"k": 0.45, "wolf_k": 0.2}, "wolf").k == 0.2
+    assert scantailor.output_coefficients({"sauvola_k": 0.1}, "wolf").k == 0.3
+    # Only technical limits clamp; junk falls back to the default.
+    assert scantailor.output_coefficients({"window_size": 5000}, "wolf").window_size == 501
+    assert scantailor.output_coefficients({"window_size": "x"}, "wolf").window_size == 35
+    assert scantailor.output_coefficients({"wolf_k": float("nan")}, "wolf").k == 0.3
+    assert scantailor.output_coefficients({"wolf_upper_bound": 300}, "wolf").upper_bound == 255
+    # New settings count as settings: changing one makes the result stale.
+    assert scantailor.stage_settings("output", {"fox_k": 1, "output_histogram": {}}) == {"fox_k": 1}
+    for keys in scantailor.OUTPUT_MODE_PARAMETERS.values():
+        assert set(keys) <= set(scantailor.STAGE_SETTING_KEYS["output"])
+
+
+def test_su_marks_strokes_and_ignores_uneven_light() -> None:
+    height, width = 400, 600
+    shade = np.linspace(120, 240, width, dtype=np.float32)[None, :].repeat(height, axis=0)
+    ink = np.zeros((height, width), dtype=bool)
+    for y in range(40, 360, 40):
+        ink[y : y + 6, 40:560] = True
+    rng = np.random.default_rng(2010)
+    # A camera-like page: blurred stroke edges, sensor noise, light falling off by half.
+    sharp = np.where(ink, shade * 0.35, shade) + rng.normal(0, 3, (height, width))
+    gray = cv2.GaussianBlur(sharp.clip(0, 255).astype(np.uint8), (5, 5), 1.2)
+    result = scantailor._binarize_with_cv2(
+        gray, Image.fromarray(gray), "su", window_size=21, k=0.0, invert=False
+    )
+    black = np.asarray(result) == 0
+    near_ink = cv2.dilate(ink.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    assert black[ink].mean() > 0.9
+    assert black[~near_ink].mean() < 0.02
+    # A larger minimum edge count leaves fewer black pixels.
+    shares = [
+        _black_share(Image.fromarray(gray), "su", window_size=21, su_min_edge_ratio=ratio)
+        for ratio in (0.5, 1, 4, 20)
+    ]
+    assert shares == sorted(shares, reverse=True) and shares[-1] < shares[0]
+
+
+def test_histogram_uses_the_selected_algorithm_settings_on_the_preview() -> None:
+    page = _text_with_blank_bottom(1920, 2400)
+    stage_input = make_stage_input(page)
+    default = scantailor._output_histogram(stage_input, "sauvola", {"window_size": 101})
+    assert default["preview_size"] == [768, 960]
+    # The window covers the same part of the page: 101 px full-res -> ~41 px on 960 px.
+    assert default["preview_window"] == 41
+    assert 0 < default["black_fraction"] < 0.5
+    lower = scantailor._output_histogram(
+        stage_input, "sauvola", {"window_size": 101, "sauvola_k": 0.6}
+    )
+    assert lower["threshold"]["median"] < default["threshold"]["median"]
+    # Legacy shared k is honoured too.
+    legacy = scantailor._output_histogram(stage_input, "sauvola", {"window_size": 101, "k": 0.6})
+    assert legacy["threshold"] == lower["threshold"]
+
+    su = scantailor._output_histogram(stage_input, "su", {"window_size": 101})
+    threshold = su["threshold"]
+    assert threshold["kind"] == "local"
+    # Su's T exists only near strokes: the white lower part has none.
+    assert 0 < threshold["defined_fraction"] < 0.6
+    assert threshold["low"] <= threshold["median"] <= threshold["high"]
+
+    otsu = scantailor._output_histogram(stage_input, "otsu", {})
+    cut = otsu["threshold"]["median"]
+    assert otsu["black_fraction"] == pytest.approx(sum(otsu["bins"][: cut + 1]) / (768 * 960))
+    white = scantailor._output_histogram(
+        make_stage_input(Image.new("L", (500, 700), 255)), "su", {}
+    )
+    assert white["threshold"] == {"kind": "local", "defined_fraction": 0.0}
+    assert white["black_fraction"] == 0.0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deskew_batch_leaves_never_run_successors_idle() -> None:
+    client, job = _create_scan_job("batch-no-cascade")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"a page", filename="page.png")
+    assert upload.status_code == 201
+    page = job.pages.get()
+    # The editor creates rows even for stages that never ran.
+    assert client.get(_stages_url(str(job.pk), str(page.pk))).status_code == 200
+    result = client.post(
+        _batch_stage_url(str(job.pk), "deskew"), {}, content_type="application/json"
+    )
+    assert result.status_code == 202
+    assert page.stage_states.get(stage="deskew").status == "success"
+    assert page.stage_states.get(stage="select_content").status == "unknown"
+    assert not ProcessingJob.objects.filter(details__stage="select_content").exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deskew_batch_reruns_only_existing_downstream_results_it_made_stale() -> None:
+    """#224 criterion 2: the same-page rule for pages that already ran later stages."""
+    client, job = _create_scan_job("batch-same-page-rule")
+    for number in (1, 2):
+        upload = _upload_scan_page(
+            client,
+            str(job.pk),
+            number,
+            "single",
+            _text_heavy_bytes(width=360, height=240),
+            filename=f"page{number}.png",
+        )
+        assert upload.status_code == 201
+    processed, fresh = job.pages.order_by("logical_sequence_number")
+    assert client.get(_stages_url(str(job.pk), str(fresh.pk))).status_code == 200
+    # Page 1 runs Deskew and Select Content; a single-page edit chains its successor.
+    for stage, parameters in (
+        ("deskew", {"manual_angle": 0}),
+        ("select_content", {"content_mode": "auto"}),
+    ):
+        response = client.post(
+            _stage_url(str(job.pk), str(processed.pk), stage),
+            data=json.dumps({"parameters": parameters}),
+            content_type="application/json",
+        )
+        assert response.status_code in {200, 202}
+    content = processed.stage_states.get(stage="select_content")
+    assert content.status == "success" and scantailor.stage_result_is_current(content)
+
+    def select_content_jobs(page: ScanPage) -> int:
+        state = page.stage_states.get(stage="select_content")
+        return ProcessingJob.objects.filter(
+            job_type=ProcessingJob.JobType.STAGE,
+            details__stage="select_content",
+            details__scan_tailor_stage_state_id=state.pk,
+        ).count()
+
+    before = select_content_jobs(processed)
+    same = {
+        "parameters": {"manual_angle": 0},
+        "preserve_exceptions": False,
+    }
+    assert (
+        client.post(
+            _batch_stage_url(str(job.pk), "deskew"), same, content_type="application/json"
+        ).status_code
+        == 202
+    )
+    assert select_content_jobs(processed) == before
+    assert select_content_jobs(fresh) == 0
+
+    turned = {
+        "parameters": {"manual_angle": 3},
+        "preserve_exceptions": False,
+    }
+    assert (
+        client.post(
+            _batch_stage_url(str(job.pk), "deskew"), turned, content_type="application/json"
+        ).status_code
+        == 202
+    )
+    assert select_content_jobs(processed) == before + 1
+    content = processed.stage_states.get(stage="select_content")
+    assert scantailor.stage_result_is_current(content)
+    # The other page never ran Select Content, so the batch did not start it there.
+    assert select_content_jobs(fresh) == 0
+    assert fresh.stage_states.get(stage="select_content").status == "unknown"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_all_checks_stages_in_order_and_only_runs_stale_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, job = _create_scan_job("run-all-stages")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="page.png")
+    assert upload.status_code == 201
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_run, "get_queue", lambda: queue)
+    url = f"/scan/jobs/{job.pk}/run-all/"
+    request = {"action": "start"}
+
+    response = client.post(url, request, content_type="application/json")
+    assert response.status_code == 202
+    first = response.json()["run"]
+    assert first["state"] == "queued" and first["total_steps"] == 5
+    duplicate = client.post(url, request, content_type="application/json")
+    assert duplicate.json()["run"]["id"] == first["id"] and len(queue.calls) == 1
+    for step, stage in enumerate(scantailor.stage_order(), start=1):
+        queue.run_next()
+        status = client.get(url).json()["run"]
+        assert status["checked_steps"] == step
+        assert job.stage_states.get(stage=stage).status == "success"
+    assert status["state"] == "complete"
+    stage_jobs = ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.STAGE)
+    assert [item.details["stage"] for item in stage_jobs.order_by("scheduled_at")] == list(
+        scantailor.stage_order()
+    )
+
+    response = client.post(url, request, content_type="application/json")
+    assert response.json()["run"]["id"] != first["id"]
+    for _ in scantailor.stage_order():
+        queue.run_next()
+    assert client.get(url).json()["run"]["state"] == "complete"
+    assert stage_jobs.count() == len(scantailor.stage_order())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_all_cancel_and_free_space_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, job = _create_scan_job("run-all-cancel")
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="page.png")
+    assert upload.status_code == 201
+    queue = _DeferredQueue()
+    monkeypatch.setattr(scan_run, "get_queue", lambda: queue)
+    url = f"/scan/jobs/{job.pk}/run-all/"
+    request = {"action": "start"}
+    with monkeypatch.context() as patch:
+        patch.setattr(scan_artifact_pruning, "low_space_message", lambda: "Disk is full.")
+        assert client.get(url).json()["blocked_reason"] == "Disk is full."
+        assert client.post(url, request, content_type="application/json").status_code == 507
+        assert not queue.calls
+
+    run = client.post(url, request, content_type="application/json").json()["run"]
+    cancelled = client.post(
+        url, {"action": "cancel", "run_id": run["id"]}, content_type="application/json"
+    )
+    assert cancelled.json()["run"]["state"] == "cancelled"
+    queue.run_next()
+    assert not queue.calls and not job.stage_states.exists()
+
+    running = client.post(url, request, content_type="application/json").json()["run"]
+    resolve_algorithm = scantailor._resolve_stage_algorithm
+
+    def cancel_during_stage(state: ScanTailorStageState) -> scantailor.StageRunner:
+        runner = resolve_algorithm(state)
+
+        def cancel_then_run(
+            state: ScanTailorStageState, stage_input: scantailor.StageInput
+        ) -> scantailor.StageResult:
+            scan_run.cancel(job.pk, running["id"])
+            return runner(state, stage_input)
+
+        return cancel_then_run
+
+    monkeypatch.setattr(scantailor, "_resolve_stage_algorithm", cancel_during_stage)
+    queue.run_next()
+    assert client.get(url).json()["run"]["state"] == "cancelled"
+    deskew = job.stage_states.get(stage="deskew")
+    assert deskew.status == "unknown" and not deskew.output_storage_identifier
+    assert not queue.calls
+
+
 @pytest.mark.django_db(transaction=True)
 def test_select_content_manual_box_is_preserved() -> None:
     client, job = _create_scan_job("scan-user-select-content-manual")
@@ -817,7 +1240,7 @@ def test_output_default_otsu_is_reproducible() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("output_mode", ["otsu", "sauvola", "wolf", "fox", "window", "grad"])
+@pytest.mark.parametrize("output_mode", ["otsu", "sauvola", "wolf", "fox", "window", "grad", "su"])
 def test_each_documented_output_algorithm_produces_an_artifact(output_mode: str) -> None:
     client, job = _create_scan_job(f"scan-user-output-{output_mode}")
     _upload_scan_page(
@@ -1128,7 +1551,7 @@ def test_unreadable_image_raises_clear_error(tmp_path: Path) -> None:
             run_stage(scantailor._run_deskew, _state(), path)
 
 
-@pytest.mark.parametrize("mode", ["otsu", "sauvola", "wolf", "fox", "window"])
+@pytest.mark.parametrize("mode", ["otsu", "sauvola", "wolf", "fox", "window", "su"])
 def test_binarization_keeps_noisy_paper_white_and_ink_black(mode: str) -> None:
     rng = np.random.default_rng(11)
     gray = rng.normal(225, 7, (400, 600)).clip(0, 255)

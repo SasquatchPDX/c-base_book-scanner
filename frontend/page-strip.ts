@@ -23,10 +23,49 @@ export interface StripItem {
   label: string;
   caption: string;
   thumbnailUrl: string;
+  declaredBlank?: boolean;
+  /** Badges on the thumbnail (#228): rescan requested, page number not verified. */
+  markers?: StripMarker[];
   stages: StripStage[];
   /** Size used by the width/height orders (current stage, full resolution). */
   width: number | null;
   height: number | null;
+}
+
+export interface StripMarker {
+  kind: "rescan" | "unverified";
+  label: string;
+  title: string;
+}
+
+/**
+ * Page markers of the strip (#228). "Rescan requested": work on the page is lost
+ * when its replacement arrives. "Page number not verified": the scanner could not
+ * confirm the printed page number of a replacement and the operator kept it anyway
+ * (``page_number_verified`` false); a verified or ordinary page gets no badge.
+ */
+export function pageMarkers(page: {
+  open_rescan_todos?: number | null;
+  page_number_verified?: boolean | null;
+}): StripMarker[] {
+  const markers: StripMarker[] = [];
+  if ((page.open_rescan_todos ?? 0) > 0) {
+    markers.push({
+      kind: "rescan",
+      label: "Rescan",
+      title: "Rescan requested: the scanner will replace this page; its stages run again then.",
+    });
+  }
+  if (page.page_number_verified === false) {
+    markers.push({
+      kind: "unverified",
+      label: "Page no.?",
+      title:
+        "Page number not verified: the scanner could not confirm the printed page number " +
+        "of this rescan; the operator kept the image anyway. Check it is the right page.",
+    });
+  }
+  return markers;
 }
 
 export type SortMode = "natural" | "width" | "height";
@@ -44,6 +83,8 @@ export function statusKind(
       return "working";
     case "failed":
       return "failed";
+    case "skipped":
+      return "done";
     default:
       // Derived from input fingerprints (#205): waiting beats an old result.
       if (stage.waiting_for) return "waiting";
@@ -54,6 +95,7 @@ export function statusKind(
 }
 
 export function statusTooltip(stage: StripStage): string {
+  if (stage.status === "skipped") return `${stage.label}: skipped (declared blank)`;
   const kind = statusKind(stage);
   const text: Record<StatusKind, string> = {
     idle: "not started",
@@ -247,7 +289,9 @@ export class PageStrip {
     image.decoding = "async";
     image.draggable = false;
     image.alt = "";
-    frame.append(image);
+    const markers = document.createElement("span");
+    markers.className = "st-strip-markers";
+    frame.append(image, markers);
     const caption = document.createElement("div");
     caption.className = "st-strip-caption";
     const icons = document.createElement("span");
@@ -272,6 +316,20 @@ export class PageStrip {
       if (item.thumbnailUrl) image.src = item.thumbnailUrl;
       else image.removeAttribute("src");
       image.alt = item.label;
+    }
+    if (image) image.hidden = item.declaredBlank === true && !item.thumbnailUrl;
+    const markers = node.querySelector<HTMLElement>(".st-strip-markers");
+    if (markers) {
+      markers.replaceChildren(
+        ...(item.markers ?? []).map((marker) => {
+          const badge = document.createElement("span");
+          badge.className = `st-strip-marker st-strip-marker-${marker.kind}`;
+          badge.dataset.marker = marker.kind;
+          badge.textContent = marker.label;
+          badge.title = marker.title;
+          return badge;
+        }),
+      );
     }
     const caption = node.querySelector<HTMLElement>(".st-strip-caption");
     if (caption) caption.textContent = item.caption ? `${item.label} · ${item.caption}` : item.label;

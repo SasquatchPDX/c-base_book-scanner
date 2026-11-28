@@ -12,7 +12,7 @@ async function openTextReview(page: Page, title: string) {
   await page.getByLabel("Book file").setInputFiles({
     name: title + ".txt",
     mimeType: "text/plain",
-    buffer: Buffer.from("Title: " + title + "\nAuthor: Ada Digital\n\nChapter one.\n"),
+    buffer: Buffer.from("Title: " + title + "\nAuthor: Ada Lovelace\n\nChapter one.\n"),
   });
   await page.getByRole("button", { name: "Start import" }).click();
   await page.getByRole("link", { name: "Resolve metadata" }).click({ timeout: 30000 });
@@ -35,7 +35,7 @@ test("a member inspects and confirms a local manuscript suggestion", async ({ pa
   await openTextReview(page, title);
   const form = page.locator("[data-local-suggestion-form]");
   await expect(form.getByLabel("Title")).toHaveValue(title);
-  await expect(form.getByLabel("Authors")).toHaveValue("Ada Digital");
+  await expect(form.getByLabel("Authors")).toHaveValue("Ada Lovelace");
   await form.getByRole("button", { name: "Create book from suggestion" }).click();
   await page.goto("/library/books/?view=html&q=" + encodeURIComponent(title));
   await page.getByRole("link", { name: title, exact: true }).click();

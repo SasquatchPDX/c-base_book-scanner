@@ -39,7 +39,11 @@ def test_worker_unit_runs_rq_with_scheduler_and_django_bootstrap() -> None:
     assert "--with-scheduler" in exec_start
     assert "--config ebook_server.rq_settings" in exec_start
     assert importlib.util.find_spec("ebook_server.rq_settings") is not None
-    assert exec_start.split()[-1] == settings.BOOK_SCANNER_QUEUE_NAME
+    # Metadata lookups first, so they never wait behind ScanTailor stage jobs (#227).
+    assert exec_start.split()[-2:] == [
+        settings.BOOK_SCANNER_METADATA_QUEUE_NAME,
+        settings.BOOK_SCANNER_QUEUE_NAME,
+    ]
     assert service["KillMode"] == "mixed"
     assert "QT_QPA_PLATFORM=offscreen" in service["Environment"]
     assert service["User"] != "root"

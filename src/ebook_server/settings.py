@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     queue_failure_ttl_seconds: int = 7 * 24 * 60 * 60
     queue_retry_max: int = 3
     queue_retry_intervals: list[int] = [30, 120, 600]
+    # Metadata lookups (scan identification, scanner-OPF completion and provider check,
+    # review "Search again") run on their own queue so they never wait behind
+    # ScanTailor stage jobs (#227). Workers list it before the main queue.
+    metadata_queue_name: str = "metadata"
+    # Look up missing scanner-OPF fields automatically when an OPF arrives (#227).
+    scan_metadata_completion: bool = True
     ldap_mode: str = "stub"
     ldap_server_uri: str = ""
     ldap_user_dn_template: str = ""
@@ -131,6 +137,17 @@ class Settings(BaseSettings):
     metadata_rate_limits: dict[str, float] = {"openlibrary": 1.0}
     metadata_rate_limit_default: float = 1.0
     metadata_rate_limit_max_wait_seconds: float = 60.0
+    # Provider lookup costs (#220, docs/intake-evaluation.md): wall-clock budget per
+    # provider, circuit breaker after repeated failures, reuse of identical queries
+    # (0 disables), and stopping early once a provider confirms the source ISBN.
+    metadata_provider_timeout_seconds: float = 20.0
+    metadata_provider_breaker_failures: int = 3
+    metadata_provider_breaker_cooldown_seconds: float = 120.0
+    metadata_provider_cache_seconds: float = 900.0
+    identification_early_exit: bool = True
+    # Additive score weights; title + author alone stay below auto-accept by design.
+    identification_title_weight: float = 0.55
+    identification_author_weight: float = 0.3
     identification_sibling_bonus: float = 0.35
     identification_auto_accept: float = 0.86
     identification_review: float = 0.55
@@ -432,6 +449,15 @@ BOOK_SCANNER_METADATA_USER_AGENT = (
 BOOK_SCANNER_METADATA_RATE_LIMITS = settings.metadata_rate_limits
 BOOK_SCANNER_METADATA_RATE_LIMIT_DEFAULT = settings.metadata_rate_limit_default
 BOOK_SCANNER_METADATA_RATE_LIMIT_MAX_WAIT_SECONDS = settings.metadata_rate_limit_max_wait_seconds
+BOOK_SCANNER_METADATA_PROVIDER_TIMEOUT_SECONDS = settings.metadata_provider_timeout_seconds
+BOOK_SCANNER_METADATA_PROVIDER_BREAKER_FAILURES = settings.metadata_provider_breaker_failures
+BOOK_SCANNER_METADATA_PROVIDER_BREAKER_COOLDOWN_SECONDS = (
+    settings.metadata_provider_breaker_cooldown_seconds
+)
+BOOK_SCANNER_METADATA_PROVIDER_CACHE_SECONDS = settings.metadata_provider_cache_seconds
+BOOK_SCANNER_IDENTIFICATION_EARLY_EXIT = settings.identification_early_exit
+BOOK_SCANNER_IDENTIFICATION_TITLE_WEIGHT = settings.identification_title_weight
+BOOK_SCANNER_IDENTIFICATION_AUTHOR_WEIGHT = settings.identification_author_weight
 BOOK_SCANNER_QUEUE_URL = settings.redis_url
 BOOK_SCANNER_QUEUE_NAME = settings.queue_name
 BOOK_SCANNER_QUEUE_JOB_TIMEOUT_SECONDS = settings.queue_job_timeout_seconds
@@ -439,6 +465,8 @@ BOOK_SCANNER_QUEUE_RESULT_TTL_SECONDS = settings.queue_result_ttl_seconds
 BOOK_SCANNER_QUEUE_FAILURE_TTL_SECONDS = settings.queue_failure_ttl_seconds
 BOOK_SCANNER_QUEUE_RETRY_MAX = settings.queue_retry_max
 BOOK_SCANNER_QUEUE_RETRY_INTERVALS = settings.queue_retry_intervals
+BOOK_SCANNER_METADATA_QUEUE_NAME = settings.metadata_queue_name
+BOOK_SCANNER_SCAN_METADATA_COMPLETION = settings.scan_metadata_completion
 BOOK_SCANNER_LDAP_MODE = settings.ldap_mode
 BOOK_SCANNER_LDAP_SERVER_URI = settings.ldap_server_uri
 BOOK_SCANNER_LDAP_USER_DN_TEMPLATE = settings.ldap_user_dn_template

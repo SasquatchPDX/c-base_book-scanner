@@ -23,8 +23,9 @@ preview identifiers, checksums, timestamps, and status. The ordered stages are
    shadows, despeckling, content blocks from the largest whitespace rectangles, a
    text mask, and side-by-side trimming of strips that lie closer to the shadows than
    to the text. Modes: auto, manual (the box as drawn) and disabled (the whole page).
-   A page without content keeps the whole page and says so. The content size is also
-   recorded in millimetres (upstream `PhysSizeCalc`).
+   An automatic box grows by 5 pixels at 150 dpi, stopping at the image boundary
+   and the page outline from Deskew. A page without detected content keeps the
+   whole page. The expanded size is recorded in millimetres and used by Margins.
 3. Dewarping — upstream Scan Tailor's cylindrical-surface model (#195 step 6,
    `core/cylindrical.py`): a top and a bottom X-spline follow the text block, and
    the page between them is unrolled as a cylinder (`CylindricalSurfaceDewarper`,
@@ -146,8 +147,9 @@ submitted as editable parameters.
 Layout detection allocates arrays only at reduced resolution. Thresholding uses
 768-pixel tiles with a local-window halo capped at 253 pixels; Otsu retains a
 global threshold. Full-size source/output Pillow images remain necessary, but
-there are no page-sized float or component-label arrays. Large local-statistic
-regions use tile-local contrast estimates. On a detection or processing error,
+there are no page-sized float or component-label arrays. Values an algorithm
+needs page-wide (Otsu's T, Wolf's Min/Smax, Su's contrast cutoff) are computed
+over the whole page or zone before the tiles (#225). On a detection or processing error,
 the normalized source is copied and the result records `output_applied="copy_fallback"`
 and `output_warning`. `output_mode="copy"` bypasses zoning and thresholding.
 Successful execution alone does not establish output quality.
@@ -157,10 +159,94 @@ text character-error rate must be at most 5%, no worse than whole-page output by
 more than one percentage point, and picture pixel error must be below 15% of the
 whole-page result. The local Tesseract 5.5.2 run measured 0% CER for both paths,
 with picture detail retained. This is a repeatable layout regression, not proof
-of OCR quality on photographed books or the hackerspace AI server. The six output
-modes use OpenCV/NumPy statistics; Fox is a Niblack-style threshold with a noise
-floor and Wolf uses the Wolf–Jolion local-statistics formula, not a claim of
-bit-identical ScanTailor Advanced output.
+of OCR quality on photographed books or the hackerspace AI server.
+
+### Output algorithms and settings (#225, `opencv-zones-v5`)
+
+m is the local mean and s the local standard deviation in the window around a
+pixel. A pixel turns white when its gray value is above its threshold T. The
+editor shows only the settings of the selected algorithm (with zones: of the
+output, text and picture algorithms), explains each one, and gives a recommended
+range. The range is guidance only. A typed value outside it is saved and applied,
+with a note. Only technical limits clamp, and the note says so: window 3–501 px
+(the tile halo bounds memory), Wolf bounds 0–255, r ≥ 1.
+
+| Algorithm | T | Settings (default) | Source |
+|---|---|---|---|
+| Otsu | one T for the page, from the histogram | none | upstream `binarizeOtsu` |
+| Sauvola | `m · (1 + k · (s / r − 1))` | window (35), `sauvola_k` (0.34), `r` (128) | upstream `binarizeSauvola`, as in ScanTailor Advanced |
+| Wolf | `m − k · (m − Min) · (1 − s / Smax)` | window, `wolf_k` (0.3), `wolf_lower_bound` (1), `wolf_upper_bound` (254) | upstream `binarizeWolf`, as in ScanTailor Advanced |
+| Fox | `0.88 · m − k · s` | window, `fox_k` (0.2) | project-specific; no upstream or published source known |
+| Window | `m · (1 − k / 2)` | window, `window_k` (0.33) | project-specific; similar in spirit to Bradley & Roth (2007) |
+| Su | `E_mean + E_std / 2` of the stroke-edge pixels in the window | window, `su_min_edge_ratio` (1.0) | Su, Lu & Tan (2010), added by #225 |
+| Grad | Otsu of the image XOR Otsu of the gradient magnitude | none | project-specific, experimental |
+| Copy | no binarization | none | — |
+
+- **Window size** is in pixels of the full-resolution image. Use about one to
+  three text line heights, roughly 25–75 px at 300 dpi or 50–150 px at 600 dpi.
+  A smaller window follows uneven light more closely but can hollow out thick
+  strokes. A larger one behaves more like a global threshold.
+- **Each algorithm has its own k.** Before #225 one `k` (default 0.33) was shared.
+  A page saved with only `k` keeps using it for Sauvola, Wolf, Fox and Window
+  until its own coefficient is set, so its result does not change (except Fox,
+  whose formula changed, see below). Wolf and
+  Window used to clamp k to 0..1 silently. They now apply it as typed. Both
+  formulas are monotonic in k: a larger k gives less black.
+- **Wolf** computes Min (the darkest gray value) and Smax (the largest local
+  deviation) once over the page or zone, not per tile. A pixel is black only if
+  gray < T. Below `wolf_lower_bound` it is always black, and above
+  `wolf_upper_bound` always white. A completely white tile stays white (issue
+  #225 finding 1), and tiled output equals whole-page output.
+- **Fox changed in #225.** It used to be `T = m − max(|k| · s, 0.12 · m)`. Below
+  |k| ≈ 1 the 12 % floor decided and k had no effect. Above that, T fell quickly
+  until the page turned white. Now the 12 % offset is fixed and k adds Niblack's
+  contrast term on top (`T = 0.88 · m − k · s`). k acts at every value and is
+  monotonic. Negative k gives bolder text, and the sign of k now matters. On a
+  photographed thesis page (window 51 px) the black share fell steadily from
+  3.9 % at k = −0.5 to 2.7 % at 0, 2.3 % at 0.2, 1.2 % at 1, and 0 at 5.
+- **Su** (B. Su, S. Lu, C. L. Tan, "Binarization of historical document images
+  using the local maximum and minimum", DAS 2010, doi:10.1145/1815330.1815351)
+  computes the contrast image `(max − min) / (max + min + ε)` over 3×3 and marks
+  the high-contrast pixels (Otsu on the contrast, computed once per page) as
+  stroke edges. A pixel is black when its window holds at least
+  `N_min = su_min_edge_ratio × window` edge pixels and its gray value is below
+  `E_mean + E_std / 2` of those edge pixels. Elsewhere T is undefined and the
+  pixel is white. The paper uses ≤. Here equality stays white, as upstream Wolf
+  does, so the paper side of a sharp edge stays white. It handles uneven light
+  and stains well, because it reacts to contrast and not to brightness.
+  Checked on four photographed pages, two from a cookbook and two from a thesis
+  (3264×2448 and 3456×4608 camera images, not part of the repository). The result
+  was clean text with no black areas, and tiled output equals whole-page output.
+  It takes about 1–1.6 s per page, against 0.3–0.6 s for Sauvola.
+- **Not added:** Howe (2013) needs a graph-cut solver (max-flow over a Laplacian
+  energy) and automatic tuning of two parameters per image. That is a dependency
+  and runtime cost out of proportion for the second algorithm, so Su is the only
+  addition. **Mokji** (upstream `binarizeMokji` / `BinaryThreshold::mokjiThreshold`)
+  computes one global threshold from an edge co-occurrence matrix. It cannot fix
+  uneven light any better than Otsu, which the editor already offers, and neither
+  ScanTailor nor ScanTailor Advanced offers it in Output. It is not ported.
+
+### Threshold histogram
+
+The Output input pane overlays a histogram of the input, like a camera's. The
+worker computes it from the previous stage's result, scaled to at most 960 px
+(the browser preview size). Only an input that is already smaller is used as it
+is. It uses the selected algorithm and settings, so it reflects an edit once
+the edit's autosave has run the stage again. While an edit is not yet applied the
+overlay is hidden. Local windows (and with them Su's `N_min`) are scaled by
+preview edge / full-resolution edge, so they cover the same part of the page as
+at full resolution; the caption shows the window used on the preview.
+
+- Otsu: one orange line at T.
+- Sauvola, Wolf, Fox, Window, Su: T is a value per pixel. The overlay shades its
+  10th–90th percentile band and marks the median. For Su the caption also says
+  which share of pixels has a T (near text only).
+- Grad: the line marks the intensity part (the Otsu T of the image).
+- The caption also gives the black share of the result on the preview, which
+  makes algorithms and settings easy to compare for one book.
+
+Counts use a logarithmic scale. For zoned pages the overlay describes the
+selected output algorithm on the unzoned preview.
 
 Pillow, NumPy, OpenCV, and scikit-image provide the image operations. Processing
 runs as durable worker jobs. Successful stages record input/output dimensions so
@@ -241,6 +327,8 @@ The Margins stage is the pipeline's one cross-page dependency.
   It is not stored on the job. A page counts once its Select Content has a result;
   while that result is re-run, the previous one keeps counting until it is replaced,
   so a re-run on one page does not make every other page stale meanwhile.
+  A page declared blank (#219) never counts: its Margins renders a white page of
+  the common size instead, so a noisy blank page cannot enlarge every other page.
 - **Part of the input fingerprint (#205).** For a page aligned with the others,
   `stage_input_fingerprint` of its Margins row is a sha256 of the predecessor's
   `output_sha256` and the aggregate fingerprint
@@ -483,19 +571,116 @@ rows to disappear.
 Job creation (`POST /scan/jobs/` and `PUT /api/scanner/v1/jobs/{id}`) still accepts
 `capture_layout: single_page` and ignores it, and rejects `spread`.
 
+## Scan job list (#226, #227)
+
+The HTML scan-job list (`/scan/jobs/?view=html`) opens each job in the editor (also
+**Raw scans**). Per job it shows the scanner OPF's title, authors, ISBN and language
+(with values the automatic completion added, see `docs/scanner-protocol.md`), the page
+count and a derived pipeline status. The stored `ScanJob.state` alone cannot say how far a
+scan has come (processing never changes it, a web job never leaves `capturing`), so the
+label is the earliest unfinished step, derived from existing data
+(`core/scan_job_status.py`):
+
+| Label | Condition (first that applies) |
+|---|---|
+| Cancelled | state `cancelled` |
+| OCR queued / OCR running / OCR'd | state `complete` and the newest OCR job for the scan |
+| Complete | state `complete` (no OCR, or OCR failed: see the badge) |
+| Finalizing | state `finalizing` |
+| Paused | state `paused` |
+| Capturing | no pages yet, or a scanner job before `capture-complete` |
+| N / M rendered | some pages, not all, have a successful (or blank-skipped) Output stage |
+| Rendered | every page has one |
+| Metadata available | nothing rendered yet; a scanner OPF or a linked Book exists |
+| Captured | nothing rendered yet and no metadata |
+
+"Rendered" counts recorded Output results; whether each is still current is decided in the
+editor. The status can go backwards (a replaced page re-queues its stages). Badges show
+conditions that can occur at any step: **failed** (a failed stage, finalization or OCR
+job), **waiting for review** (an open review task, e.g. from identification or the
+provider check), **rescan open**, **re-finish needed** and the whole-book run state.
+
+The list never loads pages: one annotated job query (page count, newest scanner OPF, run,
+rescan and review flags as subqueries), one aggregate over stage states, one query for
+finalization jobs and one for OCR jobs, whatever the number of jobs and pages
+(`test_scan_job_list_query_count_does_not_grow_with_jobs_or_pages`).
+
+"Create scan job" is hidden in the list ("maybe later"): the scanner creates jobs. The
+form is kept, commented out, in `scan_jobs.html`, and `POST /scan/jobs/` still creates web
+jobs for the session API. Neither the editor nor the list uploads pages or starts
+identification by hand: the scanner uploads pages (`POST /scan/jobs/{id}/pages/` remains
+for the session API) and identification runs automatically.
+
+## Run all stages
+
+Use **Run all** below the stage list to check every page through Output.
+Confirmation shows the page and stage counts and about how many stage jobs it will
+run: every page stage without a current result. The button is disabled, with the
+reason, while the scan storage free-space guard refuses new work. The worker
+keeps current results and uses each page's saved settings, including manual
+settings. It checks the whole book at each stage before moving on, so Margins
+sees the current content sizes. Each chunk goes to the back of the queue so an
+interactive edit can run between chunks.
+
+The editor shows progress and offers **Cancel run**. Cancelled runs preserve
+completed results and stop at the next processing checkpoint. A later run skips
+those current results. The scan storage free-space guard can block new runs or
+stop a run between chunks. Run all waits for work already running in another worker and reuses its result.
+If that work exceeds the worker timeout, the run reports the incomplete stages.
+
+## Declared blank pages
+
+In the editor, choose **Mark page as blank** and confirm against the scan preview.
+Select Content can suggest reviewing an empty detection. Use **Blank pages only**
+to find declarations and **Clear blank declaration** to resume normal processing.
+The action records the actor, active raw version, previous value and timestamp.
+A stale edit returns a revision conflict, and other open editors receive the change
+through the workspace event stream.
+
+Deskew, Select Content, Dewarping and Output report `skipped` with reason
+`declared_blank`. A blank page does not contribute to the common page size.
+Margins renders it as a full-resolution white image at that size. Until there is
+a measurable common size, Margins uses the raw page dimensions. Finalization and
+OCR input preserve page order and use the white image. The OCR service still
+receives the page because its interface accepts a complete document.
+
+The original scan and logical page number are preserved. Declaring the page blank
+cancels open or claimed rescans, and a new raw version clears the declaration.
+Changing a declaration after finalization marks previous library derivatives
+stale and returns the job to **re-finish needed**.
+
+The declaration is stored as `ScanPage.page_disposition` (#219), one of `normal`,
+`blank` and `excluded`. Only `blank` is built: a blank page stays a real page of the
+book, so the PDF keeps it and printed page numbers stay aligned. `excluded` (a
+duplicate shot, a hand, a calibration frame: not part of the book, dropped from the
+PDF) is reserved for later and refused by the API for now. Detection never sets the
+disposition; Select Content's "no content" result only suggests it.
+
+`POST /scan/jobs/{job}/pages/{page}/blank/` takes `{"disposition": "blank" | "normal"}`
+(or the older `{"declared_blank": true | false}`), the `version_id` of the active raw
+version the reviewer saw, and the page's current stage `revisions`. A changed raw
+version or any stale revision answers 409. Each change writes a
+`ScanPageDispositionEvent` (page, raw version, actor, previous and new disposition,
+reason `declared`, or `raw_version_replaced` without an actor when a rescan cleared
+it) and bumps the revision of every stage row of the page.
+
 ## Browser workspace
 
-Two pages (#195 step 3):
+One page per job (#195 step 3, #228):
 
-- **Job overview** (`/scan/jobs/{id}/workspace/`): metadata, identification,
-  uploads, rescans, finishing, and one card per page with server-rendered stage
-  statuses and Run forms, so it works without JavaScript. "Open ScanTailor editor"
-  and each stage's "Edit" link open the editor (`?page=<id>&stage=<stage>`).
-- **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. It
-  fills the browser viewport (no site header, no page scrolling) with three columns:
+- **Editor** (`/scan/jobs/{id}/editor/`): upstream Scan Tailor's main window. The
+  job list, raw scans, the scanner's QR code (`/j/{id}`) and every redirect after a
+  form post open it; `?page=<id>&stage=<stage>` opens a page and stage. It fills the
+  browser viewport with three columns. **Request rescan** and **Finish…** (see
+  "Rescan and finish in the editor" below) replace the old job overview:
+  - *header*: the job title, a link to the library book once one is linked, "Raw
+    scan" for a `captured` job, the scanner's completeness check (gaps in the printed
+    page numbers) when it found any, "Re-finish needed", **Finish…** while the job
+    can be finished, and a link to the last finalization's status;
   - *left*: the numbered stage list (1 Deskew … 5 Output) with a ▶ button per stage
     that runs it for every page with each page's own settings (upstream "Launch
-    batch processing"), the options of the selected stage with "Revert to saved"
+    batch processing"). A stage batch starts only that stage and reruns any
+    existing downstream results made stale on the same page. Below are the options of the selected stage with "Revert to saved"
     (there is no save button: edits are autosaved, see "Automatic runs and cancellation") and "Apply to…" (selected pages, all pages, this page only, this page and the
     following ones, or every other page counted from this one, optionally keeping
     pages with manual settings), and a
@@ -527,9 +712,9 @@ Two pages (#195 step 3):
     stage gestures (deskew rotation). The image is the stage's working-resolution
     preview (about 150 dpi); full-resolution tiles are not part of this step;
   - *right*: the page strip. It is virtualised (only the rows in view exist in the
-    DOM) and its thumbnails load lazily from tokenised, immutable URLs: the current
-    stage's current output (each stage run writes a 400 px `thumbnail.jpg`), else the
-    last current stage before it, else the page's working-image thumbnail. Under
+    DOM) and its thumbnails load lazily from tokenised, immutable URLs: the
+    output of the furthest current stage (each stage run writes a 400 px
+    `thumbnail.jpg`), or the page's working-image thumbnail if no stage is current. Under
     each: the page number and file name, and one small numbered icon per stage: grey
     (not started), grey ring (waiting for an earlier stage), amber and pulsing
     (queued or running), green (done), green ring (stale result), blue (done with
@@ -539,7 +724,70 @@ Two pages (#195 step 3):
     Select Content, output size otherwise). Click selects a page, Ctrl/Cmd-click
     toggles, Shift-click selects a range; Home, End, PgUp (or Q), PgDown (or W) and
     the arrow keys move between pages, and "Keep current page in view" scrolls the
-    strip along (upstream ThumbnailSequence and MainWindow behaviour).
+    strip along (upstream ThumbnailSequence and MainWindow behaviour). Two badges
+    on the thumbnail mark pages that need attention (#228): **Rescan** (a rescan is
+    requested or claimed by the scanner: work on the page is lost when the
+    replacement arrives) and **Page no.?** (the active version is a rescan whose
+    printed page number the scanner's OCR could not confirm and the operator kept
+    anyway, `page_number_verified: false`: check that it is the right page). There is
+    no badge for a verified page number; it calls for no action.
+
+The **old job overview** (`/scan/jobs/{id}/workspace/`) is retired (#228). Its
+per-page stage grid duplicated the editor; its upload form is not needed (the
+scanner uploads pages; generic clients use `POST /scan/jobs/{id}/pages/`); the
+manual "Resolve book identity" form is replaced by the automatic step of #227, and
+the scanner metadata moves to the job list (#227). The URL keeps working: an HTML
+request redirects to the editor (keeping a `?page=` UUID), a JSON request still
+answers the page and stage state.
+
+### Rescan and finish in the editor
+
+**Request rescan** (canvas toolbar) asks for a reason in a dialog and posts it as
+JSON to `POST /scan/pages/{page_id}/rescan/` with the CSRF header: the same
+`ScanTodo` (type `rescan`) the old overview form created, with the same
+permission check (an active member, the job in `open`, `capturing`, `paused`,
+`captured` or `complete`) and, for a scanner job, the `rescan_flag` line in
+`scan.jsonl`. A page with an open request cannot be requested again (the button
+reads "Rescan requested"), and a page declared blank cannot be requested at all.
+Other open editors see the marker without reloading: whenever the job's rescan
+todos change (a request, the scanner's claim, a replacement completing it) the
+workspace event stream, and the polling fallback, carry `pages` with every page's
+`open_rescan_todos` and `page_number_verified`. The todo token is part of the job
+row query, so an idle tick costs no extra query.
+
+**Finish…** (left column, while the job is `open`, `capturing`, `paused` or
+`captured`) opens a confirmation dialog and then posts to
+`POST /scan/jobs/{id}/finish/`, the same view the overview used, with
+`create_cleaned_variant: true`, `auto_ocr` from "Submit cleaned PDF to OCR" and an
+optional OCR `language` (engine and model stay the server's defaults). The dialog
+says what happens to the library book: it is the linked Book, or the Book linked or
+created from the scanner's OPF, or, when neither exists, finish starts the
+bibliographic identification and the editor goes to its review (finish again once
+the book is identified). It says why finish is refused before sending anything,
+from the editor's live page data:
+
+- pages without a current Output result (a page declared blank needs its Margins
+  result); a stale result does not count, as on the server;
+- pages with an open or claimed rescan;
+- no pages at all.
+
+Each reason names the pages (the first ten) and has a "Show page" button. The
+server stays authoritative: its refusal (`400` with `error` and, for missing
+output, `missing_pages`) is shown in the dialog. On success the editor goes to the
+finalization status page (`/scan-finalizations/{id}/`), where packaging and the
+optional OCR run in workers; the editor header links the last finalization.
+
+*Decision: finish is blocked while rescans are open.* `scan_pipeline` refuses
+finish while any `ScanTodo` is `open` or `claimed` ("outstanding scan todos must be
+resolved"), and #228 keeps that. A requested rescan says the page is wrong;
+finishing would put the wrong page into the library and the replacement would
+immediately make the book stale again (re-finish needed). To finish without the
+replacement, cancel the rescan (`POST /scan/todos/{id}/cancel/`) or declare the page
+blank, which cancels it.
+
+What finish should ultimately trigger (OCR with a local AI model on the c-base
+production machine, and which OCR options are the defaults) is not designed yet;
+#228 only moves today's finalization into the editor.
 
 **Deskew** (upstream `deskew::ImageView` and `OptionsWidget`): the input preview turns
 live in the browser (a CSS rotation about the page centre) while the angle changes;
@@ -593,10 +841,15 @@ parameters.
 
 ## HTTP contracts
 
-- `GET /scan/jobs/<job_id>/workspace/` — HTML workspace or JSON page/stage state.
+- `GET /scan/jobs/<job_id>/editor/` — the editor (HTML).
+- `GET /scan/jobs/<job_id>/workspace/` — JSON page/stage state; an HTML request
+  redirects to the editor (the job overview is retired, #228).
+- `GET /scan/jobs/<job_id>/workspace/state/?since=<cursor>` — polling fallback:
+  changed stage rows plus `pages` (rescan markers of every page).
 - `GET /scan/jobs/<job_id>/workspace/events/` — authenticated SSE state stream.
   The first event (including reconnects) contains all stages; later events contain
-  changed stages only. Unchanged ticks send periodic keep-alive comments without
+  changed stages only. `pages` (rescan markers) is sent on the first event and
+  whenever the job's rescan todos change (#228). Unchanged ticks send periodic keep-alive comments without
   reloading full stage models or serializing JSON. See the [300-page event polling
   measurements](measurements/scantailor-workspace-events.md) for the PostgreSQL
   fingerprint path, portable token fallback, and remaining database scan cost.
@@ -608,6 +861,9 @@ parameters.
 - `POST /scan/jobs/<job_id>/stages/<stage>/batch/` — apply parameters to selected
   page IDs or all pages, optionally preserving manual exceptions; every applied page
   reports its `waiting_for`, and `jobs` lists only the jobs actually queued.
+- `POST /scan/jobs/<job_id>/pages/<page_id>/blank/` — declare or clear a blank page
+  (#219, see [Declared blank pages](#declared-blank-pages)); `409` on a stale
+  revision or raw version, `400` for `excluded`.
 
 Every stage row carries `applied_input_sha256`, `applied_revision`,
 `settings_applied` and, for Deskew, `input_sha256` (the active version's checksum),

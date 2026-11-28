@@ -103,9 +103,19 @@ urlpatterns = [
         name="scan-job-stage-batch",
     ),
     path(
+        "scan/jobs/<scan_job_id:job_id>/run-all/",
+        views.scan_job_run_all,
+        name="scan-job-run-all",
+    ),
+    path(
         "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/preview/",
         views.scan_page_stage_preview,
         name="scan-job-page-stage-preview",
+    ),
+    path(
+        "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/blank/",
+        views.scan_page_blank,
+        name="scan-job-page-blank",
     ),
     path(
         "scan/jobs/<scan_job_id:job_id>/pages/<uuid:page_id>/stages/<str:stage>/thumbnail/",

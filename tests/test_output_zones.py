@@ -216,7 +216,7 @@ def test_list_zone_edit_survives_batch_and_only_replaces_output() -> None:
     assert replay.json()["unchanged"] is True
     manual.refresh_from_db()
     assert manual.output_sha256 == original
-    assert manual.algorithm_version == "opencv-zones-v3"
+    assert manual.algorithm_version == scantailor.DEFAULT_STAGE_ALGORITHM_VERSION["output"]
     assert (
         list(
             ScanTailorStageState.objects.filter(scan_page=pages[0])

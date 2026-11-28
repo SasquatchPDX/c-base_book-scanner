@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -12,14 +13,19 @@ from django.test import Client
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from PIL import Image
 
-from ebook_server.core import conversion, ocr, scan_pipeline, views
+from ebook_server.core import conversion, ocr, scan_pipeline, scantailor, views
 from ebook_server.core.models import (
     Book,
     FileVariant,
     ProcessingJob,
+    ReviewTask,
     ScanJob,
+    ScanJobOpf,
     ScanPage,
     ScanPageVersion,
+    ScanTailorRun,
+    ScanTailorStageState,
+    ScanTodo,
     StorageLocation,
 )
 from ebook_server.jobs import RQ_ENQUEUE_OPTIONS
@@ -260,6 +266,508 @@ def test_scan_job_create_and_list() -> None:
     assert payload["count"] >= 1
     assert any(item["id"] == str(job.id) for item in payload["items"])
     assert "capture_layout" not in payload["items"][0]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_scan_job_html_list_counts_pages_without_serializing_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, job = _create_scan_job("scanner-list-html")
+    pages = [
+        ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+        for number in (1, 2, 3)
+    ]
+    for page in pages[:2]:
+        ScanTodo.objects.create(scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN)
+    ScanTailorRun.objects.create(scan_job=job, page_ids=[str(page.pk) for page in pages])
+    for version, app_generated, title in [
+        (1, False, "Scanner OPF Title"),
+        (2, True, "Generated OPF Title"),
+    ]:
+        ScanJobOpf.objects.create(
+            scan_job=job,
+            version=version,
+            app_generated=app_generated,
+            content=b"",
+            sha256=str(version) * 64,
+            size_bytes=0,
+            fields={
+                "title": title,
+                "authors": ["Scanner Author"],
+                "isbn": "9780306406157",
+                "language": "en",
+            },
+        )
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("HTML scan job list performed per-page serialization")
+
+    monkeypatch.setattr(views, "_scan_job_list_item", unexpected)
+    monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
+    response = client.get("/scan/jobs/?view=html&with_open_todos=true")
+    assert response.status_code == 200
+    assert b"3 pages" in response.content
+    assert b"Scanner OPF Title" in response.content
+    assert b"Generated OPF Title" not in response.content
+    assert b"Scanner Author" in response.content
+    assert b'ISBN <span class="mono">9780306406157</span>' in response.content
+    assert b"ScanTailor queued" in response.content
+    assert b'data-badge="rescan"' in response.content
+    assert f"/scan/jobs/{job.pk}/editor/".encode() in response.content
+    assert f"/scan/jobs/{job.pk}/workspace/".encode() not in response.content
+    # "Create scan job" is hidden (#227, maybe later); the POST path still works.
+    assert b"Create workspace" not in response.content
+    assert b"Metadata available" in response.content
+
+
+def _stage_rows(job: ScanJob, page: ScanPage, statuses: dict[str, str]) -> None:
+    for stage, status in statuses.items():
+        ScanTailorStageState.objects.create(
+            scan_job=job, scan_page=page, stage=stage, status=status
+        )
+
+
+def _list_job(client: Client, job: ScanJob, query: str = "") -> str:
+    content = client.get(f"/scan/jobs/?view=html{query}").content.decode()
+    marker = f'data-scan-job="{job.pk}"'
+    assert marker in content
+    return content.split(marker, 1)[1].split("</article>", 1)[0]
+
+
+@pytest.mark.django_db
+def test_scan_job_list_derives_pipeline_status_and_badges() -> None:
+    client, job = _create_scan_job("scanner-list-status")
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Capturing<" in row
+
+    pages = [
+        ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+        for number in (1, 2, 3)
+    ]
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Captured<" in row  # a web job has no capture-complete
+
+    _stage_rows(job, pages[0], {"deskew": "success", "output": "success"})
+    _stage_rows(job, pages[1], {"deskew": "failed"})
+    ReviewTask.objects.create(scan_job=job, source_filename="scan")
+    job.refinish_needed = True
+    job.save(update_fields=["refinish_needed"])
+    row = _list_job(client, job)
+    assert "data-pipeline-label>1 / 3 rendered<" in row
+    assert 'data-badge="failed"' in row and "Failed: 1 stage" in row
+    assert 'data-badge="review"' in row
+    assert 'data-badge="refinish"' in row
+
+    _stage_rows(job, pages[1], {"output": "success"})
+    _stage_rows(job, pages[2], {"output": "skipped"})  # a declared blank page counts
+    assert "data-pipeline-label>Rendered<" in _list_job(client, job)
+
+    # A scanner job is capturing until capture-complete, whatever was processed.
+    ScanJob.objects.filter(pk=job.pk).update(
+        source=ScanJob.Source.SCANNER, state=ScanJob.State.CAPTURING
+    )
+    row = _list_job(client, job)
+    assert "data-pipeline-label>Capturing<" in row and "3 / 3 rendered" in row
+
+    ScanJob.objects.filter(pk=job.pk).update(state=ScanJob.State.FINALIZING)
+    assert "data-pipeline-label>Finalizing<" in _list_job(client, job)
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.SCAN_FINALIZATION,
+        state=ProcessingJob.JobState.FAILED,
+        details={"scan_job_id": str(job.pk)},
+    )
+    assert "finalization" in _list_job(client, job)
+
+    ScanJob.objects.filter(pk=job.pk).update(state=ScanJob.State.COMPLETE)
+    assert "data-pipeline-label>Complete<" in _list_job(client, job, "&state=complete")
+    ocr_job = ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.OCR,
+        details={"source_type": "scan_job", "scan_job_id": str(job.pk)},
+    )
+    assert "data-pipeline-label>OCR queued<" in _list_job(client, job, "&state=complete")
+    ProcessingJob.objects.filter(pk=ocr_job.pk).update(state=ProcessingJob.JobState.SUCCESS)
+    assert "data-pipeline-label>OCR&#x27;d<" in _list_job(client, job, "&state=complete")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    [
+        ({"state": "cancelled"}, "Cancelled"),
+        ({"state": "paused", "page_count": 3, "rendered": 1}, "Paused"),
+        ({"state": "open", "page_count": 0}, "Capturing"),
+        ({"state": "captured", "page_count": 4, "has_metadata": True}, "Metadata available"),
+        ({"state": "captured", "page_count": 4, "rendered": 4}, "Rendered"),
+        ({"state": "complete", "ocr_state": "running"}, "OCR running"),
+        ({"state": "complete", "ocr_state": "failed"}, "Complete"),
+    ],
+)
+def test_pipeline_status_derivation(kwargs: dict[str, Any], label: str) -> None:
+    from ebook_server.core import scan_job_status
+
+    arguments: dict[str, Any] = {
+        "source": "web",
+        "page_count": 0,
+        "rendered": 0,
+        "has_metadata": False,
+        **kwargs,
+    }
+    assert scan_job_status.derive(**arguments)[1] == label
+
+
+@pytest.mark.django_db
+def test_job_pages_offer_no_manual_upload_or_identification() -> None:
+    client, job = _create_scan_job("scanner-no-manual-actions")
+    editor = client.get(f"/scan/jobs/{job.pk}/editor/").content.decode()
+    assert "Resolve book identity" not in editor
+    assert "Upload page" not in editor
+    assert "Upload the first page" not in editor
+    assert "The scanner uploads the pages" in editor
+
+
+def _populated_job(index: int) -> ScanJob:
+    job = ScanJob.objects.create(
+        provisional_title=f"Query count {index}", source=ScanJob.Source.SCANNER
+    )
+    for number in (1, 2):
+        page = ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+        _stage_rows(
+            job, page, {"deskew": "success", "output": "success" if number == 1 else "failed"}
+        )
+        ScanTodo.objects.create(scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN)
+    ScanJobOpf.objects.create(
+        scan_job=job,
+        version=1,
+        content=b"",
+        sha256=f"{index:064d}",
+        size_bytes=0,
+        fields={"title": f"OPF {index}", "authors": ["A"], "isbn": None, "language": "en"},
+    )
+    ProcessingJob.objects.create(
+        job_type=ProcessingJob.JobType.SCAN_FINALIZATION, details={"scan_job_id": str(job.pk)}
+    )
+    ReviewTask.objects.create(scan_job=job, source_filename="scan")
+    return job
+
+
+@pytest.mark.django_db
+def test_scan_job_list_query_count_does_not_grow_with_jobs_or_pages() -> None:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    client, _job = _create_scan_job("scanner-list-queries")
+    _populated_job(0)
+
+    def count() -> int:
+        with CaptureQueriesContext(connection) as queries:
+            assert client.get("/scan/jobs/?view=html").status_code == 200
+        return len(queries)
+
+    client.get("/scan/jobs/?view=html")  # warm the session and profile caches
+    few = count()
+    for index in range(1, 6):
+        _populated_job(index)
+    assert count() == few
+    assert few <= 12
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("with_open_todos", [False, True])
+def test_scan_job_json_list_query_count_does_not_grow_with_pages(
+    monkeypatch: pytest.MonkeyPatch, with_open_todos: bool
+) -> None:
+    """#226: the JSON list uses its prefetches and never checks page files on disk."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    client, job = _create_scan_job("scanner-list-json")
+    location, _ = StorageLocation.objects.get_or_create(
+        identifier="list-test", defaults={"base_path": "list-test"}
+    )
+
+    def add_pages(first: int, count: int) -> None:
+        for number in range(first, first + count):
+            page = ScanPage.objects.create(scan_job=job, logical_sequence_number=number)
+            for version in (1, 2):
+                ScanPageVersion.objects.create(
+                    scan_page=page,
+                    version=version,
+                    is_active=version == 2,
+                    storage_location=location,
+                    storage_identifier=f"p{number}-v{version}",
+                    checksum_sha256=f"{number:032x}{version:032x}",
+                    mime_type="image/png",
+                    size_bytes=1,
+                )
+            ScanTodo.objects.create(
+                scan_job=job, scan_page=page, todo_type=ScanTodo.TodoType.RESCAN
+            )
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("JSON scan job list checked page files")
+
+    monkeypatch.setattr(scan_pipeline, "pipeline_progress", unexpected)
+    url = "/scan/jobs/?with_open_todos=true" if with_open_todos else "/scan/jobs/"
+
+    def list_queries() -> tuple[int, dict[str, Any]]:
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get(url, HTTP_ACCEPT="application/json")
+        assert response.status_code == 200
+        return len(queries), response.json()
+
+    add_pages(1, 2)
+    small, payload = list_queries()
+    add_pages(3, 8)
+    large, payload = list_queries()
+    assert large == small
+
+    item = next(item for item in payload["items"] if item["id"] == str(job.pk))
+    assert "pipeline" not in item
+    assert [page["logical_sequence_number"] for page in item["pages"]] == list(range(1, 11))
+    first = item["pages"][0]
+    assert first["active_version"]["version"] == 2
+    assert [version["version"] for version in first["available_versions"]] == [2, 1]
+    assert first["open_rescan_todos"] == 1
+    assert first["thumbnail"] == f"/scan/pages/{first['id']}/image/"
+    if with_open_todos:
+        assert item["open_rescan_todo_count"] == 10
+
+
+@pytest.mark.django_db(transaction=True)
+def test_blank_page_is_audited_preserved_in_pdf_and_reset_on_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pypdf import PdfReader
+
+    from ebook_server.core.storage_registry import backend_for_location
+
+    book = Book.objects.create(title="A book with a blank verso")
+    client, job = _create_scan_job_with_book("blank-page-reviewer", book_id=book.id)
+    monkeypatch.setattr(scantailor, "get_queue", lambda: None)
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    base_url = f"/scan/jobs/{job.pk}"
+
+    for sequence, width in ((1, 64), (2, 120)):
+        data = io.BytesIO()
+        Image.new("L", (width, 96), 140).save(data, format="PNG", dpi=(300, 300))
+        upload = _upload_scan_page(
+            client, str(job.pk), sequence, "single", data.getvalue(), filename=f"{sequence}.png"
+        )
+        assert upload.status_code == 201
+        normal_page = job.pages.get(logical_sequence_number=sequence)
+        result = client.post(
+            f"{base_url}/pages/{normal_page.pk}/stages/deskew/",
+            {"parameters": {"deskew_mode": "manual", "angle_degrees": 0}},
+            content_type="application/json",
+        )
+        assert result.status_code in {200, 202}
+        result = client.post(
+            f"{base_url}/pages/{normal_page.pk}/stages/select_content/",
+            {"parameters": {"content_mode": "disabled"}},
+            content_type="application/json",
+        )
+        assert result.status_code in {200, 202}
+
+    page = job.pages.get(logical_sequence_number=2)
+    version = page.active_version()
+    assert version is not None
+    page_url = f"{base_url}/pages/{page.pk}"
+    revisions = dict(page.stage_states.values_list("stage", "revision"))
+    payload = {"declared_blank": True, "version_id": str(version.pk), "revisions": revisions}
+    todo = client.post(f"/scan/pages/{page.pk}/rescan/", data={})
+    assert todo.status_code == 201
+    previous_width = scantailor.margins_aggregate(job).width_mm
+
+    response = client.post(f"{page_url}/blank/", payload, content_type="application/json")
+    assert response.status_code == 200, response.content
+    skipped = [row for row in response.json()["stages"] if row["status"] == "skipped"]
+    assert {row["stage"] for row in skipped} == {"deskew", "select_content", "dewarping", "output"}
+    assert all(row["skip_reason"] == "declared_blank" for row in skipped)
+    assert page.todos.get().state == ScanTodo.State.CANCELLED
+    assert client.post(f"/scan/pages/{page.pk}/rescan/").status_code == 400
+    event = page.disposition_events.get()
+    assert event.actor_id == job.operator_id
+    assert (event.previous_disposition, event.disposition) == ("normal", "blank")
+    assert event.reason == "declared" and event.version_id == version.pk
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.BLANK
+    assert response.json()["page_disposition"] == "blank"
+    assert (
+        client.post(f"{page_url}/blank/", payload, content_type="application/json").status_code
+        == 409
+    )
+
+    assert scantailor.margins_aggregate(job).width_mm < previous_width
+    first_margins = job.pages.get(logical_sequence_number=1).stage_states.get(stage="margins")
+    margins = page.stage_states.get(stage="margins")
+    assert margins.output_storage_location is not None
+    assert margins.parameters["output_width"] == first_margins.parameters["output_width"]
+    with (
+        backend_for_location(margins.output_storage_location).open(
+            margins.output_storage_identifier
+        ) as stream,
+        Image.open(stream) as canvas,
+    ):
+        assert canvas.getextrema() == (255, 255)
+
+    assert scan_pipeline.pipeline_progress(job)["processed_pages"] == 2
+    ocr_input = ocr._zip_scan_job_pages(job)
+    try:
+        with (
+            zipfile.ZipFile(ocr_input) as archive,
+            archive.open("0002-single.png") as zipped_page,
+            Image.open(zipped_page) as image,
+        ):
+            assert image.getextrema() == (255, 255)
+    finally:
+        ocr_input.unlink()
+
+    finish = client.post(f"{base_url}/finish/")
+    assert finish.status_code == 202, finish.content
+    variant = FileVariant.objects.get(book=book, source_type=FileVariant.SourceType.CLEANED)
+    assert variant.storage_identifier is not None
+    with backend_for_location(variant.storage_location).open(variant.storage_identifier) as stream:
+        assert len(PdfReader(stream).pages) == 2
+    assert not page.stage_states.get(stage="margins").output_storage_identifier
+    ocr_input = ocr._zip_scan_job_pages(job)
+    try:
+        with (
+            zipfile.ZipFile(ocr_input) as archive,
+            Image.open(io.BytesIO(archive.read("0002-single.png"))) as image,
+        ):
+            assert image.getextrema() == (255, 255)
+            assert image.size[0] == margins.parameters["output_width"]
+    finally:
+        ocr_input.unlink()
+
+    current_revisions = dict(page.stage_states.values_list("stage", "revision"))
+    reset = client.post(
+        f"{page_url}/blank/",
+        {"declared_blank": False, "version_id": str(version.pk), "revisions": current_revisions},
+        content_type="application/json",
+    )
+    assert reset.status_code == 200, reset.content
+    job.refresh_from_db()
+    variant.refresh_from_db()
+    assert job.refinish_needed and job.state == ScanJob.State.CAPTURED
+    assert variant.processing_state == FileVariant.ProcessingState.FAILED
+    assert page.active_version() == version
+
+    payload["revisions"] = dict(page.stage_states.values_list("stage", "revision"))
+    redeclared = client.post(f"{page_url}/blank/", payload, content_type="application/json")
+    assert redeclared.status_code == 200, redeclared.content
+    replacement = _put_scan_page(client, page.pk, _black_png_bytes())
+    assert replacement.status_code in {200, 201, 202}, replacement.content
+    page.refresh_from_db()
+    job.refresh_from_db()
+    assert not page.declared_blank and page.versions.count() == 2
+    assert job.refinish_needed
+    events = list(page.disposition_events.order_by("created_at", "pk"))
+    assert [event.disposition for event in events] == ["blank", "normal", "blank", "normal"]
+    # The rescan cleared the declaration: a system event (no actor) with its reason.
+    assert events[-1].reason == "raw_version_replaced" and events[-1].actor_id is None
+    # ...and re-queued the page's stages: nothing is skipped any more.
+    assert not page.stage_states.filter(status=ScanTailorStageState.StageStatus.SKIPPED).exists()
+    margins_after = page.stage_states.get(stage="margins")
+    assert "declared_blank" not in margins_after.parameters
+
+
+@pytest.mark.django_db(transaction=True)
+def test_blank_declaration_conflicts_with_concurrent_edits_and_reaches_other_editors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#219 criteria 1 and 7: the declaration uses the stage revisions and live events."""
+    from ebook_server.core.models import get_or_create_profile
+    from ebook_server.core.workspace_events import WorkspaceEventPoller
+
+    client, job = _create_scan_job_with_book("blank-page-editor-a")
+    other = Client()
+    other.force_login(get_or_create_profile("blank-page-editor-b").user)
+    monkeypatch.setattr(scantailor, "get_queue", lambda: None)
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    upload = _upload_scan_page(client, str(job.pk), 1, "single", b"page", filename="1.png")
+    assert upload.status_code == 201
+    page = job.pages.get()
+    version = page.active_version()
+    assert version is not None
+    page_url = f"/scan/jobs/{job.pk}/pages/{page.pk}"
+    assert client.get(f"{page_url}/stages/deskew/").status_code == 200
+    stale = dict(page.stage_states.values_list("stage", "revision"))
+
+    # Only "blank" is built; "excluded" is modelled but refused (open question 1).
+    for disposition in ("excluded", "bogus"):
+        refused = client.post(
+            f"{page_url}/blank/",
+            {"disposition": disposition, "version_id": str(version.pk), "revisions": stale},
+            content_type="application/json",
+        )
+        assert refused.status_code == 400
+    page.refresh_from_db()
+    assert page.page_disposition == ScanPage.Disposition.NORMAL
+
+    # Editor B saves a Deskew change first: editor A's declaration was made against
+    # the old revisions and must conflict instead of overwriting B's edit.
+    saved = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 1.0},
+            "expected_revision": stale["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert saved.status_code in {200, 202}, saved.content
+    conflict = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": stale},
+        content_type="application/json",
+    )
+    assert conflict.status_code == 409
+    assert not page.disposition_events.exists()
+
+    poller = WorkspaceEventPoller(str(job.pk), views._serialize_stage_state)
+    poller.poll()
+    current = dict(page.stage_states.values_list("stage", "revision"))
+    declared = client.post(
+        f"{page_url}/blank/",
+        {"disposition": "blank", "version_id": str(version.pk), "revisions": current},
+        content_type="application/json",
+    )
+    assert declared.status_code == 200, declared.content
+    # Editor B's open workspace receives every row of the page with the new state.
+    update = poller.poll()
+    assert update.payload is not None
+    rows = {row["stage"]: row for row in update.payload["stages"]}
+    assert {stage for stage, row in rows.items() if row["skip_reason"] == "declared_blank"} == {
+        "deskew",
+        "select_content",
+        "dewarping",
+        "output",
+    }
+    assert rows["margins"]["parameters"].get("declared_blank") is True
+    # ...and B's next save with its old revision conflicts; editing a skipped stage
+    # is refused until the declaration is cleared.
+    late = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": current["deskew"],
+        },
+        content_type="application/json",
+    )
+    assert late.status_code == 409
+    refused_edit = other.post(
+        f"{page_url}/stages/deskew/",
+        {
+            "parameters": {"manual_angle": 2.0},
+            "expected_revision": rows["deskew"]["revision"],
+        },
+        content_type="application/json",
+    )
+    assert refused_edit.status_code == 400
+
+    # The job payload (read by the editor's page strip) reports the disposition.
+    detail = client.get(f"/scan/jobs/{job.pk}/")
+    assert detail.status_code == 200
+    assert {p["page_disposition"] for p in detail.json()["pages"]} >= {"blank"}
 
 
 @pytest.mark.django_db(transaction=True)

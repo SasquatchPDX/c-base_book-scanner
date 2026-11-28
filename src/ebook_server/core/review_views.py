@@ -165,6 +165,42 @@ def _review_search_context(task: ReviewTask) -> dict[str, Any]:
     }
 
 
+def _source_path_display(task: ReviewTask) -> dict[str, str]:
+    import_job = task.import_job
+    source = import_job.source_location if import_job is not None else None
+    if (
+        source is None
+        or task.processing_job_id is not None
+        or task.task_type == ReviewTask.TaskType.MULTIPART_WORK
+        or not task.source_path_hint
+    ):
+        return {}
+    path = task.source_path_hint.replace("\\", "/")
+    root = source.root_path.replace("\\", "/").rstrip("/") + "/"
+    if path == root.rstrip("/"):
+        return {}
+    if path.startswith(root):
+        relative = path[len(root) :]
+    elif path.startswith("/") or (len(path) > 2 and path[1:3] == ":/"):
+        # The configured root may have moved. Keep the nearest folder and filename
+        # from the original hint without exposing the old server root.
+        parts = path[2:] if path[1:3] == ":/" else path
+        relative = "/".join(parts.strip("/").split("/")[-2:])
+    else:
+        relative = path
+    if (
+        not relative
+        or relative.endswith("/")
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return {}
+    return {
+        "source": source.name,
+        "path": relative,
+        "folder": relative.rpartition("/")[0],
+    }
+
+
 def _serialize_task(task: ReviewTask) -> dict[str, Any]:
     source_type = "import" if task.import_job_id is not None else "scan"
     source_id = task.import_job_id or task.scan_job_id
@@ -180,6 +216,7 @@ def _serialize_task(task: ReviewTask) -> dict[str, Any]:
         "task_type": task.task_type,
         "source_filename": task.source_filename,
         "source_path_hint": task.source_path_hint,
+        "source_path_display": _source_path_display(task),
         "inferred_title": task.inferred_title,
         "inferred_authors": task.inferred_authors,
         "embedded_metadata": task.embedded_metadata,
@@ -581,17 +618,19 @@ def review_queue(request: HttpRequest) -> HttpResponseBase:
             min_score=min_score,
             ambiguity_margin=margin,
         )
+        task_payload = _serialize_task(task)
         rows.append(
             {
                 "task": task,
                 "top_candidate": candidates[0] if candidates else None,
                 "candidate_count": len(candidates),
                 "eligibility": eligibility,
+                "source_path": task_payload["source_path_display"],
             },
         )
         payload.append(
             {
-                **_serialize_task(task),
+                **task_payload,
                 "source_location_id": (
                     task.import_job.source_location_id if task.import_job is not None else None
                 ),
@@ -718,7 +757,9 @@ def review_detail(request: HttpRequest, task_id: str) -> HttpResponseBase:
         return HttpResponseForbidden()
 
     try:
-        task = ReviewTask.objects.select_related("import_job", "scan_job").get(pk=task_id)
+        task = ReviewTask.objects.select_related("import_job__source_location", "scan_job").get(
+            pk=task_id
+        )
     except ReviewTask.DoesNotExist:
         return HttpResponseNotFound()
     if not _can_manage_review_task(profile, task, allow_worker_failure=True):

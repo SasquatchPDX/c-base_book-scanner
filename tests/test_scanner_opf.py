@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from django.test import Client
+from django.test import Client, override_settings
 
 from ebook_server.core import identification, scan_identification, scan_pipeline, scanner_opf
 from ebook_server.core.models import (
@@ -271,16 +271,15 @@ def test_capture_complete_checks_the_opf_checksum(key: str) -> None:
 
 
 @pytest.mark.django_db
-def test_raw_scan_shows_opf_on_job_page_and_raw_scans(key: str, admin_client: Client) -> None:
+def test_raw_scan_shows_opf_in_editor_finish_and_raw_scans(key: str, admin_client: Client) -> None:
     _register(key)
     assert _put_opf(key, _opf(language="ger")).status_code == 201
     assert _capture_complete(key, _manifest({})).status_code == 200
 
-    page = admin_client.get(f"/scan/jobs/{JOB_ID}/workspace/?view=html").content.decode()
-    assert "The Physical Book" in page
-    assert "Ada Scanner" in page
-    assert ISBN in page
-    assert "data-opf-language>de<" in page
+    # The editor's finish dialog says the book comes from the scanner's OPF (#228).
+    page = admin_client.get(f"/scan/jobs/{JOB_ID}/editor/").content.decode()
+    assert "from the scanner&#x27;s metadata (“The Physical Book”)" in page
+    assert "data-raw-scan" in page
 
     item = admin_client.get("/scan/raw/").json()["items"][0]
     assert item["title"] == "The Physical Book"
@@ -402,6 +401,7 @@ def test_finish_without_opf_title_runs_scan_identification(
     if payload is not None:
         assert job.notes["scanner_opf"]["reason"] == "no_title"
         assert job.provisional_authors == ["Ada Scanner"]
+        assert scan_identification._provisional_terms(job) == {"isbn": ISBN}
 
 
 @pytest.mark.django_db(transaction=True)
@@ -635,7 +635,7 @@ def held_checks(monkeypatch: pytest.MonkeyPatch) -> _RecordingQueue:
     """Provider checks are queued, not run: the test runs them in the order it wants."""
     monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
     recording = _RecordingQueue()
-    monkeypatch.setattr(scanner_opf, "get_queue", lambda: recording)
+    monkeypatch.setattr(scanner_opf, "get_queue", lambda *_: recording)
     return recording
 
 
@@ -827,3 +827,176 @@ def test_resolution_is_rejected_when_the_book_or_evidence_changed(
     assert accepted.status_code == 200, accepted.content
     book.refresh_from_db()
     assert book.title == "A Completely Different Book"
+
+
+# --- automatic completion of missing OPF fields (#227) -------------------------------------
+
+
+def _identification_jobs() -> list[ProcessingJob]:
+    return list(
+        ProcessingJob.objects.filter(job_type=ProcessingJob.JobType.SCAN_IDENTIFICATION).order_by(
+            "scheduled_at"
+        )
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_only_opf_is_completed_in_the_background_and_finish_uses_it(
+    key: str, admin_client: Client, providers: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_pipeline, "get_queue", lambda: None)
+    providers.append(_provider_record("The Physical Book", "Ada Scanner"))
+    _prepare_finish(key, admin_client, _opf(title=None, authors=(), language=None))
+
+    [lookup] = _identification_jobs()
+    assert lookup.state == ProcessingJob.JobState.SUCCESS
+    assert lookup.details["terms"] == {"isbn": ISBN}
+    assert lookup.details["automatic"]["opf_version"] == 1
+    assert lookup.details["review_task_id"] is None
+    job = ScanJob.objects.get(pk=JOB_ID)
+    completion = job.notes["opf_completion"]
+    assert completion["status"] == "completed"
+    assert completion["fields"] == {"title": "The Physical Book", "authors": ["Ada Scanner"]}
+    assert job.provisional_title == "The Physical Book"
+    assert not ReviewTask.objects.exists()  # a strong match needs no person
+    assert Book.objects.count() == 0  # still raw: completion creates no Book
+
+    listing = admin_client.get("/scan/jobs/?view=html").content.decode()
+    assert "completed from provider: authors, title" in listing
+    assert "The Physical Book" in listing
+
+    response = _finish(admin_client)
+    assert response.status_code == 202, response.content
+    assert "requires_bibliographic_review" not in response.json()
+    book = Book.objects.get()
+    assert book.title == "The Physical Book"
+    assert [a.full_name for a in book.authors.all()] == ["Ada Scanner"]
+    sources = dict(
+        BookMetadataProvenance.objects.filter(book=book, action="set").values_list(
+            "field", "source"
+        )
+    )
+    assert sources == {
+        "title": "provider_check",
+        "authors": "provider_check",
+        "isbn": "scanner_opf",
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("edition", [True, False], ids=["edition-record", "work-record"])
+@override_settings(BOOK_SCANNER_IDENTIFICATION_STRONG_MATCH_ENABLED=True)
+def test_title_and_author_without_isbn_complete_the_isbn_on_a_strong_match(
+    key: str, admin_client: Client, providers: list[dict[str, Any]], edition: bool
+) -> None:
+    record = _provider_record("The Physical Book", "Ada Scanner")
+    if edition:
+        record["isbn_13"] = [ISBN]
+    providers.append(record)
+    _prepare_finish(key, admin_client, _opf(isbn=None))
+
+    [lookup] = _identification_jobs()
+    assert lookup.details["terms"] == {
+        "title": "The Physical Book",
+        "authors": ["Ada Scanner"],
+        "language": "en",
+    }
+    completion = ScanJob.objects.get(pk=JOB_ID).notes["opf_completion"]
+    assert completion["status"] == "completed", completion
+    # A work-level search hit identifies the work, not the edition: its ISBN list is
+    # never used to guess the scanned edition's ISBN.
+    assert completion["fields"] == ({"isbn": ISBN} if edition else {})
+    assert not ReviewTask.objects.exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_weak_match_completes_nothing_and_trusts_a_titled_opf(
+    key: str, admin_client: Client, providers: list[dict[str, Any]]
+) -> None:
+    providers.append(
+        {"key": "/works/OL5W", "title": "Physical Books Explained", "author_name": ["Ann Other"]}
+    )
+    _prepare_finish(key, admin_client, _opf(isbn=None))
+
+    completion = ScanJob.objects.get(pk=JOB_ID).notes["opf_completion"]
+    assert completion["status"] == "no_strong_match"
+    assert completion["fields"] == {}
+    assert not ReviewTask.objects.exists()  # scanner metadata is trusted; nothing guessed
+
+
+@pytest.mark.django_db(transaction=True)
+def test_contradicting_isbn_record_completes_nothing(
+    key: str, admin_client: Client, providers: list[dict[str, Any]]
+) -> None:
+    providers.append(_provider_record("A Completely Different Book", "Someone Else"))
+    _prepare_finish(key, admin_client, _opf(authors=()))
+
+    completion = ScanJob.objects.get(pk=JOB_ID).notes["opf_completion"]
+    assert completion["status"] == "contradicted"
+    assert completion["fields"] == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_isbn_only_opf_without_a_strong_match_waits_for_a_person(
+    key: str, admin_client: Client
+) -> None:
+    _prepare_finish(key, admin_client, _opf(title=None, authors=(), language=None))
+
+    [lookup] = _identification_jobs()
+    task = ReviewTask.objects.get(scan_job_id=JOB_ID)
+    assert lookup.details["review_task_id"] == task.pk
+    assert ScanJob.objects.get(pk=JOB_ID).notes["opf_completion"]["status"] == "no_strong_match"
+    status_page = admin_client.get(
+        f"/scan-identifications/{lookup.job_id}/?view=html"
+    ).content.decode()
+    assert f"/reviews/{task.pk}/" in status_page
+    listing = admin_client.get("/scan/jobs/?view=html").content.decode()
+    assert 'data-badge="review"' in listing
+
+
+@pytest.mark.django_db(transaction=True)
+def test_newer_opf_version_makes_an_older_completion_obsolete(
+    key: str, admin_client: Client, providers: list[dict[str, Any]]
+) -> None:
+    providers.append(_provider_record("The Physical Book", "Ada Scanner"))
+    _prepare_finish(key, admin_client, _opf(title=None, authors=(), language=None))
+    job = ScanJob.objects.get(pk=JOB_ID)
+    v1 = scanner_opf.effective_opf(job)
+    assert v1 is not None and scanner_opf.display_metadata(job)["completed"]  # type: ignore[index]
+
+    assert _put_opf(key, _opf(title="Scanner Title", authors=("Ada Scanner",))).status_code == 201
+    job.refresh_from_db()
+    v2 = scanner_opf.effective_opf(job)
+    assert v2 is not None and v2.version == 2
+    from ebook_server.core import scan_metadata_completion
+
+    fields, completed = scan_metadata_completion.merged_fields(job, v2)
+    assert completed == {}
+    assert fields["title"] == "Scanner Title"
+    # v2 has title, authors and ISBN: nothing important is missing, no new lookup.
+    assert len(_identification_jobs()) == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_completion_runs_on_the_metadata_queue_and_only_when_needed(
+    key: str, admin_client: Client, monkeypatch: pytest.MonkeyPatch, settings: Any
+) -> None:
+    queued: list[tuple[str | None, str]] = []
+
+    class NamedQueue:
+        def __init__(self, name: str | None) -> None:
+            self.name = name
+
+        def enqueue(self, func: Any, *args: Any, **_kwargs: Any) -> None:
+            queued.append((self.name, func.__name__))
+
+    monkeypatch.setattr(scan_identification, "get_queue", lambda name=None: NamedQueue(name))
+    _prepare_finish(key, admin_client, _opf(title=None, authors=(), language=None))
+    assert queued == [("metadata", "process_scan_identification_job")]
+
+    # Complete scanner metadata needs no lookup; nor does a disabled feature.
+    queued.clear()
+    assert _put_opf(key, _opf()).status_code == 201
+    settings.BOOK_SCANNER_SCAN_METADATA_COMPLETION = False
+    assert _put_opf(key, _opf(title=None, isbn=OTHER_ISBN)).status_code == 201
+    assert queued == []

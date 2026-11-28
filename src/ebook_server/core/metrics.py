@@ -14,7 +14,7 @@ from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from redis import Redis
 from rq import Queue
 
-from ebook_server.jobs import llm_queue_name
+from ebook_server.jobs import llm_queue_name, metadata_queue_name
 
 from .models import (
     Book,
@@ -379,6 +379,8 @@ class PersistentStateCollector:
         )
         queue_url = settings.BOOK_SCANNER_QUEUE_URL
         queue_names = [settings.BOOK_SCANNER_QUEUE_NAME]
+        if metadata_queue_name() not in queue_names:
+            queue_names.append(metadata_queue_name())
         if getattr(settings, "BOOK_SCANNER_LLM_ENABLED", False):
             llm_queue = llm_queue_name()
             if llm_queue not in queue_names:

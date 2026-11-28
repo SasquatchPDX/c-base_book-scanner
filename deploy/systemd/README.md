@@ -30,6 +30,12 @@ A single-page ScanTailor edit is queued at the front of the queue, so it runs be
 queued batch work ("Apply to all pages" is split into jobs of eight pages). No
 separate queue or worker configuration is needed for that.
 
+Metadata lookups (scan identification, the scanner-OPF completion and provider check,
+review searches) use their own queue, `metadata` (`BOOK_SCANNER_METADATA_QUEUE_NAME`,
+#227). The worker template lists it before the main queue, so every worker takes a
+waiting lookup before the next stage job. Keep `metadata` in the queue list when you
+adapt the command; see "Queues" in `docs/operations.md`.
+
 They assume:
 
 - a dedicated unprivileged `book-scanner` user and group;

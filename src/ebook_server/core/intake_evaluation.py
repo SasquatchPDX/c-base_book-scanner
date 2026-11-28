@@ -18,7 +18,7 @@ import isbnlib
 from django.db import transaction
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from . import identification, intake, local_identity
+from . import identification, intake, local_identity, provider_runtime
 from .languages import normalize_language
 from .models import Identifier, ImportJob, MetadataCandidate, ReviewTask, SourceLocation
 
@@ -347,6 +347,7 @@ def run_corpus(corpus: Corpus, root: Path, threshold: float) -> dict[str, Any]:
         stack.enter_context(patch("socket.socket.sendto", side_effect=deny_network))
         stack.enter_context(patch("socket.create_connection", side_effect=deny_network))
         stack.enter_context(patch("socket.getaddrinfo", side_effect=deny_network))
+        stack.callback(provider_runtime.set_store, None)
         for case in corpus.cases:
             case_root = root / case.id
             case_root.mkdir(parents=True)
@@ -357,6 +358,9 @@ def run_corpus(corpus: Corpus, root: Path, threshold: float) -> dict[str, Any]:
                 providers.insert(0, FixtureProvider([], failed=True))
             if case.provider_failure == "all":
                 providers = providers[:1]
+            # Fixture records differ per case: no cached lookup or open circuit breaker
+            # may carry over from the previous case (#220).
+            provider_runtime.set_store(provider_runtime.LocalProviderStateStore())
             with (
                 transaction.atomic(),
                 patch.object(identification, "_provider_instances", return_value=providers),

@@ -71,7 +71,11 @@ def _active_output_state(page: ScanPage) -> ScanTailorStageState | None:
         ScanTailorStageState.objects.filter(
             scan_job=page.scan_job,
             scan_page=page,
-            stage=ScanTailorStageState.Stage.OUTPUT.value,
+            stage=(
+                ScanTailorStageState.Stage.MARGINS
+                if page.declared_blank
+                else ScanTailorStageState.Stage.OUTPUT
+            ),
             status=ScanTailorStageState.StageStatus.SUCCESS,
         )
         .order_by("-revision", "-created_at")
@@ -96,7 +100,7 @@ def _select_page_source_identifier(
     ):
         return ("scan_stage_output", output_state.output_storage_identifier)
 
-    if allow_raw_pages:
+    if allow_raw_pages and not page.declared_blank:
         active_version = page.active_version()
         if active_version is not None:
             return ("scan_page_version", active_version.storage_identifier)
@@ -396,6 +400,7 @@ def create_cleaned_variant_for_scan_job(
                 "side": page.side,
                 "source_kind": source_kind,
                 "storage_identifier": source_identifier,
+                **({"declared_blank": True} if page.declared_blank else {}),
             },
         )
 
@@ -410,6 +415,7 @@ def create_cleaned_variant_for_scan_job(
             book_id=job.book_id,
             format="pdf",
             source_type=FileVariant.SourceType.CLEANED,
+            processing_state=FileVariant.ProcessingState.COMPLETE,
             sha256=output_sha,
         )
         .filter(storage_location_id=_library_location().id)
