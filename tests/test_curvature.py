@@ -1,11 +1,12 @@
 """Actual remapped pixels, geometric improvement, replay, and memory bounds (#171)."""
 
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from ebook_server.core import curvature
 from tests.curvature_fixtures import curled_page, straightness
@@ -97,3 +98,51 @@ def test_isolated_crossing_auto_trace_does_not_discard_ordered_text_rows() -> No
     # The automatic filter must not make the same contradictory manual edit valid.
     with pytest.raises(ValueError, match="cross"):
         curvature.normalize_curves([*good, bad], (1000, 500))
+
+
+def inner_band_test_page(*, sparse: bool = False) -> Image.Image:
+    source = Image.new("L", (1000, 1400), 255)
+    draw = ImageDraw.Draw(source)
+    font = ImageFont.load_default(size=38)
+    if sparse:
+        rows = [
+            (28, "FIRST REAL TEXT LINE " * 3),
+            (660, "CENTRE TEXT LINE " * 3),
+            (1330, "LAST REAL TEXT LINE " * 3),
+        ]
+    else:
+        rows = [(22, "PAGE 007    " * 4), (1335, "PAGE 008    " * 4)]
+        rows.extend((row, f"CURVED PAGE CALIBRATION LINE {row}") for row in range(210, 1230, 85))
+    for row, text in rows:
+        draw.text((65, row), text, fill=0, font=font)
+    return source
+
+
+def test_inner_band_ignores_running_page_numbers() -> None:
+    source = inner_band_test_page()
+    original = curvature.detect_curves(source, inner_band=False)
+    restricted = curvature.detect_curves(source, inner_band=True)
+
+    def middle(curve: list[list[float]]) -> float:
+        return float(np.median([point[1] for point in curve])) / source.height
+
+    assert original == curvature.detect_curves(source)
+    assert min(map(middle, original)) < 0.05 and max(map(middle, original)) > 0.95
+    assert all(0.10 <= middle(curve) <= 0.90 for curve in restricted)
+    assert len(restricted) == len(original) - 2
+
+
+def test_inner_band_preserves_passthrough_when_it_drops_real_lines() -> None:
+    from ebook_server.core import scantailor
+    from tests.stage_helpers import run_stage
+
+    source = inner_band_test_page(sparse=True)
+    assert len(curvature.detect_curves(source)) == 3
+    with pytest.raises(ValueError, match="reliable text baselines"):
+        curvature.detect_curves(source, inner_band=True)
+
+    config = SimpleNamespace(parameters={"dewarp_mode": "auto", "dewarp_inner_band": True})
+    result = run_stage(scantailor._run_dewarping, config, source)
+    assert not result.parameters["dewarp_applied"]
+    assert "No text lines" in result.parameters["dewarp_warning"]
+    assert result.image.tobytes() == source.tobytes()

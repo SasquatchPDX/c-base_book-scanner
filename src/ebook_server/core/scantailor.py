@@ -433,7 +433,13 @@ STAGE_SETTING_KEYS: Final[dict[str, tuple[str, ...]]] = {
         "width",
         "height",
     ),
-    "dewarping": ("dewarp_mode", "depth_perception", "top_curve", "bottom_curve"),
+    "dewarping": (
+        "dewarp_mode",
+        "depth_perception",
+        "top_curve",
+        "bottom_curve",
+        "dewarp_inner_band",
+    ),
     "margins": (
         "margins_mode",
         # Millimetres and "align with other pages" (#208).
@@ -1676,12 +1682,14 @@ def _spline_through(polyline: Points) -> cylindrical.XSpline:
     return cylindrical.XSpline(points, [0.0, 1.0, 1.0, 1.0, 0.0])
 
 
-def _auto_dewarp_curves(stage_input: StageInput) -> tuple[Points, Points] | None:
+def _auto_dewarp_curves(
+    stage_input: StageInput, *, inner_band: bool = False
+) -> tuple[Points, Points] | None:
     """Bridge until the upstream detection is ported (#195 step 6b): the topmost and
     bottommost baselines found by the pre-port detector, extended to the page edges."""
     sx, sy = stage_input.scale
     try:
-        baselines = curvature.detect_curves(stage_input.image)
+        baselines = curvature.detect_curves(stage_input.image, inner_band=inner_band)
     except ValueError:  # "no reliable text baselines found"
         return None
     if len(baselines) < 2:
@@ -1749,7 +1757,9 @@ def _run_cylindrical_dewarp(state: ScanTailorStageState, stage_input: StageInput
         else:
             mode = updates["dewarp_mode"] = "auto"
     if top_spline is None or bottom_spline is None:
-        found = _auto_dewarp_curves(stage_input)
+        found = _auto_dewarp_curves(
+            stage_input, inner_band=_coerce_bool(parameters.get("dewarp_inner_band"), False)
+        )
         trivial = found is None
         if found is None:
             top_line, bottom_line = cylindrical.trivial_curves(width, height)
